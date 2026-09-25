@@ -257,6 +257,10 @@ class ScreenRecorderApp(QObject):
             "prompt_name": "",
             "prompt_edited": False,
             "is_scrum": False,
+            "generate_deepseek_prompt": False,
+            "include_name_in_prompt": False,
+            "include_project_in_prompt": False,
+            "include_comment_in_prompt": False,
             "previous_protocol_path": "",
             "attachments": [],
             "send_attachments_to_transcribe": False,
@@ -399,11 +403,12 @@ class ScreenRecorderApp(QObject):
         self._current_session_meta = meta
         log.info(
             "Метаданные для записи получены: project=%s, name=%s, "
-            "template=%r, abbr=%r, is_scrum=%s, prompt=%d символов, "
-            "attachments=%d, send_to_transcribe=%s, send_to_deepseek=%s",
+            "template=%r, abbr=%r, is_scrum=%s, generate_deepseek=%s, "
+            "prompt=%d символов, attachments=%d, "
+            "send_to_transcribe=%s, send_to_deepseek=%s",
             meta.get("project"), meta.get("name"),
             meta.get("name_template", ""), meta.get("name_abbr", ""),
-            meta.get("is_scrum"),
+            meta.get("is_scrum"), meta.get("generate_deepseek_prompt"),
             len(meta.get("prompt", "") or ""),
             len(meta.get("attachments", []) or []),
             meta.get("send_attachments_to_transcribe"),
@@ -631,9 +636,10 @@ class ScreenRecorderApp(QObject):
         size_mb = os.path.getsize(path) / 1024 / 1024 if os.path.exists(path) else 0
         log.info(
             "Сессия сохранена: dir=%s, video=%s (%.2f МБ), "
-            "name=%s, is_scrum=%s, attachments=%d",
+            "name=%s, is_scrum=%s, generate_deepseek=%s, attachments=%d",
             session_dir, os.path.basename(path), size_mb,
             meta.get("name"), meta.get("is_scrum", False),
+            meta.get("generate_deepseek_prompt", False),
             len(meta.get("attachments", []) or []),
         )
 

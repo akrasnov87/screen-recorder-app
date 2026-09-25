@@ -1,4 +1,4 @@
-"""Конвейер обработки: конвертация → транскрибация (без загрузки на NAS)."""
+"""Конвейер обработки: конвертация → транскрибация → суммаризация → DeepSeek-промпт."""
 from __future__ import annotations
 
 import asyncio
@@ -57,9 +57,15 @@ class VideoProcessor(QObject):
         log.info("=" * 60)
         log.info("Начало обработки задачи %s", task_id)
         log.info("Видео: %s", video_path)
-        log.info("Метаданные: project=%s, name=%s, is_scrum=%s, attachments=%d",
+        log.info("Метаданные: project=%s, name=%s, is_scrum=%s, "
+                 "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
+                 "ctx_comment=%s, attachments=%d",
                  metadata.get("project"), metadata.get("name"),
                  metadata.get("is_scrum"),
+                 metadata.get("generate_deepseek_prompt"),
+                 metadata.get("include_name_in_prompt"),
+                 metadata.get("include_project_in_prompt"),
+                 metadata.get("include_comment_in_prompt"),
                  len(metadata.get("attachments", []) or []))
 
         t0 = time.monotonic()
@@ -94,6 +100,12 @@ class VideoProcessor(QObject):
             if provider not in ("server", "litellm"):
                 provider = "server"
 
+            gl = self.config.get("glossary", {}) or {}
+            gl_terms = gl.get("terms", []) or []
+            gl_text = self._build_glossary_text(gl_terms)
+            gl_to_summarizer = bool(gl.get("send_to_summarizer", True))
+            gl_to_deepseek = bool(gl.get("send_to_deepseek", True))
+
             transcript_path = ""
             summary_path = ""
 
@@ -103,7 +115,7 @@ class VideoProcessor(QObject):
                 self.task_queue.update_task_status(task_id, "transcribing", 50)
                 self.task_progress.emit(task_id, 50, "transcribing")
 
-                # Промпт пользователя (что ввёл в окне метаданных)
+                # Промпт пользователя
                 prompt = (
                     metadata.get("prompt")
                     or self.config.get("metadata", {}).get("default_prompt", "")
@@ -111,8 +123,19 @@ class VideoProcessor(QObject):
                 log.debug("[%s] Промпт пользователя (%d символов)",
                           task_id, len(prompt))
 
-                # Дополняем промпт вложениями (если включено)
-                # — вложения нужны и для LiteLLM, и для сервера
+                # Контекст записи — шапка перед промптом
+                ctx_header = self._build_context_header(
+                    metadata=metadata,
+                    include_name=bool(metadata.get("include_name_in_prompt")),
+                    include_project=bool(metadata.get("include_project_in_prompt")),
+                    include_comment=bool(metadata.get("include_comment_in_prompt")),
+                )
+                if ctx_header:
+                    prompt = ctx_header + "\n\n" + prompt
+                    log.info("[%s] В промпт добавлен контекст записи "
+                             "(%d символов)", task_id, len(ctx_header))
+
+                # Вложения
                 if metadata.get("send_attachments_to_transcribe"):
                     att_text = self._read_attachments_text(
                         metadata.get("attachments", []) or []
@@ -126,16 +149,23 @@ class VideoProcessor(QObject):
                         log.info("[%s] К промпту добавлены вложения "
                                  "(%d символов)", task_id, len(att_text))
 
+                # Глоссарий
+                if gl_to_summarizer and gl_text:
+                    prompt = (
+                        prompt
+                        + "\n\n===== ГЛОССАРИЙ (используй правильные "
+                          "формулировки) =====\n\n"
+                        + gl_text
+                    )
+                    log.info("[%s] К промпту добавлен глоссарий "
+                             "(%d терминов, %d символов)",
+                             task_id, len(gl_terms), len(gl_text))
+
                 target_for_transcribe = audio_path if audio_path else video_path
                 log.info("[%s] Для транскрибации используется: %s",
                          task_id, target_for_transcribe)
 
-                # --- Обращаемся к серверу за расшифровкой ---
                 t2 = time.monotonic()
-
-                # Если суммаризация на сервере — сразу просим и промпт.
-                # Если суммаризация в LiteLLM — просим только script,
-                # чтобы не тратить токены сервера впустую.
                 server_prompt = prompt if provider == "server" else ""
                 transcript = await self.transcribe(
                     target_for_transcribe, transcribe_cfg, prompt=server_prompt
@@ -160,14 +190,11 @@ class VideoProcessor(QObject):
                 if self._is_cancelled(task_id):
                     raise RuntimeError("cancelled")
 
-                # --- Сохраняем расшифровку ---
                 transcript_path = str(Path(video_path).with_suffix(".txt"))
                 summary_path = str(Path(video_path).with_name("video_summary.md"))
                 self._save_transcript(transcript, transcript_path)
 
-                # --- Суммаризация ---
                 if provider == "litellm":
-                    # Локальный вызов LiteLLM
                     self.task_queue.update_task_status(task_id, "summarizing", 70)
                     self.task_progress.emit(task_id, 70, "summarizing")
                     try:
@@ -186,21 +213,18 @@ class VideoProcessor(QObject):
                     except LiteLLMError as exc:
                         err = f"litellm: {exc}"
                         log.error("[%s] Ошибка LiteLLM: %s", task_id, err)
-                        # Транскрибация у нас есть, а summary нет.
-                        # Считаем это ошибкой задачи — пользователь
-                        # ожидал увидеть протокол.
                         self.task_queue.mark_failed(task_id, err)
                         self.task_failed.emit(task_id, err)
                         return {"error": err, "task_id": task_id}
                 else:
-                    # Суммаризация на сервере: summary уже в ответе
                     self._save_summary(transcript, summary_path)
             else:
                 log.info("[%s] Транскрибация пропущена: URL сервера не задан",
                          task_id)
 
-            # --- Шаг 3: DeepSeek-промпт для скрам-митинга ---
-            if metadata.get("is_scrum") and transcript_path:
+            # --- Шаг 3: DeepSeek-промпт ---
+            if metadata.get("generate_deepseek_prompt") and transcript_path:
+                use_scrum = bool(metadata.get("is_scrum", False))
                 try:
                     prompt_path = self._build_deepseek_prompt(
                         session_dir=os.path.dirname(video_path),
@@ -212,12 +236,29 @@ class VideoProcessor(QObject):
                         include_attachments=bool(
                             metadata.get("send_attachments_to_deepseek", False)
                         ),
+                        use_scrum_template=use_scrum,
+                        user_prompt=str(metadata.get("prompt") or ""),
+                        glossary_text=gl_text if gl_to_deepseek else "",
+                        metadata=metadata,
                     )
                     if prompt_path:
-                        log.info("[%s] Промпт DeepSeek: %s", task_id, prompt_path)
+                        log.info(
+                            "[%s] Промпт DeepSeek: %s (template=%s, glossary=%s)",
+                            task_id, prompt_path,
+                            "scrum" if use_scrum else "user",
+                            bool(gl_to_deepseek and gl_text),
+                        )
                 except Exception as exc:
                     log.exception("[%s] Не удалось собрать DeepSeek-промпт: %s",
                                   task_id, exc)
+            else:
+                log.info(
+                    "[%s] DeepSeek-промпт не формируется: "
+                    "generate_deepseek_prompt=%s, transcript_path=%r",
+                    task_id,
+                    metadata.get("generate_deepseek_prompt"),
+                    transcript_path,
+                )
 
             # --- Завершение ---
             self.task_queue.update_task_status(task_id, "completed", 100)
@@ -323,16 +364,6 @@ class VideoProcessor(QObject):
         user_prompt: str,
         video_title: str = "",
     ) -> str:
-        """
-        Готовит финальное резюме через LiteLLM.
-
-        Собирает user-сообщение из:
-          • заголовка видео (если есть),
-          • пользовательского промпта (или дефолтного),
-          • самого транскрипта.
-
-        System-сообщение берётся из summarizer.litellm.system_prompt.
-        """
         cfg = self.config.get("summarizer", {}) or {}
         l = cfg.get("litellm", {}) or {}
 
@@ -351,14 +382,12 @@ class VideoProcessor(QObject):
         if not script.strip():
             raise LiteLLMError("Пустой script — нечего суммаризировать")
 
-        # Пользовательский промпт
         if not user_prompt or not user_prompt.strip():
             user_prompt = (
                 self.config.get("metadata", {}).get("default_prompt")
                 or "Составь краткое содержание записи."
             )
 
-        # Собираем user-сообщение
         parts: List[str] = []
         if video_title:
             parts.append(f"# {video_title}")
@@ -392,13 +421,52 @@ class VideoProcessor(QObject):
             )
 
     # ------------------------------------------------------------------
+    # Контекст записи
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_context_header(
+        metadata: Dict[str, Any],
+        include_name: bool,
+        include_project: bool,
+        include_comment: bool,
+    ) -> str:
+        """
+        Формирует шапку «КОНТЕКСТ ЗАПИСИ» для промпта.
+
+        Возвращает пустую строку, если ничего не выбрано или все
+        выбранные поля пусты.
+        """
+        lines: List[str] = []
+
+        if include_name:
+            name = str(metadata.get("name") or "").strip()
+            if name:
+                lines.append(f"Название записи: {name}")
+
+        if include_project:
+            project = str(metadata.get("project") or "").strip()
+            if project:
+                lines.append(f"Проект: {project}")
+
+        if include_comment:
+            comment = str(metadata.get("comment") or "").strip()
+            if comment:
+                # Комментарий может быть многострочным — оставляем как есть
+                lines.append(f"Комментарий: {comment}")
+
+        if not lines:
+            return ""
+
+        return (
+            "===== КОНТЕКСТ ЗАПИСИ =====\n\n"
+            + "\n".join(lines)
+            + "\n\n===== ИНСТРУКЦИЯ ====="
+        )
+
+    # ------------------------------------------------------------------
     # Вложения
     # ------------------------------------------------------------------
     def _read_attachments_text(self, paths: List[str]) -> str:
-        """
-        Читает все вложения и возвращает склеенный текст.
-        Поддерживает .txt/.md/.csv/.json напрямую, .docx — через python-docx.
-        """
         if not paths:
             return ""
 
@@ -417,6 +485,29 @@ class VideoProcessor(QObject):
         return "\n\n".join(blocks)
 
     # ------------------------------------------------------------------
+    # Глоссарий
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_glossary_text(terms: List[Dict[str, Any]]) -> str:
+        if not terms:
+            return ""
+        lines: List[str] = []
+        for item in terms:
+            if isinstance(item, dict):
+                t = str(item.get("term") or "").strip()
+                d = str(item.get("description") or "").strip()
+            else:
+                t = str(item or "").strip()
+                d = ""
+            if not t:
+                continue
+            if d:
+                lines.append(f"- {t} — {d}")
+            else:
+                lines.append(f"- {t}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # DeepSeek-промпт
     # ------------------------------------------------------------------
     def _build_deepseek_prompt(
@@ -426,22 +517,62 @@ class VideoProcessor(QObject):
         previous_protocol_path: str = "",
         attachments: Optional[List[str]] = None,
         include_attachments: bool = False,
+        use_scrum_template: bool = True,
+        user_prompt: str = "",
+        glossary_text: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Формирует файл с готовым промптом для DeepSeek в выбранном формате
-        (docx / md / txt), сохраняет в <session_dir>/.
-        """
-        log.info("Сборка DeepSeek-промпта: transcript=%s, prev=%s, attach=%s",
-                 transcript_path, previous_protocol_path or "—",
-                 include_attachments)
+        Формирует файл с готовым промптом для DeepSeek.
 
-        scrum_cfg = self.config.get("scrum", {})
-        template = scrum_cfg.get("prompt_template") or ""
-        export_format = (scrum_cfg.get("export_format") or "docx").lower()
+        Если у metadata стоят флаги include_*_in_prompt — в файл
+        добавляется блок «КОНТЕКСТ ЗАПИСИ» перед шаблоном.
+        """
+        log.info(
+            "Сборка DeepSeek-промпта: transcript=%s, prev=%s, attach=%s, "
+            "use_scrum_template=%s, user_prompt=%d симв, glossary=%d симв",
+            transcript_path, previous_protocol_path or "—",
+            include_attachments, use_scrum_template, len(user_prompt or ""),
+            len(glossary_text or ""),
+        )
+
+        # Контекст записи
+        ctx_header = ""
+        if metadata:
+            ctx_header = self._build_context_header(
+                metadata=metadata,
+                include_name=bool(metadata.get("include_name_in_prompt")),
+                include_project=bool(metadata.get("include_project_in_prompt")),
+                include_comment=bool(metadata.get("include_comment_in_prompt")),
+            )
+            if ctx_header:
+                log.info("В DeepSeek-промпт добавлен контекст записи "
+                         "(%d символов)", len(ctx_header))
+
+        # Шаблон
+        if use_scrum_template:
+            scrum_cfg = self.config.get("scrum", {})
+            template = scrum_cfg.get("prompt_template") or ""
+            template_source = "scrum"
+        else:
+            template = (user_prompt or "").strip()
+            if not template:
+                template = (
+                    self.config.get("metadata", {}).get("default_prompt", "")
+                    or ""
+                )
+                template_source = "default"
+            else:
+                template_source = "user"
+        log.info("Шаблон DeepSeek-промпта: источник=%s, %d символов",
+                 template_source, len(template))
+
+        export_format = (
+            self.config.get("scrum", {}).get("export_format") or "docx"
+        ).lower()
         if export_format not in ("docx", "md", "txt"):
             export_format = "docx"
 
-        # Стенограмма
         transcript_text = ""
         try:
             with open(transcript_path, "r", encoding="utf-8") as f:
@@ -450,12 +581,10 @@ class VideoProcessor(QObject):
             log.warning("Не удалось прочитать стенограмму %s: %s",
                         transcript_path, exc)
 
-        # Предыдущий протокол
         previous_text = ""
         if previous_protocol_path and os.path.exists(previous_protocol_path):
             previous_text = self._read_any_text(previous_protocol_path)
 
-        # Вложения (если включено)
         attachments_text = ""
         if include_attachments and attachments:
             attachments_text = self._read_attachments_text(attachments)
@@ -463,15 +592,30 @@ class VideoProcessor(QObject):
                 log.info("В промпт DeepSeek добавлены вложения "
                          "(%d символов)", len(attachments_text))
 
-        # Собираем части
+        # Собираем файл
         parts: List[str] = []
+
+        if ctx_header:
+            parts.append(ctx_header)
+            parts.append("")
+
         parts.append(template)
         parts.append("")
-        parts.append("=" * 60)
-        parts.append("ПРЕДЫДУЩИЙ ПРОТОКОЛ")
-        parts.append("=" * 60)
-        parts.append("")
-        parts.append(previous_text or "(Предыдущий протокол не приложен.)")
+
+        if previous_text or use_scrum_template:
+            parts.append("=" * 60)
+            parts.append("ПРЕДЫДУЩИЙ ПРОТОКОЛ")
+            parts.append("=" * 60)
+            parts.append("")
+            parts.append(previous_text or "(Предыдущий протокол не приложен.)")
+
+        if glossary_text:
+            parts.append("")
+            parts.append("=" * 60)
+            parts.append("ГЛОССАРИЙ (используй правильные формулировки)")
+            parts.append("=" * 60)
+            parts.append("")
+            parts.append(glossary_text)
 
         if attachments_text:
             parts.append("")
@@ -489,8 +633,6 @@ class VideoProcessor(QObject):
         parts.append(transcript_text)
 
         full_text = "\n".join(parts)
-
-        # Экспорт
         return self._export_prompt_file(
             session_dir=session_dir,
             full_text=full_text,
@@ -499,7 +641,6 @@ class VideoProcessor(QObject):
 
     def _export_prompt_file(self, session_dir: str, full_text: str,
                             fmt: str) -> str:
-        """Сохраняет текст промпта в файл нужного формата."""
         base_name = "deepseek_prompt"
         try:
             if fmt == "txt":
@@ -518,7 +659,6 @@ class VideoProcessor(QObject):
                          path, len(full_text))
                 return path
 
-            # docx по умолчанию
             path = os.path.join(session_dir, f"{base_name}.docx")
             try:
                 from docx import Document  # type: ignore
@@ -543,7 +683,6 @@ class VideoProcessor(QObject):
 
     @staticmethod
     def _read_any_text(path: str) -> str:
-        """Читает .txt/.md/.csv/.json напрямую; .docx — через python-docx."""
         ext = os.path.splitext(path)[1].lower()
         if ext in (".txt", ".md", ".csv", ".json", ".log"):
             try:
@@ -593,10 +732,6 @@ class VideoProcessor(QObject):
 
     @staticmethod
     def _save_transcript(data: Dict[str, Any], path: str) -> None:
-        """
-        Сохраняет расшифровку с сервера (`script`) в video.txt.
-        Если `script` нет — падаем на `text`/`summary`/строковое представление.
-        """
         try:
             text = (
                 data.get("script")
@@ -613,10 +748,6 @@ class VideoProcessor(QObject):
 
     @staticmethod
     def _save_summary(data: Dict[str, Any], path: str) -> None:
-        """
-        Сохраняет summary с сервера в video_summary.md.
-        Если summary нет — просто пропускаем (файл не создаём).
-        """
         try:
             summary = data.get("summary")
             if not summary or not str(summary).strip():
@@ -631,7 +762,6 @@ class VideoProcessor(QObject):
 
     @staticmethod
     def _write_file(path: str, text: str) -> None:
-        """Универсальная запись текста в файл с логированием."""
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)

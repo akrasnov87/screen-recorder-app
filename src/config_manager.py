@@ -156,9 +156,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "export_format": "docx",
     },
     # --- Формирование протокола (резюме) ---
-    # provider: "server" — суммаризация на сервере транскрибации (промпт уходит в API);
-    #           "litellm" — суммаризация локально через LiteLLM-совместимый API
-    #           (сервер транскрибации используется только для расшифровки).
     "summarizer": {
         "provider": "server",          # server | litellm
         "litellm": {
@@ -176,6 +173,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "Отвечай на русском языке, если в инструкции не сказано иное."
             ),
         },
+    },
+    # --- Глоссарий терминов ---
+    # Список терминов/аббревиатур, которые нужно «знать» модели.
+    #   terms              — список {"term": ..., "description": ...}
+    #   send_to_summarizer — дописывать глоссарий в промпт суммаризации
+    #                        (summary_prompt для сервера или user-prompt
+    #                         для LiteLLM);
+    #   send_to_deepseek   — добавлять блок «ГЛОССАРИЙ» в файл
+    #                        deepseek_prompt.*.
+    "glossary": {
+        "terms": [
+            {"term": "ЕЖД", "description": "Единый журнал дежурств"},
+        ],
+        "send_to_summarizer": True,
+        "send_to_deepseek": True,
     },
 }
 
@@ -276,10 +288,6 @@ class ConfigManager:
 
     # --- Шаблоны названий ---
     def get_name_templates(self) -> List[Dict[str, str]]:
-        """
-        Возвращает список шаблонов названий вида
-        [{"label": "...", "template": "..."}].
-        """
         meta = self.config.get("metadata", {}) or {}
         raw = meta.get("name_templates", [])
         if not isinstance(raw, list):
@@ -296,7 +304,6 @@ class ConfigManager:
         return result
 
     def add_name_template(self, label: str, template: str) -> None:
-        """Добавляет шаблон названия (или обновляет существующий с таким же template)."""
         label = (label or "").strip()
         template = (template or "").strip()
         if not template:
@@ -352,12 +359,6 @@ class ConfigManager:
         }
 
     def get_summarizer_settings(self) -> Dict[str, Any]:
-        """
-        Возвращает настройки суммаризатора:
-          • provider: "server" | "litellm";
-          • litellm: dict с base_url/api_key/model/…;
-          • системный промпт.
-        """
         cfg = self.config.get("summarizer", {}) or {}
         provider = str(cfg.get("provider", "server")).strip().lower()
         if provider not in ("server", "litellm"):
@@ -377,4 +378,30 @@ class ConfigManager:
         return {
             "provider": provider,
             "litellm": litellm,
+        }
+
+    # --- Глоссарий ---
+    def get_glossary_settings(self) -> Dict[str, Any]:
+        """
+        Возвращает настройки глоссария:
+          • terms              — список {"term": ..., "description": ...};
+          • send_to_summarizer — bool;
+          • send_to_deepseek   — bool.
+        """
+        cfg = self.config.get("glossary", {}) or {}
+        raw_terms = cfg.get("terms", [])
+        terms: List[Dict[str, str]] = []
+        if isinstance(raw_terms, list):
+            for item in raw_terms:
+                if isinstance(item, dict):
+                    term = str(item.get("term") or "").strip()
+                    desc = str(item.get("description") or "").strip()
+                    if term:
+                        terms.append({"term": term, "description": desc})
+                elif isinstance(item, str) and item.strip():
+                    terms.append({"term": item.strip(), "description": ""})
+        return {
+            "terms": terms,
+            "send_to_summarizer": bool(cfg.get("send_to_summarizer", True)),
+            "send_to_deepseek": bool(cfg.get("send_to_deepseek", True)),
         }

@@ -45,6 +45,7 @@ class SettingsWindow(QDialog):
         self.tabs.addTab(self._build_metadata_tab(), "Проекты, промпты, имена")
         self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
         self.tabs.addTab(self._build_summarizer_tab(), "Суммаризация")
+        self.tabs.addTab(self._build_glossary_tab(), "Глоссарий")
         self.tabs.addTab(self._build_recording_tab(), "Запись")
         self.tabs.addTab(self._build_queue_tab(), "Очередь")
         self.tabs.addTab(self._build_scrum_tab(), "Скрам")
@@ -232,7 +233,7 @@ class SettingsWindow(QDialog):
         log.debug("Промпт перемещён: %d → %d", row, new_row)
 
     # ------------------------------------------------------------------
-    # Шаблоны названий (в окне настроек)
+    # Шаблоны названий
     # ------------------------------------------------------------------
     def _name_tpl_add(self) -> None:
         row = self.name_templates_table.rowCount()
@@ -372,7 +373,6 @@ class SettingsWindow(QDialog):
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        # --- Выбор провайдера ---
         form_top = QFormLayout()
         self.sum_provider_combo = QComboBox()
         self.sum_provider_combo.addItem(
@@ -387,7 +387,6 @@ class SettingsWindow(QDialog):
         )
         layout.addLayout(form_top)
 
-        # --- LiteLLM ---
         lite_header = QHBoxLayout()
         lite_header.addWidget(QLabel("<b>LiteLLM</b>"))
         lite_header.addStretch()
@@ -492,7 +491,6 @@ class SettingsWindow(QDialog):
         connect_timeout = float(self.sum_litellm_connect_timeout.value())
         read_timeout = float(self.sum_litellm_read_timeout.value())
 
-        # Показываем пользователю, что процесс пошёл.
         QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         async def _run_ping():
@@ -535,6 +533,128 @@ class SettingsWindow(QDialog):
 
         log.info("Тест LiteLLM: успех (метод=%s)", method)
         QMessageBox.information(self, "Суммаризация", msg)
+
+    # ------------------------------------------------------------------
+    # Глоссарий
+    # ------------------------------------------------------------------
+    def _build_glossary_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "Список терминов и аббревиатур, которые будут переданы ИИ. "
+            "Помогает модели правильно понимать специфику: названия систем, "
+            "сокращения, ФИО и т.п."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        hint = QLabel(
+            "Формат: «Термин» — как модель должна писать это слово; "
+            "«Пояснение» — что это значит. Пояснение можно оставить "
+            "пустым, тогда в промпт уйдёт только термин.\n\n"
+            "Примеры:\n"
+            "  • ЕЖД — Единый журнал дежурств\n"
+            "  • vNext — платформа vNext\n"
+            "  • ПЛ — Планирование\n"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(hint)
+
+        # --- Таблица терминов ---
+        terms_header = QHBoxLayout()
+        terms_header.addWidget(QLabel("<b>Термины</b>"))
+        terms_header.addStretch()
+        terms_header.addWidget(make_info_icon("glossary_terms"))
+        layout.addLayout(terms_header)
+
+        self.glossary_table = QTableWidget(0, 2)
+        self.glossary_table.setHorizontalHeaderLabels(["Термин", "Пояснение"])
+        self.glossary_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        header = self.glossary_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.glossary_table.setMinimumHeight(240)
+        layout.addWidget(self.glossary_table)
+
+        g_btns = QHBoxLayout()
+        g_add_btn = QPushButton("Добавить")
+        g_add_btn.clicked.connect(self._glossary_add)
+        g_del_btn = QPushButton("Удалить")
+        g_del_btn.clicked.connect(self._glossary_delete)
+        g_up_btn = QPushButton("Вверх")
+        g_up_btn.clicked.connect(lambda: self._glossary_move(-1))
+        g_down_btn = QPushButton("Вниз")
+        g_down_btn.clicked.connect(lambda: self._glossary_move(1))
+        g_btns.addWidget(g_add_btn)
+        g_btns.addWidget(g_del_btn)
+        g_btns.addWidget(g_up_btn)
+        g_btns.addWidget(g_down_btn)
+        g_btns.addStretch()
+        layout.addLayout(g_btns)
+
+        # --- Куда передавать ---
+        send_header = QHBoxLayout()
+        send_header.addWidget(QLabel("<b>Куда передавать глоссарий</b>"))
+        send_header.addStretch()
+        send_header.addWidget(make_info_icon("glossary_send_to_summarizer"))
+        layout.addLayout(send_header)
+
+        self.glossary_send_to_summarizer_check = QCheckBox(
+            "Передавать в суммаризацию (сервер транскрибации или LiteLLM)"
+        )
+        attach_tooltip(self.glossary_send_to_summarizer_check,
+                       "glossary_send_to_summarizer")
+        layout.addWidget(self.glossary_send_to_summarizer_check)
+
+        self.glossary_send_to_deepseek_check = QCheckBox(
+            "Передавать в файл промпта DeepSeek (deepseek_prompt.*)"
+        )
+        attach_tooltip(self.glossary_send_to_deepseek_check,
+                       "glossary_send_to_deepseek")
+        layout.addWidget(self.glossary_send_to_deepseek_check)
+
+        layout.addStretch()
+        return w
+
+    def _glossary_add(self) -> None:
+        row = self.glossary_table.rowCount()
+        self.glossary_table.insertRow(row)
+        self.glossary_table.setItem(row, 0, QTableWidgetItem(""))
+        self.glossary_table.setItem(row, 1, QTableWidgetItem(""))
+        self.glossary_table.editItem(self.glossary_table.item(row, 0))
+        log.debug("Добавлена пустая строка в глоссарий (строка %d)", row)
+
+    def _glossary_delete(self) -> None:
+        row = self.glossary_table.currentRow()
+        if row < 0:
+            return
+        item = self.glossary_table.item(row, 0)
+        term = item.text() if item else ""
+        if QMessageBox.question(
+            self, "Удалить термин",
+            f"Удалить термин «{term}» из глоссария?",
+        ) == QMessageBox.StandardButton.Yes:
+            log.info("Удаление термина «%s» (строка %d)", term, row)
+            self.glossary_table.removeRow(row)
+
+    def _glossary_move(self, delta: int) -> None:
+        row = self.glossary_table.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= self.glossary_table.rowCount():
+            return
+        for col in range(self.glossary_table.columnCount()):
+            a = self.glossary_table.takeItem(row, col)
+            b = self.glossary_table.takeItem(new_row, col)
+            self.glossary_table.setItem(row, col, b)
+            self.glossary_table.setItem(new_row, col, a)
+        self.glossary_table.setCurrentCell(new_row, 0)
+        log.debug("Термин перемещён: %d → %d", row, new_row)
 
     # ------------------------------------------------------------------
     # Запись
@@ -875,6 +995,23 @@ class SettingsWindow(QDialog):
         self.sum_litellm_read_timeout.setValue(int(l["read_timeout"]))
         self.sum_litellm_system.setPlainText(l["system_prompt"])
 
+        # --- Глоссарий ---
+        g = self.config_manager.get_glossary_settings()
+        self.glossary_table.setRowCount(0)
+        for item in g["terms"]:
+            row = self.glossary_table.rowCount()
+            self.glossary_table.insertRow(row)
+            self.glossary_table.setItem(row, 0, QTableWidgetItem(item.get("term", "")))
+            self.glossary_table.setItem(
+                row, 1, QTableWidgetItem(item.get("description", ""))
+            )
+        self.glossary_send_to_summarizer_check.setChecked(
+            bool(g["send_to_summarizer"])
+        )
+        self.glossary_send_to_deepseek_check.setChecked(
+            bool(g["send_to_deepseek"])
+        )
+
         # Запись
         rec = cfg.get("recording", {})
         idx = int(rec.get("monitor", 0))
@@ -936,9 +1073,10 @@ class SettingsWindow(QDialog):
 
         log.info(
             "Настройки загружены в окно: projects=%d, prompts=%d, "
-            "name_templates=%d, summarizer=%s, log_level=%s",
+            "name_templates=%d, summarizer=%s, glossary_terms=%d, "
+            "log_level=%s",
             len(cfg.get("projects", []) or []), len(prompts),
-            len(name_tpls), sum_cfg["provider"], level,
+            len(name_tpls), sum_cfg["provider"], len(g["terms"]), level,
         )
 
     def save_settings(self) -> bool:
@@ -1007,7 +1145,6 @@ class SettingsWindow(QDialog):
                 "prompt_template": self.scrum_template_edit.toPlainText(),
                 "export_format": self.scrum_format_combo.currentText(),
             }
-            # --- Суммаризация ---
             cfg["summarizer"] = {
                 "provider": self.sum_provider_combo.currentData() or "server",
                 "litellm": {
@@ -1022,6 +1159,24 @@ class SettingsWindow(QDialog):
                     "system_prompt": self.sum_litellm_system.toPlainText().strip(),
                 },
             }
+
+            # --- Глоссарий ---
+            glossary_terms: List[dict] = []
+            for row in range(self.glossary_table.rowCount()):
+                term_item = self.glossary_table.item(row, 0)
+                desc_item = self.glossary_table.item(row, 1)
+                term = term_item.text().strip() if term_item else ""
+                desc = desc_item.text().strip() if desc_item else ""
+                if not term:
+                    continue
+                glossary_terms.append({"term": term, "description": desc})
+
+            cfg["glossary"] = {
+                "terms": glossary_terms,
+                "send_to_summarizer": self.glossary_send_to_summarizer_check.isChecked(),
+                "send_to_deepseek": self.glossary_send_to_deepseek_check.isChecked(),
+            }
+
             cfg["compression"] = {
                 "audio_format": self.audio_fmt_combo.currentText(),
                 "audio_bitrate": self.audio_bitrate_spin.value(),
@@ -1041,10 +1196,13 @@ class SettingsWindow(QDialog):
             self.config_manager.save(cfg)
             log.info(
                 "Настройки сохранены: projects=%d, prompts=%d, "
-                "name_templates=%d, summarizer=%s, monitor=%d, "
-                "log_level=%s, temp_path=%s",
+                "name_templates=%d, summarizer=%s, glossary_terms=%d, "
+                "glossary_to_summarizer=%s, glossary_to_deepseek=%s, "
+                "monitor=%d, log_level=%s, temp_path=%s",
                 len(cfg["projects"]), len(prompts), len(name_templates),
-                cfg["summarizer"]["provider"],
+                cfg["summarizer"]["provider"], len(glossary_terms),
+                cfg["glossary"]["send_to_summarizer"],
+                cfg["glossary"]["send_to_deepseek"],
                 cfg["recording"]["monitor"], cfg["logging"]["level"],
                 cfg["storage"]["temp_path"],
             )
@@ -1172,6 +1330,9 @@ class SettingsWindow(QDialog):
             "библиотека промптов и шаблоны названий записи.\n"
             "• Вкладка «Суммаризация» — выбор провайдера формирования "
             "протокола/резюме: сервер транскрибации или LiteLLM.\n"
+            "• Вкладка «Глоссарий» — список терминов и аббревиатур, "
+            "которые добавляются в промпт транскрибации и/или в файл "
+            "deepseek_prompt.*.\n"
             "• Шаблоны названий поддерживают плейсхолдеры:\n"
             "    {name} / {название} — введённое имя,\n"
             "    {abbr} / {сокр} — сокращение,\n"

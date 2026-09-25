@@ -2,14 +2,10 @@
 
 Особенности:
   • Название записи вводится в отдельном QLineEdit.
-  • Шаблон выбирается в QComboBox — это НЕ редактируемое поле,
-    а селектор одного из сохранённых шаблонов (metadata.name_templates).
-  • Поддерживаются плейсхолдеры:
-        {name}  {название}   — введённое имя
-        {abbr}  {сокр}       — сокращение
-        {date}  {дата}       — YYYY-MM-DD
-        {time}  {время}      — HH-MM
-        {datetime}           — YYYY-MM-DD HH-MM
+  • Шаблон выбирается в QComboBox.
+  • Промпт для DeepSeek можно формировать независимо от скрам-митинга.
+  • Пользователь может включать в промпт контекст записи
+    (название / проект / комментарий).
 """
 from __future__ import annotations
 
@@ -31,7 +27,6 @@ from .tooltips import attach_tooltip, make_info_icon, with_info
 log = get_logger(__name__)
 
 
-# Плейсхолдеры, которые знает шаблон названия
 _NAME_PLACEHOLDERS = {
     "{name}", "{название}",
     "{abbr}", "{сокр}",
@@ -47,13 +42,6 @@ def format_name_template(
     abbr: str = "",
     now: Optional[datetime] = None,
 ) -> str:
-    """
-    Подставляет плейсхолдеры в шаблон имени.
-
-    Если после подстановки остаются лишние пустые скобки/дефисы —
-    пробелы чистятся:
-      "Совещание: Name () — 2026-09-25" → "Совещание: Name — 2026-09-25"
-    """
     if not template:
         return (name or "").strip()
     now = now or datetime.now()
@@ -76,13 +64,11 @@ def format_name_template(
     for key, value in replacements.items():
         result = result.replace(key, value)
 
-    # Чистим пустые следы от {abbr}, если сокращение не ввели
     result = (
         result.replace("()", "")
         .replace("( )", "")
         .replace("()", "")
     )
-    # Несколько пробелов подряд → один
     while "  " in result:
         result = result.replace("  ", " ")
     return result.strip()
@@ -91,7 +77,7 @@ def format_name_template(
 class MetadataDialog(QDialog):
     """
     Окно ввода метаданных: проект, название, комментарий, промпт, скрам,
-    вложения.
+    вложения, формирование промпта для DeepSeek, контекст в промпте.
     """
 
     def __init__(
@@ -112,8 +98,8 @@ class MetadataDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.setMinimumWidth(900)
-        self.setMinimumHeight(900)
+        self.setMinimumWidth(920)
+        self.setMinimumHeight(950)
 
         self._projects = projects or []
         self._prompts = list(prompts or [])
@@ -123,7 +109,6 @@ class MetadataDialog(QDialog):
         self._on_save_prompt_cb = on_save_prompt
         self._get_prompts_cb = get_prompts
 
-        # --- Шаблоны названий ---
         self._name_templates: List[Dict[str, str]] = list(name_templates or [])
         self._on_save_name_template_cb = on_save_name_template
         self._get_name_templates_cb = get_name_templates
@@ -165,12 +150,11 @@ class MetadataDialog(QDialog):
         self.project_combo.addItems(self._projects)
         self.project_combo.setCurrentIndex(-1)
 
-        # ---- Название: отдельное поле ввода + селектор шаблона + сокращение ----
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Например: Совещание по проекту X")
 
         self.name_combo = QComboBox()
-        self.name_combo.setEditable(False)      # ← важно: только выбор шаблона
+        self.name_combo.setEditable(False)
         self.name_combo.setMinimumWidth(240)
         self._populate_name_templates()
 
@@ -224,7 +208,7 @@ class MetadataDialog(QDialog):
 
         # --- Промпт ---
         prompt_header = QHBoxLayout()
-        prompt_header.addWidget(QLabel("<b>Промпт для краткого содержания</b>"))
+        prompt_header.addWidget(QLabel("<b>Промпт для суммаризации / DeepSeek</b>"))
         prompt_header.addStretch()
 
         self.prompt_combo = QComboBox()
@@ -242,7 +226,7 @@ class MetadataDialog(QDialog):
 
         self.prompt_input = QPlainTextEdit()
         self.prompt_input.setPlaceholderText(
-            "Промпт для формирования краткого содержания…"
+            "Промпт для формирования краткого содержания и/или DeepSeek-промпта…"
         )
         self.prompt_input.setMinimumHeight(120)
         root.addWidget(self.prompt_input)
@@ -257,12 +241,77 @@ class MetadataDialog(QDialog):
         prompt_actions.addStretch()
         root.addLayout(prompt_actions)
 
+        # --- Контекст записи в промпт ---
+        ctx_header = QHBoxLayout()
+        ctx_header.addWidget(QLabel("<b>Контекст записи в промпте</b>"))
+        ctx_header.addStretch()
+        ctx_header.addWidget(make_info_icon("meta_context_to_prompt"))
+        root.addLayout(ctx_header)
+
+        ctx_hint = QLabel(
+            "Выберите, что из карточки записи добавить в промпт. "
+            "Информация добавляется отдельным блоком «КОНТЕКСТ ЗАПИСИ» "
+            "перед инструкцией. Это помогает ИИ корректнее писать "
+            "результат (правильно называть встречу, учитывать проект, "
+            "обращать внимание на комментарий)."
+        )
+        ctx_hint.setWordWrap(True)
+        ctx_hint.setStyleSheet("QLabel { color: #666; }")
+        root.addWidget(ctx_hint)
+
+        ctx_box = QHBoxLayout()
+        self.include_name_check = QCheckBox("Название записи")
+        attach_tooltip(self.include_name_check, "meta_include_name_in_prompt")
+        ctx_box.addWidget(self.include_name_check)
+
+        self.include_project_check = QCheckBox("Проект")
+        attach_tooltip(self.include_project_check, "meta_include_project_in_prompt")
+        ctx_box.addWidget(self.include_project_check)
+
+        self.include_comment_check = QCheckBox("Комментарий")
+        attach_tooltip(self.include_comment_check, "meta_include_comment_in_prompt")
+        ctx_box.addWidget(self.include_comment_check)
+
+        ctx_box.addStretch()
+
+        self.context_all_btn = QPushButton("Включить всё")
+        self.context_all_btn.setToolTip(
+            "Проставить все три галочки контекста"
+        )
+        self.context_all_btn.clicked.connect(self._on_context_enable_all)
+        ctx_box.addWidget(self.context_all_btn)
+
+        root.addLayout(ctx_box)
+
+        # --- Промпт для DeepSeek ---
+        root.addWidget(QLabel("<b>Промпт для DeepSeek</b>"))
+
+        deepseek_box = QVBoxLayout()
+        self.generate_deepseek_check = QCheckBox(
+            "Сформировать файл промпта для DeepSeek"
+        )
+        attach_tooltip(self.generate_deepseek_check, "meta_generate_deepseek_prompt")
+        deepseek_box.addWidget(self.generate_deepseek_check)
+
+        deepseek_hint = QLabel(
+            "Шаблон промпта зависит от признака «Скрам-митинг»:\n"
+            "  • <b>Скрам включён</b> → используется шаблон из "
+            "Настройки → Скрам (плюс предыдущий протокол и стенограмма).\n"
+            "  • <b>Скрам выключен</b> → используется промпт, "
+            "введённый выше."
+        )
+        deepseek_hint.setWordWrap(True)
+        deepseek_hint.setStyleSheet("QLabel { color: #666; }")
+        deepseek_box.addWidget(deepseek_hint)
+
+        root.addLayout(deepseek_box)
+
         # --- Скрам ---
         root.addWidget(QLabel("<b>Скрам-митинг</b>"))
 
         scrum_box = QFormLayout()
         self.is_scrum_check = QCheckBox(
-            "Это скрам-митинг (подготовить промпт для DeepSeek)"
+            "Это скрам-митинг (использовать шаблон из Настройки → Скрам)"
         )
         attach_tooltip(self.is_scrum_check, "meta_is_scrum")
         scrum_box.addRow("", self.is_scrum_check)
@@ -379,19 +428,27 @@ class MetadataDialog(QDialog):
         self.prompt_combo.currentIndexChanged.connect(self._on_prompt_selected)
         self.prompt_input.textChanged.connect(self._on_prompt_edited)
 
-        # --- Название ---
         self.name_input.textChanged.connect(self._refresh_name_preview)
         self.name_combo.currentIndexChanged.connect(self._on_name_template_changed)
         self.name_abbr_input.textChanged.connect(self._refresh_name_preview)
+
+        self.is_scrum_check.toggled.connect(self._on_scrum_toggled)
+
+    # ------------------------------------------------------------------
+    # Контекст в промпте
+    # ------------------------------------------------------------------
+    def _on_context_enable_all(self) -> None:
+        self.include_name_check.setChecked(True)
+        self.include_project_check.setChecked(True)
+        self.include_comment_check.setChecked(True)
+        log.info("Включены все чекбоксы контекста записи")
 
     # ------------------------------------------------------------------
     # Шаблоны названий
     # ------------------------------------------------------------------
     def _populate_name_templates(self) -> None:
-        """Заполняет combo шаблонами + пунктом «ввести вручную»."""
         self.name_combo.blockSignals(True)
         self.name_combo.clear()
-        # Первый пункт — ручной ввод (без применения шаблона)
         self.name_combo.addItem("— без шаблона —", "")
         for item in self._name_templates:
             label = item.get("label") or item.get("template") or ""
@@ -401,7 +458,6 @@ class MetadataDialog(QDialog):
         self.name_combo.blockSignals(False)
 
     def _refresh_name_templates(self, selected_template: str = "") -> None:
-        """Обновляет список шаблонов из конфига (если задан колбэк)."""
         if self._get_name_templates_cb is not None:
             try:
                 fresh = self._get_name_templates_cb() or []
@@ -418,23 +474,17 @@ class MetadataDialog(QDialog):
                 self.name_combo.setCurrentIndex(idx)
 
     def _current_template(self) -> str:
-        """Возвращает выбранный шаблон (или пустую строку для ручного ввода)."""
         idx = self.name_combo.currentIndex()
         if idx <= 0:
             return ""
         return self.name_combo.itemData(idx) or ""
 
     def _on_name_template_changed(self, index: int) -> None:
-        """
-        Выбор шаблона в combo НЕ должен трогать поле имени.
-        Мы только обновляем предпросмотр.
-        """
         if index < 0:
             return
         self._refresh_name_preview()
 
     def _refresh_name_preview(self) -> None:
-        """Обновляет предпросмотр итогового имени."""
         template = self._current_template()
         raw_name = self.name_input.text().strip()
         abbr = self.name_abbr_input.text().strip()
@@ -450,16 +500,9 @@ class MetadataDialog(QDialog):
         self.name_preview_label.setText(f"Итоговое имя: {final}")
 
     def _on_save_name_template(self) -> None:
-        """
-        Сохраняет текущий текст из поля имени (или выбранный шаблон)
-        как новый шаблон через колбэк.
-        """
         template = self._current_template()
         raw_name = self.name_input.text().strip()
 
-        # Что сохраняем:
-        # • если выбран шаблон — сохраняем сам шаблон (он уже проверен);
-        # • иначе — сохраняем «сырое» имя как шаблон.
         candidate = template or raw_name
         if not candidate:
             QMessageBox.warning(
@@ -487,7 +530,6 @@ class MetadataDialog(QDialog):
                                      f"Не удалось сохранить шаблон:\n{exc}")
                 return
 
-        # Перечитываем список из конфига и ставим на новый шаблон
         self._refresh_name_templates(selected_template=candidate)
         QMessageBox.information(self, "Шаблон",
                                 f"Шаблон «{label}» сохранён.")
@@ -497,6 +539,12 @@ class MetadataDialog(QDialog):
     # ------------------------------------------------------------------
     # Скрам
     # ------------------------------------------------------------------
+    def _on_scrum_toggled(self, checked: bool) -> None:
+        if checked and not self.generate_deepseek_check.isChecked():
+            self.generate_deepseek_check.setChecked(True)
+            log.info("Скрам включён — автоматически включено формирование "
+                     "промпта для DeepSeek")
+
     def _update_scrum_visibility(self, checked: bool) -> None:
         for w in self._scrum_widgets:
             w.setEnabled(checked)
@@ -519,7 +567,6 @@ class MetadataDialog(QDialog):
         log.info("Файл протокола сброшен (был: %s)", old or "—")
 
     def _on_pick_from_session(self) -> None:
-        """Диалог выбора предыдущего протокола из существующих сессий."""
         if not self._sessions_root or not os.path.isdir(self._sessions_root):
             QMessageBox.warning(
                 self, "Протокол",
@@ -527,8 +574,6 @@ class MetadataDialog(QDialog):
             )
             return
 
-        log.debug("Сканирование сессий для выбора протокола: %s",
-                  self._sessions_root)
         candidates: List[Dict[str, str]] = []
         for name in sorted(os.listdir(self._sessions_root), reverse=True):
             session_dir = os.path.join(self._sessions_root, name)
@@ -565,8 +610,6 @@ class MetadataDialog(QDialog):
                 "deepseek_prompt.(docx|md|txt), video.txt.",
             )
             return
-
-        log.info("Найдено кандидатов в протоколы: %d", len(candidates))
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Выбор протокола")
@@ -622,8 +665,6 @@ class MetadataDialog(QDialog):
         if added:
             log.info("Добавлено вложений: %d (всего %d)",
                      added, len(self._attachments))
-            for f in files:
-                log.debug("  вложение: %s", f)
             self._refresh_attachments_list()
 
     def _on_remove_attachment(self) -> None:
@@ -652,12 +693,10 @@ class MetadataDialog(QDialog):
         elif self._projects:
             self.project_combo.setCurrentIndex(0)
 
-        # --- Название ---
         init_name = init.get("name", "") or init.get("description", "")
         init_template = init.get("name_template", "")
         init_abbr = init.get("name_abbr", "")
 
-        # Сырое имя идёт в name_input
         self.name_input.blockSignals(True)
         self.name_input.setText(init_name)
         self.name_input.blockSignals(False)
@@ -666,7 +705,6 @@ class MetadataDialog(QDialog):
         self.name_abbr_input.setText(init_abbr)
         self.name_abbr_input.blockSignals(False)
 
-        # Шаблон — в combo
         if init_template:
             idx = self.name_combo.findData(init_template)
             if idx >= 0:
@@ -675,7 +713,7 @@ class MetadataDialog(QDialog):
                 self.name_combo.blockSignals(False)
         else:
             self.name_combo.blockSignals(True)
-            self.name_combo.setCurrentIndex(0)   # «без шаблона»
+            self.name_combo.setCurrentIndex(0)
             self.name_combo.blockSignals(False)
 
         self.comment_input.setPlainText(init.get("comment", ""))
@@ -696,9 +734,29 @@ class MetadataDialog(QDialog):
 
         # Скрам
         is_scrum = bool(init.get("is_scrum", False))
+        self.is_scrum_check.blockSignals(True)
         self.is_scrum_check.setChecked(is_scrum)
+        self.is_scrum_check.blockSignals(False)
         self._update_scrum_visibility(is_scrum)
         self.protocol_path_input.setText(init.get("previous_protocol_path", ""))
+
+        # DeepSeek
+        if "generate_deepseek_prompt" in init:
+            gen = bool(init.get("generate_deepseek_prompt"))
+        else:
+            gen = is_scrum
+        self.generate_deepseek_check.setChecked(gen)
+
+        # Контекст в промпт
+        self.include_name_check.setChecked(
+            bool(init.get("include_name_in_prompt", False))
+        )
+        self.include_project_check.setChecked(
+            bool(init.get("include_project_in_prompt", False))
+        )
+        self.include_comment_check.setChecked(
+            bool(init.get("include_comment_in_prompt", False))
+        )
 
         # Вложения
         self._attachments = list(init.get("attachments", []) or [])
@@ -713,9 +771,14 @@ class MetadataDialog(QDialog):
         log.debug(
             "Начальные значения применены: project=%r, name=%r, "
             "template=%r, abbr=%r, prompt=%d символов, is_scrum=%s, "
-            "attachments=%d",
+            "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
+            "ctx_comment=%s, attachments=%d",
             project, init_name, init_template, init_abbr,
-            len(prompt_text), is_scrum, len(self._attachments),
+            len(prompt_text), is_scrum, gen,
+            self.include_name_check.isChecked(),
+            self.include_project_check.isChecked(),
+            self.include_comment_check.isChecked(),
+            len(self._attachments),
         )
 
     # ------------------------------------------------------------------
@@ -846,7 +909,6 @@ class MetadataDialog(QDialog):
     def _on_accept(self) -> None:
         project = self.project_combo.currentText().strip() or "Default"
 
-        # --- Формируем финальное имя ---
         template = self._current_template()
         raw_name = self.name_input.text().strip()
         abbr = self.name_abbr_input.text().strip()
@@ -869,6 +931,8 @@ class MetadataDialog(QDialog):
             if prompt_name == "— не выбрано —":
                 prompt_name = ""
 
+        is_scrum = bool(self.is_scrum_check.isChecked())
+
         result: Dict[str, Any] = {
             "project": project,
             "name": final_name,
@@ -880,8 +944,16 @@ class MetadataDialog(QDialog):
             "prompt_name": prompt_name,
             "prompt_edited": bool(self._prompt_edited),
             # --- Скрам ---
-            "is_scrum": bool(self.is_scrum_check.isChecked()),
+            "is_scrum": is_scrum,
             "previous_protocol_path": self.protocol_path_input.text().strip(),
+            # --- DeepSeek ---
+            "generate_deepseek_prompt": bool(
+                self.generate_deepseek_check.isChecked()
+            ),
+            # --- Контекст в промпте ---
+            "include_name_in_prompt": bool(self.include_name_check.isChecked()),
+            "include_project_in_prompt": bool(self.include_project_check.isChecked()),
+            "include_comment_in_prompt": bool(self.include_comment_check.isChecked()),
             # --- Вложения ---
             "attachments": list(self._attachments),
             "send_attachments_to_transcribe": bool(
@@ -898,10 +970,16 @@ class MetadataDialog(QDialog):
         log.info(
             "Метаданные подтверждены: project=%s, name=%s, "
             "template=%r, abbr=%r, prompt=%d символов (изменён: %s), "
-            "is_scrum=%s, protocol=%s, attachments=%d, "
+            "is_scrum=%s, generate_deepseek=%s, "
+            "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
+            "protocol=%s, attachments=%d, "
             "send_to_transcribe=%s, send_to_deepseek=%s",
             project, final_name, template, abbr, len(prompt),
-            result["prompt_edited"], result["is_scrum"],
+            result["prompt_edited"], is_scrum,
+            result["generate_deepseek_prompt"],
+            result["include_name_in_prompt"],
+            result["include_project_in_prompt"],
+            result["include_comment_in_prompt"],
             os.path.basename(result["previous_protocol_path"]) or "—",
             len(self._attachments),
             result["send_attachments_to_transcribe"],
