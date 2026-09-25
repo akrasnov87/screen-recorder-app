@@ -1,0 +1,182 @@
+/* ============================================================
+   Screen Recorder — styles.qss
+   ============================================================ */
+
+QWidget {
+    background-color: palette(window);
+    color: palette(windowText);
+    font-size: 13px;
+}
+
+/* ---------- Кнопки ---------- */
+QPushButton {
+    background-color: palette(button);
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    padding: 6px 12px;
+    min-height: 24px;
+}
+
+QPushButton:hover {
+    background-color: palette(light);
+}
+
+QPushButton:pressed {
+    background-color: palette(dark);
+}
+
+/* ---------- Текстовые поля и спинбоксы ---------- */
+QLineEdit, QTextEdit, QPlainTextEdit {
+    background-color: palette(base);
+    color: palette(text);
+    border: 1px solid palette(mid);
+    border-radius: 4px;
+    padding: 4px 6px;
+    min-height: 22px;
+}
+
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+    border-color: palette(highlight);
+}
+
+QSpinBox, QDoubleSpinBox {
+    background-color: palette(base);
+    color: palette(text);
+    border: 1px solid palette(mid);
+    border-radius: 4px;
+    padding: 4px 6px;
+    min-height: 22px;
+}
+
+QSpinBox:focus, QDoubleSpinBox:focus {
+    border-color: palette(highlight);
+}
+
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 18px;
+    border-left: 1px solid palette(mid);
+    border-bottom: 1px solid palette(mid);
+    border-top-right-radius: 4px;
+    background-color: palette(button);
+}
+
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 18px;
+    border-left: 1px solid palette(mid);
+    border-bottom-right-radius: 4px;
+    background-color: palette(button);
+}
+
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: palette(light);
+}
+
+QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
+    background-color: palette(dark);
+}
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: url(resources/icons/arrow_up.svg);
+    width: 8px;
+    height: 6px;
+}
+
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url(resources/icons/arrow_down.svg);
+    width: 8px;
+    height: 6px;
+}
+
+/* ---------- QComboBox ---------- */
+QComboBox {
+    background-color: #ffffff;
+    color: #222222;
+    border: 1px solid #b0b0b0;
+    border-radius: 4px;
+    padding: 4px 8px;
+    min-height: 22px;
+}
+
+QComboBox:hover {
+    border-color: #7a7a7a;
+}
+
+QComboBox:focus {
+    border-color: #2d89ef;
+}
+
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 22px;
+    border-left: 1px solid #b0b0b0;
+    background-color: #ececec;
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+}
+
+QComboBox::down-arrow {
+    image: url(resources/icons/chevron_down.svg);
+    width: 10px;
+    height: 6px;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #ffffff;
+    color: #222222;
+    border: 1px solid #b0b0b0;
+    border-radius: 4px;
+    padding: 2px;
+    selection-background-color: #2d89ef;
+    selection-color: #ffffff;
+    outline: none;
+}
+
+QComboBox QAbstractItemView::item {
+    min-height: 22px;
+    padding: 4px 8px;
+}
+
+QComboBox QAbstractItemView::item:selected {
+    background-color: #2d89ef;
+    color: #ffffff;
+}
+
+QComboBox QAbstractItemView::item:hover {
+    background-color: #e0e0e0;
+}
+
+/* ---------- QTabWidget ---------- */
+QTabWidget::pane {
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+}
+
+QTabBar::tab {
+    padding: 8px 16px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}
+
+QTabBar::tab:selected {
+    background-color: palette(highlight);
+    color: palette(highlightedText);
+}
+
+/* ---------- QProgressBar ---------- */
+QProgressBar {
+    border: 1px solid palette(mid);
+    border-radius: 4px;
+    text-align: center;
+}
+
+QProgressBar::chunk {
+    background-color: palette(highlight);
+    border-radius: 3px;
+}

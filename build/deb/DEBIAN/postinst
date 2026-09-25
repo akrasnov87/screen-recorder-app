@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+update-desktop-database /usr/share/applications || true
+exit 0

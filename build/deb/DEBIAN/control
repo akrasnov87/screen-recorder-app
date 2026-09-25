@@ -1,0 +1,7 @@
+Package: screen-recorder
+Version: 1.0.0
+Architecture: amd64
+Maintainer: Your Name <email@example.com>
+Depends: ffmpeg, python3 (>= 3.10), python3-pyside6, python3-aiohttp, python3-aiofiles, python3-cryptography, python3-keyring, python3-pynput
+Description: Screen Recorder & Transcriber Application
+ Record screen, transcribe, and upload to Synology NAS.

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Screen Recorder & Transcriber
+Comment=Record screen, transcribe, upload to NAS
+Exec=screen-recorder
+Icon=screen-recorder
+Terminal=false
+Categories=Utility;AudioVideo;
+StartupNotify=false
