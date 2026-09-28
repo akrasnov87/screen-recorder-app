@@ -14,6 +14,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from src.config_manager import ConfigManager
     from src.hotkeys import GlobalHotkeyManager
+    from src.import_window import ImportWindow
+    from src.library_window import LibraryWindow
     from src.logger import (
         get_logger,
         register_gui_handler,
@@ -33,6 +35,8 @@ if __package__ in (None, ""):
 else:
     from .config_manager import ConfigManager
     from .hotkeys import GlobalHotkeyManager
+    from .import_window import ImportWindow
+    from .library_window import LibraryWindow
     from .logger import (
         get_logger,
         register_gui_handler,
@@ -50,7 +54,8 @@ else:
     from .tray_manager import TrayManager
     from .utils import check_ffmpeg_installed, get_system_monitors
 
-from PySide6.QtCore import QObject, QTimer, Slot
+from PySide6.QtCore import QObject, QTimer, QUrl, Slot
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QMessageBox, QSystemTrayIcon,
 )
@@ -89,6 +94,7 @@ class ScreenRecorderApp(QObject):
         self.settings_window: Optional[SettingsWindow] = None
         self.queue_window: Optional[QueueWindow] = None
         self.sessions_window: Optional[SessionsWindow] = None
+        self.library_window: Optional[LibraryWindow] = None
 
         self.hotkey_manager = GlobalHotkeyManager(
             self.recorder,
@@ -116,6 +122,8 @@ class ScreenRecorderApp(QObject):
         self.tray_manager.open_settings_requested.connect(self._open_settings)
         self.tray_manager.open_queue_requested.connect(self._open_queue)
         self.tray_manager.open_sessions_requested.connect(self._open_sessions)
+        self.tray_manager.open_library_requested.connect(self._open_library)
+        self.tray_manager.import_requested.connect(self._open_import)
         self.tray_manager.upload_video_requested.connect(self._open_upload_video)
         self.tray_manager.quit_requested.connect(self._quit)
 
@@ -548,6 +556,227 @@ class ScreenRecorderApp(QObject):
                                  f"Не удалось добавить в очередь:\n{exc}")
 
     # ------------------------------------------------------------------
+    # Импорт готовых материалов
+    # ------------------------------------------------------------------
+    @Slot()
+    def _open_import(self) -> None:
+        """Диалог импорта готового видео/стенограммы/протокола."""
+        log.info("Запрос на импорт материалов")
+
+        cfg = self.config_manager.config
+        projects = list(cfg.get("projects", []) or [])
+
+        dlg = ImportWindow(
+            projects=projects,
+            sessions_root=self._sessions_root(),
+            parent=None,
+        )
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            log.info("Импорт отменён пользователем")
+            return
+
+        data = dlg.result_data
+        self._perform_import(data)
+
+    def _perform_import(self, data: Dict[str, Any]) -> None:
+        """Копирует файлы, создаёт сессию и (опц.) ставит задачу в очередь."""
+        date_dt: datetime = data["date"]
+        video_src = data.get("video_path") or ""
+        transcript_src = data.get("transcript_path") or ""
+        protocol_src = data.get("protocol_path") or ""
+        name = data.get("name") or f"Импорт {date_dt:%Y-%m-%d}"
+        project = data.get("project") or "Default"
+        comment = data.get("comment") or ""
+        enqueue = bool(data.get("enqueue"))
+        open_folder = bool(data.get("open_folder", True))
+
+        # --- Создаём папку сессии с датой из диалога ---
+        temp = self.config_manager.config["storage"].get(
+            "temp_path", "/tmp/screen-recorder"
+        )
+        sessions_root = os.path.join(temp, "sessions")
+        os.makedirs(sessions_root, exist_ok=True)
+
+        base_name = date_dt.strftime("%Y-%m-%d_%H-%M-%S")
+        session_dir = os.path.join(sessions_root, base_name)
+        i = 1
+        while os.path.exists(session_dir):
+            session_dir = os.path.join(sessions_root, f"{base_name}_{i}")
+            i += 1
+        os.makedirs(session_dir, exist_ok=True)
+
+        log.info("Импорт: создана папка сессии %s", session_dir)
+
+        # --- Копируем видео ---
+        video_dst = ""
+        if video_src and os.path.isfile(video_src):
+            ext = os.path.splitext(video_src)[1].lower() or ".mp4"
+            video_dst = os.path.join(session_dir, f"video{ext}")
+            try:
+                shutil.copy2(video_src, video_dst)
+                log.info("Импорт: видео скопировано %s → %s",
+                         video_src, video_dst)
+            except Exception as exc:
+                log.exception("Импорт: ошибка копирования видео: %s", exc)
+                video_dst = ""
+
+        # --- Копируем стенограмму под именем video.txt ---
+        transcript_dst = ""
+        if transcript_src and os.path.isfile(transcript_src):
+            ext = os.path.splitext(transcript_src)[1].lower()
+            if ext == ".txt":
+                transcript_dst = os.path.join(session_dir, "video.txt")
+                try:
+                    shutil.copy2(transcript_src, transcript_dst)
+                    log.info("Импорт: стенограмма скопирована %s → %s",
+                             transcript_src, transcript_dst)
+                except Exception as exc:
+                    log.exception("Импорт: ошибка копирования стенограммы: %s",
+                                  exc)
+                    transcript_dst = ""
+            else:
+                text = self._read_imported_text(transcript_src)
+                if text:
+                    transcript_dst = os.path.join(session_dir, "video.txt")
+                    try:
+                        with open(transcript_dst, "w", encoding="utf-8") as f:
+                            f.write(text)
+                        log.info(
+                            "Импорт: стенограмма извлечена %s → %s "
+                            "(%d символов)",
+                            transcript_src, transcript_dst, len(text),
+                        )
+                    except Exception as exc:
+                        log.exception(
+                            "Импорт: ошибка записи стенограммы: %s", exc
+                        )
+                        transcript_dst = ""
+
+        # --- Копируем протокол под именем manual_protocol.<ext> ---
+        protocol_dst = ""
+        if protocol_src and os.path.isfile(protocol_src):
+            ext = os.path.splitext(protocol_src)[1].lower() or ".txt"
+            protocol_dst = os.path.join(session_dir, f"manual_protocol{ext}")
+            try:
+                shutil.copy2(protocol_src, protocol_dst)
+                log.info("Импорт: протокол скопирован %s → %s",
+                         protocol_src, protocol_dst)
+            except Exception as exc:
+                log.exception("Импорт: ошибка копирования протокола: %s", exc)
+                protocol_dst = ""
+
+        # --- Формируем метаданные ---
+        meta: Dict[str, Any] = {
+            "project": project,
+            "name": name,
+            "description": name,
+            "date": date_dt.strftime("%Y-%m-%d"),
+            "time": date_dt.strftime("%H:%M:%S"),
+            "comment": comment,
+            "source": "import",
+            "source_files": {
+                "video": video_src,
+                "transcript": transcript_src,
+                "protocol": protocol_src,
+            },
+            "video_path": video_dst,
+            "session_dir": session_dir,
+            "monitor": self.config_manager.config["recording"].get("monitor", 0),
+            "name_template": "",
+            "name_abbr": "",
+            "prompt": self.config_manager.get_default_prompt(),
+            "prompt_name": "",
+            "prompt_edited": False,
+            "is_scrum": False,
+            "generate_deepseek_prompt": False,
+            "include_name_in_prompt": False,
+            "include_project_in_prompt": False,
+            "include_comment_in_prompt": False,
+            "previous_protocol_path": protocol_dst,
+            "manual_protocol_path": protocol_dst,
+            "attachments": [],
+            "send_attachments_to_transcribe": False,
+            "send_attachments_to_deepseek": False,
+        }
+
+        self._save_session_metadata(meta, session_dir)
+
+        # --- Опционально ставим в очередь ---
+        task_id = ""
+        if enqueue and video_dst:
+            try:
+                task_payload = {
+                    "video_path": video_dst,
+                    "metadata": dict(meta),
+                }
+                task_id = self.task_queue.add_task(task_payload)
+                log.info("Импорт: задача %s добавлена в очередь", task_id)
+            except Exception as exc:
+                log.exception("Импорт: не удалось добавить в очередь: %s", exc)
+
+        # --- Уведомление ---
+        files_summary = []
+        if video_dst:
+            files_summary.append("видео")
+        if transcript_dst:
+            files_summary.append("стенограмма")
+        if protocol_dst:
+            files_summary.append("протокол")
+        files_str = ", ".join(files_summary) or "без файлов"
+
+        if task_id:
+            self._notify(
+                "Импорт",
+                f"Запись «{name}» импортирована ({files_str}), "
+                f"поставлена в очередь",
+            )
+        else:
+            self._notify(
+                "Импорт",
+                f"Запись «{name}» импортирована ({files_str})",
+            )
+
+        # --- Открываем папку ---
+        if open_folder:
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(session_dir))
+            except Exception as exc:
+                log.warning("Импорт: не удалось открыть папку: %s", exc)
+
+    @staticmethod
+    def _read_imported_text(path: str) -> str:
+        """Читает текст стенограммы из txt/md/docx/json."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".docx":
+            try:
+                from docx import Document  # type: ignore
+                doc = Document(path)
+                return "\n".join(p.text for p in doc.paragraphs)
+            except Exception as exc:
+                log.warning("Импорт: не удалось прочитать .docx %s: %s",
+                            path, exc)
+                return ""
+        if ext == ".json":
+            try:
+                import json as _json
+                with open(path, "r", encoding="utf-8") as f:
+                    data = _json.load(f)
+                for key in ("script", "text", "transcript", "content"):
+                    if isinstance(data, dict) and data.get(key):
+                        return str(data[key])
+                return _json.dumps(data, ensure_ascii=False, indent=2)
+            except Exception as exc:
+                log.warning("Импорт: не удалось прочитать .json %s: %s",
+                            path, exc)
+                return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception as exc:
+            log.warning("Импорт: не удалось прочитать %s: %s", path, exc)
+            return ""
+
+    # ------------------------------------------------------------------
     # Хоткеи
     # ------------------------------------------------------------------
     def _hotkey_start_recording(self) -> None:
@@ -688,7 +917,7 @@ class ScreenRecorderApp(QObject):
             self.overlay_panel.add_log(f"ERROR: {error}")
 
     # ------------------------------------------------------------------
-    # Настройки, очередь, записи
+    # Настройки, очередь, записи, библиотека
     # ------------------------------------------------------------------
     def _open_settings(self) -> None:
         log.info("Открытие окна настроек")
@@ -716,7 +945,24 @@ class ScreenRecorderApp(QObject):
             self.processor,
             config_manager=self.config_manager,
         )
+        self.sessions_window.import_requested.connect(self._open_import)
         self.sessions_window.show()
+
+    def _open_library(self) -> None:
+        log.info("Открытие окна «Библиотека»")
+        try:
+            self.library_window = LibraryWindow(
+                sessions_root=self._sessions_root(),
+                config_manager=self.config_manager,
+                parent=None,
+            )
+            self.library_window.show()
+        except Exception as exc:
+            log.exception("Не удалось открыть окно «Библиотека»: %s", exc)
+            QMessageBox.critical(
+                None, "Библиотека",
+                f"Не удалось открыть окно поиска:\n{exc}",
+            )
 
     # ------------------------------------------------------------------
     # Логи / уведомления

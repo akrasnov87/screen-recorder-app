@@ -12,7 +12,7 @@ import shutil
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
@@ -69,6 +69,10 @@ def _write_json(path: str, data: Dict[str, Any]) -> bool:
 
 class SessionsWindow(QDialog):
     """Список всех записей в папке sessions/."""
+
+    # Сигнал: пользователь запросил импорт материалов.
+    # Обрабатывается в main.ScreenRecorderApp.
+    import_requested = Signal()
 
     def __init__(
         self,
@@ -214,6 +218,16 @@ class SessionsWindow(QDialog):
 
         # ---------------- Файл ----------------
         m_file = bar.addMenu("Файл")
+
+        act_import = QAction("Импорт материалов…", self)
+        act_import.setShortcut(QKeySequence("Ctrl+I"))
+        act_import.setToolTip(
+            "Импортировать готовое видео, стенограмму или протокол"
+        )
+        act_import.triggered.connect(self._on_import_requested)
+        m_file.addAction(act_import)
+
+        m_file.addSeparator()
 
         act_open_folder = QAction("Открыть папку записи", self)
         act_open_folder.setShortcut(QKeySequence("Ctrl+Shift+E"))
@@ -384,6 +398,14 @@ class SessionsWindow(QDialog):
         m_help.addAction(act_shortcuts)
 
     # ------------------------------------------------------------------
+    # Сигнал импорта
+    # ------------------------------------------------------------------
+    def _on_import_requested(self) -> None:
+        """Сообщает главному окну, что пользователь хочет открыть импорт."""
+        log.debug("Запрошен импорт из окна «Записи»")
+        self.import_requested.emit()
+
+    # ------------------------------------------------------------------
     # Легенда
     # ------------------------------------------------------------------
     def _build_legend(self) -> QWidget:
@@ -482,12 +504,21 @@ class SessionsWindow(QDialog):
             meta_path = os.path.join(session_dir, "session.json")
             meta = _read_json(meta_path) or {}
 
-            video_path = os.path.join(session_dir, "video.mp4")
-            has_video = os.path.exists(video_path)
+            # Ищем видео с любым расширением
+            video_path = ""
+            for ext in (".mp4", ".mkv", ".mov", ".avi", ".webm",
+                        ".flv", ".wmv", ".mp3", ".wav", ".m4a",
+                        ".aac", ".opus", ".ogg"):
+                p = os.path.join(session_dir, f"video{ext}")
+                if os.path.exists(p):
+                    video_path = p
+                    break
+
+            has_video = bool(video_path)
             has_transcript = os.path.exists(os.path.join(session_dir, "video.txt"))
             has_audio = os.path.exists(os.path.join(session_dir, "video.mp3"))
 
-            task = tasks_index.get(os.path.abspath(video_path))
+            task = tasks_index.get(os.path.abspath(video_path)) if video_path else None
             task_id = (task or {}).get("task_id", "")
 
             if task is not None:
@@ -509,12 +540,12 @@ class SessionsWindow(QDialog):
                     status = STATUS_UNKNOWN
 
             date_str = meta.get("date") or ""
-            time_str = ""
+            time_str = meta.get("time") or ""
             try:
                 parts = name.split("_")
                 if len(parts) >= 2:
                     date_str = date_str or parts[0]
-                    time_str = parts[1].replace("-", ":")
+                    time_str = time_str or parts[1].replace("-", ":")
             except Exception:
                 pass
             if not date_str:
@@ -608,7 +639,12 @@ class SessionsWindow(QDialog):
                 status_item.setForeground(Qt.GlobalColor.darkYellow)
             self.table.setItem(row, 3, status_item)
 
-            src = "Загрузка" if r["source"] == "upload" else "Запись"
+            src_map = {
+                "record": "Запись",
+                "upload": "Загрузка",
+                "import": "Импорт",
+            }
+            src = src_map.get(r["source"], r["source"] or "—")
             self.table.setItem(row, 4, QTableWidgetItem(src))
             self.table.setItem(row, 5, QTableWidgetItem("да" if r["is_scrum"] else "—"))
 
@@ -895,15 +931,6 @@ class SessionsWindow(QDialog):
     # ------------------------------------------------------------------
     @staticmethod
     def _downloads_dir() -> str:
-        """
-        Возвращает путь к папке «Загрузки».
-
-        Порядок проверки:
-          1. XDG-папка Загрузки (через xdg-user-dir, если доступна);
-          2. ~/Загрузки  — русская локализация;
-          3. ~/Downloads — английская локализация;
-          4. ~            — как последний резерв.
-        """
         try:
             import subprocess
             out = subprocess.check_output(
@@ -923,17 +950,11 @@ class SessionsWindow(QDialog):
         return home
 
     def _save_prompt_to_downloads(self) -> None:
-        """
-        Копирует все существующие файлы deepseek_prompt.* из папки сессии
-        в папку «Загрузки». Имя целевого файла получает префикс
-        с именем записи и меткой времени, чтобы ничего не перезатиралось.
-        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
 
-        # Собираем все существующие файлы промпта
         candidates = []
         for fname in (
             "deepseek_prompt.docx",
@@ -1018,7 +1039,6 @@ class SessionsWindow(QDialog):
     # ------------------------------------------------------------------
     @staticmethod
     def _format_size(size_bytes: int) -> str:
-        """Форматирует размер файла в человекочитаемый вид."""
         size = float(size_bytes)
         for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
             if size < 1024:
@@ -1027,7 +1047,6 @@ class SessionsWindow(QDialog):
         return f"{size:.1f} ПБ"
 
     def _iter_session_dirs(self) -> List[str]:
-        """Возвращает отсортированный список папок внутри sessions_root."""
         if not os.path.isdir(self.sessions_root):
             return []
         try:
@@ -1045,18 +1064,16 @@ class SessionsWindow(QDialog):
 
     @staticmethod
     def _find_video_file(session_dir: str) -> str:
-        """Возвращает путь к video.mp4, если он есть; иначе — пустая строка."""
-        p = os.path.join(session_dir, "video.mp4")
-        return p if os.path.exists(p) else ""
+        for ext in (".mp4", ".mkv", ".mov", ".avi", ".webm",
+                    ".flv", ".wmv", ".mp3", ".wav", ".m4a",
+                    ".aac", ".opus", ".ogg"):
+            p = os.path.join(session_dir, f"video{ext}")
+            if os.path.exists(p):
+                return p
+        return ""
 
     @staticmethod
     def _find_audio_file(session_dir: str) -> str:
-        """
-        Ищет первый существующий аудиофайл в папке сессии.
-
-        Порядок: video.mp3 (по умолчанию), затем video.aac, video.wav,
-        video.opus, video.ogg, video.m4a.
-        """
         for fname in (
             "video.mp3", "video.aac", "video.wav", "video.opus",
             "video.ogg", "video.m4a",
@@ -1067,18 +1084,6 @@ class SessionsWindow(QDialog):
         return ""
 
     def _collect_video_stats(self) -> Dict[str, Any]:
-        """
-        Проходит по всем сессиям и собирает статистику по video.mp4:
-
-          {
-            "sessions_total": int,
-            "sessions_with_video": int,
-            "sessions_without_audio": int,   # видео есть, аудио нет — не удаляем
-            "deletable": [  # список словарей {session, video, video_size} ]
-            "total_size": int,               # суммарный размер удаляемых файлов
-            "keep_size": int,                # суммарный размер тех, что оставим
-          }
-        """
         result: Dict[str, Any] = {
             "sessions_total": 0,
             "sessions_with_video": 0,
@@ -1095,6 +1100,12 @@ class SessionsWindow(QDialog):
             if not video_path:
                 continue
 
+            # Считаем только «тяжёлые» видео, не аудиофайлы
+            if os.path.splitext(video_path)[1].lower() in (
+                ".mp3", ".wav", ".m4a", ".aac", ".opus", ".ogg"
+            ):
+                continue
+
             result["sessions_with_video"] += 1
 
             try:
@@ -1104,7 +1115,6 @@ class SessionsWindow(QDialog):
 
             audio_path = self._find_audio_file(session_dir)
             if not audio_path:
-                # Видео есть, аудио нет — удалять нельзя
                 result["sessions_without_audio"] += 1
                 result["keep_size"] += size
                 continue
@@ -1121,7 +1131,6 @@ class SessionsWindow(QDialog):
         return result
 
     def _show_video_stats(self) -> None:
-        """Диалог только со статистикой (без удаления)."""
         stats = self._collect_video_stats()
 
         total = stats["sessions_total"]
@@ -1147,12 +1156,6 @@ class SessionsWindow(QDialog):
         )
 
     def _delete_video_files(self) -> None:
-        """
-        Удаление video.mp4 из всех сессий, где есть аудиофайл.
-
-        Сначала показывает подробное подтверждение с количеством и
-        размером. Только после «Yes» запускает удаление с прогресс-баром.
-        """
         stats = self._collect_video_stats()
         deletable: List[Dict[str, Any]] = stats["deletable"]
 
@@ -1168,7 +1171,6 @@ class SessionsWindow(QDialog):
 
         total_size_str = self._format_size(stats["total_size"])
 
-        # Предпросмотр списка: если сессий много — показываем первые N и «…».
         preview_lines: List[str] = []
         preview_limit = 15
         for i, item in enumerate(deletable):
@@ -1207,7 +1209,6 @@ class SessionsWindow(QDialog):
             log.info("Удаление видеофайлов отменено пользователем")
             return
 
-        # Прогресс-диалог
         progress = QProgressDialog(
             "Удаление видеофайлов…",
             "Отмена",
@@ -1233,7 +1234,6 @@ class SessionsWindow(QDialog):
             video_path = item["video"]
             size = item["video_size"]
 
-            # Двойная проверка: аудио всё ещё на месте?
             audio_path = self._find_audio_file(item["session"])
             if not audio_path:
                 errors.append(
@@ -1284,7 +1284,6 @@ class SessionsWindow(QDialog):
             removed, freed_str, len(errors),
         )
 
-        # Обновляем таблицу — размеры файлов изменились
         self.refresh()
 
     # ------------------------------------------------------------------
@@ -1339,7 +1338,7 @@ class SessionsWindow(QDialog):
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
-        if not os.path.exists(r["video_path"]):
+        if not r["video_path"] or not os.path.exists(r["video_path"]):
             QMessageBox.warning(self, "Записи",
                                 f"Видео не найдено:\n{r['video_path']}")
             return
@@ -1414,7 +1413,7 @@ class SessionsWindow(QDialog):
             QMessageBox.information(self, "Записи",
                                     f"Запись уже в очереди: {r['task_id']}")
             return
-        if not os.path.exists(r["video_path"]):
+        if not r["video_path"] or not os.path.exists(r["video_path"]):
             QMessageBox.warning(self, "Записи",
                                 f"Видео не найдено:\n{r['video_path']}")
             return
@@ -1637,7 +1636,7 @@ class SessionsWindow(QDialog):
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
         video = r["video_path"]
-        if not os.path.exists(video):
+        if not video or not os.path.exists(video):
             QMessageBox.warning(self, "Записи", f"Видео не найдено:\n{video}")
             return
         log.info("Открытие видео: %s", video)
@@ -1671,6 +1670,7 @@ class SessionsWindow(QDialog):
         QMessageBox.information(
             self,
             "Горячие клавиши",
+            "Ctrl+I        — импорт материалов\n"
             "Ctrl+Shift+E  — открыть папку записи\n"
             "Ctrl+Shift+V  — открыть видео\n"
             "Ctrl+P        — изменить summary\n"

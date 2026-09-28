@@ -29,7 +29,9 @@ class TrayManager(QObject):
     toggle_recording_requested = Signal()
     open_settings_requested = Signal()
     open_queue_requested = Signal()
-    open_sessions_requested = Signal()       # ← новое
+    open_sessions_requested = Signal()
+    open_library_requested = Signal()
+    import_requested = Signal()
     upload_video_requested = Signal()
     quit_requested = Signal()
 
@@ -63,15 +65,39 @@ class TrayManager(QObject):
 
         menu.addSeparator()
 
+        # --- Загрузить видео ---
         upload_action = QAction("Загрузить видео", menu)
+        upload_action.setToolTip(
+            "Выбрать видеофайл и поставить его в очередь обработки"
+        )
         upload_action.triggered.connect(self.upload_video)
         menu.addAction(upload_action)
 
-        # --- Новый пункт: Записи ---
+        # --- Импорт готовых материалов (новое) ---
+        import_action = QAction("Импорт", menu)
+        import_action.setToolTip(
+            "Импортировать готовые видео, стенограммы и протоколы"
+        )
+        import_action.triggered.connect(self.open_import)
+        menu.addAction(import_action)
+
+        menu.addSeparator()
+
+        # --- Записи ---
         sessions_action = QAction("Записи", menu)
         sessions_action.triggered.connect(self.open_sessions)
         menu.addAction(sessions_action)
 
+        # --- Библиотека ---
+        library_action = QAction("Библиотека…", menu)
+        library_action.setToolTip(
+            "Полнотекстовый поиск по стенограммам, протоколам, "
+            "summary и вложениям"
+        )
+        library_action.triggered.connect(self.open_library)
+        menu.addAction(library_action)
+
+        # --- Очередь ---
         queue_action = QAction("Очередь задач", menu)
         queue_action.triggered.connect(self.open_queue)
         menu.addAction(queue_action)
@@ -131,6 +157,14 @@ class TrayManager(QObject):
     def open_sessions(self) -> None:
         log.debug("Клик: открыть список записей")
         self.open_sessions_requested.emit()
+
+    def open_library(self) -> None:
+        log.debug("Клик: открыть библиотеку")
+        self.open_library_requested.emit()
+
+    def open_import(self) -> None:
+        log.debug("Клик: открыть импорт материалов")
+        self.import_requested.emit()
 
     def upload_video(self) -> None:
         log.debug("Клик: загрузить видео")
