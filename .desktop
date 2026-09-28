@@ -1,9 +1,14 @@
 [Desktop Entry]
+Version=1.1
 Type=Application
-Name=Screen Recorder & Transcriber
-Comment=Record screen, transcribe, upload to NAS
-Exec=screen-recorder
+Name=Screen Recorder
+GenericName=Screen Recorder & Transcriber
+Comment=Запись экрана, транскрибация и интеграция с Bitrix24
+Exec=screen-recorder-gui
 Icon=screen-recorder
 Terminal=false
-Categories=Utility;AudioVideo;
-StartupNotify=false
+Categories=AudioVideo;Recorder;Utility;
+Keywords=screen;record;recorder;video;audio;transcribe;скриншот;запись;
+StartupNotify=true
+StartupWMClass=Screen Recorder
+X-GNOME-UsesNotifications=true

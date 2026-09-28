@@ -1,2 +1,36 @@
-.venv
-__pycache__
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Логи и временные файлы ---
+*.log
+app.log*
+
+# --- Локальные конфиги и секреты ---
+.env
+.env.local
+config.json
+
+# --- Ресурсы ОС ---
+.DS_Store
+Thumbs.db

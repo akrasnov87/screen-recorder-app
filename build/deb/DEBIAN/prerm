@@ -1,3 +1,31 @@
 #!/bin/bash
+# prerm — действия перед удалением пакета.
 set -e
+
+# ---- Останавливаем приложение, если оно запущено --------------------------
+# Процесс называется screen-recorder, но может быть несколько инстансов
+# (кто-то запустил через консоль). Аккуратно.
+if command -v pkill &>/dev/null; then
+    pkill -f "src.main" 2>/dev/null || true
+fi
+
+# ---- Удаление десктоп-файлов и обновление баз ------------------------------
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+
+# ---- Сообщение пользователю ------------------------------------------------
+cat <<EOF
+Screen Recorder удалён из системы.
+
+Обратите внимание: файлы пользователя НЕ удалены.
+  • Конфигурация:  ~/.config/screen-recorder/
+  • Очередь:       /tmp/screen-recorder/
+  • Записи:        в каталоге, указанном в настройках (по умолчанию
+                   /tmp/screen-recorder/sessions/)
+
+Если вы хотите удалить конфигурацию полностью:
+    rm -rf ~/.config/screen-recorder/
+EOF
+
 exit 0

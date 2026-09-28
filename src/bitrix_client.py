@@ -6,8 +6,9 @@ litellm_client). Не требует requests.
 Поддерживает:
   • отправку текстовых сообщений (im.message.add);
   • загрузку файлов на Диск (disk.folder.uploadfile с двумя шагами);
-  • привязку файла к чату (im.disk.file.commit);
-  • отправку файлов-вложений в чат с комментарием;
+  • привязку файлов к чату (im.disk.file.commit);
+  • отправку одного или нескольких файлов-вложений в чат
+    одним сообщением с общим комментарием;
   • автоматический выбор папки чата (im.disk.folder.get) для загрузки.
 """
 from __future__ import annotations
@@ -52,6 +53,12 @@ class Bitrix24Client:
             await client.send_message("chat2101", "Текст")
             await client.send_file_message("chat2101", "/path/file.docx",
                                            comment="Протокол")
+            # Несколько файлов одним сообщением:
+            await client.send_file_message(
+                "chat2101",
+                ["/path/a.docx", "/path/b.md"],
+                comment="Протокол + summary",
+            )
     """
 
     def __init__(
@@ -307,35 +314,46 @@ class Bitrix24Client:
     async def commit_file_to_chat(
         self,
         dialog_id: str,
-        disk_file_id: int,
-    ) -> int:
+        disk_file_ids: Any,
+    ) -> List[int]:
         """
-        Прикрепляет файл с Диска к чату через im.disk.file.commit.
+        Прикрепляет файлы с Диска к чату через im.disk.file.commit.
 
         Bitrix24 возвращает вложенную структуру:
             result: {
                 FILES: {
-                    "upload<id>": {
-                        id: <число>,
-                        chatId: <число>,
-                        name: "<имя файла>",
-                        status: "done",
-                        ...
-                    }
+                    "upload<id>": {"id": <число>, "chatId": ..., ...},
+                    "upload<id2>": {"id": <число>, ...},
+                    ...
                 }
             }
+        Может вернуть и плоский результат: {"ID": <число>} или просто число.
 
-        Возвращает ID файла для использования в im.message.add
-        (параметр FILES=[<id>]).
+        Args:
+            dialog_id:     ID чата (chat39110 или 39110).
+            disk_file_ids: ID файла (int) или список ID (List[int]).
+
+        Returns:
+            Список FILE_ID, готовых к использованию в im.message.add
+            (параметр FILES=[id1, id2, ...]).
         """
-        # Нормализуем dialog_id: Bitrix24 принимает и chatXXX, и XXX.
+        # Нормализуем в список
+        if isinstance(disk_file_ids, (int, str)):
+            ids_list = [int(disk_file_ids)]
+        else:
+            ids_list = [int(x) for x in (disk_file_ids or [])]
+
+        if not ids_list:
+            return []
+
+        # Нормализуем dialog_id
         raw = dialog_id.strip()
         if raw.lower().startswith("chat"):
             raw = raw[4:]
         raw = raw.strip()
 
         params: Dict[str, Any] = {
-            "UPLOAD_ID": int(disk_file_id),
+            "UPLOAD_ID": ids_list[0] if len(ids_list) == 1 else ids_list,
         }
         if raw.isdigit():
             params["CHAT_ID"] = int(raw)
@@ -347,9 +365,9 @@ class Bitrix24Client:
         except Bitrix24Error as exc:
             log.warning(
                 "Bitrix24: im.disk.file.commit не сработал (%s), "
-                "используем disk_file_id напрямую", exc,
+                "используем исходные disk_file_ids", exc,
             )
-            return int(disk_file_id)
+            return ids_list
 
         result = data.get("result")
 
@@ -357,48 +375,51 @@ class Bitrix24Client:
         if isinstance(result, (int, str)) and str(result).isdigit():
             file_id = int(result)
             log.info(
-                "Bitrix24: файл привязан к чату %s, FILE_ID=%s "
-                "(из disk_file_id=%s)",
-                dialog_id, file_id, disk_file_id,
+                "Bitrix24: файл привязан к чату %s, FILE_ID=%s",
+                dialog_id, file_id,
             )
-            return file_id
+            return [file_id]
 
-        # --- Вариант 2: result — dict с полями ID / FILE_ID ---
         if isinstance(result, dict):
+            # --- Вариант 2: result.ID / result.FILE_ID ---
             fid = result.get("ID") or result.get("FILE_ID")
             if fid and str(fid).isdigit():
                 file_id = int(fid)
                 log.info(
-                    "Bitrix24: файл привязан к чату %s, FILE_ID=%s "
-                    "(из disk_file_id=%s)",
-                    dialog_id, file_id, disk_file_id,
+                    "Bitrix24: файл привязан к чату %s, FILE_ID=%s",
+                    dialog_id, file_id,
                 )
-                return file_id
+                return [file_id]
 
             # --- Вариант 3: result.FILES.<uploadXXX>.id ---
             files = result.get("FILES")
             if isinstance(files, dict):
-                # В норме там один файл — берём первый.
+                collected: List[int] = []
                 for key, item in files.items():
                     if not isinstance(item, dict):
                         continue
                     fid = item.get("id") or item.get("ID")
                     if fid and str(fid).isdigit():
-                        file_id = int(fid)
-                        log.info(
-                            "Bitrix24: файл привязан к чату %s, "
-                            "FILE_ID=%s (из ключа %s, disk_file_id=%s)",
-                            dialog_id, file_id, key, disk_file_id,
+                        collected.append(int(fid))
+                        log.debug(
+                            "Bitrix24: файл из ключа %s → FILE_ID=%s",
+                            key, fid,
                         )
-                        return file_id
+                if collected:
+                    log.info(
+                        "Bitrix24: привязано файлов к чату %s: %d "
+                        "(FILE_IDs=%s)",
+                        dialog_id, len(collected), collected,
+                    )
+                    return collected
 
         # --- Ничего не распознали ---
         log.warning(
             "Bitrix24: im.disk.file.commit вернул неожиданную "
-            "структуру. Используем disk_file_id=%s. Ответ: %s",
-            disk_file_id, str(data)[:300],
+            "структуру. Используем исходные disk_file_ids=%s. Ответ: %s",
+            ids_list, str(data)[:300],
         )
-        return int(disk_file_id)
+        return ids_list
 
     async def ensure_subfolder(self, parent_id: int, name: str) -> int:
         """
@@ -627,7 +648,7 @@ class Bitrix24Client:
     async def send_file_message(
         self,
         dialog_id: str,
-        file_path: str,
+        file_paths: Any,
         comment: str = "",
         *,
         folder_id: int = 0,
@@ -636,17 +657,20 @@ class Bitrix24Client:
         prefer_chat_folder: bool = True,
     ) -> Dict[str, Any]:
         """
-        Отправляет файл в чат Bitrix24 как вложение + комментарий.
+        Отправляет один или несколько файлов в чат Bitrix24
+        как вложения + комментарий.
 
         Порядок действий:
           1) Определяем папку (папка чата или явный folder_id).
-          2) Загружаем файл на Диск (upload_file → disk_file_id).
-          3) Привязываем файл к чату (im.disk.file.commit → file_id).
-          4) Отправляем сообщение с FILES=[file_id] и MESSAGE=comment.
+          2) Загружаем каждый файл на Диск (upload_file → disk_file_id).
+          3) Привязываем файлы к чату (im.disk.file.commit → [file_id]).
+          4) Отправляем ОДНО сообщение с FILES=[id1, id2, ...] и
+             MESSAGE=comment.
 
         Args:
             dialog_id:          ID чата (chat2101 или 2101).
-            file_path:          путь к файлу.
+            file_paths:         путь к файлу (str) или список путей
+                                (List[str]).
             comment:            текст сообщения (обычно заголовок).
             folder_id:          явный ID папки (0 = авто).
             system:             системное сообщение.
@@ -658,8 +682,20 @@ class Bitrix24Client:
         """
         if not dialog_id:
             raise Bitrix24Error("Не указан dialog_id")
-        if not file_path or not os.path.exists(file_path):
-            raise Bitrix24Error(f"Файл не найден: {file_path}")
+
+        # Нормализуем в список путей
+        if isinstance(file_paths, (str, os.PathLike)):
+            paths: List[str] = [str(file_paths)]
+        else:
+            paths = [str(p) for p in (file_paths or []) if p]
+
+        if not paths:
+            raise Bitrix24Error("Не указан ни один файл")
+
+        # Проверяем существование всех файлов
+        for p in paths:
+            if not os.path.exists(p):
+                raise Bitrix24Error(f"Файл не найден: {p}")
 
         # --- Шаг 1: выбор папки ---
         target_folder_id = int(folder_id or 0)
@@ -670,8 +706,8 @@ class Bitrix24Client:
                 target_folder_id = chat_folder
                 log.info(
                     "Bitrix24: используем папку чата %s (id=%s) "
-                    "для загрузки файла",
-                    dialog_id, target_folder_id,
+                    "для загрузки %d файлов",
+                    dialog_id, target_folder_id, len(paths),
                 )
 
         if target_folder_id <= 0:
@@ -680,30 +716,47 @@ class Bitrix24Client:
                 "хранилища по умолчанию"
             )
 
-        # --- Шаг 2: загрузка файла на Диск ---
-        disk_file_id = await self.upload_file(
-            file_path, folder_id=target_folder_id
+        # --- Шаг 2: загрузка всех файлов на Диск ---
+        disk_file_ids: List[int] = []
+        for p in paths:
+            try:
+                fid = await self.upload_file(p, folder_id=target_folder_id)
+                disk_file_ids.append(int(fid))
+            except Bitrix24Error as exc:
+                log.error(
+                    "Bitrix24: не удалось загрузить %s: %s", p, exc
+                )
+                # Продолжаем с остальными; если упадёт всё — вернём ошибку ниже
+                continue
+
+        if not disk_file_ids:
+            raise Bitrix24Error(
+                "Bitrix24: ни один файл не удалось загрузить на Диск"
+            )
+
+        # --- Шаг 3: привязка файлов к чату ---
+        file_ids_for_message = await self.commit_file_to_chat(
+            dialog_id, disk_file_ids
         )
 
-        # --- Шаг 3: привязка файла к чату ---
-        # im.disk.file.commit возвращает новый FILE_ID, который
-        # принимается im.message.add через FILES.
-        file_id_for_message = await self.commit_file_to_chat(
-            dialog_id, disk_file_id
-        )
+        if not file_ids_for_message:
+            raise Bitrix24Error(
+                "Bitrix24: не удалось получить ID файлов для отправки"
+            )
 
-        # --- Шаг 4: отправка сообщения с вложением ---
-        params = {
+        # --- Шаг 4: отправка одного сообщения со всеми файлами ---
+        params: Dict[str, Any] = {
             "DIALOG_ID": dialog_id,
             "MESSAGE": _truncate(comment or ""),
             "SYSTEM": "Y" if system else "N",
             "URL_PREVIEW": "Y" if url_preview else "N",
-            "FILES": [file_id_for_message],
+            "FILES": file_ids_for_message,
         }
         log.info(
-            "Bitrix24: отправка файла в чат %s (FILE_ID=%s, "
-            "комментарий=%d символов)",
-            dialog_id, file_id_for_message, len(comment or ""),
+            "Bitrix24: отправка %d файлов в чат %s "
+            "(FILE_IDs=%s, комментарий=%d символов)",
+            len(file_ids_for_message), dialog_id,
+            file_ids_for_message, len(comment or ""),
         )
         return await self.call("im.message.add", params)
 

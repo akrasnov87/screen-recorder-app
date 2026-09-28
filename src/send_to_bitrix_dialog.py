@@ -7,6 +7,9 @@
 Папка для загрузки файла выбирается автоматически:
   • если задан upload_folder_id > 0 в настройках — используется он;
   • иначе — папка самого чата (у каждого чата в Bitrix24 она своя).
+
+Если выбрано «Отправить всё» и оба материала уходят файлами, они
+упаковываются в ОДНО сообщение с двумя вложениями.
 """
 from __future__ import annotations
 
@@ -293,9 +296,10 @@ class SendToBitrixDialog(QDialog):
         self.send_mode_combo.setToolTip(
             "Как отправлять содержимое в чат:\n\n"
             "• «Текстом» — весь текст уходит сообщением.\n"
-            "• «Файлом» — документ загружается на Диск Bitrix24, "
-            "в чат отправляется вложение с превью и коротким "
-            "комментарием.\n"
+            "• «Файлом» — документы загружаются на Диск Bitrix24, "
+            "в чат отправляются вложения с превью и коротким "
+            "комментарием. Если отправляется и протокол, и summary — "
+            "оба файла уходят одним сообщением.\n"
             "• «Автоматически» — небольшие тексты уходят как текст, "
             "крупные (протоколы, длинные summary) — как файл."
         )
@@ -377,7 +381,9 @@ class SendToBitrixDialog(QDialog):
         self.send_both_btn = QPushButton("Отправить всё")
         self.send_both_btn.setToolTip(
             "Отправить двумя сообщениями: сначала протокол, "
-            "потом summary."
+            "потом summary.\n\n"
+            "В режиме «Файлом с комментарием» оба файла уйдут "
+            "одним сообщением с двумя вложениями."
         )
         self.send_both_btn.clicked.connect(
             lambda: self._on_send(which="both")
@@ -713,14 +719,21 @@ class SendToBitrixDialog(QDialog):
                     "is_file": self._is_file_mode("summary", len(body_plain)),
                 })
 
-        # Превью
-        preview_lines = []
-        for p in plan:
-            kind = "файлом" if p["is_file"] else "текстом"
+        # --- Превью: файлы уходят одним сообщением ---
+        file_items_preview = [p for p in plan if p["is_file"]]
+        text_items_preview = [p for p in plan if not p["is_file"]]
+
+        preview_lines: List[str] = []
+        if file_items_preview:
+            names = ", ".join(p["which"] for p in file_items_preview)
             preview_lines.append(
-                f"• {p['which']}: {kind}, {len(p['body'])} символов"
+                f"• файлом (одним сообщением): {names}"
             )
-        preview_text = "\n".join(preview_lines)
+        for p in text_items_preview:
+            preview_lines.append(
+                f"• текстом: {p['which']}, {len(p['body'])} символов"
+            )
+        preview_text = "\n".join(preview_lines) or "(нечего отправлять)"
 
         reply = QMessageBox.question(
             self, "Отправка в Bitrix24",
@@ -745,71 +758,101 @@ class SendToBitrixDialog(QDialog):
         )
         prefer_chat_folder = forced_folder_id <= 0
 
+        # --- Группируем: все файлы — в одно сообщение, тексты — отдельно ---
+        file_items = [it for it in plan if it["is_file"]]
+        text_items = [it for it in plan if not it["is_file"]]
+
         QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         async def _run_send() -> tuple:
             sent = 0
             errors: List[str] = []
+
             async with Bitrix24Client(
                 webhook_url=webhook,
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
             ) as client:
-                for idx, item in enumerate(plan, start=1):
-                    try:
-                        if item["is_file"]:
-                            file_path = self._prepare_file_for_item(item)
-                            if not file_path:
-                                raise Bitrix24Error(
-                                    "не удалось подготовить файл "
-                                    "для отправки"
-                                )
-                            comment = item["header"]
+                # --- Файлы: одно сообщение со всеми вложениями ---
+                if file_items:
+                    prepared: List[str] = []
+                    cleanup_paths: List[str] = []
+                    for it in file_items:
+                        p = self._prepare_file_for_item(it)
+                        if p:
+                            prepared.append(p)
+                            if it.get("_tmp"):
+                                cleanup_paths.append(p)
+
+                    if not prepared:
+                        errors.append("файлы: нечего отправлять")
+                    else:
+                        # Комментарий — объединяем заголовки файлов
+                        headers = [
+                            it.get("header", "") for it in file_items
+                        ]
+                        headers = [h for h in headers if h]
+                        comment = " / ".join(headers) if headers else ""
+
+                        try:
                             log.info(
-                                "Bitrix24: файл #%d (%s, %d символов) "
-                                "→ чат %s",
-                                idx, item["which"], len(item["body"]),
-                                chat_id,
+                                "Bitrix24: отправка %d файлов одним "
+                                "сообщением в чат %s",
+                                len(prepared), chat_id,
                             )
                             await client.send_file_message(
                                 dialog_id=chat_id,
-                                file_path=file_path,
+                                file_paths=prepared,
                                 comment=comment,
                                 folder_id=forced_folder_id,
                                 system=system,
                                 url_preview=url_preview,
                                 prefer_chat_folder=prefer_chat_folder,
                             )
-                            # Убираем временный файл
-                            if item.get("_tmp") and os.path.exists(file_path):
+                            sent += 1
+                        except Bitrix24Error as exc:
+                            log.error(
+                                "Bitrix24: ошибка отправки файлов: %s",
+                                exc,
+                            )
+                            errors.append(f"файлы: {exc}")
+                        finally:
+                            # Убираем временные файлы
+                            for p in cleanup_paths:
                                 try:
-                                    os.remove(file_path)
+                                    os.remove(p)
                                 except Exception:
                                     pass
-                        else:
-                            text = self._build_text_message(item)
-                            log.info(
-                                "Bitrix24: текст #%d (%s, %d символов) "
-                                "→ чат %s",
-                                idx, item["which"], len(text), chat_id,
-                            )
-                            await client.send_message(
-                                dialog_id=chat_id,
-                                text=text,
-                                system=system,
-                                url_preview=url_preview,
-                            )
+
+                # --- Тексты: каждое сообщение отдельно ---
+                for idx, it in enumerate(text_items, start=1):
+                    try:
+                        text = self._build_text_message(it)
+                        log.info(
+                            "Bitrix24: текст #%d (%s, %d символов) "
+                            "→ чат %s",
+                            idx, it["which"], len(text), chat_id,
+                        )
+                        await client.send_message(
+                            dialog_id=chat_id,
+                            text=text,
+                            system=system,
+                            url_preview=url_preview,
+                        )
                         sent += 1
                     except Bitrix24Error as exc:
                         log.error(
-                            "Bitrix24: ошибка отправки #%d: %s", idx, exc
+                            "Bitrix24: ошибка отправки текста #%d: %s",
+                            idx, exc,
                         )
-                        errors.append(f"#{idx}: {exc}")
+                        errors.append(f"текст #{idx}: {exc}")
                     except Exception as exc:
                         log.exception(
-                            "Bitrix24: неожиданная ошибка #%d: %s", idx, exc
+                            "Bitrix24: неожиданная ошибка текста #%d: %s",
+                            idx, exc,
                         )
-                        errors.append(f"#{idx}: {exc}")
+                        errors.append(f"текст #{idx}: {exc}")
+
             return sent, errors
 
         try:
@@ -826,10 +869,10 @@ class SendToBitrixDialog(QDialog):
         if not errors:
             QMessageBox.information(
                 self, "Bitrix24",
-                f"Отправлено: {sent_count}\n\nЧат: {chat_id}",
+                f"Отправлено сообщений: {sent_count}\n\nЧат: {chat_id}",
             )
             log.info(
-                "Bitrix24: успешно отправлено %d элементов в %s",
+                "Bitrix24: успешно отправлено %d сообщений в %s",
                 sent_count, chat_id,
             )
         elif sent_count == 0:
@@ -840,6 +883,6 @@ class SendToBitrixDialog(QDialog):
         else:
             QMessageBox.warning(
                 self, "Bitrix24",
-                f"Отправлено: {sent_count} из {len(plan)}\n\n"
+                f"Отправлено: {sent_count}\n\n"
                 "Ошибки:\n" + "\n".join(errors),
             )
