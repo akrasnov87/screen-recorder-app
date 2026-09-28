@@ -1,6 +1,7 @@
 """Окно со списком всех записей (сессий).
 
 Действия вынесены в верхнее меню, чтобы не переполнять панель.
+Дополнительно есть служебное меню «Утилиты» для обслуживания хранилища.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QMenuBar, QMessageBox, QPushButton,
+    QInputDialog, QLabel, QMenuBar, QMessageBox, QProgressDialog, QPushButton,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -351,6 +352,29 @@ class SessionsWindow(QDialog):
             lambda: self._change_status(STATUS_ERROR)
         )
         m_queue.addAction(act_status_error)
+
+        # ---------------- Утилиты ----------------
+        m_utils = bar.addMenu("Утилиты")
+
+        act_stats = QAction("Показать размер видеофайлов…", self)
+        act_stats.setToolTip(
+            "Посчитать, сколько места занимают video.mp4 во всех сессиях"
+        )
+        act_stats.triggered.connect(self._show_video_stats)
+        m_utils.addAction(act_stats)
+
+        m_utils.addSeparator()
+
+        act_del_video = QAction(
+            "Удалить видеофайлы (оставить только аудио)…", self
+        )
+        act_del_video.setToolTip(
+            "Удалить video.mp4 из всех сессий, где уже есть аудиофайл.\n"
+            "Помогает освободить дисковое пространство.\n"
+            "Требует подтверждения."
+        )
+        act_del_video.triggered.connect(self._delete_video_files)
+        m_utils.addAction(act_del_video)
 
         # ---------------- Справка ----------------
         m_help = bar.addMenu("Справка")
@@ -990,6 +1014,280 @@ class SessionsWindow(QDialog):
             )
 
     # ------------------------------------------------------------------
+    # Утилиты: работа с видеофайлами
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        """Форматирует размер файла в человекочитаемый вид."""
+        size = float(size_bytes)
+        for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} ПБ"
+
+    def _iter_session_dirs(self) -> List[str]:
+        """Возвращает отсортированный список папок внутри sessions_root."""
+        if not os.path.isdir(self.sessions_root):
+            return []
+        try:
+            entries = sorted(os.listdir(self.sessions_root))
+        except OSError as exc:
+            log.error("Не удалось прочитать %s: %s", self.sessions_root, exc)
+            return []
+
+        result: List[str] = []
+        for name in entries:
+            d = os.path.join(self.sessions_root, name)
+            if os.path.isdir(d):
+                result.append(d)
+        return result
+
+    @staticmethod
+    def _find_video_file(session_dir: str) -> str:
+        """Возвращает путь к video.mp4, если он есть; иначе — пустая строка."""
+        p = os.path.join(session_dir, "video.mp4")
+        return p if os.path.exists(p) else ""
+
+    @staticmethod
+    def _find_audio_file(session_dir: str) -> str:
+        """
+        Ищет первый существующий аудиофайл в папке сессии.
+
+        Порядок: video.mp3 (по умолчанию), затем video.aac, video.wav,
+        video.opus, video.ogg, video.m4a.
+        """
+        for fname in (
+            "video.mp3", "video.aac", "video.wav", "video.opus",
+            "video.ogg", "video.m4a",
+        ):
+            p = os.path.join(session_dir, fname)
+            if os.path.exists(p):
+                return p
+        return ""
+
+    def _collect_video_stats(self) -> Dict[str, Any]:
+        """
+        Проходит по всем сессиям и собирает статистику по video.mp4:
+
+          {
+            "sessions_total": int,
+            "sessions_with_video": int,
+            "sessions_without_audio": int,   # видео есть, аудио нет — не удаляем
+            "deletable": [  # список словарей {session, video, video_size} ]
+            "total_size": int,               # суммарный размер удаляемых файлов
+            "keep_size": int,                # суммарный размер тех, что оставим
+          }
+        """
+        result: Dict[str, Any] = {
+            "sessions_total": 0,
+            "sessions_with_video": 0,
+            "sessions_without_audio": 0,
+            "deletable": [],
+            "total_size": 0,
+            "keep_size": 0,
+        }
+
+        for session_dir in self._iter_session_dirs():
+            result["sessions_total"] += 1
+
+            video_path = self._find_video_file(session_dir)
+            if not video_path:
+                continue
+
+            result["sessions_with_video"] += 1
+
+            try:
+                size = os.path.getsize(video_path)
+            except OSError:
+                size = 0
+
+            audio_path = self._find_audio_file(session_dir)
+            if not audio_path:
+                # Видео есть, аудио нет — удалять нельзя
+                result["sessions_without_audio"] += 1
+                result["keep_size"] += size
+                continue
+
+            result["deletable"].append({
+                "session": session_dir,
+                "name": os.path.basename(session_dir),
+                "video": video_path,
+                "video_size": size,
+                "audio": audio_path,
+            })
+            result["total_size"] += size
+
+        return result
+
+    def _show_video_stats(self) -> None:
+        """Диалог только со статистикой (без удаления)."""
+        stats = self._collect_video_stats()
+
+        total = stats["sessions_total"]
+        with_video = stats["sessions_with_video"]
+        without_audio = stats["sessions_without_audio"]
+        deletable = len(stats["deletable"])
+        total_size = self._format_size(stats["total_size"])
+
+        msg = (
+            f"<b>Всего сессий:</b> {total}<br>"
+            f"<b>Сессий с video.mp4:</b> {with_video}<br>"
+            f"<b>Сессий без аудио (удалять нельзя):</b> {without_audio}<br>"
+            f"<br>"
+            f"<b>Можно удалить video.mp4:</b> {deletable} шт.<br>"
+            f"<b>Освободится:</b> {total_size}"
+        )
+
+        QMessageBox.information(self, "Размер видеофайлов", msg)
+        log.info(
+            "Статистика видеофайлов: всего сессий=%d, с видео=%d, "
+            "без аудио=%d, можно удалить=%d (%s)",
+            total, with_video, without_audio, deletable, total_size,
+        )
+
+    def _delete_video_files(self) -> None:
+        """
+        Удаление video.mp4 из всех сессий, где есть аудиофайл.
+
+        Сначала показывает подробное подтверждение с количеством и
+        размером. Только после «Yes» запускает удаление с прогресс-баром.
+        """
+        stats = self._collect_video_stats()
+        deletable: List[Dict[str, Any]] = stats["deletable"]
+
+        if not deletable:
+            QMessageBox.information(
+                self, "Удаление видеофайлов",
+                "Нет сессий, где можно удалить video.mp4.\n\n"
+                "Удаляются только сессии, в которых уже есть аудиофайл "
+                "(video.mp3 / .aac / .wav / .opus / .ogg / .m4a).\n"
+                "Сессии без аудио не трогаются, чтобы не потерять запись.",
+            )
+            return
+
+        total_size_str = self._format_size(stats["total_size"])
+
+        # Предпросмотр списка: если сессий много — показываем первые N и «…».
+        preview_lines: List[str] = []
+        preview_limit = 15
+        for i, item in enumerate(deletable):
+            if i >= preview_limit:
+                preview_lines.append(
+                    f"… и ещё {len(deletable) - preview_limit} сессий"
+                )
+                break
+            size_str = self._format_size(item["video_size"])
+            preview_lines.append(f"• {item['name']} — {size_str}")
+
+        preview = "\n".join(preview_lines)
+
+        msg = (
+            f"<b>Будет удалён video.mp4 из сессий:</b> {len(deletable)} шт.<br>"
+            f"<b>Освободится места:</b> {total_size_str}<br>"
+            f"<br>"
+            f"Аудиофайлы (video.mp3 и др.) <b>останутся</b>.<br>"
+            f"Сессии без аудио не трогаются.<br>"
+            f"<br>"
+            f"<b>Сессии к удалению:</b><br>"
+            f"<pre style='font-family:monospace'>{preview}</pre>"
+            f"<br>"
+            f"<b style='color:#c62828'>Действие необратимо.</b><br>"
+            f"Продолжить?"
+        )
+
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение удаления",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            log.info("Удаление видеофайлов отменено пользователем")
+            return
+
+        # Прогресс-диалог
+        progress = QProgressDialog(
+            "Удаление видеофайлов…",
+            "Отмена",
+            0,
+            len(deletable),
+            self,
+        )
+        progress.setWindowTitle("Удаление видеофайлов")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        removed = 0
+        freed_bytes = 0
+        errors: List[str] = []
+
+        for i, item in enumerate(deletable):
+            if progress.wasCanceled():
+                log.warning("Удаление видеофайлов отменено пользователем "
+                            "на шаге %d/%d", i, len(deletable))
+                break
+
+            video_path = item["video"]
+            size = item["video_size"]
+
+            # Двойная проверка: аудио всё ещё на месте?
+            audio_path = self._find_audio_file(item["session"])
+            if not audio_path:
+                errors.append(
+                    f"{item['name']}: аудио исчезло, пропуск"
+                )
+                log.warning("Пропуск %s: аудио исчезло перед удалением",
+                            video_path)
+                progress.setValue(i + 1)
+                continue
+
+            try:
+                os.remove(video_path)
+                removed += 1
+                freed_bytes += size
+                log.info(
+                    "Удалён видеофайл: %s (%s)",
+                    video_path, self._format_size(size),
+                )
+            except Exception as exc:
+                errors.append(f"{item['name']}: {exc}")
+                log.exception("Не удалось удалить %s: %s", video_path, exc)
+
+            progress.setValue(i + 1)
+
+        progress.setValue(len(deletable))
+
+        freed_str = self._format_size(freed_bytes)
+
+        if errors:
+            QMessageBox.warning(
+                self, "Удаление видеофайлов",
+                f"Удалено файлов: {removed} из {len(deletable)}\n"
+                f"Освобождено: {freed_str}\n\n"
+                f"Ошибки при удалении:\n"
+                + "\n".join(errors[:20])
+                + ("\n…" if len(errors) > 20 else ""),
+            )
+        else:
+            QMessageBox.information(
+                self, "Удаление видеофайлов",
+                f"Удалено файлов: {removed}\n"
+                f"Освобождено: {freed_str}",
+            )
+
+        log.info(
+            "Удаление видеофайлов завершено: удалено=%d, освобождено=%s, "
+            "ошибок=%d",
+            removed, freed_str, len(errors),
+        )
+
+        # Обновляем таблицу — размеры файлов изменились
+        self.refresh()
+
+    # ------------------------------------------------------------------
     # Внутренние операции
     # ------------------------------------------------------------------
     def _remove_from_queue(self, task_id: str) -> bool:
@@ -1383,5 +1681,8 @@ class SessionsWindow(QDialog):
             "Ctrl+R        — перезапустить обработку\n"
             "F5            — обновить список\n"
             "Ctrl+Delete   — удалить запись\n"
-            "Ctrl+W        — закрыть окно\n",
+            "Ctrl+W        — закрыть окно\n"
+            "\n"
+            "Утилиты → «Удалить видеофайлы» — освободить место, "
+            "оставив только аудио (с подтверждением).",
         )
