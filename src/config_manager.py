@@ -40,8 +40,6 @@ DEFAULT_SCRUM_PROMPT = (
 )
 
 # Дефолтные шаблоны названий записи.
-# Плейсхолдеры: {name} {abbr} {date} {time} {datetime}
-# Также поддерживаются русские варианты: {название} {сокр} {дата} {время}
 DEFAULT_NAME_TEMPLATES: List[Dict[str, str]] = [
     {
         "label": "Название + дата",
@@ -67,11 +65,12 @@ DEFAULT_NAME_TEMPLATES: List[Dict[str, str]] = [
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    # --- Проекты (новый формат: name + chat_id) ---
     "projects": [
-        "Россети",
-        "iserv",
-        "Внутренние",
-        "Тестовые",
+        {"name": "Россети",     "chat_id": ""},
+        {"name": "iserv",       "chat_id": ""},
+        {"name": "Внутренние",  "chat_id": ""},
+        {"name": "Тестовые",    "chat_id": ""},
     ],
     "metadata": {
         "prompts": [
@@ -108,7 +107,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "Выдели ключевые темы, решения и задачи с ответственными. "
             "В конце — список action items."
         ),
-        # --- Шаблоны названий записи ---
         "name_templates": DEFAULT_NAME_TEMPLATES,
     },
     "transcribe": {
@@ -150,9 +148,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     # --- Скрам-митинги ---
     "scrum": {
-        # Шаблон промпта для DeepSeek
         "prompt_template": DEFAULT_SCRUM_PROMPT,
-        # Формат экспорта промпта: txt | md | docx
         "export_format": "docx",
     },
     # --- Формирование протокола (резюме) ---
@@ -175,19 +171,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
     },
     # --- Глоссарий терминов ---
-    # Список терминов/аббревиатур, которые нужно «знать» модели.
-    #   terms              — список {"term": ..., "description": ...}
-    #   send_to_summarizer — дописывать глоссарий в промпт суммаризации
-    #                        (summary_prompt для сервера или user-prompt
-    #                         для LiteLLM);
-    #   send_to_deepseek   — добавлять блок «ГЛОССАРИЙ» в файл
-    #                        deepseek_prompt.*.
     "glossary": {
         "terms": [
             {"term": "ЕЖД", "description": "Единый журнал дежурств"},
         ],
         "send_to_summarizer": True,
         "send_to_deepseek": True,
+    },
+    # --- Bitrix24 ---
+    "bitrix": {
+        "enabled": False,
+        "webhook_url": "",
+        "connect_timeout": 15,
+        "read_timeout": 60,
+        # как отправлять по умолчанию: "protocol" | "summary" | "both"
+        "default_send": "protocol",
+        # добавлять ли в сообщение заголовок (имя записи + дата)
+        "include_header": True,
+        # системное сообщение (SYSTEM=Y)
+        "system_message": False,
+        # отключить предпросмотр ссылок
+        "disable_url_preview": False,
+        # --- Отправка файлов ---
+        # Автоматически отправлять файлом, если текст длиннее порога
+        "file_message_max_chars": 3000,
+        # ID папки на Диске для загрузки (0 = корень общего диска)
+        "upload_folder_id": 0,
     },
 }
 
@@ -382,12 +391,6 @@ class ConfigManager:
 
     # --- Глоссарий ---
     def get_glossary_settings(self) -> Dict[str, Any]:
-        """
-        Возвращает настройки глоссария:
-          • terms              — список {"term": ..., "description": ...};
-          • send_to_summarizer — bool;
-          • send_to_deepseek   — bool.
-        """
         cfg = self.config.get("glossary", {}) or {}
         raw_terms = cfg.get("terms", [])
         terms: List[Dict[str, str]] = []
@@ -404,4 +407,70 @@ class ConfigManager:
             "terms": terms,
             "send_to_summarizer": bool(cfg.get("send_to_summarizer", True)),
             "send_to_deepseek": bool(cfg.get("send_to_deepseek", True)),
+        }
+
+    # ------------------------------------------------------------------
+    # Проекты (новый формат: name + chat_id)
+    # ------------------------------------------------------------------
+    def get_projects(self) -> List[Dict[str, str]]:
+        raw = self.config.get("projects", []) or []
+        result: List[Dict[str, str]] = []
+        for item in raw:
+            if isinstance(item, str):
+                name = item.strip()
+                if name:
+                    result.append({"name": name, "chat_id": ""})
+            elif isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                chat_id = str(item.get("chat_id") or "").strip()
+                result.append({"name": name, "chat_id": chat_id})
+        return result
+
+    def get_project_names(self) -> List[str]:
+        return [p["name"] for p in self.get_projects()]
+
+    def get_project_chat_id(self, project_name: str) -> str:
+        if not project_name:
+            return ""
+        name = project_name.strip()
+        for p in self.get_projects():
+            if p["name"] == name:
+                return p["chat_id"]
+        return ""
+
+    def set_projects(self, projects: List[Dict[str, str]]) -> None:
+        normalized = []
+        for p in projects or []:
+            name = str(p.get("name") or "").strip()
+            if not name:
+                continue
+            normalized.append({
+                "name": name,
+                "chat_id": str(p.get("chat_id") or "").strip(),
+            })
+        self.config["projects"] = normalized
+        self.save()
+
+    # ------------------------------------------------------------------
+    # Bitrix24
+    # ------------------------------------------------------------------
+    def get_bitrix_settings(self) -> Dict[str, Any]:
+        """Возвращает настройки интеграции с Bitrix24."""
+        cfg = self.config.get("bitrix", {}) or {}
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "webhook_url": str(cfg.get("webhook_url", "")).strip(),
+            "connect_timeout": int(cfg.get("connect_timeout", 15)),
+            "read_timeout": int(cfg.get("read_timeout", 60)),
+            "default_send": str(cfg.get("default_send", "protocol")),
+            "include_header": bool(cfg.get("include_header", True)),
+            "system_message": bool(cfg.get("system_message", False)),
+            "disable_url_preview": bool(cfg.get("disable_url_preview", False)),
+            # --- Отправка файлов ---
+            "file_message_max_chars": int(
+                cfg.get("file_message_max_chars", 3000)
+            ),
+            "upload_folder_id": int(cfg.get("upload_folder_id", 0)),
         }

@@ -104,7 +104,6 @@ class SessionsWindow(QDialog):
         root.setContentsMargins(8, 4, 8, 8)
         root.setSpacing(6)
 
-        # Заголовок: сводка и текущая выбранная запись
         header = QHBoxLayout()
         self.summary_label = QLabel("")
         header.addWidget(self.summary_label)
@@ -115,7 +114,6 @@ class SessionsWindow(QDialog):
         header.addStretch()
         root.addLayout(header)
 
-        # Таблица
         self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels([
             "Дата и время", "Название", "Проект", "Статус",
@@ -145,10 +143,8 @@ class SessionsWindow(QDialog):
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         root.addWidget(self.table, 1)
 
-        # Легенда
         root.addWidget(self._build_legend())
 
-        # Нижняя строка: обновление + закрыть
         bottom = QHBoxLayout()
         bottom.addStretch()
 
@@ -163,13 +159,6 @@ class SessionsWindow(QDialog):
         root.addLayout(bottom)
 
     def _build_menu_bar(self) -> None:
-        """
-        Верхнее меню со всеми действиями.
-
-        Установка локального стиля для QMenuBar/QMenu перекрывает
-        глобальные правила styles.qss, из-за которых выделённый пункт
-        меню становился белым на белом.
-        """
         bar = QMenuBar(self)
         bar.setStyleSheet(
             "QMenuBar {"
@@ -324,6 +313,29 @@ class SessionsWindow(QDialog):
         act_save_downloads.triggered.connect(self._save_prompt_to_downloads)
         m_deepseek.addAction(act_save_downloads)
 
+        # ---------------- Bitrix24 ----------------
+        m_bitrix = bar.addMenu("Bitrix24")
+
+        act_send = QAction("Отправить в чат…", self)
+        act_send.setShortcut(QKeySequence("Ctrl+B"))
+        act_send.setToolTip(
+            "Отправить протокол и/или summary записи в чат Bitrix24"
+        )
+        act_send.triggered.connect(self._send_to_bitrix)
+        m_bitrix.addAction(act_send)
+
+        act_send_protocol = QAction("Отправить протокол…", self)
+        act_send_protocol.triggered.connect(
+            lambda: self._send_to_bitrix(default="protocol")
+        )
+        m_bitrix.addAction(act_send_protocol)
+
+        act_send_summary = QAction("Отправить summary…", self)
+        act_send_summary.triggered.connect(
+            lambda: self._send_to_bitrix(default="summary")
+        )
+        m_bitrix.addAction(act_send_summary)
+
         # ---------------- Вложения ----------------
         m_attach = bar.addMenu("Вложения")
 
@@ -401,7 +413,6 @@ class SessionsWindow(QDialog):
     # Сигнал импорта
     # ------------------------------------------------------------------
     def _on_import_requested(self) -> None:
-        """Сообщает главному окну, что пользователь хочет открыть импорт."""
         log.debug("Запрошен импорт из окна «Записи»")
         self.import_requested.emit()
 
@@ -669,6 +680,77 @@ class SessionsWindow(QDialog):
 
         log.debug("Список записей обновлён: %d сессий", total)
         self._on_selection_changed()
+
+    # ------------------------------------------------------------------
+    # Bitrix24
+    # ------------------------------------------------------------------
+    def _send_to_bitrix(self, default: str = "") -> None:
+        """Открывает диалог отправки протокола/summary в чат Bitrix24."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "Bitrix24",
+                "Нет доступа к настройкам — ConfigManager не передан.",
+            )
+            return
+
+        bitrix_cfg = self.config_manager.get_bitrix_settings()
+        if not bitrix_cfg.get("enabled"):
+            QMessageBox.information(
+                self, "Bitrix24",
+                "Интеграция с Bitrix24 отключена.\n\n"
+                "Включите её в Настройки → Bitrix24.",
+            )
+            return
+
+        # Определяем chat_id по проекту
+        project = r.get("project") or ""
+        chat_id = self.config_manager.get_project_chat_id(project)
+        if not chat_id:
+            log.warning(
+                "Для проекта «%s» не задан ID чата Bitrix24", project or "—"
+            )
+            QMessageBox.warning(
+                self, "Bitrix24",
+                f"Для проекта «{project or '—'}» не задан ID чата.\n\n"
+                "Укажите его в Настройки → Проекты и чаты Bitrix24.\n\n"
+                "Можно также ввести чат вручную в диалоге отправки.",
+            )
+            # Не выходим — пользователь может ввести чат вручную в диалоге
+
+        # Собираем session_info
+        session_info = {
+            "name": r.get("name") or "",
+            "project": project,
+            "date": r.get("datetime") or "",
+            "protocol_path": r.get("manual_protocol_path") or "",
+            "protocol_label": (
+                os.path.basename(r["manual_protocol_path"])
+                if r.get("manual_protocol_path") else ""
+            ),
+            "summary_bb": r.get("summary_bb") or "",
+            "comment": "",
+        }
+
+        # Комментарий из session.json
+        try:
+            meta = _read_json(os.path.join(r["dir"], "session.json")) or {}
+            session_info["comment"] = meta.get("comment") or ""
+        except Exception:
+            pass
+
+        from .send_to_bitrix_dialog import SendToBitrixDialog
+        dlg = SendToBitrixDialog(
+            session_info=session_info,
+            chat_id=chat_id,
+            bitrix_cfg=bitrix_cfg,
+            parent=self,
+        )
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # Ручной протокол
@@ -1100,7 +1182,6 @@ class SessionsWindow(QDialog):
             if not video_path:
                 continue
 
-            # Считаем только «тяжёлые» видео, не аудиофайлы
             if os.path.splitext(video_path)[1].lower() in (
                 ".mp3", ".wav", ".m4a", ".aac", ".opus", ".ogg"
             ):
@@ -1671,6 +1752,7 @@ class SessionsWindow(QDialog):
             self,
             "Горячие клавиши",
             "Ctrl+I        — импорт материалов\n"
+            "Ctrl+B        — отправить протокол/summary в Bitrix24\n"
             "Ctrl+Shift+E  — открыть папку записи\n"
             "Ctrl+Shift+V  — открыть видео\n"
             "Ctrl+P        — изменить summary\n"

@@ -204,8 +204,7 @@ class ScreenRecorderApp(QObject):
         title: str = "Метаданные записи",
         initial: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        cfg = self.config_manager.config
-        projects = list(cfg.get("projects", []) or [])
+        projects = self.config_manager.get_project_names()
         prompts = self.config_manager.get_prompts()
         default_prompt = self.config_manager.get_default_prompt()
         name_templates = self.config_manager.get_name_templates()
@@ -250,8 +249,7 @@ class ScreenRecorderApp(QObject):
         return None
 
     def _build_default_meta(self) -> Dict[str, Any]:
-        cfg = self.config_manager.config
-        projects = cfg.get("projects", []) or []
+        projects = self.config_manager.get_project_names()
         default_project = projects[0] if projects else "Default"
         now_str = f"{datetime.now():%Y-%m-%d %H-%M}"
         meta = {
@@ -563,8 +561,7 @@ class ScreenRecorderApp(QObject):
         """Диалог импорта готового видео/стенограммы/протокола."""
         log.info("Запрос на импорт материалов")
 
-        cfg = self.config_manager.config
-        projects = list(cfg.get("projects", []) or [])
+        projects = self.config_manager.get_project_names()
 
         dlg = ImportWindow(
             projects=projects,

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
@@ -30,7 +30,7 @@ class SettingsWindow(QDialog):
         super().__init__(parent)
         self.config_manager = config
         self.setWindowTitle("Настройки Screen Recorder")
-        self.setMinimumSize(960, 780)
+        self.setMinimumSize(1000, 820)
         self.setModal(True)
         log.info("Открытие окна настроек")
         self._build_ui()
@@ -42,7 +42,9 @@ class SettingsWindow(QDialog):
         self.tabs = QTabWidget()
         root.addWidget(self.tabs)
 
-        self.tabs.addTab(self._build_metadata_tab(), "Проекты, промпты, имена")
+        self.tabs.addTab(self._build_projects_tab(), "Проекты и чаты Bitrix24")
+        self.tabs.addTab(self._build_bitrix_tab(), "Bitrix24")
+        self.tabs.addTab(self._build_metadata_tab(), "Промпты и имена")
         self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
         self.tabs.addTab(self._build_summarizer_tab(), "Суммаризация")
         self.tabs.addTab(self._build_glossary_tab(), "Глоссарий")
@@ -71,33 +73,299 @@ class SettingsWindow(QDialog):
         root.addLayout(buttons)
 
     # ------------------------------------------------------------------
-    # Проекты, промпты, шаблоны имён
+    # Проекты и чаты Bitrix24
+    # ------------------------------------------------------------------
+    def _build_projects_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "Список проектов, доступных при вводе метаданных записи. "
+            "Для каждого проекта можно указать ID чата Bitrix24 — "
+            "тогда в окне «Записи» можно будет быстро отправить "
+            "протокол и/или summary в этот чат."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        hint = QLabel(
+            "ID чата — это идентификатор диалога в Bitrix24. "
+            "Найти его можно через API методом "
+            "<code>im.recent.get</code> или из URL чата в веб-интерфейсе.<br><br>"
+            "Формат: <code>chat2101</code> или просто <code>2101</code>. "
+            "Обычно достаточно указать число — метод <code>im.message.add</code> "
+            "примет оба варианта.<br><br>"
+            "Если чат не задан — отправка в Bitrix24 для этого проекта "
+            "будет недоступна."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(hint)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Проекты</b>"))
+        header.addStretch()
+        header.addWidget(make_info_icon("projects_list"))
+        layout.addLayout(header)
+
+        self.projects_table = QTableWidget(0, 2)
+        self.projects_table.setHorizontalHeaderLabels([
+            "Проект", "Чат Bitrix24",
+        ])
+        self.projects_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.projects_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        hv = self.projects_table.horizontalHeader()
+        hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.projects_table.setMinimumHeight(320)
+        layout.addWidget(self.projects_table)
+
+        btns = QHBoxLayout()
+        add_btn = QPushButton("Добавить")
+        add_btn.clicked.connect(self._project_add)
+        del_btn = QPushButton("Удалить")
+        del_btn.clicked.connect(self._project_delete)
+        up_btn = QPushButton("Вверх")
+        up_btn.clicked.connect(lambda: self._project_move(-1))
+        down_btn = QPushButton("Вниз")
+        down_btn.clicked.connect(lambda: self._project_move(1))
+        btns.addWidget(add_btn)
+        btns.addWidget(del_btn)
+        btns.addWidget(up_btn)
+        btns.addWidget(down_btn)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        layout.addStretch()
+        return w
+
+    def _project_add(self) -> None:
+        row = self.projects_table.rowCount()
+        self.projects_table.insertRow(row)
+        self.projects_table.setItem(row, 0, QTableWidgetItem("Новый проект"))
+        self.projects_table.setItem(row, 1, QTableWidgetItem(""))
+        self.projects_table.editItem(self.projects_table.item(row, 0))
+        log.debug("Добавлен пустой проект (строка %d)", row)
+
+    def _project_delete(self) -> None:
+        row = self.projects_table.currentRow()
+        if row < 0:
+            return
+        item = self.projects_table.item(row, 0)
+        name = item.text() if item else ""
+        if QMessageBox.question(
+            self, "Удалить проект",
+            f"Удалить проект «{name}»?",
+        ) == QMessageBox.StandardButton.Yes:
+            log.info("Удаление проекта «%s» (строка %d)", name, row)
+            self.projects_table.removeRow(row)
+
+    def _project_move(self, delta: int) -> None:
+        row = self.projects_table.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= self.projects_table.rowCount():
+            return
+        for col in range(self.projects_table.columnCount()):
+            a = self.projects_table.takeItem(row, col)
+            b = self.projects_table.takeItem(new_row, col)
+            self.projects_table.setItem(row, col, b)
+            self.projects_table.setItem(new_row, col, a)
+        self.projects_table.setCurrentCell(new_row, 0)
+        log.debug("Проект перемещён: %d → %d", row, new_row)
+
+    # ------------------------------------------------------------------
+    # Bitrix24
+    # ------------------------------------------------------------------
+    def _build_bitrix_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "Настройки интеграции с Bitrix24. Используется для отправки "
+            "протоколов и кратких описаний в чаты команд из окна «Записи»."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+
+        self.bitrix_enabled_check = QCheckBox(
+            "Включить интеграцию с Bitrix24"
+        )
+        attach_tooltip(self.bitrix_enabled_check, "bitrix_enabled")
+        form.addRow("", self.bitrix_enabled_check)
+
+        self.bitrix_webhook_input = QLineEdit()
+        self.bitrix_webhook_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.bitrix_webhook_input.setPlaceholderText(
+            "https://portal.bitrix24.ru/rest/1/token/"
+        )
+
+        self.bitrix_show_webhook = QCheckBox("Показать")
+        self.bitrix_show_webhook.toggled.connect(
+            lambda checked: self.bitrix_webhook_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked
+                else QLineEdit.EchoMode.Password
+            )
+        )
+
+        wh_row = QWidget()
+        wh_l = QHBoxLayout(wh_row)
+        wh_l.setContentsMargins(0, 0, 0, 0)
+        wh_l.setSpacing(6)
+        wh_l.addWidget(self.bitrix_webhook_input, 1)
+        wh_l.addWidget(self.bitrix_show_webhook, 0)
+        form.addRow("Вебхук:", with_info(wh_row, "bitrix_webhook"))
+
+        self.bitrix_connect_timeout = QSpinBox()
+        self.bitrix_connect_timeout.setRange(1, 600)
+        self.bitrix_connect_timeout.setSuffix(" сек")
+        self.bitrix_connect_timeout.setValue(15)
+        form.addRow(
+            "Таймаут соединения:",
+            with_info(self.bitrix_connect_timeout, "bitrix_connect_timeout"),
+        )
+
+        self.bitrix_read_timeout = QSpinBox()
+        self.bitrix_read_timeout.setRange(5, 3600)
+        self.bitrix_read_timeout.setSuffix(" сек")
+        self.bitrix_read_timeout.setValue(60)
+        form.addRow(
+            "Таймаут чтения:",
+            with_info(self.bitrix_read_timeout, "bitrix_read_timeout"),
+        )
+
+        self.bitrix_default_send_combo = QComboBox()
+        self.bitrix_default_send_combo.addItem("Протокол", "protocol")
+        self.bitrix_default_send_combo.addItem("Summary", "summary")
+        self.bitrix_default_send_combo.addItem("И то и другое", "both")
+        form.addRow(
+            "Что отправлять по умолчанию:",
+            with_info(self.bitrix_default_send_combo, "bitrix_default_send"),
+        )
+
+        self.bitrix_header_check = QCheckBox(
+            "Добавлять заголовок (название записи + дата)"
+        )
+        attach_tooltip(self.bitrix_header_check, "bitrix_header")
+        form.addRow("", self.bitrix_header_check)
+
+        self.bitrix_system_check = QCheckBox(
+            "Системное сообщение (SYSTEM=Y)"
+        )
+        attach_tooltip(self.bitrix_system_check, "bitrix_system")
+        form.addRow("", self.bitrix_system_check)
+
+        self.bitrix_no_preview_check = QCheckBox(
+            "Отключить предпросмотр ссылок"
+        )
+        attach_tooltip(self.bitrix_no_preview_check, "bitrix_no_preview")
+        form.addRow("", self.bitrix_no_preview_check)
+
+        # --- Загрузка файлов ---
+        files_header = QHBoxLayout()
+        files_header.addWidget(QLabel("<b>Отправка файлов</b>"))
+        files_header.addStretch()
+        files_header.addWidget(make_info_icon("bitrix_files_section"))
+        files_row = QWidget()
+        files_row.setLayout(files_header)
+        form.addRow("", files_row)
+
+        self.bitrix_file_threshold = QSpinBox()
+        self.bitrix_file_threshold.setRange(500, 100000)
+        self.bitrix_file_threshold.setSingleStep(500)
+        self.bitrix_file_threshold.setSuffix(" символов")
+        self.bitrix_file_threshold.setValue(3000)
+        form.addRow(
+            "Порог «текст → файл»:",
+            with_info(self.bitrix_file_threshold, "bitrix_file_threshold"),
+        )
+
+        self.bitrix_upload_folder = QSpinBox()
+        self.bitrix_upload_folder.setRange(0, 999999999)
+        self.bitrix_upload_folder.setValue(0)
+        self.bitrix_upload_folder.setSpecialValueText("Папка чата (авто)")
+        form.addRow(
+            "Папка для загрузки:",
+            with_info(self.bitrix_upload_folder, "bitrix_upload_folder"),
+        )
+
+        # --- Кнопка проверки ---
+        self.bitrix_test_btn = QPushButton("Проверить подключение")
+        self.bitrix_test_btn.clicked.connect(self._test_bitrix_connection)
+        form.addRow("", self.bitrix_test_btn)
+
+        layout.addLayout(form)
+        layout.addStretch()
+        return w
+
+    def _test_bitrix_connection(self) -> None:
+        webhook = self.bitrix_webhook_input.text().strip()
+        if not webhook:
+            QMessageBox.warning(
+                self, "Bitrix24",
+                "Укажите URL вебхука Bitrix24.",
+            )
+            return
+
+        from .bitrix_client import Bitrix24Client, Bitrix24Error
+
+        connect_timeout = float(self.bitrix_connect_timeout.value())
+        read_timeout = float(self.bitrix_read_timeout.value())
+
+        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        async def _run_ping() -> str:
+            async with Bitrix24Client(
+                webhook_url=webhook,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            ) as client:
+                return await client.ping()
+
+        try:
+            name = asyncio.run(_run_ping())
+        except Bitrix24Error as exc:
+            log.warning("Проверка Bitrix24 не удалась: %s", exc)
+            QMessageBox.warning(
+                self, "Bitrix24",
+                f"Не удалось подключиться:\n\n{exc}",
+            )
+            return
+        except Exception as exc:
+            log.exception("Ошибка при проверке Bitrix24: %s", exc)
+            QMessageBox.critical(self, "Bitrix24", f"Ошибка:\n{exc}")
+            return
+        finally:
+            if QGuiApplication.overrideCursor() is not None:
+                QGuiApplication.restoreOverrideCursor()
+
+        QMessageBox.information(
+            self, "Bitrix24",
+            f"Подключение успешно.\n\nПользователь вебхука: {name}",
+        )
+
+    # ------------------------------------------------------------------
+    # Промпты и шаблоны имён
     # ------------------------------------------------------------------
     def _build_metadata_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Список проектов (по одному в строке или через запятую). "
-            "Промпты используются в диалоге метаданных. "
-            "Шаблоны названий — для быстрого формирования имени записи."
+            "Библиотека промптов и шаблоны названий записи. "
+            "Промпты используются в диалоге метаданных, "
+            "шаблоны — для быстрого формирования имени записи."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        # --- Проекты ---
-        projects_header = QHBoxLayout()
-        projects_header.addWidget(QLabel("<b>Проекты</b>"))
-        projects_header.addStretch()
-        projects_header.addWidget(make_info_icon("projects_list"))
-        layout.addLayout(projects_header)
-
-        self.projects_edit = QPlainTextEdit()
-        self.projects_edit.setPlaceholderText("Россети\niserv\nВнутренние\nТестовые")
-        self.projects_edit.setFixedHeight(90)
-        layout.addWidget(self.projects_edit)
-
-        # --- Промпты ---
         prompts_header = QHBoxLayout()
         prompts_header.addWidget(QLabel("<b>Библиотека промптов</b>"))
         prompts_header.addStretch()
@@ -131,7 +399,6 @@ class SettingsWindow(QDialog):
         prompt_btns.addStretch()
         layout.addLayout(prompt_btns)
 
-        # --- Промпт по умолчанию ---
         default_header = QHBoxLayout()
         default_header.addWidget(QLabel("<b>Промпт по умолчанию</b>"))
         default_header.addStretch()
@@ -142,7 +409,6 @@ class SettingsWindow(QDialog):
         self.default_prompt_edit.setFixedHeight(90)
         layout.addWidget(self.default_prompt_edit)
 
-        # --- Шаблоны названий записи ---
         names_header = QHBoxLayout()
         names_header.addWidget(QLabel("<b>Шаблоны названий записи</b>"))
         names_header.addStretch()
@@ -562,7 +828,6 @@ class SettingsWindow(QDialog):
         hint.setStyleSheet("QLabel { color: #666; }")
         layout.addWidget(hint)
 
-        # --- Таблица терминов ---
         terms_header = QHBoxLayout()
         terms_header.addWidget(QLabel("<b>Термины</b>"))
         terms_header.addStretch()
@@ -596,7 +861,6 @@ class SettingsWindow(QDialog):
         g_btns.addStretch()
         layout.addLayout(g_btns)
 
-        # --- Куда передавать ---
         send_header = QHBoxLayout()
         send_header.addWidget(QLabel("<b>Куда передавать глоссарий</b>"))
         send_header.addStretch()
@@ -940,10 +1204,39 @@ class SettingsWindow(QDialog):
         cfg = self.config_manager.config
         log.debug("Загрузка настроек в окно")
 
-        # Проекты
-        self.projects_edit.setPlainText("\n".join(cfg.get("projects", []) or []))
+        # --- Проекты (новая логика) ---
+        projects = self.config_manager.get_projects()
+        self.projects_table.setRowCount(0)
+        for p in projects:
+            row = self.projects_table.rowCount()
+            self.projects_table.insertRow(row)
+            self.projects_table.setItem(row, 0, QTableWidgetItem(p["name"]))
+            self.projects_table.setItem(row, 1, QTableWidgetItem(p["chat_id"]))
 
-        # Промпты
+        # --- Bitrix24 ---
+        bitrix = self.config_manager.get_bitrix_settings()
+        self.bitrix_enabled_check.setChecked(bitrix["enabled"])
+        self.bitrix_webhook_input.setText(bitrix["webhook_url"])
+        self.bitrix_connect_timeout.setValue(bitrix["connect_timeout"])
+        self.bitrix_read_timeout.setValue(bitrix["read_timeout"])
+        idx = self.bitrix_default_send_combo.findData(
+            bitrix["default_send"]
+        )
+        if idx >= 0:
+            self.bitrix_default_send_combo.setCurrentIndex(idx)
+        self.bitrix_header_check.setChecked(bitrix["include_header"])
+        self.bitrix_system_check.setChecked(bitrix["system_message"])
+        self.bitrix_no_preview_check.setChecked(
+            bitrix["disable_url_preview"]
+        )
+        self.bitrix_file_threshold.setValue(
+            int(bitrix.get("file_message_max_chars", 3000))
+        )
+        self.bitrix_upload_folder.setValue(
+            int(bitrix.get("upload_folder_id", 0))
+        )
+
+        # --- Промпты ---
         prompts = self.config_manager.get_prompts()
         self.prompts_table.setRowCount(0)
         for p in prompts:
@@ -956,7 +1249,7 @@ class SettingsWindow(QDialog):
             cfg.get("metadata", {}).get("default_prompt", "")
         )
 
-        # Шаблоны названий
+        # --- Шаблоны названий ---
         name_tpls = self.config_manager.get_name_templates()
         if not name_tpls:
             name_tpls = list(DEFAULT_NAME_TEMPLATES)
@@ -971,7 +1264,7 @@ class SettingsWindow(QDialog):
                 row, 1, QTableWidgetItem(tpl.get("template", ""))
             )
 
-        # Транскрибация
+        # --- Транскрибация ---
         tr = cfg.get("transcribe", {})
         self.tr_url_input.setText(tr.get("url", ""))
         self.tr_key_input.setText(tr.get("access_key", ""))
@@ -1012,7 +1305,7 @@ class SettingsWindow(QDialog):
             bool(g["send_to_deepseek"])
         )
 
-        # Запись
+        # --- Запись ---
         rec = cfg.get("recording", {})
         idx = int(rec.get("monitor", 0))
         if 0 <= idx < self.monitor_combo.count():
@@ -1032,13 +1325,13 @@ class SettingsWindow(QDialog):
             bool(rec.get("show_start_notification", True))
         )
 
-        # Очередь
+        # --- Очередь ---
         q = cfg.get("queue", {})
         self.auto_retry_check.setChecked(bool(q.get("auto_retry_enabled", True)))
         self.retry_interval_spin.setValue(int(q.get("retry_interval_minutes", 5)))
         self.max_retries_spin.setValue(int(q.get("max_retries", 10)))
 
-        # Скрам
+        # --- Скрам ---
         scrum = cfg.get("scrum", {})
         from .config_manager import DEFAULT_SCRUM_PROMPT
         self.scrum_template_edit.setPlainText(
@@ -1049,19 +1342,19 @@ class SettingsWindow(QDialog):
         if i >= 0:
             self.scrum_format_combo.setCurrentIndex(i)
 
-        # Сжатие
+        # --- Сжатие ---
         comp = cfg.get("compression", {})
         self.audio_fmt_combo.setCurrentText(comp.get("audio_format", "mp3"))
         self.audio_bitrate_spin.setValue(int(comp.get("audio_bitrate", 192)))
         self.video_bitrate_spin.setValue(int(comp.get("video_bitrate", 4000)))
         self.compression_spin.setValue(int(comp.get("compression_level", 5)))
 
-        # Хранилище
+        # --- Хранилище ---
         st = cfg.get("storage", {})
         self.temp_path_input.setText(st.get("temp_path", "/tmp/screen-recorder"))
         self.retention_spin.setValue(int(st.get("retention_hours", 24)))
 
-        # Логи
+        # --- Логи ---
         logging_cfg = cfg.get("logging", {})
         self.log_path_input.setText(
             logging_cfg.get("log_path", "/tmp/screen-recorder/app.log")
@@ -1074,18 +1367,46 @@ class SettingsWindow(QDialog):
         log.info(
             "Настройки загружены в окно: projects=%d, prompts=%d, "
             "name_templates=%d, summarizer=%s, glossary_terms=%d, "
-            "log_level=%s",
-            len(cfg.get("projects", []) or []), len(prompts),
-            len(name_tpls), sum_cfg["provider"], len(g["terms"]), level,
+            "bitrix_enabled=%s, log_level=%s",
+            len(projects), len(prompts), len(name_tpls),
+            sum_cfg["provider"], len(g["terms"]),
+            bitrix["enabled"], level,
         )
 
     def save_settings(self) -> bool:
         try:
             cfg = self.config_manager.config
 
-            raw = self.projects_edit.toPlainText()
-            parts = [p.strip() for line in raw.splitlines() for p in line.split(",")]
-            cfg["projects"] = [p for p in parts if p]
+            # --- Проекты (новая логика) ---
+            projects: List[Dict[str, str]] = []
+            for row in range(self.projects_table.rowCount()):
+                name_item = self.projects_table.item(row, 0)
+                chat_item = self.projects_table.item(row, 1)
+                name = name_item.text().strip() if name_item else ""
+                chat_id = chat_item.text().strip() if chat_item else ""
+                if not name:
+                    continue
+                projects.append({"name": name, "chat_id": chat_id})
+            cfg["projects"] = projects
+
+            # --- Bitrix24 ---
+            cfg["bitrix"] = {
+                "enabled": self.bitrix_enabled_check.isChecked(),
+                "webhook_url": self.bitrix_webhook_input.text().strip(),
+                "connect_timeout": int(self.bitrix_connect_timeout.value()),
+                "read_timeout": int(self.bitrix_read_timeout.value()),
+                "default_send": (
+                    self.bitrix_default_send_combo.currentData() or "protocol"
+                ),
+                "include_header": self.bitrix_header_check.isChecked(),
+                "system_message": self.bitrix_system_check.isChecked(),
+                "disable_url_preview": self.bitrix_no_preview_check.isChecked(),
+                # --- Отправка файлов ---
+                "file_message_max_chars": int(
+                    self.bitrix_file_threshold.value()
+                ),
+                "upload_folder_id": int(self.bitrix_upload_folder.value()),
+            }
 
             # --- Промпты ---
             prompts: List[dict] = []
@@ -1197,12 +1518,10 @@ class SettingsWindow(QDialog):
             log.info(
                 "Настройки сохранены: projects=%d, prompts=%d, "
                 "name_templates=%d, summarizer=%s, glossary_terms=%d, "
-                "glossary_to_summarizer=%s, glossary_to_deepseek=%s, "
-                "monitor=%d, log_level=%s, temp_path=%s",
-                len(cfg["projects"]), len(prompts), len(name_templates),
+                "bitrix_enabled=%s, monitor=%d, log_level=%s, temp_path=%s",
+                len(projects), len(prompts), len(name_templates),
                 cfg["summarizer"]["provider"], len(glossary_terms),
-                cfg["glossary"]["send_to_summarizer"],
-                cfg["glossary"]["send_to_deepseek"],
+                cfg["bitrix"]["enabled"],
                 cfg["recording"]["monitor"], cfg["logging"]["level"],
                 cfg["storage"]["temp_path"],
             )
@@ -1326,8 +1645,13 @@ class SettingsWindow(QDialog):
             self,
             "Справка",
             "Screen Recorder & Transcriber\n\n"
-            "• Вкладка «Проекты, промпты, имена» — три секции: проекты, "
-            "библиотека промптов и шаблоны названий записи.\n"
+            "• Вкладка «Проекты и чаты Bitrix24» — список проектов "
+            "с привязкой к чатам Bitrix24. Используется при отправке "
+            "протоколов и summary из окна «Записи».\n"
+            "• Вкладка «Bitrix24» — параметры подключения к порталу: "
+            "вебхук, таймауты, поведение при отправке, режим файлов.\n"
+            "• Вкладка «Промпты и имена» — библиотека промптов "
+            "и шаблоны названий записи.\n"
             "• Вкладка «Суммаризация» — выбор провайдера формирования "
             "протокола/резюме: сервер транскрибации или LiteLLM.\n"
             "• Вкладка «Глоссарий» — список терминов и аббревиатур, "

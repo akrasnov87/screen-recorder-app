@@ -156,6 +156,70 @@ def bbcode_to_plain(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# BB → BB Bitrix24
+# ---------------------------------------------------------------------------
+def bbcode_to_bitrix(text: str) -> str:
+    """
+    Преобразует внутренний BB-код в BB-код Bitrix24.
+
+    Bitrix24 рендерит BB-теги в верхнем регистре ([B], [I], [URL], ...).
+    Внутренний формат использует нижний регистр ([b], [i], [url], ...).
+
+    Особенности:
+      • Простые теги (b, i, u, s, url, img, code, list, table, ...)
+        приводятся к верхнему регистру — Bitrix24 отрендерит их.
+      • [quote] — нет прямого аналога в Bitrix24. Заменяется на "> ".
+      • [spoiler] — Bitrix24 поддерживает, оставляем как есть.
+      • Прочие теги игнорируются (остаются как текст).
+
+    Результат можно передавать в Bitrix24 через API im.message.add —
+    портал отрендерит его как форматированный текст.
+    """
+    if not text:
+        return ""
+
+    s = text
+
+    # --- Простые парные теги: нижний → верхний регистр ---
+    simple_tags = (
+        "b", "i", "u", "s",
+        "url", "img",
+        "code",
+        "list", "table", "tr", "td",
+        "color", "size", "font",
+        "left", "center", "right", "justify",
+    )
+    for tag in simple_tags:
+        # Открывающие: [tag] и [tag=...]
+        s = re.sub(
+            rf"\[{tag}(\]|=)",
+            lambda m, t=tag: f"[{t.upper()}{m.group(1)}",
+            s,
+            flags=re.IGNORECASE,
+        )
+        # Закрывающие: [/tag]
+        s = re.sub(
+            rf"\[/{tag}\]",
+            f"[/{tag.upper()}]",
+            s,
+            flags=re.IGNORECASE,
+        )
+
+    # --- Spoiler: Bitrix24 поддерживает ---
+    s = re.sub(r"\[spoiler\]", "[SPOILER]", s, flags=re.IGNORECASE)
+    s = re.sub(r"\[/spoiler\]", "[/SPOILER]", s, flags=re.IGNORECASE)
+
+    # --- Quote: нет прямого аналога, обозначаем как цитату ---
+    s = re.sub(r"\[quote\]", "\n> ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\[/quote\]", "\n", s, flags=re.IGNORECASE)
+
+    # --- Нормализуем переводы строк ---
+    s = re.sub(r"\n{3,}", "\n\n", s)
+
+    return s.strip()
+
+
+# ---------------------------------------------------------------------------
 # Редактор
 # ---------------------------------------------------------------------------
 class BBCodeEditorDialog(QDialog):
