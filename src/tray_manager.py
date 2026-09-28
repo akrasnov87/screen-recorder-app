@@ -89,7 +89,7 @@ class TrayManager(QObject):
         menu.addAction(sessions_action)
 
         # --- Библиотека ---
-        library_action = QAction("Библиотека…", menu)
+        library_action = QAction("Библиотека", menu)
         library_action.setToolTip(
             "Полнотекстовый поиск по стенограммам, протоколам, "
             "summary и вложениям"
