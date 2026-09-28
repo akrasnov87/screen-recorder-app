@@ -58,11 +58,12 @@ class VideoProcessor(QObject):
         log.info("=" * 60)
         log.info("Начало обработки задачи %s", task_id)
         log.info("Видео: %s", video_path)
-        log.info("Метаданные: project=%s, name=%s, is_scrum=%s, "
-                 "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
-                 "ctx_comment=%s, attachments=%d, summary_bb=%d, "
-                 "manual_protocol=%s",
+        log.info("Метаданные: project=%s, name=%s, generate_summary=%s, "
+                 "is_scrum=%s, generate_deepseek=%s, "
+                 "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
+                 "attachments=%d, summary_bb=%d, manual_protocol=%s",
                  metadata.get("project"), metadata.get("name"),
+                 metadata.get("generate_summary"),
                  metadata.get("is_scrum"),
                  metadata.get("generate_deepseek_prompt"),
                  metadata.get("include_name_in_prompt"),
@@ -104,6 +105,10 @@ class VideoProcessor(QObject):
             if provider not in ("server", "litellm"):
                 provider = "server"
 
+            # Флаг формирования summary — берётся из метаданных записи.
+            # По умолчанию (если поля нет) — False (не формировать).
+            generate_summary = bool(metadata.get("generate_summary", False))
+
             gl = self.config.get("glossary", {}) or {}
             gl_terms = gl.get("terms", []) or []
             gl_text = self._build_glossary_text(gl_terms)
@@ -114,8 +119,12 @@ class VideoProcessor(QObject):
             summary_path = ""
 
             if transcribe_url:
-                log.info("[%s] Шаг 2/2: транскрибация (провайдер суммаризации: %s)",
-                         task_id, provider)
+                log.info(
+                    "[%s] Шаг 2/2: транскрибация "
+                    "(провайдер суммаризации: %s, summary: %s)",
+                    task_id, provider,
+                    "on" if generate_summary else "off",
+                )
                 self.task_queue.update_task_status(task_id, "transcribing", 50)
                 self.task_progress.emit(task_id, 50, "transcribing")
 
@@ -185,10 +194,23 @@ class VideoProcessor(QObject):
                 log.info("[%s] Для транскрибации используется: %s",
                          task_id, target_for_transcribe)
 
+                # Если summary для записи не формируется — не передаём
+                # промпт на сервер транскрибации: он там не нужен.
+                if provider == "server" and generate_summary:
+                    server_prompt = prompt
+                else:
+                    server_prompt = ""
+                    if provider == "server" and not generate_summary:
+                        log.info(
+                            "[%s] Summary отключено — промпт на сервер "
+                            "транскрибации не передаём",
+                            task_id,
+                        )
+
                 t2 = time.monotonic()
-                server_prompt = prompt if provider == "server" else ""
                 transcript = await self.transcribe(
-                    target_for_transcribe, transcribe_cfg, prompt=server_prompt
+                    target_for_transcribe, transcribe_cfg,
+                    prompt=server_prompt,
                 )
                 log.info("[%s] Транскрибация завершена за %.1f с",
                          task_id, time.monotonic() - t2)
@@ -214,7 +236,15 @@ class VideoProcessor(QObject):
                 summary_path = str(Path(video_path).with_name("video_summary.md"))
                 self._save_transcript(transcript, transcript_path)
 
-                if provider == "litellm":
+                # --- Суммаризация ---
+                if not generate_summary:
+                    log.info(
+                        "[%s] Формирование summary отключено для этой "
+                        "записи — пропускаем шаг суммаризации "
+                        "(провайдер=%s)",
+                        task_id, provider,
+                    )
+                elif provider == "litellm":
                     self.task_queue.update_task_status(task_id, "summarizing", 70)
                     self.task_progress.emit(task_id, 70, "summarizing")
                     try:
@@ -228,8 +258,10 @@ class VideoProcessor(QObject):
                             self._write_file(summary_path, summary_text)
                             transcript["summary"] = summary_text
                         else:
-                            log.warning("[%s] LiteLLM вернул пустой ответ — "
-                                        "файл summary не создан", task_id)
+                            log.warning(
+                                "[%s] LiteLLM вернул пустой ответ — "
+                                "файл summary не создан", task_id,
+                            )
                     except LiteLLMError as exc:
                         err = f"litellm: {exc}"
                         log.error("[%s] Ошибка LiteLLM: %s", task_id, err)
@@ -237,6 +269,8 @@ class VideoProcessor(QObject):
                         self.task_failed.emit(task_id, err)
                         return {"error": err, "task_id": task_id}
                 else:
+                    # server-режим: сервер уже отдал summary в transcript,
+                    # сохраняем его на диск (если он есть).
                     self._save_summary(transcript, summary_path)
             else:
                 log.info("[%s] Транскрибация пропущена: URL сервера не задан",

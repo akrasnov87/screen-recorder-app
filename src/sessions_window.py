@@ -2,6 +2,13 @@
 
 Действия вынесены в верхнее меню, чтобы не переполнять панель.
 Дополнительно есть служебное меню «Утилиты» для обслуживания хранилища.
+
+Новое в разделе «Протокол»:
+  • «Создать/редактировать протокол (Markdown)…» — двухпанельный
+    редактор Markdown с предпросмотром и экспортом в DOCX;
+  • «Экспорт протокола в DOCX…» — конвертирует прикреплённый
+    протокол (.md/.txt/.pdf) в manual_protocol.docx и прикрепляет
+    его к записи, чтобы Bitrix24-отправка уходила именно в .docx.
 """
 from __future__ import annotations
 
@@ -27,6 +34,8 @@ from .bbcode_editor import (
     bbcode_to_plain,
 )
 from .logger import get_logger
+from .markdown_docx import markdown_to_docx
+from .markdown_editor import MarkdownEditorDialog
 from .task_queue import TaskQueue
 
 log = get_logger(__name__)
@@ -250,10 +259,40 @@ class SessionsWindow(QDialog):
         # ---------------- Протокол ----------------
         m_protocol = bar.addMenu("Протокол")
 
-        act_attach_protocol = QAction("Прикрепить протокол…", self)
+        act_edit_protocol_md = QAction(
+            "Создать/редактировать протокол (Markdown)…", self
+        )
+        act_edit_protocol_md.setShortcut(QKeySequence("Ctrl+M"))
+        act_edit_protocol_md.setToolTip(
+            "Открыть встроенный Markdown-редактор. Слева — исходный "
+            "текст, справа — готовый документ.\n"
+            "Файл сохраняется как manual_protocol.md и прикрепляется "
+            "к записи."
+        )
+        act_edit_protocol_md.triggered.connect(self._edit_manual_protocol_md)
+        m_protocol.addAction(act_edit_protocol_md)
+
+        act_export_protocol_docx = QAction(
+            "Экспорт протокола в DOCX…", self
+        )
+        act_export_protocol_docx.setShortcut(QKeySequence("Ctrl+Shift+M"))
+        act_export_protocol_docx.setToolTip(
+            "Сконвертировать прикреплённый протокол (Markdown или "
+            "текст) в документ .docx.\n\n"
+            "По умолчанию результат сохраняется как "
+            "<session_dir>/manual_protocol.docx и прикрепляется к "
+            "записи — после этого «Отправить в чат…» (Bitrix24) "
+            "сможет отправить именно DOCX."
+        )
+        act_export_protocol_docx.triggered.connect(self._export_protocol_docx)
+        m_protocol.addAction(act_export_protocol_docx)
+
+        m_protocol.addSeparator()
+
+        act_attach_protocol = QAction("Прикрепить файл протокола…", self)
         act_attach_protocol.setToolTip(
-            "Загрузить вручную подготовленный протокол (.docx/.txt/.md/.pdf) "
-            "и прикрепить его к записи"
+            "Загрузить вручную подготовленный протокол "
+            "(.docx/.txt/.md/.pdf) и прикрепить его к записи"
         )
         act_attach_protocol.triggered.connect(self._attach_manual_protocol)
         m_protocol.addAction(act_attach_protocol)
@@ -730,6 +769,7 @@ class SessionsWindow(QDialog):
             ),
             "summary_bb": r.get("summary_bb") or "",
             "comment": "",
+            "session_dir": r.get("dir") or "",
         }
 
         # Комментарий из session.json
@@ -755,7 +795,239 @@ class SessionsWindow(QDialog):
         dlg.exec()
 
     # ------------------------------------------------------------------
-    # Ручной протокол
+    # Протокол: Markdown-редактор и конвертация в DOCX
+    # ------------------------------------------------------------------
+    def _edit_manual_protocol_md(self) -> None:
+        """
+        Открывает Markdown-редактор и сохраняет результат в
+        <session_dir>/manual_protocol.md, а путь — в session.json.
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        # Если уже есть .md-протокол — читаем его. Иначе — пробуем
+        # подхватить существующий manual_protocol.* и сконвертировать
+        # его в текст, чтобы пользователь не начинал с пустого листа.
+        md_path = os.path.join(r["dir"], "manual_protocol.md")
+        initial_text = ""
+
+        if os.path.exists(md_path):
+            try:
+                with open(md_path, "r", encoding="utf-8") as f:
+                    initial_text = f.read()
+            except Exception as exc:
+                log.warning("Не удалось прочитать %s: %s", md_path, exc)
+        else:
+            existing = r.get("manual_protocol_path") or ""
+            if existing and os.path.exists(existing):
+                try:
+                    initial_text = self._read_protocol_as_text(existing)
+                except Exception as exc:
+                    log.warning("Не удалось прочитать %s: %s", existing, exc)
+
+        # Путь для экспорта в .docx — рядом с сессией.
+        default_docx = os.path.join(r["dir"], "manual_protocol.docx")
+
+        dlg = MarkdownEditorDialog(
+            text=initial_text,
+            title=f"Протокол (Markdown) — {r['name']}",
+            parent=self,
+            default_docx_path=default_docx,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            log.debug("Markdown-редактор протокола закрыт без сохранения")
+            return
+
+        new_text = dlg.result_text()
+
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(new_text)
+            log.info("Markdown-протокол сохранён: %s (%d символов)",
+                     md_path, len(new_text))
+        except Exception as exc:
+            log.exception("Не удалось записать %s: %s", md_path, exc)
+            QMessageBox.critical(
+                self, "Протокол",
+                f"Не удалось сохранить протокол:\n{exc}",
+            )
+            return
+
+        session_json = os.path.join(r["dir"], "session.json")
+        meta = _read_json(session_json) or {}
+        meta["manual_protocol_path"] = md_path
+        if not _write_json(session_json, meta):
+            QMessageBox.critical(
+                self, "Протокол",
+                "Файл протокола записан, но не удалось обновить session.json.",
+            )
+            return
+
+        self.refresh()
+        QMessageBox.information(
+            self, "Протокол",
+            f"Протокол сохранён и прикреплён к записи:\n{md_path}\n\n"
+            "Чтобы получить .docx для отправки в чат — "
+            "используйте «Протокол → Экспорт протокола в DOCX…».",
+        )
+
+    def _export_protocol_docx(self) -> None:
+        """
+        Конвертирует текущий протокол (manual_protocol.md / .txt / .pdf)
+        в .docx.
+
+        Если исходник — .docx, ничего не делаем: он уже в нужном формате.
+        Если сохраняем прямо рядом с сессией как manual_protocol.docx —
+        автоматически прикрепляем к записи, чтобы Bitrix-отправка
+        взяла именно DOCX.
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        # Определяем исходный файл протокола.
+        src_path = r.get("manual_protocol_path") or ""
+        md_path = os.path.join(r["dir"], "manual_protocol.md")
+
+        # Приоритет: то, что явно прикреплено; иначе — .md рядом.
+        if not src_path or not os.path.exists(src_path):
+            if os.path.exists(md_path):
+                src_path = md_path
+            else:
+                QMessageBox.information(
+                    self, "Экспорт в DOCX",
+                    "К записи не прикреплён протокол.\n\n"
+                    "Используйте «Протокол → Создать/редактировать "
+                    "протокол (Markdown)…» или «Прикрепить файл "
+                    "протокола…».",
+                )
+                return
+
+        ext = os.path.splitext(src_path)[1].lower()
+
+        if ext == ".docx":
+            QMessageBox.information(
+                self, "Экспорт в DOCX",
+                f"Протокол уже в формате DOCX:\n{src_path}",
+            )
+            return
+
+        # Читаем исходник как текст.
+        if ext in (".md", ".txt"):
+            try:
+                with open(src_path, "r", encoding="utf-8", errors="replace") as f:
+                    md_text = f.read()
+            except Exception as exc:
+                log.exception("Не удалось прочитать %s: %s", src_path, exc)
+                QMessageBox.critical(
+                    self, "Экспорт в DOCX",
+                    f"Не удалось прочитать исходный протокол:\n{exc}",
+                )
+                return
+        else:
+            # .pdf или что-то ещё — попробуем извлечь текст.
+            md_text = self._read_protocol_as_text(src_path)
+            if not md_text.strip():
+                QMessageBox.warning(
+                    self, "Экспорт в DOCX",
+                    "Не удалось извлечь текст из исходного файла.\n"
+                    "Поддерживаются .md, .txt, .docx, .pdf.",
+                )
+                return
+
+        # Куда сохранять — по умолчанию рядом с сессией.
+        default_path = os.path.join(r["dir"], "manual_protocol.docx")
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить протокол как DOCX",
+            default_path,
+            "Документы Word (*.docx);;Все файлы (*)",
+        )
+        if not target:
+            return
+
+        if not target.lower().endswith(".docx"):
+            target += ".docx"
+
+        title = r.get("name") or ""
+
+        try:
+            markdown_to_docx(md_text, target, title=title)
+        except Exception as exc:
+            log.exception("Ошибка конвертации в DOCX: %s", exc)
+            QMessageBox.critical(
+                self, "Экспорт в DOCX",
+                f"Не удалось сохранить файл:\n{exc}",
+            )
+            return
+
+        # Если сохранили прямо рядом с сессией под стандартным именем —
+        # прикрепляем к записи, чтобы Bitrix-отправка брала именно DOCX.
+        attach = False
+        if os.path.abspath(target) == os.path.abspath(default_path):
+            session_json = os.path.join(r["dir"], "session.json")
+            meta = _read_json(session_json) or {}
+            meta["manual_protocol_path"] = target
+            if _write_json(session_json, meta):
+                attach = True
+
+        if attach:
+            log.info("Протокол DOCX сохранён и прикреплён к записи: %s", target)
+            QMessageBox.information(
+                self, "Экспорт в DOCX",
+                f"Документ сохранён и прикреплён к записи:\n{target}\n\n"
+                "Теперь его можно отправить в Bitrix24 через "
+                "«Bitrix24 → Отправить в чат…».",
+            )
+            self.refresh()
+        else:
+            log.info("Протокол DOCX сохранён отдельно: %s", target)
+            QMessageBox.information(
+                self, "Экспорт в DOCX",
+                f"Документ сохранён:\n{target}",
+            )
+
+    @staticmethod
+    def _read_protocol_as_text(path: str) -> str:
+        """
+        Читает протокол из .md/.txt/.docx/.pdf в виде обычного текста —
+        чтобы подставить в Markdown-редактор или сконвертировать
+        в .docx.
+        """
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".md", ".txt"):
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        if ext == ".docx":
+            try:
+                from docx import Document  # type: ignore
+                doc = Document(path)
+                return "\n\n".join(p.text for p in doc.paragraphs)
+            except Exception as exc:
+                log.warning("Не удалось прочитать .docx %s: %s", path, exc)
+                return ""
+        if ext == ".pdf":
+            try:
+                from pypdf import PdfReader  # type: ignore
+                reader = PdfReader(path)
+                return "\n\n".join(
+                    (pg.extract_text() or "") for pg in reader.pages
+                )
+            except Exception as exc:
+                log.warning("Не удалось прочитать .pdf %s: %s", path, exc)
+                return ""
+        # Прочее — попробуем как текст
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------
+    # Ручной протокол (загрузка файла)
     # ------------------------------------------------------------------
     def _attach_manual_protocol(self) -> None:
         r = self._selected_row()
@@ -814,7 +1086,8 @@ class SessionsWindow(QDialog):
             QMessageBox.information(
                 self, "Протокол",
                 "К этой записи не прикреплён ручной протокол.\n\n"
-                "Меню «Протокол» → «Прикрепить протокол…»",
+                "Меню «Протокол» → «Создать/редактировать протокол "
+                "(Markdown)…» или «Прикрепить файл протокола…».",
             )
             return
         log.info("Открытие ручного протокола: %s", path)
@@ -1754,6 +2027,8 @@ class SessionsWindow(QDialog):
             self,
             "Горячие клавиши",
             "Ctrl+I        — импорт материалов\n"
+            "Ctrl+M        — создать/редактировать протокол (Markdown)\n"
+            "Ctrl+Shift+M  — экспорт протокола в DOCX\n"
             "Ctrl+B        — отправить протокол/summary в Bitrix24\n"
             "Ctrl+Shift+E  — открыть папку записи\n"
             "Ctrl+Shift+V  — открыть видео\n"

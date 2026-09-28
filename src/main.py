@@ -252,6 +252,12 @@ class ScreenRecorderApp(QObject):
         projects = self.config_manager.get_project_names()
         default_project = projects[0] if projects else "Default"
         now_str = f"{datetime.now():%Y-%m-%d %H-%M}"
+
+        # Глобальный флаг формирования summary.
+        # По умолчанию — False (summary не формируется).
+        sum_cfg = self.config_manager.get_summarizer_settings()
+        default_generate_summary = bool(sum_cfg.get("enabled", False))
+
         meta = {
             "project": default_project,
             "name": f"Запись {now_str}",
@@ -262,6 +268,8 @@ class ScreenRecorderApp(QObject):
             "prompt": self.config_manager.get_default_prompt(),
             "prompt_name": "",
             "prompt_edited": False,
+            # --- Формирование summary ---
+            "generate_summary": default_generate_summary,
             "is_scrum": False,
             "generate_deepseek_prompt": False,
             "include_name_in_prompt": False,
@@ -409,11 +417,12 @@ class ScreenRecorderApp(QObject):
         self._current_session_meta = meta
         log.info(
             "Метаданные для записи получены: project=%s, name=%s, "
-            "template=%r, abbr=%r, is_scrum=%s, generate_deepseek=%s, "
-            "prompt=%d символов, attachments=%d, "
+            "template=%r, abbr=%r, generate_summary=%s, is_scrum=%s, "
+            "generate_deepseek=%s, prompt=%d символов, attachments=%d, "
             "send_to_transcribe=%s, send_to_deepseek=%s",
             meta.get("project"), meta.get("name"),
             meta.get("name_template", ""), meta.get("name_abbr", ""),
+            meta.get("generate_summary"),
             meta.get("is_scrum"), meta.get("generate_deepseek_prompt"),
             len(meta.get("prompt", "") or ""),
             len(meta.get("attachments", []) or []),
@@ -663,6 +672,9 @@ class ScreenRecorderApp(QObject):
                 protocol_dst = ""
 
         # --- Формируем метаданные ---
+        sum_cfg = self.config_manager.get_summarizer_settings()
+        default_generate_summary = bool(sum_cfg.get("enabled", False))
+
         meta: Dict[str, Any] = {
             "project": project,
             "name": name,
@@ -684,6 +696,8 @@ class ScreenRecorderApp(QObject):
             "prompt": self.config_manager.get_default_prompt(),
             "prompt_name": "",
             "prompt_edited": False,
+            # --- Формирование summary ---
+            "generate_summary": default_generate_summary,
             "is_scrum": False,
             "generate_deepseek_prompt": False,
             "include_name_in_prompt": False,
@@ -862,9 +876,11 @@ class ScreenRecorderApp(QObject):
         size_mb = os.path.getsize(path) / 1024 / 1024 if os.path.exists(path) else 0
         log.info(
             "Сессия сохранена: dir=%s, video=%s (%.2f МБ), "
-            "name=%s, is_scrum=%s, generate_deepseek=%s, attachments=%d",
+            "name=%s, generate_summary=%s, is_scrum=%s, "
+            "generate_deepseek=%s, attachments=%d",
             session_dir, os.path.basename(path), size_mb,
-            meta.get("name"), meta.get("is_scrum", False),
+            meta.get("name"), meta.get("generate_summary"),
+            meta.get("is_scrum", False),
             meta.get("generate_deepseek_prompt", False),
             len(meta.get("attachments", []) or []),
         )

@@ -1,0 +1,323 @@
+"""Простой редактор Markdown с предпросмотром и экспортом в DOCX.
+
+Поддерживаемые элементы (для панели инструментов):
+    **жирный**      — **текст**
+    *курсив*        — *текст*
+    # Заголовок     — H1..H3
+    - список        — маркированный
+    1. список       — нумерованный
+    > цитата        — цитата
+    `код`           — инлайн-код
+    ```блок```      — блок кода
+    [текст](url)    — ссылка
+    ---             — горизонтальная линия
+
+Слева — исходный Markdown, справа — отрендеренный документ.
+Кнопка «Сохранить в DOCX…» выгружает текущий текст в .docx
+через markdown_docx.markdown_to_docx().
+"""
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtWidgets import (
+    QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
+    QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTextBrowser,
+    QVBoxLayout, QWidget,
+)
+
+from .logger import get_logger
+from .markdown_docx import markdown_to_docx
+
+log = get_logger(__name__)
+
+
+class MarkdownEditorDialog(QDialog):
+    """
+    Модальный редактор Markdown.
+
+    Слева — QPlainTextEdit (исходник Markdown),
+    справа — QTextBrowser (отрендеренный HTML).
+    Сверху — панель инструментов для вставки разметки.
+    """
+
+    def __init__(
+        self,
+        text: str = "",
+        title: str = "Редактор Markdown",
+        parent: Optional[QWidget] = None,
+        default_docx_path: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumSize(1100, 720)
+
+        self._result_text: str = text or ""
+        # Путь по умолчанию для экспорта в .docx — например,
+        # <session_dir>/manual_protocol.docx.
+        self._default_docx_path: str = default_docx_path or ""
+
+        self._build_ui()
+        self._apply_initial(text)
+        self._refresh_preview()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+
+        info = QLabel(
+            "Введите текст в формате Markdown слева — справа появится "
+            "готовый документ. Панель инструментов вставляет разметку "
+            "в текущую позицию курсора."
+        )
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        # --- Панель инструментов ---
+        toolbar = QHBoxLayout()
+
+        def add_btn(label: str, tip: str, handler) -> QPushButton:
+            b = QPushButton(label)
+            b.setToolTip(tip)
+            b.setFixedHeight(28)
+            b.clicked.connect(handler)
+            toolbar.addWidget(b)
+            return b
+
+        add_btn("B", "Жирный  **текст**",
+                lambda: self._wrap_selection("**", "**"))
+        add_btn("I", "Курсив  *текст*",
+                lambda: self._wrap_selection("*", "*"))
+        add_btn("`код`", "Инлайн-код  `текст`",
+                lambda: self._wrap_selection("`", "`"))
+        toolbar.addSpacing(12)
+        add_btn("H1", "Заголовок 1  # текст",
+                lambda: self._prefix_lines("# "))
+        add_btn("H2", "Заголовок 2  ## текст",
+                lambda: self._prefix_lines("## "))
+        add_btn("H3", "Заголовок 3  ### текст",
+                lambda: self._prefix_lines("### "))
+        toolbar.addSpacing(12)
+        add_btn("• Список", "Маркированный список  - текст",
+                lambda: self._prefix_lines("- "))
+        add_btn("1. Список", "Нумерованный список  1. текст",
+                lambda: self._prefix_lines("1. "))
+        add_btn("> Цитата", "Цитата  > текст",
+                lambda: self._prefix_lines("> "))
+        toolbar.addSpacing(12)
+        add_btn("Код-блок", "Блок кода  ```…```",
+                self._insert_code_block)
+        add_btn("Ссылка", "Ссылка  [текст](url)",
+                self._insert_link)
+        add_btn("Разделитель", "Горизонтальная линия  ---",
+                self._insert_hr)
+
+        toolbar.addSpacing(12)
+        add_btn(
+            "Сохранить в DOCX…",
+            "Экспортировать текущий Markdown в документ .docx",
+            self._export_docx,
+        )
+
+        toolbar.addStretch()
+        root.addLayout(toolbar)
+
+        # --- Сплиттер ---
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self.editor = QPlainTextEdit()
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.StyleHint.TypeWriter)
+        mono.setPointSize(11)
+        self.editor.setFont(mono)
+        self.editor.setPlaceholderText(
+            "# Заголовок протокола\n\n"
+            "## Дата и участники\n\n"
+            "- Иванов И.И.\n"
+            "- Петров П.П.\n\n"
+            "## Обсуждение\n\n"
+            "> Краткая цитата из обсуждения\n\n"
+            "## Задачи\n\n"
+            "1. Подготовить макет — до 30.09\n"
+            "2. Согласовать с заказчиком — до 05.10\n"
+        )
+        splitter.addWidget(self.editor)
+
+        self.preview = QTextBrowser()
+        self.preview.setOpenExternalLinks(True)
+        splitter.addWidget(self.preview)
+
+        splitter.setSizes([560, 540])
+        root.addWidget(splitter, 1)
+
+        # --- Кнопки ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self._on_reject)
+        root.addWidget(buttons)
+
+    def _apply_initial(self, text: str) -> None:
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(text or "")
+        self.editor.blockSignals(False)
+        self.editor.textChanged.connect(self._refresh_preview)
+
+    # ------------------------------------------------------------------
+    # Вставка разметки
+    # ------------------------------------------------------------------
+    def _wrap_selection(self, prefix: str, suffix: str) -> None:
+        cursor = self.editor.textCursor()
+        selected = cursor.selectedText()
+        cursor.insertText(f"{prefix}{selected}{suffix}")
+        if not selected:
+            pos = cursor.position() - len(suffix)
+            cursor.setPosition(pos)
+            self.editor.setTextCursor(cursor)
+        self.editor.setFocus()
+
+    def _prefix_lines(self, prefix: str) -> None:
+        """Добавляет префикс к каждой выделенной строке (или к текущей)."""
+        cursor = self.editor.textCursor()
+        if not cursor.hasSelection():
+            cursor.select(QTextCursor.SelectionType.LineUnderCursor)
+
+        start = cursor.selectionStart()
+        end = cursor.selectionEnd()
+
+        cursor.setPosition(start)
+        cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+        cursor.beginEditBlock()
+
+        while True:
+            cursor.insertText(prefix)
+            end += len(prefix)
+            if cursor.position() >= end:
+                break
+            if not cursor.movePosition(QTextCursor.MoveOperation.NextBlock):
+                break
+
+        cursor.endEditBlock()
+        self.editor.setFocus()
+
+    def _insert_code_block(self) -> None:
+        cursor = self.editor.textCursor()
+        selected = cursor.selectedText().replace("\u2029", "\n")
+        if selected:
+            cursor.insertText(f"```\n{selected}\n```")
+        else:
+            cursor.insertText("```\nкод\n```")
+            pos = cursor.position() - 5
+            cursor.setPosition(pos)
+            self.editor.setTextCursor(cursor)
+        self.editor.setFocus()
+
+    def _insert_link(self) -> None:
+        cursor = self.editor.textCursor()
+        selected = cursor.selectedText()
+        if selected:
+            cursor.insertText(f"[{selected}](https://example.com)")
+        else:
+            cursor.insertText("[текст ссылки](https://example.com)")
+        self.editor.setFocus()
+
+    def _insert_hr(self) -> None:
+        cursor = self.editor.textCursor()
+        cursor.insertText("\n---\n")
+        self.editor.setFocus()
+
+    # ------------------------------------------------------------------
+    # Предпросмотр
+    # ------------------------------------------------------------------
+    def _refresh_preview(self) -> None:
+        text = self.editor.toPlainText()
+        try:
+            # Qt умеет рендерить Markdown «из коробки».
+            self.preview.setMarkdown(text)
+        except Exception as exc:
+            log.exception("Ошибка предпросмотра Markdown: %s", exc)
+            self.preview.setPlainText(f"Ошибка предпросмотра: {exc}")
+
+    # ------------------------------------------------------------------
+    # Экспорт в DOCX
+    # ------------------------------------------------------------------
+    def _export_docx(self) -> None:
+        """Экспортирует текущий текст в .docx через markdown_to_docx()."""
+        text = self.editor.toPlainText()
+        if not text.strip():
+            QMessageBox.warning(
+                self, "Экспорт в DOCX",
+                "Документ пустой — нечего экспортировать.",
+            )
+            return
+
+        # Куда сохранять: либо подсказанный путь (рядом с сессией),
+        # либо домашняя папка.
+        if self._default_docx_path:
+            default_path = self._default_docx_path
+        else:
+            base = os.path.expanduser("~")
+            default_path = os.path.join(base, "protocol.docx")
+
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить протокол как DOCX",
+            default_path,
+            "Документы Word (*.docx);;Все файлы (*)",
+        )
+        if not target:
+            return
+
+        if not target.lower().endswith(".docx"):
+            target += ".docx"
+
+        # Название документа — берём из первой строки H1, если она есть.
+        title = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("# "):
+                title = line[2:].strip()
+                break
+
+        try:
+            markdown_to_docx(text, target, title=title)
+        except Exception as exc:
+            log.exception("Ошибка экспорта в DOCX: %s", exc)
+            QMessageBox.critical(
+                self, "Экспорт в DOCX",
+                f"Не удалось сохранить файл:\n{exc}",
+            )
+            return
+
+        QMessageBox.information(
+            self, "Экспорт в DOCX",
+            f"Документ сохранён:\n{target}",
+        )
+        log.info("Markdown-редактор: экспорт в DOCX — %s", target)
+
+    # ------------------------------------------------------------------
+    # Кнопки
+    # ------------------------------------------------------------------
+    def _on_accept(self) -> None:
+        self._result_text = self.editor.toPlainText()
+        log.info("Markdown-редактор: сохранено (%d символов)",
+                 len(self._result_text))
+        self.accept()
+
+    def _on_reject(self) -> None:
+        log.info("Markdown-редактор: отменено")
+        self.reject()
+
+    def result_text(self) -> str:
+        return self._result_text

@@ -27,6 +27,10 @@
     элементов появляется вертикальный скролл.
   • Горизонтальный скролл отключён, длинные имена обрезаются
     многоточием.
+
+Превью материалов не показывается текстом — вместо этого
+отображаются ссылки на файлы, которые можно открыть двойным
+кликом или кнопкой «Открыть файл».
 """
 from __future__ import annotations
 
@@ -37,8 +41,8 @@ import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -92,6 +96,35 @@ def _safe_filename(name: str) -> str:
     return cleaned[:60]
 
 
+def _find_summary_file(session_dir: str) -> str:
+    """
+    Ищет файл summary в папке сессии.
+
+    Порядок поиска:
+      1) summary_*.docx
+      2) summary_*.md
+      3) summary_*.txt
+      4) video_summary.md (создаётся автоматически при обработке)
+
+    Возвращает путь или пустую строку.
+    """
+    if not session_dir or not os.path.isdir(session_dir):
+        return ""
+
+    try:
+        entries = sorted(os.listdir(session_dir))
+    except OSError:
+        return ""
+
+    for prefix in ("summary_", "video_summary"):
+        for ext in (".docx", ".md", ".txt"):
+            for name in entries:
+                low = name.lower()
+                if low.startswith(prefix) and low.endswith(ext):
+                    return os.path.join(session_dir, name)
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Диалог
 # ---------------------------------------------------------------------------
@@ -111,6 +144,7 @@ class SendToBitrixDialog(QDialog):
             - protocol_label: имя файла протокола
             - summary_bb: текст summary (BB-код, может быть "")
             - comment: комментарий к записи
+            - session_dir: путь к папке сессии (для «Показать в папке»)
         chat_id: ID чата Bitrix24 (определяется по проекту) — начальный
                  выбранный получатель, может быть пустым.
         bitrix_cfg: настройки интеграции (из ConfigManager).
@@ -144,17 +178,25 @@ class SendToBitrixDialog(QDialog):
         self._protocol_text = ""
         self._summary_bb = self.session_info.get("summary_bb") or ""
 
-        # Plain-версия summary — для превью пользователю.
+        # Папка сессии — для «Показать в папке» и поиска файла summary.
+        self._session_dir = self.session_info.get("session_dir") or ""
+
+        # Plain-версия summary — для отправки в режиме «текстом».
         self._summary_plain = (
             bbcode_to_plain(self._summary_bb).strip()
             if self._summary_bb else ""
         )
-        # Bitrix24-версия summary — то, что реально уйдёт в чат:
-        # BB-код с тегами в верхнем регистре ([B], [I], [URL], ...).
+        # Bitrix24-версия summary — то, что реально уйдёт в чат
+        # в режиме «текстом»: BB-код с тегами в верхнем регистре.
         self._summary_bitrix = (
             bbcode_to_bitrix(self._summary_bb).strip()
             if self._summary_bb else ""
         )
+
+        # Файл summary, если он уже есть на диске (пригодится для
+        # ссылки «Открыть файл»). Если нет — ссылка будет вести в
+        # session.json, чтобы пользователь мог посмотреть summary_bb.
+        self._summary_file_path = _find_summary_file(self._session_dir)
 
         # Множество выбранных chat_id (для быстрого доступа).
         self._selected_chat_ids: Set[str] = set()
@@ -458,49 +500,79 @@ class SendToBitrixDialog(QDialog):
         test_row.addStretch()
         root.addLayout(test_row)
 
-        # --- Превью протокола ---
-        proto_header = QHBoxLayout()
-        proto_header.addWidget(QLabel("<b>Протокол</b>"))
-        self.protocol_status = QLabel("")
-        self.protocol_status.setStyleSheet("QLabel { color: #666; }")
-        proto_header.addWidget(self.protocol_status)
-        proto_header.addStretch()
-        root.addLayout(proto_header)
+        # --- Материалы: ссылки на файлы вместо превью текста ---
+        materials_header = QHBoxLayout()
+        materials_header.addWidget(QLabel("<b>Материалы к отправке</b>"))
+        materials_header.addStretch()
+        root.addLayout(materials_header)
 
-        self.protocol_view = QPlainTextEdit()
-        self.protocol_view.setReadOnly(True)
-        self.protocol_view.setMinimumHeight(120)
-        root.addWidget(self.protocol_view)
+        materials_hint = QLabel(
+            "<span style='color:#666'>Содержимое не отображается здесь — "
+            "чтобы проверить, откройте файл двойным кликом по ссылке "
+            "или кнопкой «Открыть файл». В чат уйдёт то, что выбрано "
+            "в режиме отправки ниже.</span>"
+        )
+        materials_hint.setWordWrap(True)
+        root.addWidget(materials_hint)
 
-        proto_btns = QHBoxLayout()
+        # Протокол
+        protocol_row = QHBoxLayout()
+        protocol_row.addWidget(QLabel("Протокол:"))
+        self.protocol_link = QLabel()
+        self.protocol_link.setOpenExternalLinks(False)
+        self.protocol_link.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.protocol_link.linkActivated.connect(self._on_open_protocol_link)
+        protocol_row.addWidget(self.protocol_link, 1)
+
+        self.open_protocol_btn = QPushButton("Открыть файл")
+        self.open_protocol_btn.clicked.connect(self._on_open_protocol)
+        protocol_row.addWidget(self.open_protocol_btn)
+
+        self.show_protocol_folder_btn = QPushButton("Показать в папке")
+        self.show_protocol_folder_btn.clicked.connect(
+            lambda: self._show_in_folder(self._protocol_path)
+        )
+        protocol_row.addWidget(self.show_protocol_folder_btn)
+        root.addLayout(protocol_row)
+
+        # Summary
+        summary_row = QHBoxLayout()
+        summary_row.addWidget(QLabel("Summary:"))
+        self.summary_link = QLabel()
+        self.summary_link.setOpenExternalLinks(False)
+        self.summary_link.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.summary_link.linkActivated.connect(self._on_open_summary_link)
+        summary_row.addWidget(self.summary_link, 1)
+
+        self.open_summary_btn = QPushButton("Открыть файл")
+        self.open_summary_btn.clicked.connect(self._on_open_summary)
+        summary_row.addWidget(self.open_summary_btn)
+
+        self.show_summary_folder_btn = QPushButton("Показать в папке")
+        self.show_summary_folder_btn.clicked.connect(
+            lambda: self._show_in_folder(self._summary_target_path())
+        )
+        summary_row.addWidget(self.show_summary_folder_btn)
+        root.addLayout(summary_row)
+
+        # --- Кнопки отправки ---
+        actions_row = QHBoxLayout()
+
         self.send_protocol_btn = QPushButton("Отправить протокол")
         self.send_protocol_btn.clicked.connect(
             lambda: self._on_send(which="protocol")
         )
-        proto_btns.addWidget(self.send_protocol_btn)
-        proto_btns.addStretch()
-        root.addLayout(proto_btns)
+        actions_row.addWidget(self.send_protocol_btn)
 
-        # --- Превью summary ---
-        sum_header = QHBoxLayout()
-        sum_header.addWidget(QLabel("<b>Summary (краткое описание)</b>"))
-        self.summary_status = QLabel("")
-        self.summary_status.setStyleSheet("QLabel { color: #666; }")
-        sum_header.addWidget(self.summary_status)
-        sum_header.addStretch()
-        root.addLayout(sum_header)
-
-        self.summary_view = QPlainTextEdit()
-        self.summary_view.setReadOnly(True)
-        self.summary_view.setMinimumHeight(100)
-        root.addWidget(self.summary_view)
-
-        sum_btns = QHBoxLayout()
         self.send_summary_btn = QPushButton("Отправить summary")
         self.send_summary_btn.clicked.connect(
             lambda: self._on_send(which="summary")
         )
-        sum_btns.addWidget(self.send_summary_btn)
+        actions_row.addWidget(self.send_summary_btn)
 
         self.send_both_btn = QPushButton("Отправить всё")
         self.send_both_btn.setToolTip(
@@ -514,9 +586,10 @@ class SendToBitrixDialog(QDialog):
         self.send_both_btn.clicked.connect(
             lambda: self._on_send(which="both")
         )
-        sum_btns.addWidget(self.send_both_btn)
-        sum_btns.addStretch()
-        root.addLayout(sum_btns)
+        actions_row.addWidget(self.send_both_btn)
+
+        actions_row.addStretch()
+        root.addLayout(actions_row)
 
         # --- Нижние кнопки ---
         bottom = QDialogButtonBox(
@@ -841,41 +914,124 @@ class SendToBitrixDialog(QDialog):
         return body_len > self.auto_file_threshold.value()
 
     # ------------------------------------------------------------------
-    # Загрузка превью
+    # Ссылки на материалы
     # ------------------------------------------------------------------
-    def _load_previews(self) -> None:
-        if self._protocol_path and os.path.exists(self._protocol_path):
-            self._protocol_text = _read_text_safe(self._protocol_path)
-            self.protocol_view.setPlainText(
-                self._protocol_text[:8000]
-                or "(файл пуст или не читается)"
-            )
-            size = os.path.getsize(self._protocol_path)
-            self.protocol_status.setText(
-                f"— {os.path.basename(self._protocol_path)} "
-                f"({size / 1024:.1f} КБ, {len(self._protocol_text)} символов)"
-            )
-        else:
-            self.protocol_view.setPlainText(
-                "Протокол не прикреплён к этой записи.\n\n"
-                "Прикрепите его через меню «Протокол → Прикрепить протокол…» "
-                "в окне «Записи»."
-            )
-            self.protocol_status.setText("— не прикреплён")
+    def _summary_target_path(self) -> str:
+        """
+        Возвращает путь к файлу, который открывается по ссылке
+        «Summary». Приоритет:
+          1) найденный файл summary в папке сессии;
+          2) session.json — там живёт summary_bb.
+        """
+        if self._summary_file_path and os.path.exists(self._summary_file_path):
+            return self._summary_file_path
+        if self._session_dir:
+            sj = os.path.join(self._session_dir, "session.json")
+            if os.path.exists(sj):
+                return sj
+        return ""
 
-        if self._summary_bitrix:
-            self.summary_view.setPlainText(self._summary_plain[:8000])
-            self.summary_status.setText(
-                f"— {len(self._summary_plain)} символов "
-                f"(BB → plain для превью, в чат уйдёт с форматированием)"
+    def _load_previews(self) -> None:
+        """
+        Заполняет ссылки на файлы протокола и summary, а также
+        активирует/деактивирует кнопки «Открыть файл».
+        Никакого текстового превью — только ссылки.
+        """
+        # --- Протокол ---
+        if self._protocol_path and os.path.exists(self._protocol_path):
+            try:
+                self._protocol_text = _read_text_safe(self._protocol_path)
+            except Exception as exc:
+                log.warning("Не удалось прочитать %s: %s",
+                            self._protocol_path, exc)
+                self._protocol_text = ""
+
+            size = os.path.getsize(self._protocol_path)
+            fname = os.path.basename(self._protocol_path)
+            self.protocol_link.setText(
+                f"<a href='open:protocol'>{html.escape(fname)}</a> "
+                f"<span style='color:#666'>"
+                f"({size / 1024:.1f} КБ, "
+                f"{len(self._protocol_text)} символов)</span>"
             )
+            self.open_protocol_btn.setEnabled(True)
+            self.show_protocol_folder_btn.setEnabled(True)
         else:
-            self.summary_view.setPlainText(
-                "У этой записи нет краткого описания.\n\n"
-                "Добавьте его через меню «Summary → Изменить summary…» "
-                "в окне «Записи»."
+            self._protocol_text = ""
+            self.protocol_link.setText(
+                "<span style='color:#c62828'>"
+                "Протокол не прикреплён к этой записи.</span>"
             )
-            self.summary_status.setText("— пусто")
+            self.open_protocol_btn.setEnabled(False)
+            self.show_protocol_folder_btn.setEnabled(False)
+
+        # --- Summary ---
+        if self._summary_bitrix:
+            target = self._summary_target_path()
+            if target:
+                fname = os.path.basename(target)
+                self.summary_link.setText(
+                    f"<a href='open:summary'>{html.escape(fname)}</a> "
+                    f"<span style='color:#666'>"
+                    f"({len(self._summary_plain)} символов, "
+                    f"BB → plain для превью; в чат уйдёт "
+                    f"с форматированием)</span>"
+                )
+                self.open_summary_btn.setEnabled(True)
+                self.show_summary_folder_btn.setEnabled(True)
+            else:
+                self.summary_link.setText(
+                    "<span style='color:#666'>"
+                    "Краткое описание есть, но файла нет — "
+                    "откройте запись в окне «Записи», чтобы "
+                    "посмотреть и экспортировать.</span>"
+                )
+                self.open_summary_btn.setEnabled(False)
+                self.show_summary_folder_btn.setEnabled(False)
+        else:
+            self.summary_link.setText(
+                "<span style='color:#c62828'>"
+                "У этой записи нет краткого описания.</span>"
+            )
+            self.open_summary_btn.setEnabled(False)
+            self.show_summary_folder_btn.setEnabled(False)
+
+    def _on_open_protocol_link(self, _url: str) -> None:
+        self._on_open_protocol()
+
+    def _on_open_summary_link(self, _url: str) -> None:
+        self._on_open_summary()
+
+    def _on_open_protocol(self) -> None:
+        self._open_local_file(self._protocol_path, "Протокол")
+
+    def _on_open_summary(self) -> None:
+        self._open_local_file(self._summary_target_path(), "Summary")
+
+    @staticmethod
+    def _open_local_file(path: str, label: str) -> None:
+        if not path or not os.path.exists(path):
+            QMessageBox.information(
+                None, label,
+                f"Файл не найден:\n{path or '(путь не задан)'}",
+            )
+            return
+        log.info("Открытие файла (%s): %s", label, path)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    @staticmethod
+    def _show_in_folder(path: str) -> None:
+        if not path:
+            return
+        folder = path if os.path.isdir(path) else os.path.dirname(path)
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.information(
+                None, "Папка",
+                f"Папка не найдена:\n{folder or '(путь не задан)'}",
+            )
+            return
+        log.info("Открытие папки: %s", folder)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     # ------------------------------------------------------------------
     # Проверка подключения
@@ -1002,7 +1158,9 @@ class SendToBitrixDialog(QDialog):
         # Какие цели отправляем
         targets: List[str] = []
         if which == "protocol":
-            if not self._protocol_text.strip():
+            if not self._protocol_text.strip() and not (
+                self._protocol_path and os.path.exists(self._protocol_path)
+            ):
                 QMessageBox.warning(self, "Bitrix24",
                                     "Протокол не прикреплён.")
                 return
@@ -1013,7 +1171,9 @@ class SendToBitrixDialog(QDialog):
                 return
             targets = ["summary"]
         elif which == "both":
-            if not self._protocol_text.strip():
+            if not self._protocol_text.strip() and not (
+                self._protocol_path and os.path.exists(self._protocol_path)
+            ):
                 QMessageBox.warning(self, "Bitrix24",
                                     "Протокол не прикреплён.")
                 return

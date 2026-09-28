@@ -758,6 +758,23 @@ class SettingsWindow(QDialog):
         info.setWordWrap(True)
         layout.addWidget(info)
 
+        # --- Глобальный флаг «Формировать summary» ---
+        self.sum_enabled_check = QCheckBox(
+            "Формировать summary (краткое содержание) для новых записей"
+        )
+        self.sum_enabled_check.setChecked(False)  # значение по умолчанию
+        attach_tooltip(self.sum_enabled_check, "sum_enabled")
+        layout.addWidget(self.sum_enabled_check)
+
+        # --- Пояснение ---
+        sum_hint = QLabel(
+            "<span style='color:#666'>Значение по умолчанию для новых "
+            "записей. В карточке конкретной записи пользователь может "
+            "переопределить этот флаг.</span>"
+        )
+        sum_hint.setWordWrap(True)
+        layout.addWidget(sum_hint)
+
         form_top = QFormLayout()
         self.sum_provider_combo = QComboBox()
         self.sum_provider_combo.addItem(
@@ -1402,6 +1419,7 @@ class SettingsWindow(QDialog):
 
         # --- Суммаризация ---
         sum_cfg = self.config_manager.get_summarizer_settings()
+        self.sum_enabled_check.setChecked(bool(sum_cfg.get("enabled", False)))
         idx = self.sum_provider_combo.findData(sum_cfg["provider"])
         if idx >= 0:
             self.sum_provider_combo.setCurrentIndex(idx)
@@ -1609,6 +1627,7 @@ class SettingsWindow(QDialog):
             "export_format": self.scrum_format_combo.currentText(),
         }
         cfg["summarizer"] = {
+            "enabled": self.sum_enabled_check.isChecked(),
             "provider": self.sum_provider_combo.currentData() or "server",
             "litellm": {
                 "base_url": self.sum_litellm_url.text().strip().rstrip("/")

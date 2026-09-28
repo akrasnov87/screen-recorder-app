@@ -157,6 +157,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     # --- Формирование протокола (резюме) ---
     "summarizer": {
+        # Глобальный флаг: формировать ли summary для НОВЫХ записей.
+        # Конкретная запись может переопределить его в карточке метаданных.
+        # По умолчанию — False (summary не формируется).
+        "enabled": False,
         "provider": "server",          # server | litellm
         "litellm": {
             "base_url": "http://localhost:4000",
@@ -373,6 +377,11 @@ class ConfigManager:
 
     def get_summarizer_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("summarizer", {}) or {}
+
+        # Глобальный флаг: формировать ли summary для новых записей.
+        # По умолчанию — False.
+        enabled = bool(cfg.get("enabled", False))
+
         provider = str(cfg.get("provider", "server")).strip().lower()
         if provider not in ("server", "litellm"):
             provider = "server"
@@ -389,6 +398,7 @@ class ConfigManager:
             "system_prompt": str(l.get("system_prompt", "")),
         }
         return {
+            "enabled": enabled,
             "provider": provider,
             "litellm": litellm,
         }

@@ -6,6 +6,8 @@
   • Промпт для DeepSeek можно формировать независимо от скрам-митинга.
   • Пользователь может включать в промпт контекст записи
     (название / проект / комментарий).
+  • Отдельный флаг «Формировать summary» для конкретной записи —
+    переопределяет глобальную настройку из SettingsWindow.
 """
 from __future__ import annotations
 
@@ -77,7 +79,8 @@ def format_name_template(
 class MetadataDialog(QDialog):
     """
     Окно ввода метаданных: проект, название, комментарий, промпт, скрам,
-    вложения, формирование промпта для DeepSeek, контекст в промпте.
+    вложения, формирование промпта для DeepSeek, контекст в промпте,
+    флаг формирования summary для конкретной записи.
     """
 
     def __init__(
@@ -206,6 +209,23 @@ class MetadataDialog(QDialog):
 
         root.addLayout(form)
 
+        # --- Формирование summary ---
+        summary_header = QHBoxLayout()
+        summary_header.addWidget(QLabel("<b>Краткое содержание (summary)</b>"))
+        summary_header.addStretch()
+        summary_icon = make_info_icon("meta_generate_summary")
+        if summary_icon is not None:
+            summary_header.addWidget(summary_icon)
+        root.addLayout(summary_header)
+
+        self.generate_summary_check = QCheckBox(
+            "Формировать summary для этой записи"
+        )
+        attach_tooltip(self.generate_summary_check, "meta_generate_summary")
+        # По умолчанию — не формировать (соответствует DEFAULT_CONFIG).
+        self.generate_summary_check.setChecked(False)
+        root.addWidget(self.generate_summary_check)
+
         # --- Промпт ---
         prompt_header = QHBoxLayout()
         prompt_header.addWidget(QLabel("<b>Промпт для суммаризации / DeepSeek</b>"))
@@ -228,6 +248,7 @@ class MetadataDialog(QDialog):
         self.prompt_input.setPlaceholderText(
             "Промпт для формирования краткого содержания и/или DeepSeek-промпта…"
         )
+        # Минимум 4 строки текста + запас на рамку.
         self.prompt_input.setMinimumHeight(120)
         root.addWidget(self.prompt_input)
 
@@ -718,6 +739,15 @@ class MetadataDialog(QDialog):
 
         self.comment_input.setPlainText(init.get("comment", ""))
 
+        # --- Формирование summary ---
+        # Если в initial задано явное значение — используем его.
+        # Иначе — false (запрещено).
+        self.generate_summary_check.blockSignals(True)
+        self.generate_summary_check.setChecked(
+            bool(init.get("generate_summary", False))
+        )
+        self.generate_summary_check.blockSignals(False)
+
         prompt_text = init.get("prompt", "") or self._default_prompt
         prompt_name = init.get("prompt_name", "")
         if prompt_name:
@@ -770,10 +800,12 @@ class MetadataDialog(QDialog):
 
         log.debug(
             "Начальные значения применены: project=%r, name=%r, "
-            "template=%r, abbr=%r, prompt=%d символов, is_scrum=%s, "
+            "template=%r, abbr=%r, generate_summary=%s, "
+            "prompt=%d символов, is_scrum=%s, "
             "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
             "ctx_comment=%s, attachments=%d",
             project, init_name, init_template, init_abbr,
+            self.generate_summary_check.isChecked(),
             len(prompt_text), is_scrum, gen,
             self.include_name_check.isChecked(),
             self.include_project_check.isChecked(),
@@ -943,6 +975,10 @@ class MetadataDialog(QDialog):
             "prompt": prompt,
             "prompt_name": prompt_name,
             "prompt_edited": bool(self._prompt_edited),
+            # --- Формирование summary ---
+            "generate_summary": bool(
+                self.generate_summary_check.isChecked()
+            ),
             # --- Скрам ---
             "is_scrum": is_scrum,
             "previous_protocol_path": self.protocol_path_input.text().strip(),
@@ -970,12 +1006,15 @@ class MetadataDialog(QDialog):
         log.info(
             "Метаданные подтверждены: project=%s, name=%s, "
             "template=%r, abbr=%r, prompt=%d символов (изменён: %s), "
+            "generate_summary=%s, "
             "is_scrum=%s, generate_deepseek=%s, "
             "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
             "protocol=%s, attachments=%d, "
             "send_to_transcribe=%s, send_to_deepseek=%s",
             project, final_name, template, abbr, len(prompt),
-            result["prompt_edited"], is_scrum,
+            result["prompt_edited"],
+            result["generate_summary"],
+            is_scrum,
             result["generate_deepseek_prompt"],
             result["include_name_in_prompt"],
             result["include_project_in_prompt"],
