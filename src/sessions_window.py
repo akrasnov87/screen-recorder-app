@@ -707,20 +707,16 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # Определяем chat_id по проекту
+        # Определяем chat_id по проекту (может быть пустым — тогда
+        # пользователь выберет получателя в диалоге)
         project = r.get("project") or ""
         chat_id = self.config_manager.get_project_chat_id(project)
         if not chat_id:
-            log.warning(
-                "Для проекта «%s» не задан ID чата Bitrix24", project or "—"
+            log.info(
+                "Для проекта «%s» не задан ID чата — "
+                "пользователь выберет получателя вручную",
+                project or "—",
             )
-            QMessageBox.warning(
-                self, "Bitrix24",
-                f"Для проекта «{project or '—'}» не задан ID чата.\n\n"
-                "Укажите его в Настройки → Проекты и чаты Bitrix24.\n\n"
-                "Можно также ввести чат вручную в диалоге отправки.",
-            )
-            # Не выходим — пользователь может ввести чат вручную в диалоге
 
         # Собираем session_info
         session_info = {
@@ -744,10 +740,16 @@ class SessionsWindow(QDialog):
             pass
 
         from .send_to_bitrix_dialog import SendToBitrixDialog
+
+        projects = self.config_manager.get_projects()
+        employees = self.config_manager.get_employees()
+
         dlg = SendToBitrixDialog(
             session_info=session_info,
             chat_id=chat_id,
             bitrix_cfg=bitrix_cfg,
+            projects=projects,
+            employees=employees,
             parent=self,
         )
         dlg.exec()

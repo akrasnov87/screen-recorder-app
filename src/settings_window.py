@@ -44,6 +44,7 @@ class SettingsWindow(QDialog):
         root.addWidget(self.tabs)
 
         self.tabs.addTab(self._build_projects_tab(), "Проекты и чаты Bitrix24")
+        self.tabs.addTab(self._build_employees_tab(), "Сотрудники")
         self.tabs.addTab(self._build_bitrix_tab(), "Bitrix24")
         self.tabs.addTab(self._build_metadata_tab(), "Промпты и имена")
         self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
@@ -179,6 +180,110 @@ class SettingsWindow(QDialog):
             self.projects_table.setItem(new_row, col, a)
         self.projects_table.setCurrentCell(new_row, 0)
         log.debug("Проект перемещён: %d → %d", row, new_row)
+
+    # ------------------------------------------------------------------
+    # Сотрудники
+    # ------------------------------------------------------------------
+    def _build_employees_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "Справочник сотрудников с их личными чатами Bitrix24. "
+            "Используется в окне отправки в чат — можно выбрать "
+            "не проект, а конкретного сотрудника."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        hint = QLabel(
+            "ID чата — идентификатор личного диалога с сотрудником в "
+            "Bitrix24. Найти его можно через API методом "
+            "<code>im.recent.get</code> (ищите диалог типа "
+            "<code>user</code>) или из URL открытого чата.<br><br>"
+            "Формат: <code>123</code> — числовой ID пользователя "
+            "(без префикса <code>chat</code>)."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(hint)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Сотрудники</b>"))
+        header.addStretch()
+        header.addWidget(make_info_icon("employees_list"))
+        layout.addLayout(header)
+
+        self.employees_table = QTableWidget(0, 2)
+        self.employees_table.setHorizontalHeaderLabels([
+            "ФИО", "Чат Bitrix24 (ID пользователя)",
+        ])
+        self.employees_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.employees_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        hv = self.employees_table.horizontalHeader()
+        hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.employees_table.setMinimumHeight(320)
+        layout.addWidget(self.employees_table)
+
+        btns = QHBoxLayout()
+        add_btn = QPushButton("Добавить")
+        add_btn.clicked.connect(self._employee_add)
+        del_btn = QPushButton("Удалить")
+        del_btn.clicked.connect(self._employee_delete)
+        up_btn = QPushButton("Вверх")
+        up_btn.clicked.connect(lambda: self._employee_move(-1))
+        down_btn = QPushButton("Вниз")
+        down_btn.clicked.connect(lambda: self._employee_move(1))
+        btns.addWidget(add_btn)
+        btns.addWidget(del_btn)
+        btns.addWidget(up_btn)
+        btns.addWidget(down_btn)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        layout.addStretch()
+        return w
+
+    def _employee_add(self) -> None:
+        row = self.employees_table.rowCount()
+        self.employees_table.insertRow(row)
+        self.employees_table.setItem(row, 0, QTableWidgetItem("Фамилия И.О."))
+        self.employees_table.setItem(row, 1, QTableWidgetItem(""))
+        self.employees_table.editItem(self.employees_table.item(row, 0))
+        log.debug("Добавлен пустой сотрудник (строка %d)", row)
+
+    def _employee_delete(self) -> None:
+        row = self.employees_table.currentRow()
+        if row < 0:
+            return
+        item = self.employees_table.item(row, 0)
+        name = item.text() if item else ""
+        if QMessageBox.question(
+            self, "Удалить сотрудника",
+            f"Удалить сотрудника «{name}»?",
+        ) == QMessageBox.StandardButton.Yes:
+            log.info("Удаление сотрудника «%s» (строка %d)", name, row)
+            self.employees_table.removeRow(row)
+
+    def _employee_move(self, delta: int) -> None:
+        row = self.employees_table.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= self.employees_table.rowCount():
+            return
+        for col in range(self.employees_table.columnCount()):
+            a = self.employees_table.takeItem(row, col)
+            b = self.employees_table.takeItem(new_row, col)
+            self.employees_table.setItem(row, col, b)
+            self.employees_table.setItem(new_row, col, a)
+        self.employees_table.setCurrentCell(new_row, 0)
+        log.debug("Сотрудник перемещён: %d → %d", row, new_row)
 
     # ------------------------------------------------------------------
     # Bitrix24
@@ -1214,6 +1319,15 @@ class SettingsWindow(QDialog):
             self.projects_table.setItem(row, 0, QTableWidgetItem(p["name"]))
             self.projects_table.setItem(row, 1, QTableWidgetItem(p["chat_id"]))
 
+        # --- Сотрудники ---
+        employees = self.config_manager.get_employees()
+        self.employees_table.setRowCount(0)
+        for e in employees:
+            row = self.employees_table.rowCount()
+            self.employees_table.insertRow(row)
+            self.employees_table.setItem(row, 0, QTableWidgetItem(e["name"]))
+            self.employees_table.setItem(row, 1, QTableWidgetItem(e["chat_id"]))
+
         # --- Bitrix24 ---
         bitrix = self.config_manager.get_bitrix_settings()
         self.bitrix_enabled_check.setChecked(bitrix["enabled"])
@@ -1366,10 +1480,10 @@ class SettingsWindow(QDialog):
             self.log_level_combo.setCurrentIndex(i)
 
         log.info(
-            "Настройки загружены в окно: projects=%d, prompts=%d, "
-            "name_templates=%d, summarizer=%s, glossary_terms=%d, "
-            "bitrix_enabled=%s, log_level=%s",
-            len(projects), len(prompts), len(name_tpls),
+            "Настройки загружены в окно: projects=%d, employees=%d, "
+            "prompts=%d, name_templates=%d, summarizer=%s, "
+            "glossary_terms=%d, bitrix_enabled=%s, log_level=%s",
+            len(projects), len(employees), len(prompts), len(name_tpls),
             sum_cfg["provider"], len(g["terms"]),
             bitrix["enabled"], level,
         )
@@ -1389,6 +1503,18 @@ class SettingsWindow(QDialog):
                     continue
                 projects.append({"name": name, "chat_id": chat_id})
             cfg["projects"] = projects
+
+            # --- Сотрудники ---
+            employees: List[Dict[str, str]] = []
+            for row in range(self.employees_table.rowCount()):
+                name_item = self.employees_table.item(row, 0)
+                chat_item = self.employees_table.item(row, 1)
+                name = name_item.text().strip() if name_item else ""
+                chat_id = chat_item.text().strip() if chat_item else ""
+                if not name:
+                    continue
+                employees.append({"name": name, "chat_id": chat_id})
+            cfg["employees"] = employees
 
             # --- Bitrix24 ---
             cfg["bitrix"] = {
@@ -1517,10 +1643,12 @@ class SettingsWindow(QDialog):
 
             self.config_manager.save(cfg)
             log.info(
-                "Настройки сохранены: projects=%d, prompts=%d, "
-                "name_templates=%d, summarizer=%s, glossary_terms=%d, "
-                "bitrix_enabled=%s, monitor=%d, log_level=%s, temp_path=%s",
-                len(projects), len(prompts), len(name_templates),
+                "Настройки сохранены: projects=%d, employees=%d, "
+                "prompts=%d, name_templates=%d, summarizer=%s, "
+                "glossary_terms=%d, bitrix_enabled=%s, monitor=%d, "
+                "log_level=%s, temp_path=%s",
+                len(projects), len(employees), len(prompts),
+                len(name_templates),
                 cfg["summarizer"]["provider"], len(glossary_terms),
                 cfg["bitrix"]["enabled"],
                 cfg["recording"]["monitor"], cfg["logging"]["level"],
@@ -1669,6 +1797,28 @@ class SettingsWindow(QDialog):
             "Если чат для проекта не задан — при попытке отправки "
             "программа предупредит, но позволит ввести чат вручную "
             "в самом диалоге отправки."
+        ),
+        "Сотрудники": (
+            "<b>Сотрудники</b><br><br>"
+            "Справочник сотрудников с их личными чатами Bitrix24.<br><br>"
+            "<b>Зачем это нужно:</b><br>"
+            "Помимо отправки в чат команды (по проекту), вы можете "
+            "отправить протокол или summary в <i>личный диалог</i> "
+            "с конкретным сотрудником. Для этого в окне отправки "
+            "выбирается получатель типа «Сотрудник».<br><br>"
+            "<b>Как заполнять:</b><br>"
+            "• <b>ФИО</b> — как показывать сотрудника в списке "
+            "(«Иванов Иван Иванович» или «Иванов И.И.»).<br>"
+            "• <b>Чат Bitrix24 (ID пользователя)</b> — числовой "
+            "идентификатор пользователя в Bitrix24. Формат: "
+            "<code>123</code> (без префикса <code>chat</code>). "
+            "Найти его можно через API методом "
+            "<code>im.recent.get</code> — ищите диалог типа "
+            "<code>user</code>, поле <code>id</code>.<br><br>"
+            "<b>Кнопки:</b> «Добавить» — новая строка; «Удалить» — удалить "
+            "выделенную; «Вверх» / «Вниз» — изменить порядок.<br><br>"
+            "Если у сотрудника не задан ID чата — при попытке отправки "
+            "программа предупредит."
         ),
         "Bitrix24": (
             "<b>Bitrix24 — параметры подключения</b><br><br>"

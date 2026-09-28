@@ -209,9 +209,45 @@ class Bitrix24Client:
         result = data.get("result") or []
         return result if isinstance(result, list) else []
 
+    @staticmethod
+    def _extract_root_id(storage: Dict[str, Any]) -> int:
+        """
+        Достаёт ID корневой папки из хранилища.
+
+        Bitrix24 в разных порталах возвращает разные схемы:
+          • ROOT_OBJECT_ID: "25"           — плоское поле (чаще всего);
+          • ROOT_OBJECT: {"ID": 25, ...}   — вложенный словарь (старые
+            версии или отдельные порталы).
+        Обрабатываем оба варианта.
+        """
+        # Схема 1: ROOT_OBJECT_ID (строка или число)
+        root_id = storage.get("ROOT_OBJECT_ID")
+        if root_id is not None:
+            try:
+                return int(root_id)
+            except (TypeError, ValueError):
+                pass
+
+        # Схема 2: ROOT_OBJECT: {"ID": ...}
+        root = storage.get("ROOT_OBJECT")
+        if isinstance(root, dict):
+            rid = root.get("ID")
+            if rid is not None:
+                try:
+                    return int(rid)
+                except (TypeError, ValueError):
+                    pass
+
+        return 0
+
     async def get_root_folder_id(self) -> int:
         """
         Возвращает ID корневой папки первого доступного хранилища.
+
+        Приоритеты:
+          1) ENTITY_TYPE == "shared" (общий диск);
+          2) ENTITY_TYPE == "common" (общий диск — новая схема Bitrix24);
+          3) первое хранилище с валидным ROOT_OBJECT_ID / ROOT_OBJECT.
 
         Если хранилищ нет (например, у вебхука нет прав на disk),
         возвращает 0 — это сигнал «не удалось определить».
@@ -229,28 +265,32 @@ class Bitrix24Client:
             )
             return 0
 
+        # Приоритет 1 и 2: общий диск (shared / common)
         for s in storages:
-            if (s.get("ENTITY_TYPE") or "").lower() == "shared":
-                root = s.get("ROOT_OBJECT") or {}
-                fid = root.get("ID")
+            etype = (s.get("ENTITY_TYPE") or "").lower()
+            if etype in ("shared", "common"):
+                fid = self._extract_root_id(s)
                 if fid:
                     log.info(
-                        "Bitrix24: корневая папка общего диска id=%s", fid
+                        "Bitrix24: корневая папка общего диска id=%s "
+                        "(ENTITY_TYPE=%s)", fid, etype,
                     )
-                    return int(fid)
+                    return fid
 
-        s0 = storages[0]
-        root = s0.get("ROOT_OBJECT") or {}
-        fid = root.get("ID")
-        if fid:
-            log.info(
-                "Bitrix24: корневая папка id=%s (из первого хранилища)", fid
-            )
-            return int(fid)
+        # Приоритет 3: первое хранилище с валидным ROOT_OBJECT*
+        for s in storages:
+            fid = self._extract_root_id(s)
+            if fid:
+                log.info(
+                    "Bitrix24: корневая папка id=%s "
+                    "(из первого доступного хранилища, ENTITY_TYPE=%s)",
+                    fid, s.get("ENTITY_TYPE"),
+                )
+                return fid
 
         log.warning(
             "Bitrix24: не удалось определить ID корневой папки. "
-            "Ответ: %s", str(storages)[:300],
+            "Ответ: %s", str(storages)[:500],
         )
         return 0
 
@@ -261,6 +301,11 @@ class Bitrix24Client:
         В Bitrix24 у каждого чата есть своя папка на Диске.
         Для этого используется метод im.disk.folder.get, который
         ожидает числовой CHAT_ID (например, '39110', а не 'chat39110').
+
+        Если вебхук не является участником диалога, Bitrix24 вернёт
+        ACCESS_ERROR (HTTP 403) — это нормальная ситуация, например,
+        для личного чата другого сотрудника. В этом случае возвращаем 0,
+        и вызывающий код загрузит файл в корень общего диска.
 
         Args:
             dialog_id: ID чата ('chat39110' или '39110').
@@ -305,10 +350,21 @@ class Bitrix24Client:
                 dialog_id, str(data)[:300],
             )
         except Bitrix24Error as exc:
-            log.warning(
-                "Bitrix24: не удалось получить папку чата %s: %s",
-                dialog_id, exc,
-            )
+            # ACCESS_ERROR — типичная ситуация, когда вебхук
+            # не является участником диалога (например, это личный
+            # чат другого сотрудника). Это не критично — просто
+            # загрузим файл в корень общего диска.
+            if exc.status == 403:
+                log.info(
+                    "Bitrix24: вебхук не имеет доступа к папке чата %s "
+                    "(ACCESS_ERROR). Файл будет загружен в корень "
+                    "общего диска.", dialog_id,
+                )
+            else:
+                log.warning(
+                    "Bitrix24: не удалось получить папку чата %s: %s",
+                    dialog_id, exc,
+                )
         return 0
 
     async def commit_file_to_chat(
@@ -712,8 +768,9 @@ class Bitrix24Client:
 
         if target_folder_id <= 0:
             log.info(
-                "Bitrix24: папка чата недоступна, используем корень "
-                "хранилища по умолчанию"
+                "Bitrix24: папка чата недоступна или не задана — "
+                "используем корень общего диска (определяется "
+                "автоматически через disk.storage.getlist)"
             )
 
         # --- Шаг 2: загрузка всех файлов на Диск ---

@@ -72,6 +72,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         {"name": "Внутренние",  "chat_id": ""},
         {"name": "Тестовые",    "chat_id": ""},
     ],
+    # --- Сотрудники (ФИО + chat_id личного диалога) ---
+    "employees": [
+        # {"name": "Иванов Иван Иванович", "chat_id": ""},
+    ],
     "metadata": {
         "prompts": [
             {
@@ -451,6 +455,51 @@ class ConfigManager:
                 "chat_id": str(p.get("chat_id") or "").strip(),
             })
         self.config["projects"] = normalized
+        self.save()
+
+    # ------------------------------------------------------------------
+    # Сотрудники (ФИО + chat_id личного диалога)
+    # ------------------------------------------------------------------
+    def get_employees(self) -> List[Dict[str, str]]:
+        """Возвращает справочник сотрудников."""
+        raw = self.config.get("employees", []) or []
+        result: List[Dict[str, str]] = []
+        for item in raw:
+            if isinstance(item, str):
+                name = item.strip()
+                if name:
+                    result.append({"name": name, "chat_id": ""})
+            elif isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                chat_id = str(item.get("chat_id") or "").strip()
+                result.append({"name": name, "chat_id": chat_id})
+        return result
+
+    def get_employee_names(self) -> List[str]:
+        return [e["name"] for e in self.get_employees()]
+
+    def get_employee_chat_id(self, employee_name: str) -> str:
+        if not employee_name:
+            return ""
+        name = employee_name.strip()
+        for e in self.get_employees():
+            if e["name"] == name:
+                return e["chat_id"]
+        return ""
+
+    def set_employees(self, employees: List[Dict[str, str]]) -> None:
+        normalized = []
+        for e in employees or []:
+            name = str(e.get("name") or "").strip()
+            if not name:
+                continue
+            normalized.append({
+                "name": name,
+                "chat_id": str(e.get("chat_id") or "").strip(),
+            })
+        self.config["employees"] = normalized
         self.save()
 
     # ------------------------------------------------------------------
