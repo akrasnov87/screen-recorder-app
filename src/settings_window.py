@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import json
 import os
+import shutil
 from typing import Dict, List, Optional
+from datetime import datetime
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
@@ -60,6 +64,17 @@ class SettingsWindow(QDialog):
         buttons = QHBoxLayout()
         self.help_btn = QPushButton("Помощь")
         self.help_btn.clicked.connect(self._show_help)
+
+        self.export_btn = QPushButton("Экспорт настроек…")
+        self.export_btn.clicked.connect(self._export_settings)
+        buttons.addWidget(with_info(self.export_btn, "settings_export", stretch=False))
+
+        self.import_btn = QPushButton("Импорт настроек…")
+        self.import_btn.clicked.connect(self._import_settings)
+        buttons.addWidget(with_info(self.import_btn, "settings_import", stretch=False))
+
+        buttons.addStretch()
+
         self.reset_btn = QPushButton("Сбросить")
         self.reset_btn.clicked.connect(self.reset_to_defaults)
         self.save_btn = QPushButton("Сохранить")
@@ -67,8 +82,6 @@ class SettingsWindow(QDialog):
         self.close_btn = QPushButton("Закрыть")
         self.close_btn.clicked.connect(self.reject)
 
-        buttons.addWidget(self.help_btn)
-        buttons.addStretch()
         buttons.addWidget(self.reset_btn)
         buttons.addWidget(self.save_btn)
         buttons.addWidget(self.close_btn)
@@ -1488,174 +1501,187 @@ class SettingsWindow(QDialog):
             bitrix["enabled"], level,
         )
 
+    def _apply_form_to_config(self) -> Dict[str, Any]:
+        """
+        Собирает значения из формы в self.config_manager.config.
+        НЕ сохраняет на диск. Возвращает обновлённый конфиг.
+        """
+        cfg = self.config_manager.config
+
+        # --- Проекты (новая логика) ---
+        projects: List[Dict[str, str]] = []
+        for row in range(self.projects_table.rowCount()):
+            name_item = self.projects_table.item(row, 0)
+            chat_item = self.projects_table.item(row, 1)
+            name = name_item.text().strip() if name_item else ""
+            chat_id = chat_item.text().strip() if chat_item else ""
+            if not name:
+                continue
+            projects.append({"name": name, "chat_id": chat_id})
+        cfg["projects"] = projects
+
+        # --- Сотрудники ---
+        employees: List[Dict[str, str]] = []
+        for row in range(self.employees_table.rowCount()):
+            name_item = self.employees_table.item(row, 0)
+            chat_item = self.employees_table.item(row, 1)
+            name = name_item.text().strip() if name_item else ""
+            chat_id = chat_item.text().strip() if chat_item else ""
+            if not name:
+                continue
+            employees.append({"name": name, "chat_id": chat_id})
+        cfg["employees"] = employees
+
+        # --- Bitrix24 ---
+        cfg["bitrix"] = {
+            "enabled": self.bitrix_enabled_check.isChecked(),
+            "webhook_url": self.bitrix_webhook_input.text().strip(),
+            "connect_timeout": int(self.bitrix_connect_timeout.value()),
+            "read_timeout": int(self.bitrix_read_timeout.value()),
+            "default_send": (
+                self.bitrix_default_send_combo.currentData() or "protocol"
+            ),
+            "include_header": self.bitrix_header_check.isChecked(),
+            "system_message": self.bitrix_system_check.isChecked(),
+            "disable_url_preview": self.bitrix_no_preview_check.isChecked(),
+            "file_message_max_chars": int(
+                self.bitrix_file_threshold.value()
+            ),
+            "upload_folder_id": int(self.bitrix_upload_folder.value()),
+        }
+
+        # --- Промпты ---
+        prompts: List[dict] = []
+        for row in range(self.prompts_table.rowCount()):
+            name_item = self.prompts_table.item(row, 0)
+            text_item = self.prompts_table.item(row, 1)
+            name = name_item.text().strip() if name_item else ""
+            text = text_item.text().strip() if text_item else ""
+            if not name and not text:
+                continue
+            if not name:
+                name = f"Промпт {row + 1}"
+            prompts.append({"name": name, "text": text})
+
+        # --- Шаблоны названий ---
+        name_templates: List[dict] = []
+        for row in range(self.name_templates_table.rowCount()):
+            label_item = self.name_templates_table.item(row, 0)
+            tpl_item = self.name_templates_table.item(row, 1)
+            label = label_item.text().strip() if label_item else ""
+            template = tpl_item.text().strip() if tpl_item else ""
+            if not template:
+                continue
+            if not label:
+                label = template
+            name_templates.append({"label": label, "template": template})
+
+        meta_cfg = cfg.setdefault("metadata", {})
+        meta_cfg["prompts"] = prompts
+        meta_cfg["default_prompt"] = self.default_prompt_edit.toPlainText().strip()
+        meta_cfg["name_templates"] = name_templates
+
+        cfg["transcribe"] = {
+            "url": self.tr_url_input.text().strip(),
+            "access_key": self.tr_key_input.text(),
+            "connect_timeout": self.tr_connect_timeout.value(),
+            "read_timeout": self.tr_read_timeout.value(),
+            "max_wait": self.tr_max_wait.value(),
+        }
+        cfg["recording"] = {
+            "monitor": self.monitor_combo.currentIndex(),
+            "with_microphone": self.mic_check.isChecked(),
+            "show_watermark": self.watermark_check.isChecked(),
+            "hotkey_start": self.hotkey_start_input.text().strip() or "Ctrl+Shift+R",
+            "hotkey_stop": self.hotkey_stop_input.text().strip() or "Ctrl+Shift+S",
+            "show_metadata_on_start": self.metadata_on_start_check.isChecked(),
+            "show_metadata_on_stop": self.metadata_on_stop_check.isChecked(),
+            "show_overlay_panel": self.overlay_panel_check.isChecked(),
+            "show_start_notification": self.start_notification_check.isChecked(),
+        }
+        cfg["queue"] = {
+            "auto_retry_enabled": self.auto_retry_check.isChecked(),
+            "retry_interval_minutes": self.retry_interval_spin.value(),
+            "max_retries": self.max_retries_spin.value(),
+        }
+        cfg["scrum"] = {
+            "prompt_template": self.scrum_template_edit.toPlainText(),
+            "export_format": self.scrum_format_combo.currentText(),
+        }
+        cfg["summarizer"] = {
+            "provider": self.sum_provider_combo.currentData() or "server",
+            "litellm": {
+                "base_url": self.sum_litellm_url.text().strip().rstrip("/")
+                or "http://localhost:4000",
+                "api_key": self.sum_litellm_key.text(),
+                "model": self.sum_litellm_model.text().strip() or "gpt-4o-mini",
+                "temperature": float(self.sum_litellm_temperature.value()),
+                "max_tokens": int(self.sum_litellm_max_tokens.value()),
+                "connect_timeout": int(self.sum_litellm_connect_timeout.value()),
+                "read_timeout": int(self.sum_litellm_read_timeout.value()),
+                "system_prompt": self.sum_litellm_system.toPlainText().strip(),
+            },
+        }
+
+        # --- Глоссарий ---
+        glossary_terms: List[dict] = []
+        for row in range(self.glossary_table.rowCount()):
+            term_item = self.glossary_table.item(row, 0)
+            desc_item = self.glossary_table.item(row, 1)
+            term = term_item.text().strip() if term_item else ""
+            desc = desc_item.text().strip() if desc_item else ""
+            if not term:
+                continue
+            glossary_terms.append({"term": term, "description": desc})
+
+        cfg["glossary"] = {
+            "terms": glossary_terms,
+            "send_to_summarizer": self.glossary_send_to_summarizer_check.isChecked(),
+            "send_to_deepseek": self.glossary_send_to_deepseek_check.isChecked(),
+        }
+
+        cfg["compression"] = {
+            "audio_format": self.audio_fmt_combo.currentText(),
+            "audio_bitrate": self.audio_bitrate_spin.value(),
+            "video_bitrate": self.video_bitrate_spin.value(),
+            "compression_level": self.compression_spin.value(),
+        }
+        cfg["storage"] = {
+            "temp_path": self.temp_path_input.text().strip() or "/tmp/screen-recorder",
+            "retention_hours": self.retention_spin.value(),
+        }
+        new_log_path = self.log_path_input.text().strip() or "/tmp/screen-recorder/app.log"
+        cfg["logging"] = {
+            "log_path": new_log_path,
+            "level": self.log_level_combo.currentText(),
+        }
+
+        return cfg
+
     def save_settings(self) -> bool:
         try:
-            cfg = self.config_manager.config
-
-            # --- Проекты (новая логика) ---
-            projects: List[Dict[str, str]] = []
-            for row in range(self.projects_table.rowCount()):
-                name_item = self.projects_table.item(row, 0)
-                chat_item = self.projects_table.item(row, 1)
-                name = name_item.text().strip() if name_item else ""
-                chat_id = chat_item.text().strip() if chat_item else ""
-                if not name:
-                    continue
-                projects.append({"name": name, "chat_id": chat_id})
-            cfg["projects"] = projects
-
-            # --- Сотрудники ---
-            employees: List[Dict[str, str]] = []
-            for row in range(self.employees_table.rowCount()):
-                name_item = self.employees_table.item(row, 0)
-                chat_item = self.employees_table.item(row, 1)
-                name = name_item.text().strip() if name_item else ""
-                chat_id = chat_item.text().strip() if chat_item else ""
-                if not name:
-                    continue
-                employees.append({"name": name, "chat_id": chat_id})
-            cfg["employees"] = employees
-
-            # --- Bitrix24 ---
-            cfg["bitrix"] = {
-                "enabled": self.bitrix_enabled_check.isChecked(),
-                "webhook_url": self.bitrix_webhook_input.text().strip(),
-                "connect_timeout": int(self.bitrix_connect_timeout.value()),
-                "read_timeout": int(self.bitrix_read_timeout.value()),
-                "default_send": (
-                    self.bitrix_default_send_combo.currentData() or "protocol"
-                ),
-                "include_header": self.bitrix_header_check.isChecked(),
-                "system_message": self.bitrix_system_check.isChecked(),
-                "disable_url_preview": self.bitrix_no_preview_check.isChecked(),
-                # --- Отправка файлов ---
-                "file_message_max_chars": int(
-                    self.bitrix_file_threshold.value()
-                ),
-                "upload_folder_id": int(self.bitrix_upload_folder.value()),
-            }
-
-            # --- Промпты ---
-            prompts: List[dict] = []
-            for row in range(self.prompts_table.rowCount()):
-                name_item = self.prompts_table.item(row, 0)
-                text_item = self.prompts_table.item(row, 1)
-                name = name_item.text().strip() if name_item else ""
-                text = text_item.text().strip() if text_item else ""
-                if not name and not text:
-                    continue
-                if not name:
-                    name = f"Промпт {row + 1}"
-                prompts.append({"name": name, "text": text})
-
-            # --- Шаблоны названий ---
-            name_templates: List[dict] = []
-            for row in range(self.name_templates_table.rowCount()):
-                label_item = self.name_templates_table.item(row, 0)
-                tpl_item = self.name_templates_table.item(row, 1)
-                label = label_item.text().strip() if label_item else ""
-                template = tpl_item.text().strip() if tpl_item else ""
-                if not template:
-                    continue
-                if not label:
-                    label = template
-                name_templates.append({"label": label, "template": template})
-
-            meta_cfg = cfg.setdefault("metadata", {})
-            meta_cfg["prompts"] = prompts
-            meta_cfg["default_prompt"] = self.default_prompt_edit.toPlainText().strip()
-            meta_cfg["name_templates"] = name_templates
-
-            cfg["transcribe"] = {
-                "url": self.tr_url_input.text().strip(),
-                "access_key": self.tr_key_input.text(),
-                "connect_timeout": self.tr_connect_timeout.value(),
-                "read_timeout": self.tr_read_timeout.value(),
-                "max_wait": self.tr_max_wait.value(),
-            }
-            cfg["recording"] = {
-                "monitor": self.monitor_combo.currentIndex(),
-                "with_microphone": self.mic_check.isChecked(),
-                "show_watermark": self.watermark_check.isChecked(),
-                "hotkey_start": self.hotkey_start_input.text().strip() or "Ctrl+Shift+R",
-                "hotkey_stop": self.hotkey_stop_input.text().strip() or "Ctrl+Shift+S",
-                "show_metadata_on_start": self.metadata_on_start_check.isChecked(),
-                "show_metadata_on_stop": self.metadata_on_stop_check.isChecked(),
-                "show_overlay_panel": self.overlay_panel_check.isChecked(),
-                "show_start_notification": self.start_notification_check.isChecked(),
-            }
-            cfg["queue"] = {
-                "auto_retry_enabled": self.auto_retry_check.isChecked(),
-                "retry_interval_minutes": self.retry_interval_spin.value(),
-                "max_retries": self.max_retries_spin.value(),
-            }
-            cfg["scrum"] = {
-                "prompt_template": self.scrum_template_edit.toPlainText(),
-                "export_format": self.scrum_format_combo.currentText(),
-            }
-            cfg["summarizer"] = {
-                "provider": self.sum_provider_combo.currentData() or "server",
-                "litellm": {
-                    "base_url": self.sum_litellm_url.text().strip().rstrip("/")
-                    or "http://localhost:4000",
-                    "api_key": self.sum_litellm_key.text(),
-                    "model": self.sum_litellm_model.text().strip() or "gpt-4o-mini",
-                    "temperature": float(self.sum_litellm_temperature.value()),
-                    "max_tokens": int(self.sum_litellm_max_tokens.value()),
-                    "connect_timeout": int(self.sum_litellm_connect_timeout.value()),
-                    "read_timeout": int(self.sum_litellm_read_timeout.value()),
-                    "system_prompt": self.sum_litellm_system.toPlainText().strip(),
-                },
-            }
-
-            # --- Глоссарий ---
-            glossary_terms: List[dict] = []
-            for row in range(self.glossary_table.rowCount()):
-                term_item = self.glossary_table.item(row, 0)
-                desc_item = self.glossary_table.item(row, 1)
-                term = term_item.text().strip() if term_item else ""
-                desc = desc_item.text().strip() if desc_item else ""
-                if not term:
-                    continue
-                glossary_terms.append({"term": term, "description": desc})
-
-            cfg["glossary"] = {
-                "terms": glossary_terms,
-                "send_to_summarizer": self.glossary_send_to_summarizer_check.isChecked(),
-                "send_to_deepseek": self.glossary_send_to_deepseek_check.isChecked(),
-            }
-
-            cfg["compression"] = {
-                "audio_format": self.audio_fmt_combo.currentText(),
-                "audio_bitrate": self.audio_bitrate_spin.value(),
-                "video_bitrate": self.video_bitrate_spin.value(),
-                "compression_level": self.compression_spin.value(),
-            }
-            cfg["storage"] = {
-                "temp_path": self.temp_path_input.text().strip() or "/tmp/screen-recorder",
-                "retention_hours": self.retention_spin.value(),
-            }
-            new_log_path = self.log_path_input.text().strip() or "/tmp/screen-recorder/app.log"
-            cfg["logging"] = {
-                "log_path": new_log_path,
-                "level": self.log_level_combo.currentText(),
-            }
-
+            cfg = self._apply_form_to_config()
             self.config_manager.save(cfg)
+
             log.info(
                 "Настройки сохранены: projects=%d, employees=%d, "
                 "prompts=%d, name_templates=%d, summarizer=%s, "
                 "glossary_terms=%d, bitrix_enabled=%s, monitor=%d, "
                 "log_level=%s, temp_path=%s",
-                len(projects), len(employees), len(prompts),
-                len(name_templates),
-                cfg["summarizer"]["provider"], len(glossary_terms),
-                cfg["bitrix"]["enabled"],
-                cfg["recording"]["monitor"], cfg["logging"]["level"],
-                cfg["storage"]["temp_path"],
+                len(cfg.get("projects", [])),
+                len(cfg.get("employees", [])),
+                len(cfg.get("metadata", {}).get("prompts", [])),
+                len(cfg.get("metadata", {}).get("name_templates", [])),
+                cfg.get("summarizer", {}).get("provider"),
+                len(cfg.get("glossary", {}).get("terms", [])),
+                cfg.get("bitrix", {}).get("enabled"),
+                cfg.get("recording", {}).get("monitor"),
+                cfg.get("logging", {}).get("level"),
+                cfg.get("storage", {}).get("temp_path"),
             )
 
             current = get_current_log_path()
+            new_log_path = cfg["logging"]["log_path"]
             if os.path.abspath(current) != os.path.abspath(new_log_path):
                 QMessageBox.information(
                     self, "Настройки",
@@ -1669,6 +1695,244 @@ class SettingsWindow(QDialog):
             log.exception("Ошибка сохранения настроек: %s", exc)
             QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить: {exc}")
             return False
+
+    # ------------------------------------------------------------------
+    # Экспорт / импорт настроек
+    # ------------------------------------------------------------------
+    def _export_settings(self) -> None:
+        """
+        Сохраняет текущий конфиг в выбранный пользователем файл.
+
+        По умолчанию имя файла формируется с временным суффиксом:
+            screen-recorder-config_2026-09-28_14-30-52.json
+
+        Это удобно для резервных копий: файлы не перезаписывают
+        друг друга, и по имени всегда видно, когда снимок был сделан.
+
+        Важно: перед экспортом применяем изменения из формы к конфигу —
+        чтобы пользователь экспортировал то, что видит на экране,
+        а не старое состояние.
+        """
+        try:
+            self._apply_form_to_config()
+        except Exception as exc:
+            log.exception("Экспорт: не удалось собрать конфиг: %s", exc)
+            QMessageBox.critical(
+                self, "Экспорт настроек",
+                f"Не удалось собрать настройки:\n{exc}",
+            )
+            return
+
+        # Формируем имя по умолчанию с временным суффиксом.
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        default_name = f"screen-recorder-config_{stamp}.json"
+        default_path = os.path.join(os.path.expanduser("~"), default_name)
+
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить настройки как",
+            default_path,
+            "JSON-файлы (*.json);;Все файлы (*)",
+        )
+        if not target:
+            log.info("Экспорт настроек отменён пользователем")
+            return
+
+        # Если пользователь выбрал имя без .json — добавляем расширение.
+        if not target.lower().endswith(".json"):
+            target += ".json"
+
+        # Если такой файл уже есть — добавляем _1, _2, ... к имени.
+        target = self._deduplicate_path(target)
+
+        try:
+            with open(target, "w", encoding="utf-8") as f:
+                json.dump(
+                    self.config_manager.config,
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            log.info("Настройки экспортированы: %s", target)
+            QMessageBox.information(
+                self, "Экспорт настроек",
+                f"Настройки сохранены:\n{target}\n\n"
+                "Файл содержит чувствительные данные — "
+                "webhook, access key, API-ключи. Храните его в "
+                "безопасном месте.",
+            )
+        except Exception as exc:
+            log.exception("Ошибка экспорта настроек: %s", exc)
+            QMessageBox.critical(
+                self, "Экспорт настроек",
+                f"Не удалось сохранить файл:\n{exc}",
+            )
+
+    @staticmethod
+    def _deduplicate_path(path: str) -> str:
+        """
+        Если файл существует — добавляет _1, _2, ... перед расширением,
+        пока не найдёт свободное имя. Возвращает итоговый путь.
+
+        Пример:
+            /home/user/config.json
+            /home/user/config_1.json
+            /home/user/config_2.json
+        """
+        if not os.path.exists(path):
+            return path
+
+        base, ext = os.path.splitext(path)
+        i = 1
+        while True:
+            candidate = f"{base}_{i}{ext}"
+            if not os.path.exists(candidate):
+                return candidate
+            i += 1
+            # Защита от бесконечного цикла (маловероятно, но пусть будет).
+            if i > 10000:
+                return f"{base}_{int(datetime.now().timestamp())}{ext}"
+
+    def _import_settings(self) -> None:
+        """
+        Загружает конфиг из выбранного файла и применяет его к
+        текущему состоянию.
+
+        Логика:
+          1) Выбрать файл.
+          2) Прочитать JSON.
+          3) Показать пользователю сводку: сколько ключей верхнего
+             уровня, какие секции есть в файле.
+          4) Спросить подтверждение.
+          5) Сделать резервную копию текущего конфига (рядом с
+             config.json — .bak).
+          6) Смержить импорт с дефолтами через ConfigManager._merge,
+             чтобы не потерять новые поля, добавленные в код.
+          7) Сохранить и перечитать форму.
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите файл настроек",
+            os.path.expanduser("~"),
+            "JSON-файлы (*.json);;Все файлы (*)",
+        )
+        if not path:
+            log.info("Импорт настроек отменён пользователем")
+            return
+
+        if not os.path.isfile(path):
+            QMessageBox.warning(
+                self, "Импорт настроек",
+                f"Файл не найден:\n{path}",
+            )
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                imported = json.load(f)
+        except json.JSONDecodeError as exc:
+            log.error("Импорт: не удалось разобрать JSON: %s", exc)
+            QMessageBox.critical(
+                self, "Импорт настроек",
+                f"Не удалось прочитать JSON:\n{exc}",
+            )
+            return
+        except Exception as exc:
+            log.exception("Импорт: ошибка чтения файла: %s", exc)
+            QMessageBox.critical(
+                self, "Импорт настроек",
+                f"Не удалось открыть файл:\n{exc}",
+            )
+            return
+
+        if not isinstance(imported, dict):
+            QMessageBox.warning(
+                self, "Импорт настроек",
+                "Файл не похож на конфиг приложения: "
+                "ожидался объект JSON.",
+            )
+            return
+
+        # Сводка по секциям
+        top_keys = sorted(imported.keys())
+        preview_keys = ", ".join(top_keys[:20])
+        if len(top_keys) > 20:
+            preview_keys += f"… (+{len(top_keys) - 20})"
+
+        reply = QMessageBox.question(
+            self, "Импорт настроек",
+            "<b>Импортировать настройки из файла?</b><br><br>"
+            f"Файл: <code>{html.escape(path)}</code><br>"
+            f"Секций верхнего уровня: <b>{len(top_keys)}</b><br>"
+            f"<span style='color:#666'>Ключи: {html.escape(preview_keys)}"
+            "</span><br><br>"
+            "<b>Внимание:</b> текущие настройки будут перезаписаны. "
+            "Перед импортом сохраним резервную копию рядом с "
+            "<code>config.json</code>.<br><br>"
+            "Продолжить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            log.info("Импорт настроек отменён на этапе подтверждения")
+            return
+
+        # --- Резервная копия с временным суффиксом ---
+        try:
+            src = self.config_manager.config_path
+            if src.exists():
+                stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                backup = src.with_name(
+                    f"{src.stem}.{stamp}.bak"
+                )
+                shutil.copy2(src, backup)
+                log.info("Резервная копия конфига: %s", backup)
+        except Exception as exc:
+            log.warning("Импорт: не удалось создать резервную копию: %s", exc)
+            # Не блокируем импорт из-за этого — просто предупреждаем.
+
+        # --- Мержим: дефолты + импорт ---
+        try:
+            merged = ConfigManager._merge(
+                self.config_manager.get_defaults(),
+                imported,
+            )
+        except Exception as exc:
+            log.exception("Импорт: не удалось смержить конфиг: %s", exc)
+            QMessageBox.critical(
+                self, "Импорт настроек",
+                f"Не удалось применить настройки:\n{exc}",
+            )
+            return
+
+        # --- Сохраняем ---
+        try:
+            self.config_manager.save(merged)
+            log.info(
+                "Настройки импортированы: файл=%s, секций=%d",
+                path, len(top_keys),
+            )
+        except Exception as exc:
+            log.exception("Импорт: не удалось сохранить конфиг: %s", exc)
+            QMessageBox.critical(
+                self, "Импорт настроек",
+                f"Не удалось сохранить настройки:\n{exc}",
+            )
+            return
+
+        # --- Перечитываем форму ---
+        try:
+            self.load_settings()
+        except Exception as exc:
+            log.exception("Импорт: не удалось перечитать форму: %s", exc)
+
+        QMessageBox.information(
+            self, "Импорт настроек",
+            "Настройки успешно импортированы.\n\n"
+            "Перезапустите приложение, чтобы изменения "
+            "(особенно путь к логам, горячие клавиши и клиенты "
+            "транскрибации/суммаризации) вступили в силу.",
+        )
 
     # ------------------------------------------------------------------
     # Действия
