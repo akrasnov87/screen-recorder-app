@@ -312,17 +312,21 @@ class Bitrix24Client:
         """
         Прикрепляет файл с Диска к чату через im.disk.file.commit.
 
-        Нужен, потому что im.message.add с параметром FILE_ID не всегда
-        привязывает файл — правильный путь: сначала «закоммитить» файл
-        в чат, получить новый FILE_ID, потом передать его в FILES.
+        Bitrix24 возвращает вложенную структуру:
+            result: {
+                FILES: {
+                    "upload<id>": {
+                        id: <число>,
+                        chatId: <число>,
+                        name: "<имя файла>",
+                        status: "done",
+                        ...
+                    }
+                }
+            }
 
-        Args:
-            dialog_id:    ID чата (chat39110 или 39110).
-            disk_file_id: ID файла на Диске (полученный из upload_file).
-
-        Returns:
-            Новый FILE_ID, который нужно передать в im.message.add
-            через параметр FILES.
+        Возвращает ID файла для использования в im.message.add
+        (параметр FILES=[<id>]).
         """
         # Нормализуем dialog_id: Bitrix24 принимает и chatXXX, и XXX.
         raw = dialog_id.strip()
@@ -330,9 +334,6 @@ class Bitrix24Client:
             raw = raw[4:]
         raw = raw.strip()
 
-        # У im.disk.file.commit несколько параметров. Основной — UPLOAD_ID.
-        # В разных версиях Bitrix24 может требоваться ещё CHAT_ID/DIALOG_ID
-        # и NAME. Передадим всё, что знаем.
         params: Dict[str, Any] = {
             "UPLOAD_ID": int(disk_file_id),
         }
@@ -343,33 +344,60 @@ class Bitrix24Client:
 
         try:
             data = await self.call("im.disk.file.commit", params)
-            result = data.get("result")
-            # Результат может быть числом или dict-обёрткой.
-            file_id: Optional[int] = None
-            if isinstance(result, dict):
-                fid = result.get("ID") or result.get("FILE_ID")
-                if fid:
-                    file_id = int(fid)
-            elif isinstance(result, (int, str)) and str(result).isdigit():
-                file_id = int(result)
-
-            if file_id:
-                log.info(
-                    "Bitrix24: файл привязан к чату %s, "
-                    "новый FILE_ID=%s (из disk_file_id=%s)",
-                    dialog_id, file_id, disk_file_id,
-                )
-                return file_id
-
-            log.warning(
-                "Bitrix24: im.disk.file.commit не вернул FILE_ID. "
-                "Ответ: %s", str(data)[:300],
-            )
         except Bitrix24Error as exc:
             log.warning(
                 "Bitrix24: im.disk.file.commit не сработал (%s), "
                 "используем disk_file_id напрямую", exc,
             )
+            return int(disk_file_id)
+
+        result = data.get("result")
+
+        # --- Вариант 1: result — число (старые версии Bitrix24) ---
+        if isinstance(result, (int, str)) and str(result).isdigit():
+            file_id = int(result)
+            log.info(
+                "Bitrix24: файл привязан к чату %s, FILE_ID=%s "
+                "(из disk_file_id=%s)",
+                dialog_id, file_id, disk_file_id,
+            )
+            return file_id
+
+        # --- Вариант 2: result — dict с полями ID / FILE_ID ---
+        if isinstance(result, dict):
+            fid = result.get("ID") or result.get("FILE_ID")
+            if fid and str(fid).isdigit():
+                file_id = int(fid)
+                log.info(
+                    "Bitrix24: файл привязан к чату %s, FILE_ID=%s "
+                    "(из disk_file_id=%s)",
+                    dialog_id, file_id, disk_file_id,
+                )
+                return file_id
+
+            # --- Вариант 3: result.FILES.<uploadXXX>.id ---
+            files = result.get("FILES")
+            if isinstance(files, dict):
+                # В норме там один файл — берём первый.
+                for key, item in files.items():
+                    if not isinstance(item, dict):
+                        continue
+                    fid = item.get("id") or item.get("ID")
+                    if fid and str(fid).isdigit():
+                        file_id = int(fid)
+                        log.info(
+                            "Bitrix24: файл привязан к чату %s, "
+                            "FILE_ID=%s (из ключа %s, disk_file_id=%s)",
+                            dialog_id, file_id, key, disk_file_id,
+                        )
+                        return file_id
+
+        # --- Ничего не распознали ---
+        log.warning(
+            "Bitrix24: im.disk.file.commit вернул неожиданную "
+            "структуру. Используем disk_file_id=%s. Ответ: %s",
+            disk_file_id, str(data)[:300],
+        )
         return int(disk_file_id)
 
     async def ensure_subfolder(self, parent_id: int, name: str) -> int:
