@@ -271,7 +271,11 @@ class ScreenRecorderApp(QObject):
             # --- Формирование summary ---
             "generate_summary": default_generate_summary,
             "is_scrum": False,
-            "generate_deepseek_prompt": False,
+            # --- DeepSeek (по умолчанию включено) ---
+            # Формировать файл промпта для DeepSeek при каждой обработке.
+            # Пользователь может снять галочку в карточке метаданных,
+            # если для конкретной записи это не нужно.
+            "generate_deepseek_prompt": True,
             "include_name_in_prompt": False,
             "include_project_in_prompt": False,
             "include_comment_in_prompt": False,
@@ -699,7 +703,8 @@ class ScreenRecorderApp(QObject):
             # --- Формирование summary ---
             "generate_summary": default_generate_summary,
             "is_scrum": False,
-            "generate_deepseek_prompt": False,
+            # --- DeepSeek (по умолчанию включено) ---
+            "generate_deepseek_prompt": True,
             "include_name_in_prompt": False,
             "include_project_in_prompt": False,
             "include_comment_in_prompt": False,

@@ -3,12 +3,19 @@
 Действия вынесены в верхнее меню, чтобы не переполнять панель.
 Дополнительно есть служебное меню «Утилиты» для обслуживания хранилища.
 
-Новое в разделе «Протокол»:
+Раздел «Протокол»:
   • «Создать/редактировать протокол (Markdown)…» — двухпанельный
     редактор Markdown с предпросмотром и экспортом в DOCX;
   • «Экспорт протокола в DOCX…» — конвертирует прикреплённый
     протокол (.md/.txt/.pdf) в manual_protocol.docx и прикрепляет
-    его к записи, чтобы Bitrix24-отправка уходила именно в .docx.
+    его к записи.
+
+Раздел «Очередь»:
+  • «Редактировать метаданные и перезапустить…» (Ctrl+E) —
+    открывает карточку записи с текущими параметрами из
+    session.json и после подтверждения ставит запись в очередь
+    заново. Удобно, если забыли включить «Сформировать промпт
+    для DeepSeek» при первичной обработке.
 """
 from __future__ import annotations
 
@@ -23,20 +30,15 @@ from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QMenuBar, QMessageBox, QProgressDialog, QPushButton,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QInputDialog, QLabel, QMenu, QMenuBar, QMessageBox, QProgressDialog,
+    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .bbcode_editor import (
-    BBCodeEditorDialog,
-    BBCodeViewerDialog,
-    bbcode_to_html,
-    bbcode_to_plain,
-)
 from .logger import get_logger
 from .markdown_docx import markdown_to_docx
 from .markdown_editor import MarkdownEditorDialog, MarkdownViewerDialog
-from .markdown_to_bitrix import markdown_to_plain_with_bb
+from .markdown_to_bitrix import markdown_to_plain, markdown_to_plain_with_bb
+from .metadata_dialog import MetadataDialog
 from .task_queue import TaskQueue
 
 log = get_logger(__name__)
@@ -151,6 +153,10 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         hv.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
         root.addWidget(self.table, 1)
 
         root.addWidget(self._build_legend())
@@ -170,7 +176,11 @@ class SessionsWindow(QDialog):
 
     def _build_menu_bar(self) -> None:
         bar = QMenuBar(self)
-        bar.setStyleSheet(
+        # ВАЖНО: цвета выделения задаём явно, чтобы не зависеть от
+        # системной палитры. При использовании palette(highlight) /
+        # palette(highlighted-text) в некоторых темах выделение
+        # получается белым на белом, и текст в меню исчезает.
+        _MENU_QSS = (
             "QMenuBar {"
             "  background-color: palette(window);"
             "  color: palette(window-text);"
@@ -181,12 +191,12 @@ class SessionsWindow(QDialog):
             "  padding: 4px 10px;"
             "}"
             "QMenuBar::item:selected {"
-            "  background-color: palette(highlight);"
-            "  color: palette(highlighted-text);"
+            "  background-color: #2D7FF9;"
+            "  color: #FFFFFF;"
             "}"
             "QMenuBar::item:pressed {"
-            "  background-color: palette(highlight);"
-            "  color: palette(highlighted-text);"
+            "  background-color: #1E5FBF;"
+            "  color: #FFFFFF;"
             "}"
             "QMenu {"
             "  background-color: palette(window);"
@@ -199,8 +209,8 @@ class SessionsWindow(QDialog):
             "  padding: 5px 24px 5px 24px;"
             "}"
             "QMenu::item:selected {"
-            "  background-color: palette(highlight);"
-            "  color: palette(highlighted-text);"
+            "  background-color: #2D7FF9;"
+            "  color: #FFFFFF;"
             "}"
             "QMenu::item:disabled {"
             "  color: palette(mid);"
@@ -211,6 +221,10 @@ class SessionsWindow(QDialog):
             "  margin: 4px 8px;"
             "}"
         )
+        bar.setStyleSheet(_MENU_QSS)
+        # Дублируем стиль на само окно — чтобы контекстное меню по
+        # правому клику в таблице получило тот же вид и те же цвета.
+        self.setStyleSheet(self.styleSheet() + _MENU_QSS)
 
         layout: QVBoxLayout = self.layout()
         layout.insertWidget(0, bar)
@@ -391,8 +405,29 @@ class SessionsWindow(QDialog):
         # ---------------- Очередь и статус ----------------
         m_queue = bar.addMenu("Очередь")
 
+        act_edit_meta = QAction(
+            "Редактировать метаданные и перезапустить…", self
+        )
+        act_edit_meta.setShortcut(QKeySequence("Ctrl+E"))
+        act_edit_meta.setToolTip(
+            "Открыть карточку записи с текущими параметрами.\n"
+            "Изменённые настройки (скрам, промпт DeepSeek, вложения, "
+            "контекст в промпте) сохранятся в session.json, и запись "
+            "будет поставлена в очередь на повторную обработку.\n\n"
+            "Удобно, если при первичной обработке забыли включить "
+            "«Сформировать файл промпта для DeepSeek»."
+        )
+        act_edit_meta.triggered.connect(self._edit_metadata_and_restart)
+        m_queue.addAction(act_edit_meta)
+
+        m_queue.addSeparator()
+
         act_restart = QAction("Перезапустить обработку", self)
         act_restart.setShortcut(QKeySequence("Ctrl+R"))
+        act_restart.setToolTip(
+            "Перезапустить обработку с текущими метаданными "
+            "(без открытия карточки)"
+        )
         act_restart.triggered.connect(self._restart_processing)
         m_queue.addAction(act_restart)
 
@@ -748,8 +783,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # Определяем chat_id по проекту (может быть пустым — тогда
-        # пользователь выберет получателя в диалоге)
         project = r.get("project") or ""
         chat_id = self.config_manager.get_project_chat_id(project)
         if not chat_id:
@@ -759,7 +792,6 @@ class SessionsWindow(QDialog):
                 project or "—",
             )
 
-        # Собираем session_info
         session_info = {
             "name": r.get("name") or "",
             "project": project,
@@ -774,7 +806,6 @@ class SessionsWindow(QDialog):
             "session_dir": r.get("dir") or "",
         }
 
-        # Комментарий из session.json
         try:
             meta = _read_json(os.path.join(r["dir"], "session.json")) or {}
             session_info["comment"] = meta.get("comment") or ""
@@ -797,21 +828,14 @@ class SessionsWindow(QDialog):
         dlg.exec()
 
     # ------------------------------------------------------------------
-    # Протокол: Markdown-редактор и конвертация в DOCX
-    # ------------------------------------------------------------------
+    # Протокол: Markdown-редактор и конвертация в DOCX    # ------------------------------------------------------------------
     def _edit_manual_protocol_md(self) -> None:
-        """
-        Открывает Markdown-редактор и сохраняет результат в
-        <session_dir>/manual_protocol.md, а путь — в session.json.
-        """
+        """Открывает Markdown-редактор и сохраняет manual_protocol.md."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
 
-        # Если уже есть .md-протокол — читаем его. Иначе — пробуем
-        # подхватить существующий manual_protocol.* и сконвертировать
-        # его в текст, чтобы пользователь не начинал с пустого листа.
         md_path = os.path.join(r["dir"], "manual_protocol.md")
         initial_text = ""
 
@@ -829,7 +853,6 @@ class SessionsWindow(QDialog):
                 except Exception as exc:
                     log.warning("Не удалось прочитать %s: %s", existing, exc)
 
-        # Путь для экспорта в .docx — рядом с сессией.
         default_docx = os.path.join(r["dir"], "manual_protocol.docx")
 
         dlg = MarkdownEditorDialog(
@@ -876,25 +899,15 @@ class SessionsWindow(QDialog):
         )
 
     def _export_protocol_docx(self) -> None:
-        """
-        Конвертирует текущий протокол (manual_protocol.md / .txt / .pdf)
-        в .docx.
-
-        Если исходник — .docx, ничего не делаем: он уже в нужном формате.
-        Если сохраняем прямо рядом с сессией как manual_protocol.docx —
-        автоматически прикрепляем к записи, чтобы Bitrix-отправка
-        взяла именно DOCX.
-        """
+        """Конвертирует протокол в .docx и прикрепляет к записи."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
 
-        # Определяем исходный файл протокола.
         src_path = r.get("manual_protocol_path") or ""
         md_path = os.path.join(r["dir"], "manual_protocol.md")
 
-        # Приоритет: то, что явно прикреплено; иначе — .md рядом.
         if not src_path or not os.path.exists(src_path):
             if os.path.exists(md_path):
                 src_path = md_path
@@ -917,7 +930,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # Читаем исходник как текст.
         if ext in (".md", ".txt"):
             try:
                 with open(src_path, "r", encoding="utf-8", errors="replace") as f:
@@ -930,7 +942,6 @@ class SessionsWindow(QDialog):
                 )
                 return
         else:
-            # .pdf или что-то ещё — попробуем извлечь текст.
             md_text = self._read_protocol_as_text(src_path)
             if not md_text.strip():
                 QMessageBox.warning(
@@ -940,7 +951,6 @@ class SessionsWindow(QDialog):
                 )
                 return
 
-        # Куда сохранять — по умолчанию рядом с сессией.
         default_path = os.path.join(r["dir"], "manual_protocol.docx")
         target, _ = QFileDialog.getSaveFileName(
             self,
@@ -966,8 +976,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # Если сохранили прямо рядом с сессией под стандартным именем —
-        # прикрепляем к записи, чтобы Bitrix-отправка брала именно DOCX.
         attach = False
         if os.path.abspath(target) == os.path.abspath(default_path):
             session_json = os.path.join(r["dir"], "session.json")
@@ -994,11 +1002,7 @@ class SessionsWindow(QDialog):
 
     @staticmethod
     def _read_protocol_as_text(path: str) -> str:
-        """
-        Читает протокол из .md/.txt/.docx/.pdf в виде обычного текста —
-        чтобы подставить в Markdown-редактор или сконвертировать
-        в .docx.
-        """
+        """Читает протокол (.md/.txt/.docx/.pdf) как обычный текст."""
         ext = os.path.splitext(path)[1].lower()
         if ext in (".md", ".txt"):
             with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -1021,16 +1025,12 @@ class SessionsWindow(QDialog):
             except Exception as exc:
                 log.warning("Не удалось прочитать .pdf %s: %s", path, exc)
                 return ""
-        # Прочее — попробуем как текст
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read()
         except Exception:
             return ""
 
-    # ------------------------------------------------------------------
-    # Ручной протокол (загрузка файла)
-    # ------------------------------------------------------------------
     def _attach_manual_protocol(self) -> None:
         r = self._selected_row()
         if not r:
@@ -1096,15 +1096,10 @@ class SessionsWindow(QDialog):
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     # ------------------------------------------------------------------
-    # Summary (BB-код)
+    # Summary (Markdown)
     # ------------------------------------------------------------------
     def _edit_summary_bb(self) -> None:
-        """
-        Открывает Markdown-редактор summary.
-
-        Файл сохраняется в session.json в поле summary_bb (сохранено
-        имя для обратной совместимости — в нём теперь Markdown).
-        """
+        """Открывает Markdown-редактор summary."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -1130,8 +1125,19 @@ class SessionsWindow(QDialog):
             )
             return
 
+        # Кладём рядом summary.md, чтобы ссылка «Открыть файл» в диалоге
+        # отправки в Bitrix24 вела на реальный файл.
+        try:
+            summary_md_path = os.path.join(r["dir"], "summary.md")
+            with open(summary_md_path, "w", encoding="utf-8") as f:
+                f.write(new_text)
+            log.info("Summary-Markdown сохранён: %s (%d символов)",
+                     summary_md_path, len(new_text))
+        except Exception as exc:
+            log.warning("Не удалось сохранить summary.md: %s", exc)
+
         log.info("Summary обновлён для %s (%d символов)",
-                r["dir"], len(new_text))
+                 r["dir"], len(new_text))
         self.refresh()
 
     def _view_summary(self) -> None:
@@ -1144,10 +1150,10 @@ class SessionsWindow(QDialog):
             QMessageBox.information(
                 self, "Summary",
                 "У этой записи ещё нет краткого описания.\n\n"
-                "Меню «Summary» → «Изменить summary…»",
+                "Меню «Summary» → «Изменить summary (Markdown)…»",
             )
             return
-        dlg = BBCodeViewerDialog(
+        dlg = MarkdownViewerDialog(
             text=text,
             title=f"Просмотр summary — {r['name']}",
             parent=self,
@@ -1194,14 +1200,15 @@ class SessionsWindow(QDialog):
 
         try:
             if fmt == "docx":
-                markdown_to_docx(text_md, target_path, title=r.get("name") or "")
+                markdown_to_docx(
+                    text_md, target_path, title=r.get("name") or ""
+                )
             elif fmt == "html":
                 self._export_summary_html_md(text_md, target_path)
             elif fmt == "md":
                 with open(target_path, "w", encoding="utf-8") as f:
                     f.write(text_md)
             else:
-                from .markdown_to_bitrix import markdown_to_plain
                 with open(target_path, "w", encoding="utf-8") as f:
                     f.write(markdown_to_plain(text_md))
             log.info("Summary экспортирован (%s): %s", fmt, target_path)
@@ -1215,7 +1222,6 @@ class SessionsWindow(QDialog):
                 self, "Экспорт summary",
                 f"Не удалось сохранить: {exc}",
             )
-
 
     @staticmethod
     def _export_summary_html_md(text_md: str, path: str) -> None:
@@ -1233,78 +1239,6 @@ class SessionsWindow(QDialog):
         cleaned = "".join(("_" if c in bad else c) for c in (name or "summary"))
         cleaned = cleaned.strip() or "summary"
         return cleaned[:60]
-
-    @staticmethod
-    def _export_summary_docx(text_bb: str, path: str) -> None:
-        from docx import Document
-        import re as _re
-
-        doc = Document()
-        doc.add_heading("Краткое описание записи", level=1)
-
-        for raw_line in text_bb.splitlines():
-            paragraph = doc.add_paragraph()
-            tokens = _re.split(
-                r"(\[/?(?:b|i|u|s)\])",
-                raw_line,
-                flags=_re.IGNORECASE,
-            )
-            bold = italic = underline = False
-            for tok in tokens:
-                if not tok:
-                    continue
-                low = tok.lower()
-                if low == "[b]":
-                    bold = True
-                elif low == "[/b]":
-                    bold = False
-                elif low == "[i]":
-                    italic = True
-                elif low == "[/i]":
-                    italic = False
-                elif low == "[u]":
-                    underline = True
-                elif low == "[/u]":
-                    underline = False
-                elif low in ("[s]", "[/s]"):
-                    pass
-                else:
-                    run = paragraph.add_run(tok)
-                    run.bold = bold
-                    run.italic = italic
-                    run.underline = underline
-
-            if not tokens:
-                doc.add_paragraph()
-
-        doc.save(path)
-
-    @staticmethod
-    def _export_summary_html(text_bb: str, path: str) -> None:
-        body = bbcode_to_html(text_bb)
-        html_doc = (
-            "<!DOCTYPE html>\n"
-            "<html lang='ru'><head><meta charset='utf-8'>\n"
-            "<title>Краткое описание</title>\n"
-            "<style>"
-            "body { font-family: sans-serif; max-width: 800px; margin: 2em auto; "
-            "padding: 0 1em; color: #222; }"
-            "blockquote { border-left: 3px solid #888; margin: 6px 0; "
-            "padding: 4px 10px; color: #555; }"
-            "pre { background: #f4f4f4; padding: 6px; border-radius: 4px; "
-            "font-family: monospace; }"
-            "details { margin: 6px 0; }"
-            "</style></head><body>\n"
-            f"{body}\n"
-            "</body></html>"
-        )
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html_doc)
-
-    @staticmethod
-    def _export_summary_text(text_bb: str, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text_bb)
 
     # ------------------------------------------------------------------
     # Быстрое сохранение промпта в «Загрузки»
@@ -1350,7 +1284,9 @@ class SessionsWindow(QDialog):
                 self, "DeepSeek",
                 "Для этой записи промпт не сформирован.\n\n"
                 "Промпт создаётся при обработке, если в метаданных записи "
-                "включён флаг «Сформировать файл промпта для DeepSeek».",
+                "включён флаг «Сформировать файл промпта для DeepSeek».\n\n"
+                "Если флаг не стоял — используйте «Очередь → "
+                "Редактировать метаданные и перезапустить…» (Ctrl+E).",
             )
             return
 
@@ -1680,6 +1616,7 @@ class SessionsWindow(QDialog):
             return False
 
     def _delete_processed_files(self, session_dir: str) -> None:
+        """Удаляет только результаты транскрибации/суммаризации (без DeepSeek)."""
         for fname in ("video.mp3", "video.txt", "video.aac",
                       "video.wav", "video.opus"):
             p = os.path.join(session_dir, fname)
@@ -1687,6 +1624,34 @@ class SessionsWindow(QDialog):
                 try:
                     os.remove(p)
                     log.info("Удалён файл: %s", p)
+                except Exception as exc:
+                    log.warning("Не удалось удалить %s: %s", p, exc)
+
+    def _remove_processed_artifacts(self, session_dir: str) -> None:
+        """
+        Удаляет ВСЕ артефакты предыдущей обработки для полного
+        перезапуска. Сохраняет:
+          • исходное видео;
+          • session.json;
+          • manual_protocol.*;
+          • summary.md / summary_*.* (пользовательские);
+          • attachments/.
+        """
+        patterns = [
+            "video.mp3", "video.aac", "video.wav", "video.opus",
+            "video.ogg", "video.m4a",
+            "video.txt",
+            "video_summary.md",
+            "deepseek_prompt.txt", "deepseek_prompt.md",
+            "deepseek_prompt.docx",
+            "protocol.docx", "protocol.md", "protocol.txt",
+        ]
+        for fname in patterns:
+            p = os.path.join(session_dir, fname)
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                    log.info("Удалён артефакт обработки: %s", p)
                 except Exception as exc:
                     log.warning("Не удалось удалить %s: %s", p, exc)
 
@@ -1710,9 +1675,10 @@ class SessionsWindow(QDialog):
             return None
 
     # ------------------------------------------------------------------
-    # Перезапуск / статус
+    # Перезапуск / редактирование метаданных
     # ------------------------------------------------------------------
     def _restart_processing(self) -> None:
+        """Перезапускает обработку с текущими метаданными."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -1723,15 +1689,16 @@ class SessionsWindow(QDialog):
             return
         if QMessageBox.question(
             self, "Перезапустить обработку",
-            f"Запись «{r['name']}» будет обработана заново:\n"
+            f"Запись «{r['name']}» будет обработана заново с текущими "
+            "параметрами:\n"
             "• старая задача удалится из очереди,\n"
-            "• файлы video.mp3 / video.txt удалятся,\n"
+            "• файлы video.mp3 / video.txt / deepseek_prompt.* удалятся,\n"
             "• запись добавится в очередь заново.\n\nПродолжить?",
         ) != QMessageBox.StandardButton.Yes:
             return
         if r["task_id"]:
             self._remove_from_queue(r["task_id"])
-        self._delete_processed_files(r["dir"])
+        self._remove_processed_artifacts(r["dir"])
         task_id = self._enqueue_session(r)
         if task_id:
             QMessageBox.information(self, "Записи",
@@ -1741,6 +1708,187 @@ class SessionsWindow(QDialog):
             QMessageBox.critical(self, "Ошибка",
                                  "Не удалось добавить запись в очередь")
 
+    def _edit_metadata_and_restart(self) -> None:
+        """
+        Открывает карточку метаданных с текущими значениями из
+        session.json. После подтверждения:
+          • сохраняет обновлённые метаданные;
+          • удаляет старые артефакты обработки;
+          • ставит запись в очередь заново.
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        if not r["video_path"] or not os.path.exists(r["video_path"]):
+            QMessageBox.warning(
+                self, "Записи",
+                f"Видео не найдено:\n{r['video_path'] or '(путь не задан)'}",
+            )
+            return
+
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "Записи",
+                "Нет доступа к настройкам — ConfigManager не передан.",
+            )
+            return
+
+        session_json = os.path.join(r["dir"], "session.json")
+        meta = _read_json(session_json) or {}
+
+        projects = self.config_manager.get_project_names()
+        prompts = self.config_manager.get_prompts()
+        default_prompt = self.config_manager.get_default_prompt()
+        name_templates = self.config_manager.get_name_templates()
+
+        project = meta.get("project")
+        if project and project not in projects:
+            projects = [project] + projects
+
+        dlg = MetadataDialog(
+            projects=projects,
+            prompts=prompts,
+            title=f"Метаданные записи — {r['name']}",
+            initial=meta,
+            default_prompt=default_prompt,
+            sessions_root=self.sessions_root,
+            on_save_prompt=self._on_save_prompt_to_config,
+            get_prompts=self.config_manager.get_prompts,
+            name_templates=name_templates,
+            on_save_name_template=self._on_save_name_template,
+            get_name_templates=self.config_manager.get_name_templates,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            log.info("Редактирование метаданных отменено пользователем")
+            return
+
+        new_meta = dlg.result_data
+
+        # Сохраняем поля, которых нет в диалоге.
+        for keep_key in (
+            "date", "time", "monitor",
+            "summary_bb",
+            "manual_protocol_path",
+            "source", "source_files",
+            "video_path", "session_dir",
+        ):
+            if keep_key not in new_meta and keep_key in meta:
+                new_meta[keep_key] = meta[keep_key]
+
+        new_meta.setdefault("video_path", r["video_path"])
+        new_meta.setdefault("session_dir", r["dir"])
+        new_meta.pop("task_id", None)
+
+        reply = QMessageBox.question(
+            self,
+            "Перезапустить обработку",
+            f"Запись «{r['name']}» будет обработана заново с новыми "
+            f"параметрами:<br><br>"
+            f"• скрам-митинг: "
+            f"<b>{'да' if new_meta.get('is_scrum') else 'нет'}</b><br>"
+            f"• формировать summary: "
+            f"<b>{'да' if new_meta.get('generate_summary') else 'нет'}</b><br>"
+            f"• сформировать промпт DeepSeek: "
+            f"<b>{'да' if new_meta.get('generate_deepseek_prompt') else 'нет'}</b>"
+            f"<br><br>"
+            f"Старые файлы обработки (video.txt, video.mp3, "
+            f"deepseek_prompt.*) будут удалены.<br><br>"
+            f"Продолжить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            log.info("Перезапуск с новыми метаданными отменён")
+            return
+
+        if not _write_json(session_json, new_meta):
+            QMessageBox.critical(
+                self, "Записи",
+                "Не удалось сохранить session.json",
+            )
+            return
+        log.info(
+            "Метаданные записи обновлены: %s (is_scrum=%s, "
+            "generate_summary=%s, generate_deepseek=%s)",
+            r["dir"],
+            new_meta.get("is_scrum"),
+            new_meta.get("generate_summary"),
+            new_meta.get("generate_deepseek_prompt"),
+        )
+
+        self._remove_processed_artifacts(r["dir"])
+
+        if r["task_id"]:
+            self._remove_from_queue(r["task_id"])
+
+        task_id = self._enqueue_session({
+            "video_path": r["video_path"],
+            "dir": r["dir"],
+        })
+        if not task_id:
+            QMessageBox.critical(
+                self, "Записи",
+                "Метаданные сохранены, но не удалось поставить запись "
+                "в очередь. Проверьте лог.",
+            )
+            return
+
+        QMessageBox.information(
+            self, "Записи",
+            f"Запись поставлена в очередь на обработку: {task_id}",
+        )
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # Помощники для MetadataDialog
+    # ------------------------------------------------------------------
+    def _on_save_prompt_to_config(self, name: str, text: str) -> None:
+        """Сохраняет промпт в библиотеку через ConfigManager."""
+        try:
+            name = (name or "").strip()
+            text = (text or "").strip()
+            if not name or not text:
+                return
+            cfg = self.config_manager.config
+            meta = cfg.setdefault("metadata", {})
+            prompts = meta.setdefault("prompts", [])
+            replaced = False
+            for i, p in enumerate(prompts):
+                if isinstance(p, dict) and p.get("name") == name:
+                    prompts[i] = {"name": name, "text": text}
+                    replaced = True
+                    break
+            if not replaced:
+                prompts.append({"name": name, "text": text})
+            self.config_manager.save()
+            log.info(
+                "Промпт «%s» %s в библиотеку (%d символов)",
+                name, "обновлён" if replaced else "добавлен", len(text),
+            )
+        except Exception as exc:
+            log.exception("Ошибка сохранения промпта: %s", exc)
+            raise
+
+    def _on_save_name_template(self, label: str, template: str) -> None:
+        """Сохраняет шаблон имени в конфиг через ConfigManager."""
+        try:
+            label = (label or "").strip()
+            template = (template or "").strip()
+            if not template:
+                return
+            self.config_manager.add_name_template(label, template)
+            log.info("Шаблон имени сохранён: label=%r, template=%r",
+                     label, template)
+        except Exception as exc:
+            log.exception("Ошибка сохранения шаблона имени: %s", exc)
+            raise
+
+    # ------------------------------------------------------------------
+    # Изменение статуса
+    # ------------------------------------------------------------------
     def _change_status(self, new_status: str) -> None:
         r = self._selected_row()
         if not r:
@@ -1806,6 +1954,34 @@ class SessionsWindow(QDialog):
                                  "Не удалось добавить запись в очередь")
 
     # ------------------------------------------------------------------
+    # Контекстное меню по правому клику
+    # ------------------------------------------------------------------
+    def _show_context_menu(self, pos) -> None:
+        r = self._selected_row()
+        if not r:
+            return
+        menu = QMenu(self)
+        menu.addAction(
+            "Редактировать метаданные и перезапустить…",
+            self._edit_metadata_and_restart,
+        )
+        menu.addSeparator()
+        menu.addAction("Перезапустить обработку", self._restart_processing)
+        menu.addAction("Поставить в очередь", self._enqueue_current)
+        menu.addSeparator()
+        menu.addAction("Открыть папку записи", self._open_folder)
+        menu.addAction("Открыть видео", self._open_video)
+        menu.addSeparator()
+        menu.addAction(
+            "Изменить summary (Markdown)…", self._edit_summary_bb
+        )
+        menu.addAction(
+            "Создать/редактировать протокол (Markdown)…",
+            self._edit_manual_protocol_md,
+        )
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    # ------------------------------------------------------------------
     # DeepSeek-промпт
     # ------------------------------------------------------------------
     def _open_deepseek_prompt(self) -> None:
@@ -1819,7 +1995,9 @@ class SessionsWindow(QDialog):
                 self, "DeepSeek",
                 "Для этой записи промпт не сформирован.\n\n"
                 "Промпт создаётся при обработке, если в метаданных записи "
-                "включён флаг «Сформировать файл промпта для DeepSeek».",
+                "включён флаг «Сформировать файл промпта для DeepSeek».\n\n"
+                "Если флаг не стоял — используйте «Очередь → "
+                "Редактировать метаданные и перезапустить…» (Ctrl+E).",
             )
             return
         log.info("Открытие DeepSeek-промпта: %s", path)
@@ -1834,7 +2012,9 @@ class SessionsWindow(QDialog):
         if not path or not os.path.exists(path):
             QMessageBox.information(
                 self, "DeepSeek",
-                "Для этой записи промпт не сформирован.",
+                "Для этой записи промпт не сформирован.\n\n"
+                "Если флаг не стоял — используйте «Очередь → "
+                "Редактировать метаданные и перезапустить…» (Ctrl+E).",
             )
             return
 
@@ -1983,8 +2163,8 @@ class SessionsWindow(QDialog):
                 self, "Вложения",
                 f"Добавлено файлов: {added}\n\n"
                 "Чтобы вложения попали в транскрибацию или промпт DeepSeek, "
-                "установите соответствующие флаги в session.json и нажмите "
-                "«Перезапустить».",
+                "установите соответствующие флаги в метаданных через "
+                "«Очередь → Редактировать метаданные и перезапустить…».",
             )
             self.refresh()
 
@@ -2053,9 +2233,10 @@ class SessionsWindow(QDialog):
             "Ctrl+M        — создать/редактировать протокол (Markdown)\n"
             "Ctrl+Shift+M  — экспорт протокола в DOCX\n"
             "Ctrl+B        — отправить протокол/summary в Bitrix24\n"
+            "Ctrl+E        — редактировать метаданные и перезапустить\n"
             "Ctrl+Shift+E  — открыть папку записи\n"
             "Ctrl+Shift+V  — открыть видео\n"
-            "Ctrl+P        — изменить summary\n"
+            "Ctrl+P        — изменить summary (Markdown)\n"
             "Ctrl+Shift+P  — просмотр summary\n"
             "Ctrl+D        — открыть промпт DeepSeek\n"
             "Ctrl+Shift+D  — экспорт промпта\n"

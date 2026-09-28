@@ -8,6 +8,9 @@
     (название / проект / комментарий).
   • Отдельный флаг «Формировать summary» для конкретной записи —
     переопределяет глобальную настройку из SettingsWindow.
+  • Флаг «Сформировать файл промпта для DeepSeek» включён по умолчанию
+    для новых записей. При редактировании существующей записи
+    сохраняется её историческое значение из session.json.
 """
 from __future__ import annotations
 
@@ -248,7 +251,6 @@ class MetadataDialog(QDialog):
         self.prompt_input.setPlaceholderText(
             "Промпт для формирования краткого содержания и/или DeepSeek-промпта…"
         )
-        # Минимум 4 строки текста + запас на рамку.
         self.prompt_input.setMinimumHeight(120)
         root.addWidget(self.prompt_input)
 
@@ -309,9 +311,11 @@ class MetadataDialog(QDialog):
 
         deepseek_box = QVBoxLayout()
         self.generate_deepseek_check = QCheckBox(
-            "Сформировать файл промпта для DeepSeek"
+            "Сформировать файл промпта для DeepSeek "
+            "(включено по умолчанию)"
         )
-        attach_tooltip(self.generate_deepseek_check, "meta_generate_deepseek_prompt")
+        attach_tooltip(self.generate_deepseek_check,
+                       "meta_generate_deepseek_prompt")
         deepseek_box.addWidget(self.generate_deepseek_check)
 
         deepseek_hint = QLabel(
@@ -741,7 +745,7 @@ class MetadataDialog(QDialog):
 
         # --- Формирование summary ---
         # Если в initial задано явное значение — используем его.
-        # Иначе — false (запрещено).
+        # Иначе — false (не формировать).
         self.generate_summary_check.blockSignals(True)
         self.generate_summary_check.setChecked(
             bool(init.get("generate_summary", False))
@@ -771,10 +775,15 @@ class MetadataDialog(QDialog):
         self.protocol_path_input.setText(init.get("previous_protocol_path", ""))
 
         # DeepSeek
+        # По умолчанию включено: формировать файл промпта для DeepSeek
+        # при каждой обработке. Пользователь может снять галочку вручную
+        # в карточке записи, если для конкретной записи это не нужно.
+        # При редактировании существующей записи сохраняется её
+        # историческое значение из session.json.
         if "generate_deepseek_prompt" in init:
             gen = bool(init.get("generate_deepseek_prompt"))
         else:
-            gen = is_scrum
+            gen = True
         self.generate_deepseek_check.setChecked(gen)
 
         # Контекст в промпт
