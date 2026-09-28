@@ -1,10 +1,19 @@
-"""Поиск по стенограммам и протоколам записей без использования БД."""
+"""Поиск по стенограммам и протоколам записей без использования БД.
+
+Особенности (актуальная версия):
+  • Поиск по стенограммам (video.txt), протоколам, summary и вложениям.
+  • Для summary используется markdown_to_plain_with_bb — функция
+    корректно обрабатывает и Markdown (новые записи), и BB-код
+    (старые записи, где summary_bb хранился как BB).
+  • Нечёткий поиск (fuzzy) для стенограмм, устойчивый к опечаткам.
+  • Фильтры по проекту, датам и области поиска.
+"""
 from __future__ import annotations
 
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -60,7 +69,7 @@ _PROTOCOL_PATTERNS = (
 )
 
 _TRANSCRIPT_NAMES = ("video.txt",)
-_SUMMARY_KEYS = ("summary_bb",)  # BB-код в session.json
+_SUMMARY_KEYS = ("summary_bb",)  # Markdown или BB-код в session.json
 
 
 def _read_text_safe(path: str) -> str:
@@ -420,11 +429,14 @@ def search(
                         break
 
         # --- Summary из session.json ---
+        # В поле summary_bb может лежать Markdown (новые записи)
+        # или BB-код (старые). markdown_to_plain_with_bb корректно
+        # снимет оба варианта разметки.
         if filters.search_summaries:
             summary_bb = str(meta.get("summary_bb") or "").strip()
             if summary_bb:
-                from .bbcode_editor import bbcode_to_plain
-                plain = bbcode_to_plain(summary_bb)
+                from .markdown_to_bitrix import markdown_to_plain_with_bb
+                plain = markdown_to_plain_with_bb(summary_bb)
                 for score, snippet, kind in _search_in_text(
                     plain, query, filters.fuzzy_threshold, filters.context_chars
                 ):

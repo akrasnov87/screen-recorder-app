@@ -321,3 +321,66 @@ class MarkdownEditorDialog(QDialog):
 
     def result_text(self) -> str:
         return self._result_text
+
+class MarkdownViewerDialog(QDialog):
+    """
+    Модальное окно для просмотра Markdown без редактирования.
+
+    Слева — readonly QPlainTextEdit с исходником,
+    справа — отрендеренный QTextBrowser.
+    Только кнопка «Закрыть».
+    """
+
+    def __init__(
+        self,
+        text: str = "",
+        title: str = "Просмотр Markdown",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumSize(1000, 640)
+
+        root = QVBoxLayout(self)
+
+        info = QLabel(
+            "Просмотр сохранённого текста. Чтобы изменить — закройте "
+            "окно и используйте «Изменить…»."
+        )
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self.source = QPlainTextEdit()
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.StyleHint.TypeWriter)
+        mono.setPointSize(11)
+        self.source.setFont(mono)
+        self.source.setReadOnly(True)
+        self.source.setPlainText(text or "")
+        splitter.addWidget(self.source)
+
+        self.preview = QTextBrowser()
+        self.preview.setOpenExternalLinks(True)
+        try:
+            self.preview.setMarkdown(text or "")
+        except Exception as exc:
+            log.exception("Ошибка рендера Markdown: %s", exc)
+            self.preview.setPlainText(str(exc))
+        splitter.addWidget(self.preview)
+
+        splitter.setSizes([500, 500])
+        root.addWidget(splitter, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Close,
+            parent=self,
+        )
+        buttons.button(
+            QDialogButtonBox.StandardButton.Close
+        ).setText("Закрыть")
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        root.addWidget(buttons)

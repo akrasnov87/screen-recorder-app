@@ -35,7 +35,8 @@ from .bbcode_editor import (
 )
 from .logger import get_logger
 from .markdown_docx import markdown_to_docx
-from .markdown_editor import MarkdownEditorDialog
+from .markdown_editor import MarkdownEditorDialog, MarkdownViewerDialog
+from .markdown_to_bitrix import markdown_to_plain_with_bb
 from .task_queue import TaskQueue
 
 log = get_logger(__name__)
@@ -304,10 +305,11 @@ class SessionsWindow(QDialog):
         # ---------------- Summary ----------------
         m_summary = bar.addMenu("Summary")
 
-        act_edit_summary = QAction("Изменить summary…", self)
+        act_edit_summary = QAction("Изменить summary (Markdown)…", self)
         act_edit_summary.setShortcut(QKeySequence("Ctrl+P"))
         act_edit_summary.setToolTip(
-            "Открыть редактор BB-кода для краткого описания записи"
+            "Открыть Markdown-редактор для краткого описания записи.\n"
+            "При отправке в Bitrix24 Markdown конвертируется в BB-код."
         )
         act_edit_summary.triggered.connect(self._edit_summary_bb)
         m_summary.addAction(act_edit_summary)
@@ -316,7 +318,7 @@ class SessionsWindow(QDialog):
         act_view_summary.setShortcut(QKeySequence("Ctrl+Shift+P"))
         act_view_summary.setToolTip(
             "Открыть краткое описание в режиме только для чтения "
-            "(с отрендеренным BB-кодом)"
+            "(с отрендеренным Markdown)"
         )
         act_view_summary.triggered.connect(self._view_summary)
         m_summary.addAction(act_view_summary)
@@ -1097,18 +1099,24 @@ class SessionsWindow(QDialog):
     # Summary (BB-код)
     # ------------------------------------------------------------------
     def _edit_summary_bb(self) -> None:
+        """
+        Открывает Markdown-редактор summary.
+
+        Файл сохраняется в session.json в поле summary_bb (сохранено
+        имя для обратной совместимости — в нём теперь Markdown).
+        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
 
-        dlg = BBCodeEditorDialog(
+        dlg = MarkdownEditorDialog(
             text=r.get("summary_bb") or "",
             title=f"Краткое описание — {r['name']}",
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            log.debug("Редактор summary закрыт без сохранения")
+            log.debug("Markdown-редактор summary закрыт без сохранения")
             return
 
         new_text = dlg.result_text()
@@ -1116,12 +1124,14 @@ class SessionsWindow(QDialog):
         meta = _read_json(session_json) or {}
         meta["summary_bb"] = new_text
         if not _write_json(session_json, meta):
-            QMessageBox.critical(self, "Summary",
-                                 "Не удалось сохранить summary в session.json")
+            QMessageBox.critical(
+                self, "Summary",
+                "Не удалось сохранить summary в session.json",
+            )
             return
 
         log.info("Summary обновлён для %s (%d символов)",
-                 r["dir"], len(new_text))
+                r["dir"], len(new_text))
         self.refresh()
 
     def _view_summary(self) -> None:
@@ -1150,8 +1160,8 @@ class SessionsWindow(QDialog):
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
 
-        text_bb = r.get("summary_bb") or ""
-        if not text_bb.strip():
+        text_md = r.get("summary_bb") or ""
+        if not text_md.strip():
             QMessageBox.information(
                 self, "Экспорт summary",
                 "У этой записи нет краткого описания.",
@@ -1184,14 +1194,16 @@ class SessionsWindow(QDialog):
 
         try:
             if fmt == "docx":
-                self._export_summary_docx(text_bb, target_path)
+                markdown_to_docx(text_md, target_path, title=r.get("name") or "")
             elif fmt == "html":
-                self._export_summary_html(text_bb, target_path)
+                self._export_summary_html_md(text_md, target_path)
             elif fmt == "md":
-                self._export_summary_text(text_bb, target_path)
-            else:
                 with open(target_path, "w", encoding="utf-8") as f:
-                    f.write(bbcode_to_plain(text_bb))
+                    f.write(text_md)
+            else:
+                from .markdown_to_bitrix import markdown_to_plain
+                with open(target_path, "w", encoding="utf-8") as f:
+                    f.write(markdown_to_plain(text_md))
             log.info("Summary экспортирован (%s): %s", fmt, target_path)
             QMessageBox.information(
                 self, "Экспорт summary",
@@ -1203,6 +1215,17 @@ class SessionsWindow(QDialog):
                 self, "Экспорт summary",
                 f"Не удалось сохранить: {exc}",
             )
+
+
+    @staticmethod
+    def _export_summary_html_md(text_md: str, path: str) -> None:
+        """Экспорт Markdown-summary в HTML через QTextDocument."""
+        from PySide6.QtGui import QTextDocument
+        doc = QTextDocument()
+        doc.setMarkdown(text_md)
+        html_body = doc.toHtml()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html_body)
 
     @staticmethod
     def _safe_name(name: str) -> str:

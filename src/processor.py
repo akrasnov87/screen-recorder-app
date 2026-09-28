@@ -9,9 +9,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Signal
 
-from .bbcode_editor import bbcode_to_plain
 from .litellm_client import LiteLLMClient, LiteLLMError
 from .logger import get_logger
+from .markdown_to_bitrix import markdown_to_plain_with_bb
 from .task_queue import TaskQueue
 from .transcribe_client import TranscribeClient
 
@@ -148,10 +148,13 @@ class VideoProcessor(QObject):
                     log.info("[%s] В промпт добавлен контекст записи "
                              "(%d символов)", task_id, len(ctx_header))
 
-                # Summary из BB — конвертируем в plain text и дописываем
+                # Summary — конвертируем в plain text и дописываем.
+                # Поле summary_bb может содержать как Markdown (новые
+                # записи), так и BB-код (старые). markdown_to_plain_with_bb
+                # корректно обрабатывает оба случая.
                 summary_bb = str(metadata.get("summary_bb") or "").strip()
                 if summary_bb:
-                    summary_plain = bbcode_to_plain(summary_bb)
+                    summary_plain = markdown_to_plain_with_bb(summary_bb)
                     if summary_plain:
                         prompt = (
                             prompt
@@ -160,7 +163,7 @@ class VideoProcessor(QObject):
                         )
                         log.info(
                             "[%s] К промпту добавлено краткое описание "
-                            "(%d символов BB → %d plain)",
+                            "(%d символов источника → %d plain)",
                             task_id, len(summary_bb), len(summary_plain),
                         )
 
@@ -289,11 +292,13 @@ class VideoProcessor(QObject):
                     log.info("[%s] Ручной протокол прочитан: %s (%d символов)",
                              task_id, manual_protocol_path,
                              len(manual_protocol_text))
-                # Summary (BB → plain? — нет, для DeepSeek лучше оставить BB,
-                # но модель его не понимает. Конвертируем в plain и добавим
-                # в формате «Краткое описание»).
+                # Summary — конвертируем в plain и добавим в формате
+                # «Краткое описание». markdown_to_plain_with_bb снимет
+                # и Markdown, и старые BB-теги.
                 summary_bb = str(metadata.get("summary_bb") or "").strip()
-                summary_for_deepseek = bbcode_to_plain(summary_bb) if summary_bb else ""
+                summary_for_deepseek = (
+                    markdown_to_plain_with_bb(summary_bb) if summary_bb else ""
+                )
 
                 try:
                     prompt_path = self._build_deepseek_prompt(
@@ -596,7 +601,7 @@ class VideoProcessor(QObject):
         Формирует файл с готовым промптом для DeepSeek.
 
         Дополнительно:
-          • summary_text          — краткое описание записи (plain, без BB);
+          • summary_text          — краткое описание записи (plain, без разметки);
           • manual_protocol_text  — вручную подготовленный протокол.
         """
         log.info(
