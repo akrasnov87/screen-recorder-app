@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Signal
 
+from .bbcode_editor import bbcode_to_plain
 from .litellm_client import LiteLLMClient, LiteLLMError
 from .logger import get_logger
 from .task_queue import TaskQueue
@@ -59,14 +60,17 @@ class VideoProcessor(QObject):
         log.info("Видео: %s", video_path)
         log.info("Метаданные: project=%s, name=%s, is_scrum=%s, "
                  "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
-                 "ctx_comment=%s, attachments=%d",
+                 "ctx_comment=%s, attachments=%d, summary_bb=%d, "
+                 "manual_protocol=%s",
                  metadata.get("project"), metadata.get("name"),
                  metadata.get("is_scrum"),
                  metadata.get("generate_deepseek_prompt"),
                  metadata.get("include_name_in_prompt"),
                  metadata.get("include_project_in_prompt"),
                  metadata.get("include_comment_in_prompt"),
-                 len(metadata.get("attachments", []) or []))
+                 len(metadata.get("attachments", []) or []),
+                 len(metadata.get("summary_bb") or ""),
+                 os.path.basename(metadata.get("manual_protocol_path") or "") or "—")
 
         t0 = time.monotonic()
         try:
@@ -134,6 +138,22 @@ class VideoProcessor(QObject):
                     prompt = ctx_header + "\n\n" + prompt
                     log.info("[%s] В промпт добавлен контекст записи "
                              "(%d символов)", task_id, len(ctx_header))
+
+                # Summary из BB — конвертируем в plain text и дописываем
+                summary_bb = str(metadata.get("summary_bb") or "").strip()
+                if summary_bb:
+                    summary_plain = bbcode_to_plain(summary_bb)
+                    if summary_plain:
+                        prompt = (
+                            prompt
+                            + "\n\n===== КРАТКОЕ ОПИСАНИЕ ЗАПИСИ =====\n\n"
+                            + summary_plain
+                        )
+                        log.info(
+                            "[%s] К промпту добавлено краткое описание "
+                            "(%d символов BB → %d plain)",
+                            task_id, len(summary_bb), len(summary_plain),
+                        )
 
                 # Вложения
                 if metadata.get("send_attachments_to_transcribe"):
@@ -225,6 +245,22 @@ class VideoProcessor(QObject):
             # --- Шаг 3: DeepSeek-промпт ---
             if metadata.get("generate_deepseek_prompt") and transcript_path:
                 use_scrum = bool(metadata.get("is_scrum", False))
+                # Ручной протокол
+                manual_protocol_path = str(
+                    metadata.get("manual_protocol_path") or ""
+                ).strip()
+                manual_protocol_text = ""
+                if manual_protocol_path and os.path.exists(manual_protocol_path):
+                    manual_protocol_text = self._read_any_text(manual_protocol_path)
+                    log.info("[%s] Ручной протокол прочитан: %s (%d символов)",
+                             task_id, manual_protocol_path,
+                             len(manual_protocol_text))
+                # Summary (BB → plain? — нет, для DeepSeek лучше оставить BB,
+                # но модель его не понимает. Конвертируем в plain и добавим
+                # в формате «Краткое описание»).
+                summary_bb = str(metadata.get("summary_bb") or "").strip()
+                summary_for_deepseek = bbcode_to_plain(summary_bb) if summary_bb else ""
+
                 try:
                     prompt_path = self._build_deepseek_prompt(
                         session_dir=os.path.dirname(video_path),
@@ -240,13 +276,18 @@ class VideoProcessor(QObject):
                         user_prompt=str(metadata.get("prompt") or ""),
                         glossary_text=gl_text if gl_to_deepseek else "",
                         metadata=metadata,
+                        summary_text=summary_for_deepseek,
+                        manual_protocol_text=manual_protocol_text,
                     )
                     if prompt_path:
                         log.info(
-                            "[%s] Промпт DeepSeek: %s (template=%s, glossary=%s)",
+                            "[%s] Промпт DeepSeek: %s (template=%s, "
+                            "glossary=%s, summary=%s, manual_protocol=%s)",
                             task_id, prompt_path,
                             "scrum" if use_scrum else "user",
                             bool(gl_to_deepseek and gl_text),
+                            bool(summary_for_deepseek),
+                            bool(manual_protocol_text),
                         )
                 except Exception as exc:
                     log.exception("[%s] Не удалось собрать DeepSeek-промпт: %s",
@@ -430,12 +471,6 @@ class VideoProcessor(QObject):
         include_project: bool,
         include_comment: bool,
     ) -> str:
-        """
-        Формирует шапку «КОНТЕКСТ ЗАПИСИ» для промпта.
-
-        Возвращает пустую строку, если ничего не выбрано или все
-        выбранные поля пусты.
-        """
         lines: List[str] = []
 
         if include_name:
@@ -451,7 +486,6 @@ class VideoProcessor(QObject):
         if include_comment:
             comment = str(metadata.get("comment") or "").strip()
             if comment:
-                # Комментарий может быть многострочным — оставляем как есть
                 lines.append(f"Комментарий: {comment}")
 
         if not lines:
@@ -521,22 +555,26 @@ class VideoProcessor(QObject):
         user_prompt: str = "",
         glossary_text: str = "",
         metadata: Optional[Dict[str, Any]] = None,
+        summary_text: str = "",
+        manual_protocol_text: str = "",
     ) -> str:
         """
         Формирует файл с готовым промптом для DeepSeek.
 
-        Если у metadata стоят флаги include_*_in_prompt — в файл
-        добавляется блок «КОНТЕКСТ ЗАПИСИ» перед шаблоном.
+        Дополнительно:
+          • summary_text          — краткое описание записи (plain, без BB);
+          • manual_protocol_text  — вручную подготовленный протокол.
         """
         log.info(
             "Сборка DeepSeek-промпта: transcript=%s, prev=%s, attach=%s, "
-            "use_scrum_template=%s, user_prompt=%d симв, glossary=%d симв",
+            "use_scrum_template=%s, user_prompt=%d симв, glossary=%d симв, "
+            "summary=%d симв, manual_protocol=%d симв",
             transcript_path, previous_protocol_path or "—",
             include_attachments, use_scrum_template, len(user_prompt or ""),
-            len(glossary_text or ""),
+            len(glossary_text or ""), len(summary_text or ""),
+            len(manual_protocol_text or ""),
         )
 
-        # Контекст записи
         ctx_header = ""
         if metadata:
             ctx_header = self._build_context_header(
@@ -549,7 +587,6 @@ class VideoProcessor(QObject):
                 log.info("В DeepSeek-промпт добавлен контекст записи "
                          "(%d символов)", len(ctx_header))
 
-        # Шаблон
         if use_scrum_template:
             scrum_cfg = self.config.get("scrum", {})
             template = scrum_cfg.get("prompt_template") or ""
@@ -592,7 +629,7 @@ class VideoProcessor(QObject):
                 log.info("В промпт DeepSeek добавлены вложения "
                          "(%d символов)", len(attachments_text))
 
-        # Собираем файл
+        # --- Сборка ---
         parts: List[str] = []
 
         if ctx_header:
@@ -601,6 +638,24 @@ class VideoProcessor(QObject):
 
         parts.append(template)
         parts.append("")
+
+        # Ручной протокол — самый приоритетный контекст
+        if manual_protocol_text:
+            parts.append("=" * 60)
+            parts.append("РУЧНОЙ ПРОТОКОЛ (загружен пользователем)")
+            parts.append("=" * 60)
+            parts.append("")
+            parts.append(manual_protocol_text)
+            parts.append("")
+
+        # Краткое описание записи
+        if summary_text:
+            parts.append("=" * 60)
+            parts.append("КРАТКОЕ ОПИСАНИЕ ЗАПИСИ (введено пользователем)")
+            parts.append("=" * 60)
+            parts.append("")
+            parts.append(summary_text)
+            parts.append("")
 
         if previous_text or use_scrum_template:
             parts.append("=" * 60)

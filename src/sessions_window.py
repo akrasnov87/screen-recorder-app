@@ -1,19 +1,30 @@
-"""Окно со списком всех записей (сессий)."""
+"""Окно со списком всех записей (сессий).
+
+Действия вынесены в верхнее меню, чтобы не переполнять панель.
+"""
 from __future__ import annotations
 
+import html
 import json
 import os
 import shutil
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QLabel, QMenu, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QInputDialog, QLabel, QMenuBar, QMessageBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from .bbcode_editor import (
+    BBCodeEditorDialog,
+    BBCodeViewerDialog,
+    bbcode_to_html,
+    bbcode_to_plain,
+)
 from .logger import get_logger
 from .task_queue import TaskQueue
 
@@ -45,6 +56,16 @@ def _read_json(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _write_json(path: str, data: Dict[str, Any]) -> bool:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as exc:
+        log.exception("Не удалось записать %s: %s", path, exc)
+        return False
+
+
 class SessionsWindow(QDialog):
     """Список всех записей в папке sessions/."""
 
@@ -62,11 +83,12 @@ class SessionsWindow(QDialog):
         self.processor = processor
         self.config_manager = config_manager
         self.setWindowTitle("Записи")
-        self.setMinimumSize(1280, 720)
+        self.setMinimumSize(1400, 780)
         self.setModal(False)
         self._rows: List[Dict[str, Any]] = []
 
         self._build_ui()
+        self._build_menu_bar()
         self.refresh()
 
     # ------------------------------------------------------------------
@@ -74,21 +96,26 @@ class SessionsWindow(QDialog):
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 4, 8, 8)
+        root.setSpacing(6)
 
+        # Заголовок: сводка и текущая выбранная запись
         header = QHBoxLayout()
         self.summary_label = QLabel("")
         header.addWidget(self.summary_label)
+        header.addSpacing(20)
+        self.selection_label = QLabel("")
+        self.selection_label.setStyleSheet("QLabel { color: #666; }")
+        header.addWidget(self.selection_label)
         header.addStretch()
-        self.refresh_btn = QPushButton("Обновить")
-        self.refresh_btn.clicked.connect(self.refresh)
-        header.addWidget(self.refresh_btn)
         root.addLayout(header)
 
-        # 9 колонок
-        self.table = QTableWidget(0, 9)
+        # Таблица
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels([
             "Дата и время", "Название", "Проект", "Статус",
-            "Источник", "Скрам", "Вложения", "Task ID", "Папка",
+            "Источник", "Скрам", "Вложения", "Summary",
+            "Task ID", "Папка",
         ])
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -107,90 +134,234 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         hv.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         hv.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
-        root.addWidget(self.table)
+        hv.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        root.addWidget(self.table, 1)
 
+        # Легенда
         root.addWidget(self._build_legend())
 
-        actions = QHBoxLayout()
+        # Нижняя строка: обновление + закрыть
+        bottom = QHBoxLayout()
+        bottom.addStretch()
 
-        self.open_folder_btn = QPushButton("Открыть папку")
-        self.open_folder_btn.clicked.connect(self._open_folder)
-        actions.addWidget(self.open_folder_btn)
+        self.refresh_btn = QPushButton("Обновить")
+        self.refresh_btn.clicked.connect(self.refresh)
+        bottom.addWidget(self.refresh_btn)
 
-        self.open_video_btn = QPushButton("Открыть видео")
-        self.open_video_btn.clicked.connect(self._open_video)
-        actions.addWidget(self.open_video_btn)
-
-        self.open_prompt_btn = QPushButton("Открыть промпт DeepSeek")
-        self.open_prompt_btn.setToolTip(
-            "Открыть сгенерированный промпт DeepSeek (только для скрам-митингов)"
-        )
-        self.open_prompt_btn.clicked.connect(self._open_deepseek_prompt)
-        actions.addWidget(self.open_prompt_btn)
-
-        self.export_prompt_btn = QPushButton("Экспорт промпта…")
-        self.export_prompt_btn.setToolTip(
-            "Сохранить промпт DeepSeek в выбранном формате (docx / md / txt)"
-        )
-        self.export_prompt_btn.clicked.connect(self._export_prompt)
-        actions.addWidget(self.export_prompt_btn)
-
-        self.open_attachments_btn = QPushButton("Открыть вложения")
-        self.open_attachments_btn.setToolTip(
-            "Открыть папку с вложениями этой записи"
-        )
-        self.open_attachments_btn.clicked.connect(self._open_attachments)
-        actions.addWidget(self.open_attachments_btn)
-
-        self.add_attachment_btn = QPushButton("Добавить вложение…")
-        self.add_attachment_btn.setToolTip(
-            "Добавить файл(ы) к существующей записи и обновить session.json"
-        )
-        self.add_attachment_btn.clicked.connect(self._add_attachment_to_session)
-        actions.addWidget(self.add_attachment_btn)
-
-        self.restart_btn = QPushButton("Перезапустить")
-        self.restart_btn.clicked.connect(self._restart_processing)
-        actions.addWidget(self.restart_btn)
-
-        self.status_btn = QPushButton("Изменить статус ▾")
-        self._build_status_menu()
-        actions.addWidget(self.status_btn)
-
-        self.delete_btn = QPushButton("Удалить")
-        self.delete_btn.clicked.connect(self._delete_session)
-        actions.addWidget(self.delete_btn)
-
-        actions.addStretch()
         self.close_btn = QPushButton("Закрыть")
         self.close_btn.clicked.connect(self.close)
-        actions.addWidget(self.close_btn)
+        bottom.addWidget(self.close_btn)
 
-        root.addLayout(actions)
+        root.addLayout(bottom)
 
-    def _build_status_menu(self) -> None:
-        menu = QMenu(self)
+    def _build_menu_bar(self) -> None:
+        """
+        Верхнее меню со всеми действиями.
 
-        act_uploaded = menu.addAction("Сбросить в «Сохранено»")
-        act_uploaded.triggered.connect(lambda: self._change_status(STATUS_UPLOADED))
+        Установка локального стиля для QMenuBar/QMenu перекрывает
+        глобальные правила styles.qss, из-за которых выделённый пункт
+        меню становился белым на белом.
+        """
+        bar = QMenuBar(self)
+        bar.setStyleSheet(
+            "QMenuBar {"
+            "  background-color: palette(window);"
+            "  color: palette(window-text);"
+            "}"
+            "QMenuBar::item {"
+            "  background: transparent;"
+            "  color: palette(window-text);"
+            "  padding: 4px 10px;"
+            "}"
+            "QMenuBar::item:selected {"
+            "  background-color: palette(highlight);"
+            "  color: palette(highlighted-text);"
+            "}"
+            "QMenuBar::item:pressed {"
+            "  background-color: palette(highlight);"
+            "  color: palette(highlighted-text);"
+            "}"
+            "QMenu {"
+            "  background-color: palette(window);"
+            "  color: palette(window-text);"
+            "  border: 1px solid palette(mid);"
+            "}"
+            "QMenu::item {"
+            "  background: transparent;"
+            "  color: palette(window-text);"
+            "  padding: 5px 24px 5px 24px;"
+            "}"
+            "QMenu::item:selected {"
+            "  background-color: palette(highlight);"
+            "  color: palette(highlighted-text);"
+            "}"
+            "QMenu::item:disabled {"
+            "  color: palette(mid);"
+            "}"
+            "QMenu::separator {"
+            "  height: 1px;"
+            "  background-color: palette(mid);"
+            "  margin: 4px 8px;"
+            "}"
+        )
 
-        act_processed = menu.addAction("Пометить как «Обработан»")
-        act_processed.triggered.connect(lambda: self._change_status(STATUS_PROCESSED))
+        layout: QVBoxLayout = self.layout()
+        layout.insertWidget(0, bar)
 
-        act_error = menu.addAction("Пометить как «Ошибка»")
-        act_error.triggered.connect(lambda: self._change_status(STATUS_ERROR))
+        # ---------------- Файл ----------------
+        m_file = bar.addMenu("Файл")
 
-        act_transcribing = menu.addAction("Поставить в очередь")
-        act_transcribing.triggered.connect(self._enqueue_current)
+        act_open_folder = QAction("Открыть папку записи", self)
+        act_open_folder.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        act_open_folder.triggered.connect(self._open_folder)
+        m_file.addAction(act_open_folder)
 
-        menu.addSeparator()
-        act_refresh = menu.addAction("Обновить список")
+        act_open_video = QAction("Открыть видео", self)
+        act_open_video.setShortcut(QKeySequence("Ctrl+Shift+V"))
+        act_open_video.triggered.connect(self._open_video)
+        m_file.addAction(act_open_video)
+
+        m_file.addSeparator()
+
+        act_delete = QAction("Удалить запись…", self)
+        act_delete.setShortcut(QKeySequence("Ctrl+Delete"))
+        act_delete.triggered.connect(self._delete_session)
+        m_file.addAction(act_delete)
+
+        m_file.addSeparator()
+
+        act_refresh = QAction("Обновить список", self)
+        act_refresh.setShortcut(QKeySequence("F5"))
         act_refresh.triggered.connect(self.refresh)
+        m_file.addAction(act_refresh)
 
-        self.status_btn.setMenu(menu)
+        act_close = QAction("Закрыть окно", self)
+        act_close.setShortcut(QKeySequence("Ctrl+W"))
+        act_close.triggered.connect(self.close)
+        m_file.addAction(act_close)
 
+        # ---------------- Протокол ----------------
+        m_protocol = bar.addMenu("Протокол")
+
+        act_attach_protocol = QAction("Прикрепить протокол…", self)
+        act_attach_protocol.setToolTip(
+            "Загрузить вручную подготовленный протокол (.docx/.txt/.md/.pdf) "
+            "и прикрепить его к записи"
+        )
+        act_attach_protocol.triggered.connect(self._attach_manual_protocol)
+        m_protocol.addAction(act_attach_protocol)
+
+        act_open_protocol = QAction("Открыть прикреплённый протокол", self)
+        act_open_protocol.triggered.connect(self._open_manual_protocol)
+        m_protocol.addAction(act_open_protocol)
+
+        # ---------------- Summary ----------------
+        m_summary = bar.addMenu("Summary")
+
+        act_edit_summary = QAction("Изменить summary…", self)
+        act_edit_summary.setShortcut(QKeySequence("Ctrl+P"))
+        act_edit_summary.setToolTip(
+            "Открыть редактор BB-кода для краткого описания записи"
+        )
+        act_edit_summary.triggered.connect(self._edit_summary_bb)
+        m_summary.addAction(act_edit_summary)
+
+        act_view_summary = QAction("Просмотр summary", self)
+        act_view_summary.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        act_view_summary.setToolTip(
+            "Открыть краткое описание в режиме только для чтения "
+            "(с отрендеренным BB-кодом)"
+        )
+        act_view_summary.triggered.connect(self._view_summary)
+        m_summary.addAction(act_view_summary)
+
+        act_export_summary = QAction("Экспорт summary…", self)
+        act_export_summary.setToolTip(
+            "Сохранить краткое описание в .docx / .html / .md / .txt"
+        )
+        act_export_summary.triggered.connect(self._export_summary)
+        m_summary.addAction(act_export_summary)
+
+        # ---------------- DeepSeek ----------------
+        m_deepseek = bar.addMenu("DeepSeek")
+
+        act_open_prompt = QAction("Открыть промпт DeepSeek", self)
+        act_open_prompt.setShortcut(QKeySequence("Ctrl+D"))
+        act_open_prompt.triggered.connect(self._open_deepseek_prompt)
+        m_deepseek.addAction(act_open_prompt)
+
+        act_export_prompt = QAction("Экспорт промпта…", self)
+        act_export_prompt.setShortcut(QKeySequence("Ctrl+Shift+D"))
+        act_export_prompt.triggered.connect(self._export_prompt)
+        m_deepseek.addAction(act_export_prompt)
+
+        m_deepseek.addSeparator()
+
+        act_save_downloads = QAction("Сохранить промпт в Загрузки", self)
+        act_save_downloads.setShortcut(QKeySequence("Ctrl+Alt+D"))
+        act_save_downloads.setToolTip(
+            "Скопировать файлы промпта (deepseek_prompt.*) в папку "
+            "«Загрузки» без запроса пути"
+        )
+        act_save_downloads.triggered.connect(self._save_prompt_to_downloads)
+        m_deepseek.addAction(act_save_downloads)
+
+        # ---------------- Вложения ----------------
+        m_attach = bar.addMenu("Вложения")
+
+        act_open_attachments = QAction("Открыть папку вложений", self)
+        act_open_attachments.triggered.connect(self._open_attachments)
+        m_attach.addAction(act_open_attachments)
+
+        act_add_attachment = QAction("Добавить вложение…", self)
+        act_add_attachment.triggered.connect(self._add_attachment_to_session)
+        m_attach.addAction(act_add_attachment)
+
+        # ---------------- Очередь и статус ----------------
+        m_queue = bar.addMenu("Очередь")
+
+        act_restart = QAction("Перезапустить обработку", self)
+        act_restart.setShortcut(QKeySequence("Ctrl+R"))
+        act_restart.triggered.connect(self._restart_processing)
+        m_queue.addAction(act_restart)
+
+        act_enqueue = QAction("Поставить в очередь", self)
+        act_enqueue.triggered.connect(self._enqueue_current)
+        m_queue.addAction(act_enqueue)
+
+        m_queue.addSeparator()
+
+        act_status_uploaded = QAction("Пометить: «Сохранено»", self)
+        act_status_uploaded.triggered.connect(
+            lambda: self._change_status(STATUS_UPLOADED)
+        )
+        m_queue.addAction(act_status_uploaded)
+
+        act_status_processed = QAction("Пометить: «Обработан»", self)
+        act_status_processed.triggered.connect(
+            lambda: self._change_status(STATUS_PROCESSED)
+        )
+        m_queue.addAction(act_status_processed)
+
+        act_status_error = QAction("Пометить: «Ошибка»", self)
+        act_status_error.triggered.connect(
+            lambda: self._change_status(STATUS_ERROR)
+        )
+        m_queue.addAction(act_status_error)
+
+        # ---------------- Справка ----------------
+        m_help = bar.addMenu("Справка")
+
+        act_shortcuts = QAction("Горячие клавиши…", self)
+        act_shortcuts.triggered.connect(self._show_shortcuts)
+        m_help.addAction(act_shortcuts)
+
+    # ------------------------------------------------------------------
+    # Легенда
+    # ------------------------------------------------------------------
     def _build_legend(self) -> QWidget:
         box = QFrame()
         box.setFrameShape(QFrame.Shape.StyledPanel)
@@ -199,8 +370,8 @@ class SessionsWindow(QDialog):
             "border: 1px solid palette(mid); border-radius: 6px; }"
         )
         layout = QHBoxLayout(box)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(18)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(14)
 
         layout.addWidget(QLabel("<b>Статусы:</b>"))
         items = [
@@ -236,6 +407,24 @@ class SessionsWindow(QDialog):
         hint_lbl.setStyleSheet("color: gray; font-weight: bold; padding-left: 2px;")
         row.addWidget(hint_lbl)
         return w
+
+    # ------------------------------------------------------------------
+    # Выбор строки
+    # ------------------------------------------------------------------
+    def _on_selection_changed(self) -> None:
+        r = self._selected_row()
+        if not r:
+            self.selection_label.setText("")
+            return
+        parts = [f"<b>{r['name']}</b>"]
+        if r.get("project"):
+            parts.append(f"проект: {r['project']}")
+        parts.append(f"статус: {r['status']}")
+        if r.get("manual_protocol_path"):
+            parts.append("протокол: прикреплён")
+        if (r.get("summary_bb") or "").strip():
+            parts.append("summary: есть")
+        self.selection_label.setText(" | ".join(parts))
 
     # ------------------------------------------------------------------
     # Сбор данных
@@ -283,7 +472,7 @@ class SessionsWindow(QDialog):
                     status = STATUS_PROCESSED
                 elif st == "error":
                     status = STATUS_ERROR
-                elif st in ("pending", "converting", "transcribing"):
+                elif st in ("pending", "converting", "transcribing", "summarizing"):
                     status = STATUS_TRANSCRIBING
                 else:
                     status = STATUS_UNKNOWN
@@ -313,7 +502,6 @@ class SessionsWindow(QDialog):
                 except Exception:
                     pass
 
-            # DeepSeek-промпт
             prompt_path = ""
             for fname in (
                 "deepseek_prompt.docx", "deepseek_prompt.md",
@@ -324,7 +512,6 @@ class SessionsWindow(QDialog):
                     prompt_path = p
                     break
 
-            # Вложения
             attachments = list(meta.get("attachments", []) or [])
             attachments_dir = os.path.join(session_dir, "attachments")
             if not attachments and os.path.isdir(attachments_dir):
@@ -333,6 +520,12 @@ class SessionsWindow(QDialog):
                     for f in sorted(os.listdir(attachments_dir))
                     if os.path.isfile(os.path.join(attachments_dir, f))
                 ]
+
+            manual_protocol_path = meta.get("manual_protocol_path") or ""
+            if manual_protocol_path and not os.path.exists(manual_protocol_path):
+                manual_protocol_path = ""
+
+            summary_bb = str(meta.get("summary_bb") or "")
 
             rows.append({
                 "dir": session_dir,
@@ -347,6 +540,8 @@ class SessionsWindow(QDialog):
                 "task_id": task_id,
                 "prompt_path": prompt_path,
                 "attachments": attachments,
+                "manual_protocol_path": manual_protocol_path,
+                "summary_bb": summary_bb,
             })
 
         rows.sort(key=lambda r: r["datetime"], reverse=True)
@@ -398,10 +593,401 @@ class SessionsWindow(QDialog):
                 row, 6, QTableWidgetItem(str(att_count) if att_count else "—")
             )
 
-            self.table.setItem(row, 7, QTableWidgetItem(r["task_id"] or "—"))
-            self.table.setItem(row, 8, QTableWidgetItem(r["dir"]))
+            summary_bb = (r.get("summary_bb") or "").strip()
+            if summary_bb:
+                short = summary_bb.replace("\n", " ")
+                if len(short) > 60:
+                    short = short[:57] + "…"
+                summary_item = QTableWidgetItem(short)
+                summary_item.setToolTip(summary_bb[:1000])
+            else:
+                summary_item = QTableWidgetItem("—")
+            self.table.setItem(row, 7, summary_item)
+
+            self.table.setItem(row, 8, QTableWidgetItem(r["task_id"] or "—"))
+            self.table.setItem(row, 9, QTableWidgetItem(r["dir"]))
 
         log.debug("Список записей обновлён: %d сессий", total)
+        self._on_selection_changed()
+
+    # ------------------------------------------------------------------
+    # Ручной протокол
+    # ------------------------------------------------------------------
+    def _attach_manual_protocol(self) -> None:
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите файл протокола",
+            os.path.expanduser("~"),
+            "Документы (*.docx *.txt *.md *.pdf);;Все файлы (*)",
+        )
+        if not file_path:
+            return
+
+        if not os.path.isfile(file_path):
+            QMessageBox.warning(self, "Протокол",
+                                f"Файл не найден:\n{file_path}")
+            return
+
+        ext = os.path.splitext(file_path)[1].lower() or ".bin"
+        target = os.path.join(r["dir"], f"manual_protocol{ext}")
+
+        try:
+            shutil.copy2(file_path, target)
+            log.info("Ручной протокол скопирован: %s → %s",
+                     file_path, target)
+        except Exception as exc:
+            log.exception("Ошибка копирования протокола: %s", exc)
+            QMessageBox.critical(self, "Протокол",
+                                 f"Не удалось скопировать файл:\n{exc}")
+            return
+
+        session_json = os.path.join(r["dir"], "session.json")
+        meta = _read_json(session_json) or {}
+        meta["manual_protocol_path"] = target
+        if not _write_json(session_json, meta):
+            QMessageBox.critical(self, "Протокол",
+                                 "Не удалось обновить session.json")
+            return
+
+        QMessageBox.information(
+            self, "Протокол",
+            f"Протокол прикреплён к записи:\n{target}",
+        )
+        self.refresh()
+
+    def _open_manual_protocol(self) -> None:
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+        path = r.get("manual_protocol_path") or ""
+        if not path or not os.path.exists(path):
+            QMessageBox.information(
+                self, "Протокол",
+                "К этой записи не прикреплён ручной протокол.\n\n"
+                "Меню «Протокол» → «Прикрепить протокол…»",
+            )
+            return
+        log.info("Открытие ручного протокола: %s", path)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    # ------------------------------------------------------------------
+    # Summary (BB-код)
+    # ------------------------------------------------------------------
+    def _edit_summary_bb(self) -> None:
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        dlg = BBCodeEditorDialog(
+            text=r.get("summary_bb") or "",
+            title=f"Краткое описание — {r['name']}",
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            log.debug("Редактор summary закрыт без сохранения")
+            return
+
+        new_text = dlg.result_text()
+        session_json = os.path.join(r["dir"], "session.json")
+        meta = _read_json(session_json) or {}
+        meta["summary_bb"] = new_text
+        if not _write_json(session_json, meta):
+            QMessageBox.critical(self, "Summary",
+                                 "Не удалось сохранить summary в session.json")
+            return
+
+        log.info("Summary обновлён для %s (%d символов)",
+                 r["dir"], len(new_text))
+        self.refresh()
+
+    def _view_summary(self) -> None:
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+        text = r.get("summary_bb") or ""
+        if not text.strip():
+            QMessageBox.information(
+                self, "Summary",
+                "У этой записи ещё нет краткого описания.\n\n"
+                "Меню «Summary» → «Изменить summary…»",
+            )
+            return
+        dlg = BBCodeViewerDialog(
+            text=text,
+            title=f"Просмотр summary — {r['name']}",
+            parent=self,
+        )
+        dlg.exec()
+
+    def _export_summary(self) -> None:
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        text_bb = r.get("summary_bb") or ""
+        if not text_bb.strip():
+            QMessageBox.information(
+                self, "Экспорт summary",
+                "У этой записи нет краткого описания.",
+            )
+            return
+
+        formats = ["docx", "html", "md", "txt"]
+        fmt, ok = QInputDialog.getItem(
+            self,
+            "Экспорт summary",
+            "Формат файла:",
+            formats,
+            0,
+            False,
+        )
+        if not ok or not fmt:
+            return
+
+        default_path = os.path.join(
+            r["dir"], f"summary_{self._safe_name(r['name'])}.{fmt}"
+        )
+        target_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить summary как",
+            default_path,
+            "Word (*.docx);;HTML (*.html);;Markdown (*.md);;Text (*.txt);;All files (*)",
+        )
+        if not target_path:
+            return
+
+        try:
+            if fmt == "docx":
+                self._export_summary_docx(text_bb, target_path)
+            elif fmt == "html":
+                self._export_summary_html(text_bb, target_path)
+            elif fmt == "md":
+                self._export_summary_text(text_bb, target_path)
+            else:
+                with open(target_path, "w", encoding="utf-8") as f:
+                    f.write(bbcode_to_plain(text_bb))
+            log.info("Summary экспортирован (%s): %s", fmt, target_path)
+            QMessageBox.information(
+                self, "Экспорт summary",
+                f"Файл сохранён:\n{target_path}",
+            )
+        except Exception as exc:
+            log.exception("Ошибка экспорта summary: %s", exc)
+            QMessageBox.critical(
+                self, "Экспорт summary",
+                f"Не удалось сохранить: {exc}",
+            )
+
+    @staticmethod
+    def _safe_name(name: str) -> str:
+        bad = '<>:"/\\|?*\n\r\t'
+        cleaned = "".join(("_" if c in bad else c) for c in (name or "summary"))
+        cleaned = cleaned.strip() or "summary"
+        return cleaned[:60]
+
+    @staticmethod
+    def _export_summary_docx(text_bb: str, path: str) -> None:
+        from docx import Document
+        import re as _re
+
+        doc = Document()
+        doc.add_heading("Краткое описание записи", level=1)
+
+        for raw_line in text_bb.splitlines():
+            paragraph = doc.add_paragraph()
+            tokens = _re.split(
+                r"(\[/?(?:b|i|u|s)\])",
+                raw_line,
+                flags=_re.IGNORECASE,
+            )
+            bold = italic = underline = False
+            for tok in tokens:
+                if not tok:
+                    continue
+                low = tok.lower()
+                if low == "[b]":
+                    bold = True
+                elif low == "[/b]":
+                    bold = False
+                elif low == "[i]":
+                    italic = True
+                elif low == "[/i]":
+                    italic = False
+                elif low == "[u]":
+                    underline = True
+                elif low == "[/u]":
+                    underline = False
+                elif low in ("[s]", "[/s]"):
+                    pass
+                else:
+                    run = paragraph.add_run(tok)
+                    run.bold = bold
+                    run.italic = italic
+                    run.underline = underline
+
+            if not tokens:
+                doc.add_paragraph()
+
+        doc.save(path)
+
+    @staticmethod
+    def _export_summary_html(text_bb: str, path: str) -> None:
+        body = bbcode_to_html(text_bb)
+        html_doc = (
+            "<!DOCTYPE html>\n"
+            "<html lang='ru'><head><meta charset='utf-8'>\n"
+            "<title>Краткое описание</title>\n"
+            "<style>"
+            "body { font-family: sans-serif; max-width: 800px; margin: 2em auto; "
+            "padding: 0 1em; color: #222; }"
+            "blockquote { border-left: 3px solid #888; margin: 6px 0; "
+            "padding: 4px 10px; color: #555; }"
+            "pre { background: #f4f4f4; padding: 6px; border-radius: 4px; "
+            "font-family: monospace; }"
+            "details { margin: 6px 0; }"
+            "</style></head><body>\n"
+            f"{body}\n"
+            "</body></html>"
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+
+    @staticmethod
+    def _export_summary_text(text_bb: str, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text_bb)
+
+    # ------------------------------------------------------------------
+    # Быстрое сохранение промпта в «Загрузки»
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _downloads_dir() -> str:
+        """
+        Возвращает путь к папке «Загрузки».
+
+        Порядок проверки:
+          1. XDG-папка Загрузки (через xdg-user-dir, если доступна);
+          2. ~/Загрузки  — русская локализация;
+          3. ~/Downloads — английская локализация;
+          4. ~            — как последний резерв.
+        """
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["xdg-user-dir", "DOWNLOAD"],
+                text=True, timeout=2,
+            ).strip()
+            if out and os.path.isdir(out):
+                return out
+        except Exception:
+            pass
+
+        home = os.path.expanduser("~")
+        for candidate in ("Загрузки", "Downloads"):
+            path = os.path.join(home, candidate)
+            if os.path.isdir(path):
+                return path
+        return home
+
+    def _save_prompt_to_downloads(self) -> None:
+        """
+        Копирует все существующие файлы deepseek_prompt.* из папки сессии
+        в папку «Загрузки». Имя целевого файла получает префикс
+        с именем записи и меткой времени, чтобы ничего не перезатиралось.
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        # Собираем все существующие файлы промпта
+        candidates = []
+        for fname in (
+            "deepseek_prompt.docx",
+            "deepseek_prompt.md",
+            "deepseek_prompt.txt",
+        ):
+            p = os.path.join(r["dir"], fname)
+            if os.path.exists(p):
+                candidates.append(p)
+
+        if not candidates:
+            QMessageBox.information(
+                self, "DeepSeek",
+                "Для этой записи промпт не сформирован.\n\n"
+                "Промпт создаётся при обработке, если в метаданных записи "
+                "включён флаг «Сформировать файл промпта для DeepSeek».",
+            )
+            return
+
+        downloads = self._downloads_dir()
+        if not os.path.isdir(downloads):
+            QMessageBox.warning(
+                self, "DeepSeek",
+                f"Папка «Загрузки» не найдена:\n{downloads}",
+            )
+            return
+
+        safe_name = self._safe_name(r["name"]) or "record"
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        saved: List[str] = []
+        errors: List[str] = []
+
+        for src in candidates:
+            ext = os.path.splitext(src)[1]
+            base = os.path.basename(src)
+            stem = os.path.splitext(base)[0]
+            dst_name = f"{stem}_{safe_name}_{stamp}{ext}"
+            dst = os.path.join(downloads, dst_name)
+
+            if os.path.exists(dst):
+                i = 1
+                while os.path.exists(dst):
+                    dst = os.path.join(
+                        downloads,
+                        f"{stem}_{safe_name}_{stamp}_{i}{ext}",
+                    )
+                    i += 1
+
+            try:
+                shutil.copy2(src, dst)
+                saved.append(dst)
+                log.info("Промпт сохранён в Загрузки: %s → %s", src, dst)
+            except Exception as exc:
+                log.exception("Ошибка сохранения промпта %s: %s", src, exc)
+                errors.append(f"{base}: {exc}")
+
+        if saved and not errors:
+            lines = "\n".join(saved)
+            QMessageBox.information(
+                self, "DeepSeek",
+                f"Файлы промпта сохранены в «Загрузки»:\n\n{lines}",
+            )
+        elif saved and errors:
+            QMessageBox.warning(
+                self, "DeepSeek",
+                "Часть файлов сохранена, часть — с ошибкой:\n\n"
+                + "Сохранено:\n"
+                + "\n".join(saved)
+                + "\n\nОшибки:\n"
+                + "\n".join(errors),
+            )
+        else:
+            QMessageBox.critical(
+                self, "DeepSeek",
+                "Не удалось сохранить ни одного файла:\n\n"
+                + "\n".join(errors),
+            )
 
     # ------------------------------------------------------------------
     # Внутренние операции
@@ -556,8 +1142,8 @@ class SessionsWindow(QDialog):
             QMessageBox.information(
                 self, "DeepSeek",
                 "Для этой записи промпт не сформирован.\n\n"
-                "Промпт создаётся автоматически, только если запись помечена "
-                "как «Скрам-митинг».",
+                "Промпт создаётся при обработке, если в метаданных записи "
+                "включён флаг «Сформировать файл промпта для DeepSeek».",
             )
             return
         log.info("Открытие DeepSeek-промпта: %s", path)
@@ -585,7 +1171,6 @@ class SessionsWindow(QDialog):
             except Exception:
                 pass
 
-        from PySide6.QtWidgets import QInputDialog
         formats = ["docx", "md", "txt"]
         try:
             pref_idx = formats.index(preferred)
@@ -671,7 +1256,6 @@ class SessionsWindow(QDialog):
         QDesktopServices.openUrl(QUrl.fromLocalFile(att_dir))
 
     def _add_attachment_to_session(self) -> None:
-        """Добавляет файл(ы) в <session_dir>/attachments/ и обновляет session.json."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -715,13 +1299,9 @@ class SessionsWindow(QDialog):
 
         if added:
             meta["attachments"] = current
-            try:
-                with open(session_json, "w", encoding="utf-8") as f:
-                    json.dump(meta, f, indent=2, ensure_ascii=False)
-            except Exception as exc:
-                log.exception("Не удалось обновить session.json: %s", exc)
+            if not _write_json(session_json, meta):
                 QMessageBox.critical(self, "Ошибка",
-                                     f"Не удалось обновить session.json:\n{exc}")
+                                     "Не удалось обновить session.json")
                 return
             QMessageBox.information(
                 self, "Вложения",
@@ -785,3 +1365,23 @@ class SessionsWindow(QDialog):
         except Exception as exc:
             log.exception("Не удалось удалить %s: %s", r["dir"], exc)
             QMessageBox.critical(self, "Ошибка", f"Не удалось удалить: {exc}")
+
+    # ------------------------------------------------------------------
+    # Справка
+    # ------------------------------------------------------------------
+    def _show_shortcuts(self) -> None:
+        QMessageBox.information(
+            self,
+            "Горячие клавиши",
+            "Ctrl+Shift+E  — открыть папку записи\n"
+            "Ctrl+Shift+V  — открыть видео\n"
+            "Ctrl+P        — изменить summary\n"
+            "Ctrl+Shift+P  — просмотр summary\n"
+            "Ctrl+D        — открыть промпт DeepSeek\n"
+            "Ctrl+Shift+D  — экспорт промпта\n"
+            "Ctrl+Alt+D    — сохранить промпт в «Загрузки»\n"
+            "Ctrl+R        — перезапустить обработку\n"
+            "F5            — обновить список\n"
+            "Ctrl+Delete   — удалить запись\n"
+            "Ctrl+W        — закрыть окно\n",
+        )
