@@ -1,0 +1,11 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    remove|purge)
+        # Останавливаем запущенные экземпляры
+        pkill -f "screen-recorder" 2>/dev/null || true
+        ;;
+esac
+
+exit 0

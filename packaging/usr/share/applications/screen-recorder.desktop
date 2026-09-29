@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Screen Recorder
+Name[ru]=Запись экрана
+Comment=Screen recorder with transcription and summarization
+Comment[ru]=Запись экрана с транскрибацией и суммаризацией
+Exec=/usr/bin/screen-recorder
+Icon=screen-recorder
+Terminal=false
+Categories=AudioVideo;Recorder;
+StartupNotify=true
+StartupWMClass=screen-recorder

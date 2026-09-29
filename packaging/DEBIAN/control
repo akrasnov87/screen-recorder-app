@@ -1,0 +1,12 @@
+Package: screen-recorder
+Version: 1.1.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.11), python3-pip, python3-venv, ffmpeg, x11-utils, libxcb-xinerama0, libxcb-cursor0, libxkbcommon-x11-0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libgl1, libegl1, libpulse0, fonts-dejavu
+Maintainer: Your Name <you@example.com>
+Description: Screen Recorder & Transcriber
+ Приложение для записи экрана с транскрибацией,
+ суммаризацией через LiteLLM и отправкой результатов
+ в Bitrix24.
+ 

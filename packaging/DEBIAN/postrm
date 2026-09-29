@@ -1,0 +1,14 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    purge)
+        rm -rf /opt/screen-recorder
+        # Не трогаем ~/.config/screen-recorder — это пользовательские данные
+        ;;
+    remove)
+        rm -rf /opt/screen-recorder
+        ;;
+esac
+
+exit 0

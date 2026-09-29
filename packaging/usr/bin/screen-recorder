@@ -1,0 +1,12 @@
+#!/bin/bash
+# Обёртка для запуска Screen Recorder из venv
+VENV_PYTHON="/opt/screen-recorder/venv/bin/python3"
+APP_MAIN="/usr/share/screen-recorder/run.py"
+
+if [ ! -x "$VENV_PYTHON" ]; then
+    echo "Ошибка: виртуальное окружение не найдено ($VENV_PYTHON)"
+    echo "Попробуйте переустановить пакет: sudo apt install --reinstall screen-recorder"
+    exit 1
+fi
+
+exec "$VENV_PYTHON" "$APP_MAIN" "$@"
