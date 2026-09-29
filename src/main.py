@@ -44,6 +44,7 @@ if __package__ in (None, ""):
     from src.task_queue import TaskQueue
     from src.tray_manager import TrayManager
     from src.utils import check_ffmpeg_installed, get_system_monitors
+    from src.yandex_vm_window import YandexVMDialog
 else:
     from .config_manager import ConfigManager
     from .hotkeys import GlobalHotkeyManager
@@ -65,6 +66,7 @@ else:
     from .task_queue import TaskQueue
     from .tray_manager import TrayManager
     from .utils import check_ffmpeg_installed, get_system_monitors
+    from .yandex_vm_window import YandexVMDialog
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Slot
 from PySide6.QtGui import QDesktopServices
@@ -171,6 +173,11 @@ class ScreenRecorderApp(QObject):
         self.tray_manager.toggle_recording_requested.connect(
             self._toggle_recording
         )
+
+        self.tray_manager.open_yandex_vm_requested.connect(
+            self._open_yandex_vm
+        )
+
         self.tray_manager.open_settings_requested.connect(
             self._open_settings
         )
@@ -1080,6 +1087,18 @@ class ScreenRecorderApp(QObject):
                 None, "Библиотека",
                 f"Не удалось открыть окно поиска:\n{exc}",
             )
+
+    def _open_yandex_vm(self) -> None:
+        """Открывает окно «ВМ Yandex»."""
+        yandex_cfg = self.config_manager.get_yandex_vm_settings()
+        root_path = yandex_cfg.get("root_path", "")
+
+        dlg = YandexVMDialog(
+            root_path=root_path,
+            config_manager=self.config_manager,
+            parent=None,
+        )
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # Логи / уведомления

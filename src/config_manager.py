@@ -61,6 +61,14 @@ DEFAULT_NAME_TEMPLATES: List[Dict[str, str]] = [
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    "yandex_vm": {
+        # Корневая папка, в подпапках которой лежат конфиги ВМ.
+        # Каждая подпапка = одна ВМ.
+        # Внутри ожидаются:
+        #   schedule.cron  — расписание работы ВМ;
+        #   exceptions.txt — исключения (переопределения).
+        "root_path": "",
+    },
     # --- Проекты (новый формат: name + chat_id) ---
     "projects": [
         {"name": "Россети",     "chat_id": ""},
@@ -372,6 +380,12 @@ class ConfigManager:
         except Exception as exc:
             log.error("decrypt: ошибка: %s", exc)
             return ""
+
+    def get_yandex_vm_settings(self) -> Dict[str, Any]:
+        cfg = self.config.get("yandex_vm", {}) or {}
+        return {
+            "root_path": str(cfg.get("root_path", "")).strip(),
+        }
 
     # ------------------------------------------------------------------
     # Загрузка / сохранение

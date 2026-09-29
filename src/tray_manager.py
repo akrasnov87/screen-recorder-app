@@ -34,6 +34,7 @@ def _icon_path(name: str) -> str:
 class TrayManager(QObject):
     """Менеджер системного трея."""
 
+    open_yandex_vm_requested = Signal()
     toggle_recording_requested = Signal()
     open_settings_requested = Signal()
     open_queue_requested = Signal()
@@ -117,6 +118,14 @@ class TrayManager(QObject):
         library_action.triggered.connect(self.open_library)
         menu.addAction(library_action)
 
+        yandex_vm_action = QAction("ВМ Yandex", menu)
+        yandex_vm_action.setToolTip(
+            "Просмотр и редактирование конфигураций виртуальных "
+            "машин Yandex Cloud (расписание и исключения)"
+        )
+        yandex_vm_action.triggered.connect(self.open_yandex_vm)
+        menu.addAction(yandex_vm_action)
+
         queue_action = QAction("Очередь задач", menu)
         queue_action.triggered.connect(self.open_queue)
         menu.addAction(queue_action)
@@ -156,6 +165,10 @@ class TrayManager(QObject):
                 self._record_action.setText("Остановить запись")
             else:
                 self._record_action.setText("Начать запись")
+
+    def open_yandex_vm(self) -> None:
+        log.debug("Клик: открыть окно «ВМ Yandex»")
+        self.open_yandex_vm_requested.emit()
 
     def show_notification(
         self,

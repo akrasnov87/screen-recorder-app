@@ -70,6 +70,9 @@ class SettingsWindow(QDialog):
         self.tabs.addTab(self._build_queue_tab(), "Очередь")
         self.tabs.addTab(self._build_scrum_tab(), "Скрам")
         self.tabs.addTab(
+            self._build_yandex_vm_tab(), "ВМ Yandex"
+        )
+        self.tabs.addTab(
             self._build_compression_tab(), "Форматы и сжатие"
         )
         self.tabs.addTab(self._build_storage_tab(), "Хранилище")
@@ -104,6 +107,88 @@ class SettingsWindow(QDialog):
         buttons.addWidget(self.save_btn)
         buttons.addWidget(self.close_btn)
         root.addLayout(buttons)
+
+    def _build_yandex_vm_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "Корневая папка, внутри которой лежат подпапки с "
+            "конфигурациями виртуальных машин Yandex Cloud.\n\n"
+            "Каждая подпапка — одна ВМ. Внутри каждой папки "
+            "ожидаются файлы:\n"
+            "  • <code>schedule.cron</code> — расписание "
+            "работы ВМ;\n"
+            "  • <code>exceptions.txt</code> — исключения "
+            "(переопределения).\n\n"
+            "Через окно «ВМ Yandex» (в трее) эти файлы можно "
+            "редактировать и сохранять прямо из приложения."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.yandex_vm_root_input = QLineEdit()
+        self.yandex_vm_root_input.setPlaceholderText(
+            "Например: /home/user/vm_manager/schedules"
+        )
+
+        browse_btn = QPushButton("Обзор…")
+        browse_btn.clicked.connect(
+            self._browse_yandex_vm_root
+        )
+
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(self.yandex_vm_root_input, 1)
+        row.addWidget(browse_btn, 0)
+        icon = make_info_icon("yandex_vm_root")
+        if icon is not None:
+            row.addWidget(icon, 0)
+
+        form.addRow("Корневая папка ВМ:", container)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "<span style='color:#666'>Пример структуры:</span>\n"
+            "<pre style='font-family:monospace; color:#444'>"
+            "vm_manager/\n"
+            "├── vm-prod-01/\n"
+            "│   ├── schedule.cron\n"
+            "│   └── exceptions.txt\n"
+            "├── vm-test-02/\n"
+            "│   ├── schedule.cron\n"
+            "│   └── exceptions.txt\n"
+            "└── vm-dev-03/\n"
+            "    ├── schedule.cron\n"
+            "    └── exceptions.txt"
+            "</pre>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        layout.addStretch()
+        return w
+
+    def _browse_yandex_vm_root(self) -> None:
+        start = (
+            self.yandex_vm_root_input.text().strip()
+            or os.path.expanduser("~")
+        )
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите корневую папку с конфигурациями ВМ",
+            start,
+        )
+        if folder:
+            self.yandex_vm_root_input.setText(folder)
 
     # ------------------------------------------------------------------
     # Проекты и чаты Bitrix24
@@ -2040,6 +2125,12 @@ class SettingsWindow(QDialog):
         if i >= 0:
             self.scrum_format_combo.setCurrentIndex(i)
 
+        # --- ВМ Yandex ---
+        ycfg = cfg.get("yandex_vm", {}) or {}
+        self.yandex_vm_root_input.setText(
+            str(ycfg.get("root_path", "") or "")
+        )
+
         # --- Сжатие ---
         comp = cfg.get("compression", {})
         self.audio_fmt_combo.setCurrentText(
@@ -2106,6 +2197,10 @@ class SettingsWindow(QDialog):
                 continue
             projects.append({"name": name, "chat_id": chat_id})
         cfg["projects"] = projects
+
+        cfg["yandex_vm"] = {
+            "root_path": self.yandex_vm_root_input.text().strip(),
+        }
 
         # --- Проект и чат по умолчанию ---
         default_project = (
@@ -2730,6 +2825,17 @@ class SettingsWindow(QDialog):
     # Справка
     # ------------------------------------------------------------------
     _HELP_TEXTS: Dict[str, str] = {
+        "ВМ Yandex": (
+            "<b>ВМ Yandex</b><br><br>"
+            "Корневая папка с подпапками виртуальных машин "
+            "Yandex Cloud. Каждая подпапка — одна ВМ.<br><br>"
+            "Внутри каждой подпапки ожидаются файлы "
+            "<code>schedule.cron</code> (расписание) и "
+            "<code>exceptions.txt</code> (исключения).<br><br>"
+            "Открыть окно управления: <b>трей → ВМ Yandex</b>. "
+            "Там можно редактировать оба файла и сразу сохранять "
+            "их на диск."
+        ),
         "Проекты и чаты Bitrix24": (
             "<b>Проекты и чаты Bitrix24</b><br><br>"
             "Таблица «Проект | Чат Bitrix24» — это реестр "
