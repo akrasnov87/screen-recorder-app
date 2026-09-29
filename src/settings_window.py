@@ -4,6 +4,8 @@
   • На вкладке «Проекты и чаты Bitrix24» добавлен блок
     «Проект и чат по умолчанию».
   • Добавлена вкладка «Теги» — справочник меток для записей.
+  • В правом нижнем углу окна выводится версия приложения
+    (клик — копирование в буфер обмена).
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ from .logger import get_current_log_path, get_logger
 from .tooltips import attach_tooltip, make_info_icon, with_info
 from .transcribe_client import TranscribeClient
 from .utils import get_system_monitors
+from . import __version__
 
 log = get_logger(__name__)
 
@@ -107,6 +110,57 @@ class SettingsWindow(QDialog):
         buttons.addWidget(self.save_btn)
         buttons.addWidget(self.close_btn)
         root.addLayout(buttons)
+
+        # --- Строка с версией приложения ---
+        version_row = QHBoxLayout()
+        version_row.setContentsMargins(0, 0, 4, 0)
+        version_row.addStretch()
+        version_row.addWidget(self._build_version_label())
+        root.addLayout(version_row)
+
+    # ------------------------------------------------------------------
+    # Версия приложения
+    # ------------------------------------------------------------------
+    def _build_version_label(self) -> QLabel:
+        """
+        Маленькая серая плашка «Версия X.Y.Z» в правом нижнем
+        углу окна настроек.
+
+        По клику версия копируется в буфер обмена. По наведению
+        показывается подробная подсказка (settings_version).
+        """
+        label = QLabel(f"Версия {__version__}")
+        label.setStyleSheet(
+            "QLabel {"
+            "  color: #888;"
+            "  font-size: 11px;"
+            "  padding: 2px 4px;"
+            "}"
+            "QLabel:hover { color: #4a90d9; }"
+        )
+        label.setCursor(Qt.CursorShape.PointingHandCursor)
+        label.setToolTip(
+            f"Версия {__version__} — кликните, чтобы скопировать"
+        )
+        label.mousePressEvent = self._on_version_click  # type: ignore[assignment]
+        attach_tooltip(label, "settings_version")
+        return label
+
+    def _on_version_click(self, event) -> None:
+        """
+        Клик по плашке версии — копируем номер в буфер обмена.
+        """
+        try:
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(__version__)
+            log.info(
+                "Версия приложения скопирована в буфер: %s",
+                __version__,
+            )
+        except Exception as exc:
+            log.warning(
+                "Не удалось скопировать версию в буфер: %s", exc
+            )
 
     def _build_yandex_vm_tab(self) -> QWidget:
         w = QWidget()

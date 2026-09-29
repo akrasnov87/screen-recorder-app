@@ -5,6 +5,8 @@
   • Добавлены подсказки для тегов: tags_list, meta_tags,
     meta_tags_list, meta_include_tags_in_prompt, lib_tag,
     lib_tag_enabled.
+  • Добавлена подсказка settings_version — версия приложения
+    в правом нижнем углу окна настроек.
 """
 from __future__ import annotations
 
@@ -272,6 +274,19 @@ TOOLTIPS: Dict[str, str] = {
     ),
     "settings_import": (
         "Загрузить настройки из ранее сохранённого файла JSON."
+    ),
+    # +++ Версия приложения
+    "settings_version": (
+        "Версия приложения Screen Recorder & Transcriber.\n\n"
+        "Формат: MAJOR.MINOR.PATCH (SemVer).\n"
+        "  • MAJOR — несовместимые изменения;\n"
+        "  • MINOR — новые возможности;\n"
+        "  • PATCH — исправления.\n\n"
+        "Клик по номеру версии копирует его в буфер обмена — "
+        "удобно, когда нужно сообщить о проблеме или проверить, "
+        "какая сборка установлена.\n\n"
+        "Если установлен .deb-пакет, версия берётся из "
+        "src/__init__.py и совпадает с версией пакета."
     ),
 
     # --- Метаданные записи ---
