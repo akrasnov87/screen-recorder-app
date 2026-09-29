@@ -1,13 +1,13 @@
 """Диалог отправки протокола/summary в чат Bitrix24.
 
 Изменения:
-  • _SendWorker принимает max_message_chars и передаёт его
-    в Bitrix24Client.
-  • SendToBitrixDialog._on_send читает max_message_chars
-    из bitrix_cfg и передаёт в воркер.
-  • _on_test тоже передаёт max_message_chars.
-  • К списку получателей подключена подсказка
-    bitrix_recipients_list.
+  • Интерфейс переделан на вкладки: «Получатели», «Содержимое»,
+    «Параметры».
+  • Вся логика отправки (в т.ч. _SendWorker и _prepare_file_for_item)
+    оставлена без изменений.
+  • _SendWorker принимает max_message_chars.
+  • SendToBitrixDialog._on_send / _on_test читают
+    max_message_chars из bitrix_cfg.
 """
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSpinBox,
-    QVBoxLayout, QWidget,
+    QMessageBox, QProgressDialog, QPushButton, QSizePolicy,
+    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .bitrix_client import Bitrix24Client, Bitrix24Error
@@ -279,9 +279,10 @@ class SendToBitrixDialog(QDialog):
     """
     Диалог отправки протокола / summary в чат Bitrix24.
 
-    Поддерживает массовую рассылку: один и тот же материал уходит
-    сразу в несколько выбранных чатов (проекты / сотрудники /
-    ручные ID).
+    Переделан на вкладки:
+      • Получатели — выбор чатов и ручных ID;
+      • Содержимое — материалы, заголовки, режим отправки;
+      • Параметры — вебхук, таймауты, опции.
     """
 
     def __init__(
@@ -305,8 +306,8 @@ class SendToBitrixDialog(QDialog):
             f"{self.session_info.get('name', '')}"
         )
         self.setModal(True)
-        self.setMinimumSize(760, 640)
-        self.resize(960, 900)
+        self.setMinimumSize(820, 640)
+        self.resize(900, 720)
 
         self._protocol_path = (
             self.session_info.get("protocol_path") or ""
@@ -342,14 +343,17 @@ class SendToBitrixDialog(QDialog):
         self._build_ui()
         self._init_recipient_state()
         self._load_previews()
+        self._update_send_buttons_state()
 
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
 
-        # --- Информация о записи ---
+        # --- Плашка с информацией о записи (всегда видна) ---
         info_row = QHBoxLayout()
         name = self.session_info.get("name", "")
         project = self.session_info.get("project", "")
@@ -358,8 +362,11 @@ class SendToBitrixDialog(QDialog):
 
         info_text = (
             f"<b>{html.escape(name)}</b><br>"
-            f"Проект: <b>{html.escape(project or '—')}</b> "
-            f"&nbsp;|&nbsp; Дата: {html.escape(date or '—')}"
+            f"<span style='color:#666'>Проект:</span> "
+            f"<b>{html.escape(project or '—')}</b> "
+            f"&nbsp;|&nbsp; "
+            f"<span style='color:#666'>Дата:</span> "
+            f"{html.escape(date or '—')}"
         )
         if comment:
             info_text += (
@@ -371,11 +378,73 @@ class SendToBitrixDialog(QDialog):
         info_row.addWidget(info, 1)
         root.addLayout(info_row)
 
-        # --- Получатели ---
-        rec_header = QHBoxLayout()
-        rec_header.addWidget(QLabel("<b>Кому отправить</b>"))
-        rec_header.addStretch()
-        root.addLayout(rec_header)
+        # --- Вкладки ---
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+
+        self.tabs.addTab(
+            self._build_recipients_tab(), "Получатели"
+        )
+        self.tabs.addTab(
+            self._build_content_tab(), "Содержимое"
+        )
+        self.tabs.addTab(
+            self._build_options_tab(), "Параметры"
+        )
+
+        # --- Кнопки действий ---
+        actions_row = QHBoxLayout()
+
+        self.send_protocol_btn = QPushButton(
+            "Отправить протокол"
+        )
+        self.send_protocol_btn.clicked.connect(
+            lambda: self._on_send(which="protocol")
+        )
+        actions_row.addWidget(self.send_protocol_btn)
+
+        self.send_summary_btn = QPushButton("Отправить summary")
+        self.send_summary_btn.clicked.connect(
+            lambda: self._on_send(which="summary")
+        )
+        actions_row.addWidget(self.send_summary_btn)
+
+        self.send_both_btn = QPushButton("Отправить всё")
+        self.send_both_btn.setToolTip(
+            "Отправить двумя сообщениями: сначала протокол, "
+            "потом summary.\n\n"
+            "В режиме «Файлом с комментарием» оба файла уйдут "
+            "одним сообщением с двумя вложениями."
+        )
+        self.send_both_btn.clicked.connect(
+            lambda: self._on_send(which="both")
+        )
+        actions_row.addWidget(self.send_both_btn)
+
+        actions_row.addStretch()
+
+        bottom = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Close,
+            parent=self,
+        )
+        close_btn = bottom.button(
+            QDialogButtonBox.StandardButton.Close
+        )
+        close_btn.setText("Закрыть")
+        bottom.rejected.connect(self.reject)
+        bottom.accepted.connect(self.accept)
+        actions_row.addWidget(bottom)
+
+        root.addLayout(actions_row)
+
+    # ------------------------------------------------------------------
+    # Вкладка «Получатели»
+    # ------------------------------------------------------------------
+    def _build_recipients_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
         rec_hint = QLabel(
             "<span style='color:#666'>Отметьте галочками один или "
@@ -384,15 +453,23 @@ class SendToBitrixDialog(QDialog):
             "каждому адресату отдельно.</span>"
         )
         rec_hint.setWordWrap(True)
-        root.addWidget(rec_hint)
+        layout.addWidget(rec_hint)
 
-        recipients_block = QWidget()
-        recipients_block_layout = QVBoxLayout(recipients_block)
-        recipients_block_layout.setContentsMargins(0, 0, 0, 0)
-        recipients_block_layout.setSpacing(4)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Список получателей</b>"))
+        header.addStretch()
+        icon = None
+        try:
+            from .tooltips import make_info_icon
+            icon = make_info_icon("bitrix_recipients_list")
+        except Exception:
+            icon = None
+        if icon is not None:
+            header.addWidget(icon)
+        layout.addLayout(header)
 
         self.recipients_list = QListWidget()
-        self.recipients_list.setMinimumHeight(140)
+        self.recipients_list.setMinimumHeight(200)
         self.recipients_list.setSizePolicy(
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Expanding,
@@ -410,7 +487,7 @@ class SendToBitrixDialog(QDialog):
         self.recipients_list.itemChanged.connect(
             self._on_recipient_item_changed
         )
-        recipients_block_layout.addWidget(self.recipients_list, 1)
+        layout.addWidget(self.recipients_list, 1)
 
         self.empty_hint = QLabel(
             "<span style='color:#c62828'>"
@@ -420,10 +497,10 @@ class SendToBitrixDialog(QDialog):
         )
         self.empty_hint.setWordWrap(True)
         self.empty_hint.setVisible(True)
-        recipients_block_layout.addWidget(self.empty_hint)
+        layout.addWidget(self.empty_hint)
 
+        # --- Кнопки управления списком ---
         list_btns = QHBoxLayout()
-        list_btns.setContentsMargins(0, 2, 0, 0)
         list_btns.setSpacing(6)
 
         self.select_all_btn = QPushButton("Выбрать все")
@@ -467,19 +544,13 @@ class SendToBitrixDialog(QDialog):
         )
         list_btns.addWidget(self.selected_count_label)
 
-        recipients_block_layout.addLayout(list_btns)
+        layout.addLayout(list_btns)
 
-        root.addWidget(recipients_block, 1)
-
-        # --- Ручной ID и вебхук ---
+        # --- Ручной ID ---
         manual_form = QFormLayout()
         manual_form.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight
             | Qt.AlignmentFlag.AlignVCenter
-        )
-        manual_form.setFormAlignment(
-            Qt.AlignmentFlag.AlignLeft
-            | Qt.AlignmentFlag.AlignTop
         )
 
         self.manual_chat_input = QLineEdit()
@@ -490,77 +561,20 @@ class SendToBitrixDialog(QDialog):
             "Доп. ID чата:",
             with_info(self.manual_chat_input, "bitrix_chat_id"),
         )
-        root.addLayout(manual_form)
+        layout.addLayout(manual_form)
 
-        root.addSpacing(4)
+        return w
 
-        chat_form = QFormLayout()
-        chat_form.setLabelAlignment(
-            Qt.AlignmentFlag.AlignRight
-            | Qt.AlignmentFlag.AlignVCenter
-        )
-        chat_form.setFormAlignment(
-            Qt.AlignmentFlag.AlignLeft
-            | Qt.AlignmentFlag.AlignTop
-        )
+    # ------------------------------------------------------------------
+    # Вкладка «Содержимое»
+    # ------------------------------------------------------------------
+    def _build_content_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
-        self.webhook_input = QLineEdit(
-            self.bitrix_cfg.get("webhook_url", "") or ""
-        )
-        self.webhook_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.webhook_input.setPlaceholderText(
-            "https://portal.bitrix24.ru/rest/1/token/"
-        )
-
-        self.show_webhook = QCheckBox("Показать")
-        self.show_webhook.toggled.connect(
-            lambda checked: self.webhook_input.setEchoMode(
-                QLineEdit.EchoMode.Normal if checked
-                else QLineEdit.EchoMode.Password
-            )
-        )
-
-        webhook_row = QWidget()
-        wh = QHBoxLayout(webhook_row)
-        wh.setContentsMargins(0, 0, 0, 0)
-        wh.setSpacing(6)
-        wh.addWidget(self.webhook_input, 1)
-        wh.addWidget(self.show_webhook, 0)
-        chat_form.addRow(
-            "Вебхук Bitrix24:",
-            with_info(webhook_row, "bitrix_webhook"),
-        )
-
-        self.system_check = QCheckBox(
-            "Системное сообщение (SYSTEM=Y)"
-        )
-        self.system_check.setChecked(
-            bool(self.bitrix_cfg.get("system_message", False))
-        )
-        self.system_check.setToolTip(
-            "Если включено — сообщение отображается как системное, "
-            "без аватара отправителя."
-        )
-
-        self.no_preview_check = QCheckBox(
-            "Отключить предпросмотр ссылок"
-        )
-        self.no_preview_check.setChecked(
-            bool(self.bitrix_cfg.get(
-                "disable_url_preview", False
-            ))
-        )
-
-        opts_row = QHBoxLayout()
-        opts_row.setContentsMargins(0, 0, 0, 0)
-        opts_row.addWidget(self.system_check)
-        opts_row.addWidget(self.no_preview_check)
-        opts_row.addStretch()
-        chat_form.addRow("", self._wrap_h(opts_row))
-
-        root.addLayout(chat_form)
-
-        # --- Заголовки сообщений ---
+        # --- Заголовки ---
         header_header = QHBoxLayout()
         self.header_check = QCheckBox(
             "Добавлять заголовок к сообщениям"
@@ -574,17 +588,16 @@ class SendToBitrixDialog(QDialog):
         )
         header_header.addWidget(self.header_check)
         header_header.addStretch()
-        root.addLayout(header_header)
+        layout.addLayout(header_header)
 
         headers_hint = QLabel(
             "<span style='color:#666'>Заголовок добавляется "
-            "в начало сообщения. Оформить его можно вручную, "
-            "если нужно. Пустое поле — заголовок не добавляется. "
-            "При массовой рассылке заголовок у всех получателей "
-            "одинаковый.</span>"
+            "в начало сообщения. Пустое поле — заголовок не "
+            "добавляется. При массовой рассылке заголовок "
+            "у всех получателей одинаковый.</span>"
         )
         headers_hint.setWordWrap(True)
-        root.addWidget(headers_hint)
+        layout.addWidget(headers_hint)
 
         headers_form = QFormLayout()
         headers_form.setLabelAlignment(
@@ -615,7 +628,7 @@ class SendToBitrixDialog(QDialog):
         headers_form.addRow(
             "Заголовок summary:", self.summary_header_input
         )
-        root.addLayout(headers_form)
+        layout.addLayout(headers_form)
 
         self._recalc_protocol_header_default()
         self._recalc_summary_header_default()
@@ -623,7 +636,18 @@ class SendToBitrixDialog(QDialog):
         self.header_check.toggled.connect(self._on_header_toggled)
         self._on_header_toggled(self.header_check.isChecked())
 
+        # --- Разделитель ---
+        sep1 = QLabel("<hr>")
+        layout.addWidget(sep1)
+
         # --- Режим отправки ---
+        mode_header = QHBoxLayout()
+        mode_header.addWidget(
+            QLabel("<b>Как отправлять содержимое</b>")
+        )
+        mode_header.addStretch()
+        layout.addLayout(mode_header)
+
         mode_box = QFormLayout()
         mode_box.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight
@@ -639,7 +663,11 @@ class SendToBitrixDialog(QDialog):
             "Файлом с комментарием", "file"
         )
         self.send_mode_combo.setToolTip(
-            "Как отправлять содержимое в чат."
+            "Как отправлять содержимое в чат:\n"
+            "• Автоматически — если текст длиннее порога, "
+            "уйдёт файлом;\n"
+            "• Текстом — всегда текстом;\n"
+            "• Файлом — всегда файлом с комментарием."
         )
         mode_box.addRow("Режим отправки:", self.send_mode_combo)
 
@@ -653,26 +681,24 @@ class SendToBitrixDialog(QDialog):
         )
         self.auto_file_threshold.setSuffix(" символов")
         self.auto_file_threshold.setToolTip(
-            "Порог для автоматического режима."
+            "Порог для автоматического режима: если текст "
+            "протокола/summary длиннее — отправится файлом, "
+            "иначе — текстом."
         )
         mode_box.addRow(
             "Порог «текст → файл»:", self.auto_file_threshold
         )
 
-        root.addLayout(mode_box)
+        layout.addLayout(mode_box)
 
         self.send_mode_combo.currentIndexChanged.connect(
             self._on_send_mode_changed
         )
         self._on_send_mode_changed()
 
-        # --- Проверка подключения ---
-        test_row = QHBoxLayout()
-        self.test_btn = QPushButton("Проверить подключение")
-        self.test_btn.clicked.connect(self._on_test)
-        test_row.addWidget(self.test_btn)
-        test_row.addStretch()
-        root.addLayout(test_row)
+        # --- Разделитель ---
+        sep2 = QLabel("<hr>")
+        layout.addWidget(sep2)
 
         # --- Материалы ---
         materials_header = QHBoxLayout()
@@ -680,16 +706,18 @@ class SendToBitrixDialog(QDialog):
             QLabel("<b>Материалы к отправке</b>")
         )
         materials_header.addStretch()
-        root.addLayout(materials_header)
+        layout.addLayout(materials_header)
 
         materials_hint = QLabel(
-            "<span style='color:#666'>Содержимое не отображается "
-            "здесь — чтобы проверить, откройте файл двойным кликом "
-            "по ссылке или кнопкой «Открыть файл».</span>"
+            "<span style='color:#666'>Содержимое здесь не "
+            "отображается — чтобы проверить, откройте файл "
+            "двойным кликом по ссылке или кнопкой "
+            "«Открыть файл».</span>"
         )
         materials_hint.setWordWrap(True)
-        root.addWidget(materials_hint)
+        layout.addWidget(materials_hint)
 
+        # --- Протокол ---
         protocol_row = QHBoxLayout()
         protocol_row.addWidget(QLabel("Протокол:"))
         self.protocol_link = QLabel()
@@ -702,21 +730,23 @@ class SendToBitrixDialog(QDialog):
         )
         protocol_row.addWidget(self.protocol_link, 1)
 
-        self.open_protocol_btn = QPushButton("Открыть файл")
+        self.open_protocol_btn = QPushButton("Открыть")
         self.open_protocol_btn.clicked.connect(
             self._on_open_protocol
         )
         protocol_row.addWidget(self.open_protocol_btn)
 
-        self.show_protocol_folder_btn = QPushButton(
-            "Показать в папке"
+        self.show_protocol_folder_btn = QPushButton("В папке")
+        self.show_protocol_folder_btn.setToolTip(
+            "Показать файл в файловом менеджере"
         )
         self.show_protocol_folder_btn.clicked.connect(
             lambda: self._show_in_folder(self._protocol_path)
         )
         protocol_row.addWidget(self.show_protocol_folder_btn)
-        root.addLayout(protocol_row)
+        layout.addLayout(protocol_row)
 
+        # --- Summary ---
         summary_row = QHBoxLayout()
         summary_row.addWidget(QLabel("Summary:"))
         self.summary_link = QLabel()
@@ -729,14 +759,15 @@ class SendToBitrixDialog(QDialog):
         )
         summary_row.addWidget(self.summary_link, 1)
 
-        self.open_summary_btn = QPushButton("Открыть файл")
+        self.open_summary_btn = QPushButton("Открыть")
         self.open_summary_btn.clicked.connect(
             self._on_open_summary
         )
         summary_row.addWidget(self.open_summary_btn)
 
-        self.show_summary_folder_btn = QPushButton(
-            "Показать в папке"
+        self.show_summary_folder_btn = QPushButton("В папке")
+        self.show_summary_folder_btn.setToolTip(
+            "Показать файл в файловом менеджере"
         )
         self.show_summary_folder_btn.clicked.connect(
             lambda: self._show_in_folder(
@@ -744,56 +775,113 @@ class SendToBitrixDialog(QDialog):
             )
         )
         summary_row.addWidget(self.show_summary_folder_btn)
-        root.addLayout(summary_row)
+        layout.addLayout(summary_row)
 
-        # --- Кнопки отправки ---
-        actions_row = QHBoxLayout()
+        layout.addStretch()
+        return w
 
-        self.send_protocol_btn = QPushButton(
-            "Отправить протокол"
-        )
-        self.send_protocol_btn.clicked.connect(
-            lambda: self._on_send(which="protocol")
-        )
-        actions_row.addWidget(self.send_protocol_btn)
-
-        self.send_summary_btn = QPushButton("Отправить summary")
-        self.send_summary_btn.clicked.connect(
-            lambda: self._on_send(which="summary")
-        )
-        actions_row.addWidget(self.send_summary_btn)
-
-        self.send_both_btn = QPushButton("Отправить всё")
-        self.send_both_btn.setToolTip(
-            "Отправить двумя сообщениями: сначала протокол, "
-            "потом summary.\n\n"
-            "В режиме «Файлом с комментарием» оба файла уйдут "
-            "одним сообщением с двумя вложениями."
-        )
-        self.send_both_btn.clicked.connect(
-            lambda: self._on_send(which="both")
-        )
-        actions_row.addWidget(self.send_both_btn)
-
-        actions_row.addStretch()
-        root.addLayout(actions_row)
-
-        # --- Нижние кнопки ---
-        bottom = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Close,
-            parent=self,
-        )
-        bottom.button(
-            QDialogButtonBox.StandardButton.Close
-        ).setText("Закрыть")
-        bottom.rejected.connect(self.reject)
-        bottom.accepted.connect(self.accept)
-        root.addWidget(bottom)
-
-    @staticmethod
-    def _wrap_h(layout) -> QWidget:
+    # ------------------------------------------------------------------
+    # Вкладка «Параметры»
+    # ------------------------------------------------------------------
+    def _build_options_tab(self) -> QWidget:
         w = QWidget()
-        w.setLayout(layout)
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        info = QLabel(
+            "<span style='color:#666'>Параметры подключения к "
+            "Bitrix24 и поведение сообщений. Значения по умолчанию "
+            "берутся из Настройки → Bitrix24. Здесь можно "
+            "переопределить их для текущей отправки.</span>"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # --- Вебхук ---
+        form = QFormLayout()
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.webhook_input = QLineEdit(
+            self.bitrix_cfg.get("webhook_url", "") or ""
+        )
+        self.webhook_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.webhook_input.setPlaceholderText(
+            "https://portal.bitrix24.ru/rest/1/token/"
+        )
+
+        self.show_webhook = QCheckBox("Показать")
+        self.show_webhook.toggled.connect(
+            lambda checked: self.webhook_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked
+                else QLineEdit.EchoMode.Password
+            )
+        )
+
+        webhook_row = QWidget()
+        wh = QHBoxLayout(webhook_row)
+        wh.setContentsMargins(0, 0, 0, 0)
+        wh.setSpacing(6)
+        wh.addWidget(self.webhook_input, 1)
+        wh.addWidget(self.show_webhook, 0)
+        form.addRow(
+            "Вебхук Bitrix24:",
+            with_info(webhook_row, "bitrix_webhook"),
+        )
+
+        layout.addLayout(form)
+
+        # --- Опции ---
+        opts_header = QHBoxLayout()
+        opts_header.addWidget(QLabel("<b>Поведение сообщений</b>"))
+        opts_header.addStretch()
+        layout.addLayout(opts_header)
+
+        self.system_check = QCheckBox(
+            "Системное сообщение (SYSTEM=Y)"
+        )
+        self.system_check.setChecked(
+            bool(self.bitrix_cfg.get("system_message", False))
+        )
+        self.system_check.setToolTip(
+            "Если включено — сообщение отображается как системное, "
+            "без аватара отправителя."
+        )
+        layout.addWidget(self.system_check)
+
+        self.no_preview_check = QCheckBox(
+            "Отключить предпросмотр ссылок"
+        )
+        self.no_preview_check.setChecked(
+            bool(self.bitrix_cfg.get(
+                "disable_url_preview", False
+            ))
+        )
+        self.no_preview_check.setToolTip(
+            "Bitrix24 не будет разворачивать ссылки в превью."
+        )
+        layout.addWidget(self.no_preview_check)
+
+        # --- Разделитель ---
+        sep = QLabel("<hr>")
+        layout.addWidget(sep)
+
+        # --- Проверка подключения ---
+        test_row = QHBoxLayout()
+        self.test_btn = QPushButton("Проверить подключение")
+        self.test_btn.setToolTip(
+            "Отправить запрос profile к Bitrix24, чтобы "
+            "проверить корректность вебхука."
+        )
+        self.test_btn.clicked.connect(self._on_test)
+        test_row.addWidget(self.test_btn)
+        test_row.addStretch()
+        layout.addLayout(test_row)
+
+        layout.addStretch()
         return w
 
     # ------------------------------------------------------------------
@@ -965,7 +1053,8 @@ class SendToBitrixDialog(QDialog):
             if not has_recipients:
                 btn.setEnabled(False)
                 btn.setToolTip(
-                    "Отметьте хотя бы одного получателя"
+                    "Отметьте хотя бы одного получателя "
+                    "(вкладка «Получатели»)"
                 )
             else:
                 btn.setEnabled(True)
@@ -1111,6 +1200,7 @@ class SendToBitrixDialog(QDialog):
         return ""
 
     def _load_previews(self) -> None:
+        # --- Протокол ---
         if self._protocol_path and os.path.exists(
             self._protocol_path
         ):
@@ -1146,6 +1236,7 @@ class SendToBitrixDialog(QDialog):
             self.open_protocol_btn.setEnabled(False)
             self.show_protocol_folder_btn.setEnabled(False)
 
+        # --- Summary ---
         if self._summary_bitrix:
             target = self._summary_target_path()
             if target:
@@ -1456,7 +1547,8 @@ class SendToBitrixDialog(QDialog):
         if not webhook:
             QMessageBox.warning(
                 self, "Bitrix24",
-                "Укажите URL вебхука Bitrix24.",
+                "Укажите URL вебхука Bitrix24 "
+                "(вкладка «Параметры»).",
             )
             return
 
@@ -1464,8 +1556,8 @@ class SendToBitrixDialog(QDialog):
             QMessageBox.warning(
                 self, "Bitrix24",
                 "Не выбрано ни одного получателя.\n\n"
-                "Отметьте чаты в списке или введите ID в поле "
-                "«Доп. ID чата».",
+                "Отметьте чаты на вкладке «Получатели» или "
+                "введите ID в поле «Доп. ID чата».",
             )
             return
 

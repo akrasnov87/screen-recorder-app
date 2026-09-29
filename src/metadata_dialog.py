@@ -1,9 +1,15 @@
 """Диалоговое окно для ввода метаданных записи с библиотекой промптов.
 
 Изменения:
-  • Удалена неиспользуемая константа _NAME_PLACEHOLDERS.
-  • Добавлен блок «Теги»: список тегов из справочника с
-    чекбоксами + возможность ввести новый тег вручную.
+  • Интерфейс переделан на вкладки: «Основное», «Промпт»,
+    «Скрам и DeepSeek», «Вложения».
+  • Добавлен блок «Теги» (на вкладке «Основное»).
+  • Вкладка «Промпт» содержит библиотеку промптов и контекст
+    записи в промпте.
+  • Вкладка «Скрам и DeepSeek» объединяет summary, DeepSeek
+    и скрам-поля.
+  • Вкладка «Вложения» — список вложений и флаги, куда их
+    передавать.
 """
 from __future__ import annotations
 
@@ -18,7 +24,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
-    QPushButton, QVBoxLayout, QWidget,
+    QPushButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .logger import get_logger
@@ -67,10 +73,15 @@ def format_name_template(
 
 class MetadataDialog(QDialog):
     """
-    Окно ввода метаданных: проект, название, комментарий, промпт,
-    скрам, вложения, формирование промпта для DeepSeek, контекст
-    в промпте, флаг формирования summary для конкретной записи,
-    теги.
+    Окно ввода метаданных. Переделано на вкладки:
+      • Основное
+      • Промпт
+      • Скрам и DeepSeek
+      • Вложения
+
+    Возвращает self.result_data — тот же формат словаря,
+    что и раньше (обратная совместимость с main.py и
+    sessions_window.py).
     """
 
     def __init__(
@@ -102,8 +113,8 @@ class MetadataDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.setMinimumWidth(920)
-        self.setMinimumHeight(1050)
+        self.setMinimumWidth(820)
+        self.setMinimumHeight(600)
 
         self._projects = projects or []
         self._prompts = list(prompts or [])
@@ -147,22 +158,66 @@ class MetadataDialog(QDialog):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
 
+        # --- Вкладки ---
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+
+        self.tabs.addTab(self._build_main_tab(), "Основное")
+        self.tabs.addTab(self._build_prompt_tab(), "Промпт")
+        self.tabs.addTab(
+            self._build_scrum_tab(), "Скрам и DeepSeek"
+        )
+        self.tabs.addTab(
+            self._build_attachments_tab(), "Вложения"
+        )
+
+        # --- Кнопки ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        ).setText("Продолжить")
+        buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        ).setText("Пропустить")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self._on_reject)
+        root.addWidget(buttons)
+
+    # ------------------------------------------------------------------
+    # Вкладка «Основное»
+    # ------------------------------------------------------------------
+    def _build_main_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
         info = QLabel(
-            "Заполните информацию о записи. Название можно ввести "
-            "вручную и применить к нему шаблон (например, добавить "
-            "дату)."
+            "Базовая информация о записи: проект, название, "
+            "комментарий и теги."
         )
         info.setWordWrap(True)
-        root.addWidget(info)
+        info.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(info)
 
-        # --- Основное ---
         form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
+        # --- Проект ---
         self.project_combo = QComboBox()
         self.project_combo.setEditable(True)
         self.project_combo.addItems(self._projects)
         self.project_combo.setCurrentIndex(-1)
+        form.addRow(
+            "Проект:",
+            with_info(self.project_combo, "meta_project"),
+        )
 
+        # --- Название + шаблон ---
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText(
             "Например: Совещание по проекту X"
@@ -170,12 +225,12 @@ class MetadataDialog(QDialog):
 
         self.name_combo = QComboBox()
         self.name_combo.setEditable(False)
-        self.name_combo.setMinimumWidth(240)
+        self.name_combo.setMinimumWidth(220)
         self._populate_name_templates()
 
         self.name_abbr_input = QLineEdit()
         self.name_abbr_input.setPlaceholderText("Сокр.")
-        self.name_abbr_input.setMaximumWidth(120)
+        self.name_abbr_input.setMaximumWidth(100)
 
         name_row = QWidget()
         name_row_layout = QHBoxLayout(name_row)
@@ -190,6 +245,9 @@ class MetadataDialog(QDialog):
         if name_icon is not None:
             name_row_layout.addWidget(name_icon, 0)
 
+        form.addRow("Название:", name_row)
+
+        # --- Превью итогового имени + кнопка сохранения шаблона ---
         self.name_preview_label = QLabel("")
         self.name_preview_label.setStyleSheet(
             "QLabel { color: #666; font-style: italic; }"
@@ -210,326 +268,32 @@ class MetadataDialog(QDialog):
         name_hint_row = QHBoxLayout()
         name_hint_row.addWidget(self.name_preview_label, 1)
         name_hint_row.addWidget(self.save_name_tpl_btn, 0)
+        form.addRow("", self._wrap(name_hint_row))
 
+        # --- Комментарий ---
         self.comment_input = QPlainTextEdit()
         self.comment_input.setPlaceholderText(
             "Свободный комментарий…"
         )
         self.comment_input.setFixedHeight(70)
-
-        form.addRow(
-            "Проект:",
-            with_info(self.project_combo, "meta_project"),
-        )
-        form.addRow("Название:", name_row)
-        form.addRow("", name_hint_row)
         form.addRow(
             "Комментарий:",
             with_info(self.comment_input, "meta_comment"),
         )
 
-        root.addLayout(form)
+        layout.addLayout(form)
 
         # --- Теги ---
-        root.addWidget(self._build_tags_section())
+        layout.addWidget(self._build_tags_section())
 
-        # --- Формирование summary ---
-        summary_header = QHBoxLayout()
-        summary_header.addWidget(
-            QLabel("<b>Краткое содержание (summary)</b>")
-        )
-        summary_header.addStretch()
-        summary_icon = make_info_icon("meta_generate_summary")
-        if summary_icon is not None:
-            summary_header.addWidget(summary_icon)
-        root.addLayout(summary_header)
+        layout.addStretch()
+        return w
 
-        self.generate_summary_check = QCheckBox(
-            "Формировать summary для этой записи"
-        )
-        attach_tooltip(
-            self.generate_summary_check, "meta_generate_summary"
-        )
-        self.generate_summary_check.setChecked(False)
-        root.addWidget(self.generate_summary_check)
-
-        # --- Промпт ---
-        prompt_header = QHBoxLayout()
-        prompt_header.addWidget(
-            QLabel("<b>Промпт для суммаризации / DeepSeek</b>")
-        )
-        prompt_header.addStretch()
-
-        self.prompt_combo = QComboBox()
-        self.prompt_combo.addItem("— не выбрано —", "")
-        for p in self._prompts:
-            self.prompt_combo.addItem(p["name"], p["text"])
-        self.prompt_combo.setMinimumWidth(280)
-
-        prompt_header.addWidget(QLabel("Библиотека:"))
-        prompt_header.addWidget(self.prompt_combo)
-        prompt_icon = make_info_icon("meta_prompt")
-        if prompt_icon is not None:
-            prompt_header.addWidget(prompt_icon)
-        root.addLayout(prompt_header)
-
-        self.prompt_input = QPlainTextEdit()
-        self.prompt_input.setPlaceholderText(
-            "Промпт для формирования краткого содержания "
-            "и/или DeepSeek-промпта…"
-        )
-        self.prompt_input.setMinimumHeight(120)
-        root.addWidget(self.prompt_input)
-
-        prompt_actions = QHBoxLayout()
-        self.save_to_library_btn = QPushButton(
-            "Сохранить как новый промпт…"
-        )
-        self.save_to_library_btn.clicked.connect(
-            self._on_save_to_library
-        )
-        self.reset_prompt_btn = QPushButton("Сбросить правку")
-        self.reset_prompt_btn.clicked.connect(
-            self._on_reset_prompt
-        )
-        prompt_actions.addWidget(self.save_to_library_btn)
-        prompt_actions.addWidget(self.reset_prompt_btn)
-        prompt_actions.addStretch()
-        root.addLayout(prompt_actions)
-
-        # --- Контекст записи в промпт ---
-        ctx_header = QHBoxLayout()
-        ctx_header.addWidget(
-            QLabel("<b>Контекст записи в промпте</b>")
-        )
-        ctx_header.addStretch()
-        ctx_header.addWidget(
-            make_info_icon("meta_context_to_prompt")
-        )
-        root.addLayout(ctx_header)
-
-        ctx_hint = QLabel(
-            "Выберите, что из карточки записи добавить в промпт. "
-            "Информация добавляется отдельным блоком «КОНТЕКСТ "
-            "ЗАПИСИ» перед инструкцией. Это помогает ИИ корректнее "
-            "писать результат (правильно называть встречу, "
-            "учитывать проект, обращать внимание на комментарий)."
-        )
-        ctx_hint.setWordWrap(True)
-        ctx_hint.setStyleSheet("QLabel { color: #666; }")
-        root.addWidget(ctx_hint)
-
-        ctx_box = QHBoxLayout()
-        self.include_name_check = QCheckBox("Название записи")
-        attach_tooltip(
-            self.include_name_check, "meta_include_name_in_prompt"
-        )
-        ctx_box.addWidget(self.include_name_check)
-
-        self.include_project_check = QCheckBox("Проект")
-        attach_tooltip(
-            self.include_project_check,
-            "meta_include_project_in_prompt",
-        )
-        ctx_box.addWidget(self.include_project_check)
-
-        self.include_comment_check = QCheckBox("Комментарий")
-        attach_tooltip(
-            self.include_comment_check,
-            "meta_include_comment_in_prompt",
-        )
-        ctx_box.addWidget(self.include_comment_check)
-
-        self.include_tags_check = QCheckBox("Теги")
-        attach_tooltip(
-            self.include_tags_check,
-            "meta_include_tags_in_prompt",
-        )
-        ctx_box.addWidget(self.include_tags_check)
-
-        ctx_box.addStretch()
-
-        self.context_all_btn = QPushButton("Включить всё")
-        self.context_all_btn.setToolTip(
-            "Проставить все галочки контекста"
-        )
-        self.context_all_btn.clicked.connect(
-            self._on_context_enable_all
-        )
-        ctx_box.addWidget(self.context_all_btn)
-
-        root.addLayout(ctx_box)
-
-        # --- Промпт для DeepSeek ---
-        root.addWidget(QLabel("<b>Промпт для DeepSeek</b>"))
-
-        deepseek_box = QVBoxLayout()
-        self.generate_deepseek_check = QCheckBox(
-            "Сформировать файл промпта для DeepSeek "
-            "(включено по умолчанию)"
-        )
-        attach_tooltip(
-            self.generate_deepseek_check,
-            "meta_generate_deepseek_prompt",
-        )
-        deepseek_box.addWidget(self.generate_deepseek_check)
-
-        deepseek_hint = QLabel(
-            "Шаблон промпта зависит от признака «Скрам-митинг»:\n"
-            "  • <b>Скрам включён</b> → используется шаблон из "
-            "Настройки → Скрам (плюс предыдущий протокол "
-            "и стенограмма).\n"
-            "  • <b>Скрам выключен</b> → используется промпт, "
-            "введённый выше."
-        )
-        deepseek_hint.setWordWrap(True)
-        deepseek_hint.setStyleSheet("QLabel { color: #666; }")
-        deepseek_box.addWidget(deepseek_hint)
-
-        root.addLayout(deepseek_box)
-
-        # --- Скрам ---
-        root.addWidget(QLabel("<b>Скрам-митинг</b>"))
-
-        scrum_box = QFormLayout()
-        self.is_scrum_check = QCheckBox(
-            "Это скрам-митинг (использовать шаблон "
-            "из Настройки → Скрам)"
-        )
-        attach_tooltip(self.is_scrum_check, "meta_is_scrum")
-        scrum_box.addRow("", self.is_scrum_check)
-
-        self.protocol_path_input = QLineEdit()
-        self.protocol_path_input.setReadOnly(True)
-        self.protocol_path_input.setPlaceholderText(
-            "Файл протокола не выбран"
-        )
-
-        self.browse_protocol_btn = QPushButton("Загрузить файл…")
-        self.browse_protocol_btn.clicked.connect(
-            self._on_browse_protocol
-        )
-
-        self.from_session_btn = QPushButton("Из записи…")
-        self.from_session_btn.setToolTip(
-            "Выбрать предыдущий протокол из существующих сессий"
-        )
-        self.from_session_btn.clicked.connect(
-            self._on_pick_from_session
-        )
-
-        self.clear_protocol_btn = QPushButton("Сбросить")
-        self.clear_protocol_btn.clicked.connect(
-            self._on_clear_protocol
-        )
-
-        protocol_row = QHBoxLayout()
-        protocol_row.addWidget(self.protocol_path_input, 1)
-        protocol_row.addWidget(self.browse_protocol_btn)
-        protocol_row.addWidget(self.from_session_btn)
-        protocol_row.addWidget(self.clear_protocol_btn)
-        protocol_icon = make_info_icon("meta_protocol")
-        if protocol_icon is not None:
-            protocol_row.addWidget(protocol_icon)
-        scrum_box.addRow("Предыдущий протокол:", protocol_row)
-
-        root.addLayout(scrum_box)
-
-        self._scrum_widgets = [
-            self.protocol_path_input,
-            self.browse_protocol_btn,
-            self.from_session_btn,
-            self.clear_protocol_btn,
-        ]
-        self.is_scrum_check.toggled.connect(
-            self._update_scrum_visibility
-        )
-        self._update_scrum_visibility(False)
-
-        # --- Вложения ---
-        attach_label_row = QHBoxLayout()
-        attach_label_row.addWidget(QLabel("<b>Вложения</b>"))
-        attach_label_row.addStretch()
-        attach_icon = make_info_icon("meta_attachments")
-        if attach_icon is not None:
-            attach_label_row.addWidget(attach_icon)
-        root.addLayout(attach_label_row)
-
-        attach_box = QVBoxLayout()
-
-        info_attach = QLabel(
-            "Файлы, которые можно передать в суммаризацию "
-            "или включить в промпт DeepSeek. Текст будет "
-            "автоматически извлечён из <code>.txt</code>, "
-            "<code>.md</code>, <code>.docx</code>."
-        )
-        info_attach.setWordWrap(True)
-        attach_box.addWidget(info_attach)
-
-        self.attachments_list = QListWidget()
-        self.attachments_list.setMinimumHeight(100)
-        self.attachments_list.setSelectionMode(
-            QListWidget.SelectionMode.ExtendedSelection
-        )
-        attach_box.addWidget(self.attachments_list)
-
-        attach_btn_row = QHBoxLayout()
-        self.add_attachment_btn = QPushButton("Добавить файлы…")
-        self.add_attachment_btn.clicked.connect(
-            self._on_add_attachment
-        )
-        self.remove_attachment_btn = QPushButton(
-            "Удалить выбранные"
-        )
-        self.remove_attachment_btn.clicked.connect(
-            self._on_remove_attachment
-        )
-        attach_btn_row.addWidget(self.add_attachment_btn)
-        attach_btn_row.addWidget(self.remove_attachment_btn)
-        attach_btn_row.addStretch()
-        attach_box.addLayout(attach_btn_row)
-
-        self.send_attachments_to_transcribe_check = QCheckBox(
-            "Передать вложения в суммаризацию"
-        )
-        attach_tooltip(
-            self.send_attachments_to_transcribe_check,
-            "meta_send_to_transcribe",
-        )
-
-        self.send_attachments_to_deepseek_check = QCheckBox(
-            "Передать вложения в промпт DeepSeek"
-        )
-        attach_tooltip(
-            self.send_attachments_to_deepseek_check,
-            "meta_send_to_deepseek",
-        )
-
-        attach_box.addWidget(
-            self.send_attachments_to_transcribe_check
-        )
-        attach_box.addWidget(
-            self.send_attachments_to_deepseek_check
-        )
-
-        root.addLayout(attach_box)
-
-        # --- Нижние кнопки ---
-        root.addStretch()
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel,
-            parent=self,
-        )
-        buttons.button(
-            QDialogButtonBox.StandardButton.Ok
-        ).setText("Продолжить")
-        buttons.button(
-            QDialogButtonBox.StandardButton.Cancel
-        ).setText("Пропустить")
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self._on_reject)
-        root.addWidget(buttons)
+    @staticmethod
+    def _wrap(layout) -> QWidget:
+        w = QWidget()
+        w.setLayout(layout)
+        return w
 
     # ------------------------------------------------------------------
     # Блок тегов
@@ -537,7 +301,7 @@ class MetadataDialog(QDialog):
     def _build_tags_section(self) -> QWidget:
         box = QWidget()
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(4)
 
         header = QHBoxLayout()
@@ -595,7 +359,6 @@ class MetadataDialog(QDialog):
         return box
 
     def _populate_tags_list(self) -> None:
-        """Заполняет список тегов чекбоксами."""
         if not hasattr(self, "tags_list"):
             return
         self.tags_list.blockSignals(True)
@@ -625,8 +388,10 @@ class MetadataDialog(QDialog):
                     if qcolor.isValid():
                         item.setForeground(qcolor)
                         item.setBackground(
-                            QColor(qcolor.red(), qcolor.green(),
-                                   qcolor.blue(), 30)
+                            QColor(
+                                qcolor.red(), qcolor.green(),
+                                qcolor.blue(), 30,
+                            )
                         )
                 except Exception:
                     pass
@@ -639,7 +404,6 @@ class MetadataDialog(QDialog):
     def _refresh_tags_list(
         self, selected_names: Optional[List[str]] = None,
     ) -> None:
-        """Перечитывает справочник тегов и перезаполняет список."""
         if self._get_tags_cb is not None:
             try:
                 fresh = self._get_tags_cb() or []
@@ -662,7 +426,9 @@ class MetadataDialog(QDialog):
         if n == 0:
             self.tags_count_label.setText("Теги не выбраны")
         elif n == 1:
-            self.tags_count_label.setText(f"Выбран: {self._selected_tags[0]}")
+            self.tags_count_label.setText(
+                f"Выбран: {self._selected_tags[0]}"
+            )
         else:
             self.tags_count_label.setText(f"Выбрано: {n}")
 
@@ -684,7 +450,8 @@ class MetadataDialog(QDialog):
         name, ok = QInputDialog.getText(
             self,
             "Новый тег",
-            "Имя тега (например, «важное», «риски», «для клиента»):",
+            "Имя тега (например, «важное», «риски», "
+            "«для клиента»):",
         )
         if not ok:
             return
@@ -729,6 +496,362 @@ class MetadataDialog(QDialog):
         self._selected_tags = []
         self._populate_tags_list()
         log.debug("Все теги сняты")
+
+    # ------------------------------------------------------------------
+    # Вкладка «Промпт»
+    # ------------------------------------------------------------------
+    def _build_prompt_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        info = QLabel(
+            "Промпт — инструкция, которая используется при "
+            "суммаризации и при формировании файла DeepSeek. "
+            "Можно выбрать готовый из библиотеки или написать "
+            "свой."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(info)
+
+        # --- Выбор промпта из библиотеки ---
+        lib_row = QHBoxLayout()
+        lib_row.addWidget(QLabel("Библиотека:"))
+        self.prompt_combo = QComboBox()
+        self.prompt_combo.addItem("— не выбрано —", "")
+        for p in self._prompts:
+            self.prompt_combo.addItem(p["name"], p["text"])
+        self.prompt_combo.setMinimumWidth(280)
+        lib_row.addWidget(self.prompt_combo, 1)
+
+        prompt_icon = make_info_icon("meta_prompt")
+        if prompt_icon is not None:
+            lib_row.addWidget(prompt_icon)
+        layout.addLayout(lib_row)
+
+        # --- Текст промпта ---
+        self.prompt_input = QPlainTextEdit()
+        self.prompt_input.setPlaceholderText(
+            "Промпт для формирования краткого содержания "
+            "и/или DeepSeek-промпта…"
+        )
+        self.prompt_input.setMinimumHeight(160)
+        layout.addWidget(self.prompt_input, 1)
+
+        # --- Кнопки управления промптом ---
+        prompt_actions = QHBoxLayout()
+        self.save_to_library_btn = QPushButton(
+            "Сохранить как новый промпт…"
+        )
+        self.save_to_library_btn.clicked.connect(
+            self._on_save_to_library
+        )
+        self.reset_prompt_btn = QPushButton("Сбросить правку")
+        self.reset_prompt_btn.clicked.connect(
+            self._on_reset_prompt
+        )
+        prompt_actions.addWidget(self.save_to_library_btn)
+        prompt_actions.addWidget(self.reset_prompt_btn)
+        prompt_actions.addStretch()
+        layout.addLayout(prompt_actions)
+
+        # --- Контекст записи в промпте ---
+        layout.addWidget(self._build_context_section())
+
+        return w
+
+    def _build_context_section(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.addWidget(
+            QLabel("<b>Контекст записи в промпте</b>")
+        )
+        header.addStretch()
+        icon = make_info_icon("meta_context_to_prompt")
+        if icon is not None:
+            header.addWidget(icon)
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "<span style='color:#666'>Выберите, что из карточки "
+            "записи добавить в промпт. Информация добавляется "
+            "отдельным блоком «КОНТЕКСТ ЗАПИСИ» перед инструкцией. "
+            "Это помогает ИИ корректнее писать результат.</span>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        ctx_row = QHBoxLayout()
+        self.include_name_check = QCheckBox("Название записи")
+        attach_tooltip(
+            self.include_name_check, "meta_include_name_in_prompt"
+        )
+        ctx_row.addWidget(self.include_name_check)
+
+        self.include_project_check = QCheckBox("Проект")
+        attach_tooltip(
+            self.include_project_check,
+            "meta_include_project_in_prompt",
+        )
+        ctx_row.addWidget(self.include_project_check)
+
+        self.include_comment_check = QCheckBox("Комментарий")
+        attach_tooltip(
+            self.include_comment_check,
+            "meta_include_comment_in_prompt",
+        )
+        ctx_row.addWidget(self.include_comment_check)
+
+        self.include_tags_check = QCheckBox("Теги")
+        attach_tooltip(
+            self.include_tags_check,
+            "meta_include_tags_in_prompt",
+        )
+        ctx_row.addWidget(self.include_tags_check)
+
+        ctx_row.addStretch()
+
+        self.context_all_btn = QPushButton("Включить всё")
+        self.context_all_btn.setToolTip(
+            "Проставить все галочки контекста"
+        )
+        self.context_all_btn.clicked.connect(
+            self._on_context_enable_all
+        )
+        ctx_row.addWidget(self.context_all_btn)
+
+        layout.addLayout(ctx_row)
+        return box
+
+    # ------------------------------------------------------------------
+    # Вкладка «Скрам и DeepSeek»
+    # ------------------------------------------------------------------
+    def _build_scrum_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        info = QLabel(
+            "Управление генерацией итоговых документов: "
+            "краткого содержания и файла-промпта для DeepSeek. "
+            "Здесь же — признак скрам-митинга и файл предыдущего "
+            "протокола."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(info)
+
+        # --- Summary ---
+        summary_header = QHBoxLayout()
+        summary_header.addWidget(
+            QLabel("<b>Краткое содержание (summary)</b>")
+        )
+        summary_header.addStretch()
+        summary_icon = make_info_icon("meta_generate_summary")
+        if summary_icon is not None:
+            summary_header.addWidget(summary_icon)
+        layout.addLayout(summary_header)
+
+        self.generate_summary_check = QCheckBox(
+            "Формировать summary для этой записи"
+        )
+        attach_tooltip(
+            self.generate_summary_check, "meta_generate_summary"
+        )
+        self.generate_summary_check.setChecked(False)
+        layout.addWidget(self.generate_summary_check)
+
+        # --- DeepSeek ---
+        deepseek_header = QHBoxLayout()
+        deepseek_header.addWidget(
+            QLabel("<b>Промпт для DeepSeek</b>")
+        )
+        deepseek_header.addStretch()
+        layout.addLayout(deepseek_header)
+
+        self.generate_deepseek_check = QCheckBox(
+            "Сформировать файл промпта для DeepSeek "
+            "(включено по умолчанию)"
+        )
+        attach_tooltip(
+            self.generate_deepseek_check,
+            "meta_generate_deepseek_prompt",
+        )
+        self.generate_deepseek_check.setChecked(True)
+        layout.addWidget(self.generate_deepseek_check)
+
+        deepseek_hint = QLabel(
+            "<span style='color:#666'>Шаблон промпта зависит "
+            "от признака «Скрам-митинг»:<br>"
+            "  • <b>Скрам включён</b> → используется шаблон из "
+            "Настройки → Скрам (плюс предыдущий протокол "
+            "и стенограмма).<br>"
+            "  • <b>Скрам выключен</b> → используется промпт "
+            "с вкладки «Промпт».</span>"
+        )
+        deepseek_hint.setWordWrap(True)
+        layout.addWidget(deepseek_hint)
+
+        # --- Скрам ---
+        scrum_header = QHBoxLayout()
+        scrum_header.addWidget(QLabel("<b>Скрам-митинг</b>"))
+        scrum_header.addStretch()
+        scrum_icon = make_info_icon("meta_is_scrum")
+        if scrum_icon is not None:
+            scrum_header.addWidget(scrum_icon)
+        layout.addLayout(scrum_header)
+
+        self.is_scrum_check = QCheckBox(
+            "Это скрам-митинг (использовать шаблон "
+            "из Настройки → Скрам)"
+        )
+        attach_tooltip(self.is_scrum_check, "meta_is_scrum")
+        layout.addWidget(self.is_scrum_check)
+
+        protocol_form = QFormLayout()
+        protocol_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+        )
+
+        self.protocol_path_input = QLineEdit()
+        self.protocol_path_input.setReadOnly(True)
+        self.protocol_path_input.setPlaceholderText(
+            "Файл протокола не выбран"
+        )
+
+        self.browse_protocol_btn = QPushButton("Загрузить файл…")
+        self.browse_protocol_btn.clicked.connect(
+            self._on_browse_protocol
+        )
+
+        self.from_session_btn = QPushButton("Из записи…")
+        self.from_session_btn.setToolTip(
+            "Выбрать предыдущий протокол из существующих сессий"
+        )
+        self.from_session_btn.clicked.connect(
+            self._on_pick_from_session
+        )
+
+        self.clear_protocol_btn = QPushButton("Сбросить")
+        self.clear_protocol_btn.clicked.connect(
+            self._on_clear_protocol
+        )
+
+        protocol_row = QHBoxLayout()
+        protocol_row.addWidget(self.protocol_path_input, 1)
+        protocol_row.addWidget(self.browse_protocol_btn)
+        protocol_row.addWidget(self.from_session_btn)
+        protocol_row.addWidget(self.clear_protocol_btn)
+        protocol_icon = make_info_icon("meta_protocol")
+        if protocol_icon is not None:
+            protocol_row.addWidget(protocol_icon)
+
+        protocol_form.addRow(
+            "Предыдущий протокол:", self._wrap(protocol_row)
+        )
+        layout.addLayout(protocol_form)
+
+        self._scrum_widgets = [
+            self.protocol_path_input,
+            self.browse_protocol_btn,
+            self.from_session_btn,
+            self.clear_protocol_btn,
+        ]
+        self.is_scrum_check.toggled.connect(
+            self._update_scrum_visibility
+        )
+        self._update_scrum_visibility(False)
+
+        layout.addStretch()
+        return w
+
+    # ------------------------------------------------------------------
+    # Вкладка «Вложения»
+    # ------------------------------------------------------------------
+    def _build_attachments_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        info = QLabel(
+            "Файлы, которые можно передать в суммаризацию "
+            "или включить в промпт DeepSeek. Текст будет "
+            "автоматически извлечён из <code>.txt</code>, "
+            "<code>.md</code>, <code>.docx</code>, "
+            "<code>.pdf</code>."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(info)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Вложения</b>"))
+        header.addStretch()
+        attach_icon = make_info_icon("meta_attachments")
+        if attach_icon is not None:
+            header.addWidget(attach_icon)
+        layout.addLayout(header)
+
+        self.attachments_list = QListWidget()
+        self.attachments_list.setMinimumHeight(160)
+        self.attachments_list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection
+        )
+        layout.addWidget(self.attachments_list, 1)
+
+        attach_btn_row = QHBoxLayout()
+        self.add_attachment_btn = QPushButton("Добавить файлы…")
+        self.add_attachment_btn.clicked.connect(
+            self._on_add_attachment
+        )
+        self.remove_attachment_btn = QPushButton(
+            "Удалить выбранные"
+        )
+        self.remove_attachment_btn.clicked.connect(
+            self._on_remove_attachment
+        )
+        attach_btn_row.addWidget(self.add_attachment_btn)
+        attach_btn_row.addWidget(self.remove_attachment_btn)
+        attach_btn_row.addStretch()
+        layout.addLayout(attach_btn_row)
+
+        # --- Куда передавать ---
+        send_header = QHBoxLayout()
+        send_header.addWidget(
+            QLabel("<b>Куда передавать вложения</b>")
+        )
+        send_header.addStretch()
+        layout.addLayout(send_header)
+
+        self.send_attachments_to_transcribe_check = QCheckBox(
+            "Передать вложения в суммаризацию"
+        )
+        attach_tooltip(
+            self.send_attachments_to_transcribe_check,
+            "meta_send_to_transcribe",
+        )
+        layout.addWidget(
+            self.send_attachments_to_transcribe_check
+        )
+
+        self.send_attachments_to_deepseek_check = QCheckBox(
+            "Передать вложения в промпт DeepSeek"
+        )
+        attach_tooltip(
+            self.send_attachments_to_deepseek_check,
+            "meta_send_to_deepseek",
+        )
+        layout.addWidget(self.send_attachments_to_deepseek_check)
+
+        return w
 
     # ------------------------------------------------------------------
     # Подключение сигналов
@@ -904,7 +1027,7 @@ class MetadataDialog(QDialog):
             self,
             "Выберите файл предыдущего протокола",
             os.path.expanduser("~"),
-            "Документы (*.docx *.txt *.md);;Все файлы (*)",
+            "Документы (*.docx *.txt *.md *.pdf);;Все файлы (*)",
         )
         if path:
             self.protocol_path_input.setText(path)
@@ -945,6 +1068,8 @@ class MetadataDialog(QDialog):
                 except Exception:
                     pass
             for fname in (
+                "manual_protocol.docx", "manual_protocol.md",
+                "manual_protocol.txt", "manual_protocol.pdf",
                 "protocol.docx", "protocol.md", "protocol.txt",
                 "deepseek_prompt.docx", "deepseek_prompt.md",
                 "deepseek_prompt.txt", "video.txt",
@@ -964,8 +1089,8 @@ class MetadataDialog(QDialog):
                 self, "Протокол",
                 "В папке сессий не найдено ни одного файла "
                 "протокола.\n\n"
-                "Поддерживаются: protocol.(docx|md|txt), "
-                "deepseek_prompt.(docx|md|txt), video.txt.",
+                "Поддерживаются: manual_protocol.*, "
+                "protocol.*, deepseek_prompt.*, video.txt.",
             )
             return
 
@@ -1109,12 +1234,20 @@ class MetadataDialog(QDialog):
         self._selected_tags = selected_tags
         self._populate_tags_list()
 
+        # --- Summary / DeepSeek ---
         self.generate_summary_check.blockSignals(True)
         self.generate_summary_check.setChecked(
             bool(init.get("generate_summary", False))
         )
         self.generate_summary_check.blockSignals(False)
 
+        if "generate_deepseek_prompt" in init:
+            gen = bool(init.get("generate_deepseek_prompt"))
+        else:
+            gen = True
+        self.generate_deepseek_check.setChecked(gen)
+
+        # --- Промпт ---
         prompt_text = (
             init.get("prompt", "") or self._default_prompt
         )
@@ -1131,21 +1264,7 @@ class MetadataDialog(QDialog):
         self.prompt_input.blockSignals(False)
         self._prompt_edited = False
 
-        is_scrum = bool(init.get("is_scrum", False))
-        self.is_scrum_check.blockSignals(True)
-        self.is_scrum_check.setChecked(is_scrum)
-        self.is_scrum_check.blockSignals(False)
-        self._update_scrum_visibility(is_scrum)
-        self.protocol_path_input.setText(
-            init.get("previous_protocol_path", "")
-        )
-
-        if "generate_deepseek_prompt" in init:
-            gen = bool(init.get("generate_deepseek_prompt"))
-        else:
-            gen = True
-        self.generate_deepseek_check.setChecked(gen)
-
+        # --- Контекст в промпт ---
         self.include_name_check.setChecked(
             bool(init.get("include_name_in_prompt", False))
         )
@@ -1159,6 +1278,17 @@ class MetadataDialog(QDialog):
             bool(init.get("include_tags_in_prompt", False))
         )
 
+        # --- Скрам ---
+        is_scrum = bool(init.get("is_scrum", False))
+        self.is_scrum_check.blockSignals(True)
+        self.is_scrum_check.setChecked(is_scrum)
+        self.is_scrum_check.blockSignals(False)
+        self._update_scrum_visibility(is_scrum)
+        self.protocol_path_input.setText(
+            init.get("previous_protocol_path", "")
+        )
+
+        # --- Вложения ---
         self._attachments = list(
             init.get("attachments", []) or []
         )
@@ -1369,16 +1499,13 @@ class MetadataDialog(QDialog):
 
         is_scrum = bool(self.is_scrum_check.isChecked())
 
-        # Собираем итоговый список тегов: только те, что отмечены
-        # в чекбоксах, в порядке справочника.
+        # Собираем теги в порядке справочника.
         selected_set = set(self._selected_tags)
         ordered_tags: List[str] = []
         for tag in self._tags:
             name = tag.get("name") or ""
             if name and name in selected_set:
                 ordered_tags.append(name)
-        # Дополняем тегами, которые выбраны, но отсутствуют
-        # в справочнике (например, добавлены вручную).
         for name in self._selected_tags:
             if name and name not in ordered_tags:
                 ordered_tags.append(name)

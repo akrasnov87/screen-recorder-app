@@ -761,7 +761,8 @@ class VideoProcessor(QObject):
             template = (user_prompt or "").strip()
             if not template:
                 template = (
-                    self.config.get("metadata", {}).get("default_prompt", "")
+                    self.config.get("metadata", {})
+                    .get("default_prompt", "")
                     or ""
                 )
                 template_source = "default"
@@ -776,126 +777,584 @@ class VideoProcessor(QObject):
         if export_format not in ("docx", "md", "txt"):
             export_format = "docx"
 
+        # --- Стенограмма (всегда plain text) ---
         transcript_text = read_any_text(
             transcript_path, self._max_file_read_chars
         )
 
-        previous_text = ""
-        if previous_protocol_path and os.path.exists(previous_protocol_path):
-            previous_text = read_any_text(
-                previous_protocol_path, self._max_file_read_chars
+        # --- Предыдущий протокол: сохраняем формат исходного файла ---
+        # Путь сохранён, но сам текст для .docx читать не будем —
+        # вставим его как отдельный документ в финальной сборке.
+        previous_path = previous_protocol_path or ""
+        previous_ext = ""
+        if previous_path and os.path.exists(previous_path):
+            previous_ext = os.path.splitext(previous_path)[1].lower()
+        else:
+            previous_path = ""
+
+        previous_plain_text = ""
+        if previous_path and previous_ext in (".txt", ".json"):
+            # Для .txt/.json читаем как plain — их нечего форматировать.
+            previous_plain_text = read_any_text(
+                previous_path, self._max_file_read_chars
+            )
+        elif previous_path and previous_ext in (".md", ".docx", ".pdf"):
+            # Для .md/.docx/.pdf форматирование сохраним при сборке
+            # финального файла. Здесь — только фиксируем путь.
+            log.info(
+                "Предыдущий протокол %s (формат %s) будет вставлен "
+                "с сохранением форматирования",
+                previous_path, previous_ext,
+            )
+        elif previous_path:
+            # Неизвестное расширение — читаем как plain на всякий случай.
+            previous_plain_text = read_any_text(
+                previous_path, self._max_file_read_chars
             )
 
-        attachments_text = ""
+        # --- Вложения: сохраняем пути, а не только текст ---
+        # Вложения тоже могут быть .docx/.md — сохраняем их пути,
+        # чтобы вставить с форматированием.
+        attachment_paths: List[str] = []
         if include_attachments and attachments:
-            attachments_text = self._read_attachments_text(attachments)
-            if attachments_text:
-                log.info("В промпт DeepSeek добавлены вложения "
-                         "(%d символов)", len(attachments_text))
+            for p in attachments:
+                if p and os.path.exists(p):
+                    attachment_paths.append(p)
+            if attachment_paths:
+                log.info(
+                    "В промпт DeepSeek будет добавлено вложений: %d "
+                    "(с сохранением форматирования для .md/.docx)",
+                    len(attachment_paths),
+                )
 
-        parts: List[str] = []
+        # --- Формируем структурированные блоки ---
+        blocks: List[Dict[str, Any]] = []
 
         if ctx_header:
-            parts.append(ctx_header)
-            parts.append("")
+            blocks.append({
+                "kind": "text",
+                "title": "",
+                "text": ctx_header,
+            })
 
-        parts.append(template)
-        parts.append("")
+        if template.strip():
+            blocks.append({
+                "kind": "text",
+                "title": "",
+                "text": template,
+            })
 
         if manual_protocol_text:
-            parts.append("=" * 60)
-            parts.append("РУЧНОЙ ПРОТОКОЛ (загружен пользователем)")
-            parts.append("=" * 60)
-            parts.append("")
-            parts.append(manual_protocol_text)
-            parts.append("")
+            blocks.append({
+                "kind": "text",
+                "title": "РУЧНОЙ ПРОТОКОЛ (загружен пользователем)",
+                "text": manual_protocol_text,
+            })
 
         if summary_text:
-            parts.append("=" * 60)
-            parts.append("КРАТКОЕ ОПИСАНИЕ ЗАПИСИ (введено пользователем)")
-            parts.append("=" * 60)
-            parts.append("")
-            parts.append(summary_text)
-            parts.append("")
+            blocks.append({
+                "kind": "text",
+                "title": "КРАТКОЕ ОПИСАНИЕ ЗАПИСИ (введено пользователем)",
+                "text": summary_text,
+            })
 
-        if previous_text or use_scrum_template:
-            parts.append("=" * 60)
-            parts.append("ПРЕДЫДУЩИЙ ПРОТОКОЛ")
-            parts.append("=" * 60)
-            parts.append("")
-            parts.append(previous_text or "(Предыдущий протокол не приложен.)")
+        # --- Предыдущий протокол ---
+        if previous_path:
+            blocks.append({
+                "kind": "file",
+                "title": "ПРЕДЫДУЩИЙ ПРОТОКОЛ",
+                "path": previous_path,
+                "ext": previous_ext,
+                "fallback_text": previous_plain_text,
+            })
+        elif use_scrum_template:
+            blocks.append({
+                "kind": "text",
+                "title": "ПРЕДЫДУЩИЙ ПРОТОКОЛ",
+                "text": "(Предыдущий протокол не приложен.)",
+            })
 
+        # --- Глоссарий ---
         if glossary_text:
-            parts.append("")
-            parts.append("=" * 60)
-            parts.append("ГЛОССАРИЙ (используй правильные формулировки)")
-            parts.append("=" * 60)
-            parts.append("")
-            parts.append(glossary_text)
+            blocks.append({
+                "kind": "text",
+                "title": "ГЛОССАРИЙ (используй правильные формулировки)",
+                "text": glossary_text,
+            })
 
-        if attachments_text:
-            parts.append("")
-            parts.append("=" * 60)
-            parts.append("ВЛОЖЕНИЯ")
-            parts.append("=" * 60)
-            parts.append("")
-            parts.append(attachments_text)
+        # --- Вложения ---
+        for p in attachment_paths:
+            ext = os.path.splitext(p)[1].lower()
+            blocks.append({
+                "kind": "file",
+                "title": f"ВЛОЖЕНИЕ: {os.path.basename(p)}",
+                "path": p,
+                "ext": ext,
+                "fallback_text": "",
+            })
 
-        parts.append("")
-        parts.append("=" * 60)
-        parts.append("СТЕНОГРАММА СЕГОДНЯШНЕГО СОВЕЩАНИЯ")
-        parts.append("=" * 60)
-        parts.append("")
-        parts.append(transcript_text)
+        # --- Стенограмма ---
+        blocks.append({
+            "kind": "text",
+            "title": "СТЕНОГРАММА СЕГОДНЯШНЕГО СОВЕЩАНИЯ",
+            "text": transcript_text,
+        })
 
-        full_text = "\n".join(parts)
         return self._export_prompt_file(
             session_dir=session_dir,
-            full_text=full_text,
+            blocks=blocks,
             fmt=export_format,
         )
 
-    def _export_prompt_file(self, session_dir: str, full_text: str,
-                            fmt: str) -> str:
-        base_name = "deepseek_prompt"
-        try:
-            if fmt == "txt":
-                path = os.path.join(session_dir, f"{base_name}.txt")
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(full_text)
-                log.info("Промпт сохранён (txt): %s (%d символов)",
-                         path, len(full_text))
-                return path
+    # ------------------------------------------------------------------
+    # Рендеринг блоков промпта в DOCX / MD / TXT
+    # ------------------------------------------------------------------
+    def _render_blocks_to_docx(
+        self,
+        blocks: List[Dict[str, Any]],
+        doc,
+    ) -> None:
+        """
+        Наполняет python-docx Document блоками промпта.
 
-            if fmt == "md":
-                path = os.path.join(session_dir, f"{base_name}.md")
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(full_text)
-                log.info("Промпт сохранён (md): %s (%d символов)",
-                         path, len(full_text))
-                return path
+        Правила:
+          • text-блок: заголовок (если есть) стилем Heading 2,
+            затем абзацы текста как есть.
+          • file-блок:
+              – .docx — вставляем как отдельный документ
+                с сохранением абзацев, стилей, жирного/курсива,
+                списков (насколько это возможно);
+              – .md   — конвертируем через markdown_to_docx
+                во временный файл и вставляем как .docx;
+              – .txt/.json/прочее — читаем как plain,
+                вставляем абзацами;
+              – .pdf  — читаем как plain (pypdf не отдаёт
+                форматирование).
+        """
+        from docx import Document  # type: ignore
+        from docx.shared import Pt  # type: ignore
+        from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
 
-            path = os.path.join(session_dir, f"{base_name}.docx")
+        for idx, b in enumerate(blocks):
+            kind = b.get("kind", "text")
+            title = (b.get("title") or "").strip()
+
+            # Разделитель между блоками (визуальный)
+            if idx > 0:
+                sep = doc.add_paragraph()
+                run = sep.add_run("─" * 60)
+                run.font.size = Pt(9)
+                run.font.color.rgb = None
+                sep.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            # --- Заголовок блока ---
+            if title:
+                doc.add_heading(title, level=2)
+
+            # --- Text-блок ---
+            if kind == "text":
+                text = b.get("text") or ""
+                for line in text.splitlines():
+                    doc.add_paragraph(line)
+                continue
+
+            # --- File-блок ---
+            if kind == "file":
+                path = b.get("path") or ""
+                ext = (b.get("ext") or "").lower()
+                fallback = b.get("fallback_text") or ""
+
+                if not path or not os.path.exists(path):
+                    if fallback:
+                        for line in fallback.splitlines():
+                            doc.add_paragraph(line)
+                    else:
+                        doc.add_paragraph("(Файл недоступен.)")
+                    continue
+
+                try:
+                    if ext == ".docx":
+                        self._append_docx_content(doc, path)
+                    elif ext == ".md":
+                        tmp_docx = self._md_to_tmp_docx(path)
+                        if tmp_docx:
+                            try:
+                                self._append_docx_content(
+                                    doc, tmp_docx
+                                )
+                            finally:
+                                try:
+                                    os.remove(tmp_docx)
+                                except Exception:
+                                    pass
+                        else:
+                            # Fallback: как plain text
+                            plain = read_any_text(
+                                path, self._max_file_read_chars
+                            )
+                            for line in plain.splitlines():
+                                doc.add_paragraph(line)
+                    else:
+                        # .txt, .json, .pdf, прочее — как plain
+                        plain = read_any_text(
+                            path, self._max_file_read_chars
+                        )
+                        if plain:
+                            for line in plain.splitlines():
+                                doc.add_paragraph(line)
+                        elif fallback:
+                            for line in fallback.splitlines():
+                                doc.add_paragraph(line)
+                        else:
+                            doc.add_paragraph("(Пустой файл.)")
+                except Exception as exc:
+                    log.exception(
+                        "Не удалось вставить файл %s как docx: %s",
+                        path, exc,
+                    )
+                    doc.add_paragraph(
+                        f"(Не удалось вставить файл: "
+                        f"{os.path.basename(path)})"
+                    )
+
+    @staticmethod
+    def _append_docx_content(target_doc, src_path: str) -> None:
+        """
+        Вставляет содержимое .docx в целевой Document,
+        сохраняя форматирование на уровне runs (bold/italic/
+        underline, размер шрифта) и стили абзацев
+        (Heading 1..N, List Bullet, List Number, Quote).
+        """
+        from docx import Document  # type: ignore
+        from docx.shared import Pt  # type: ignore
+
+        src = Document(src_path)
+
+        for para in src.paragraphs:
+            text = para.text or ""
+            style_name = (para.style.name if para.style else "") or ""
+
+            # Определяем, какой стиль использовать в целевом
+            # документе. Heading N → Heading N. Списки → списки.
+            target_style = None
+            if style_name.startswith("Heading "):
+                try:
+                    level = int(style_name.split(" ")[1])
+                    level = max(1, min(level, 6))
+                    target_style = f"Heading {level}"
+                except (IndexError, ValueError):
+                    target_style = None
+            elif style_name in ("List Bullet", "List Number",
+                                "Quote", "Intense Quote"):
+                target_style = style_name
+
+            if target_style:
+                try:
+                    new_para = target_doc.add_paragraph(
+                        style=target_style
+                    )
+                except KeyError:
+                    # Стиль не существует в целевом doc — обычный
+                    new_para = target_doc.add_paragraph()
+            else:
+                new_para = target_doc.add_paragraph()
+
+            # Копируем runs с их форматированием
+            if not para.runs:
+                # Пустой абзац — просто перенос
+                continue
+
+            for run in para.runs:
+                new_run = new_para.add_run(run.text)
+                new_run.bold = run.bold
+                new_run.italic = run.italic
+                new_run.underline = run.underline
+                # Размер шрифта
+                if run.font.size is not None:
+                    new_run.font.size = run.font.size
+                # Имя шрифта
+                if run.font.name:
+                    new_run.font.name = run.font.name
+
+        # Таблицы (если есть) — вставляем как простые таблицы
+        for table in src.tables:
             try:
-                from docx import Document  # type: ignore
-            except ImportError:
-                log.warning("python-docx не установлен. "
-                            "Сохраняю .txt вместо .docx")
-                path = os.path.join(session_dir, f"{base_name}.txt")
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(full_text)
-                return path
+                rows = len(table.rows)
+                cols = len(table.columns)
+                if rows == 0 or cols == 0:
+                    continue
+                new_table = target_doc.add_table(
+                    rows=rows, cols=cols
+                )
+                for r_idx, row in enumerate(table.rows):
+                    for c_idx, cell in enumerate(row.cells):
+                        new_table.cell(r_idx, c_idx).text = (
+                            cell.text or ""
+                        )
+            except Exception as exc:
+                log.warning(
+                    "Не удалось вставить таблицу из %s: %s",
+                    src_path, exc,
+                )
 
+    def _md_to_tmp_docx(self, md_path: str) -> str:
+        """
+        Конвертирует .md в временный .docx через markdown_to_docx.
+        Возвращает путь к временному файлу или "".
+        """
+        try:
+            from .markdown_docx import markdown_to_docx
+        except Exception as exc:
+            log.warning(
+                "markdown_to_docx недоступен: %s", exc
+            )
+            return ""
+
+        try:
+            md_text = read_any_text(
+                md_path, self._max_file_read_chars
+            )
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать md %s: %s", md_path, exc
+            )
+            return ""
+
+        if not md_text.strip():
+            return ""
+
+        import tempfile
+        stem = os.path.splitext(os.path.basename(md_path))[0]
+        tmp = os.path.join(
+            tempfile.gettempdir(),
+            f"prompt_embed_{stem}_{os.getpid()}.docx",
+        )
+        try:
+            markdown_to_docx(md_text, tmp, title="")
+        except Exception as exc:
+            log.exception(
+                "Не удалось сконвертировать %s в docx: %s",
+                md_path, exc,
+            )
+            return ""
+        return tmp
+
+    def _export_prompt_file(
+        self,
+        session_dir: str,
+        blocks: List[Dict[str, Any]],
+        fmt: str,
+    ) -> str:
+        base_name = "deepseek_prompt"
+
+        # ------------------------------------------------------------------
+        # TXT: собираем plain text из блоков
+        # ------------------------------------------------------------------
+        if fmt == "txt":
+            path = os.path.join(session_dir, f"{base_name}.txt")
+            parts: List[str] = []
+            for idx, b in enumerate(blocks):
+                title = (b.get("title") or "").strip()
+                kind = b.get("kind", "text")
+
+                if idx > 0:
+                    parts.append("")
+                    parts.append("=" * 60)
+                    parts.append("")
+
+                if title:
+                    parts.append(title)
+                    parts.append("=" * 60)
+                    parts.append("")
+
+                if kind == "text":
+                    parts.append(b.get("text") or "")
+                elif kind == "file":
+                    p = b.get("path") or ""
+                    ext = (b.get("ext") or "").lower()
+                    if p and os.path.exists(p):
+                        if ext == ".docx":
+                            # В .txt сохраняем как plain text
+                            try:
+                                from docx import Document
+                                d = Document(p)
+                                parts.append(
+                                    "\n".join(
+                                        para.text
+                                        for para in d.paragraphs
+                                    )
+                                )
+                            except Exception as exc:
+                                log.warning(
+                                    "Не удалось прочитать docx %s: %s",
+                                    p, exc,
+                                )
+                                parts.append(
+                                    b.get("fallback_text") or ""
+                                )
+                        else:
+                            txt = read_any_text(
+                                p, self._max_file_read_chars
+                            )
+                            parts.append(txt or b.get("fallback_text") or "")
+                    else:
+                        parts.append(b.get("fallback_text") or "")
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(parts))
+            log.info("Промпт сохранён (txt): %s", path)
+            return path
+
+        # ------------------------------------------------------------------
+        # MD: собираем Markdown
+        # ------------------------------------------------------------------
+        if fmt == "md":
+            path = os.path.join(session_dir, f"{base_name}.md")
+            md_parts: List[str] = []
+            for idx, b in enumerate(blocks):
+                title = (b.get("title") or "").strip()
+                kind = b.get("kind", "text")
+
+                if idx > 0:
+                    md_parts.append("")
+                    md_parts.append("---")
+                    md_parts.append("")
+
+                if title:
+                    md_parts.append(f"## {title}")
+                    md_parts.append("")
+
+                if kind == "text":
+                    md_parts.append(b.get("text") or "")
+                elif kind == "file":
+                    p = b.get("path") or ""
+                    ext = (b.get("ext") or "").lower()
+                    if p and os.path.exists(p):
+                        if ext == ".md":
+                            # Сохраняем Markdown как есть
+                            md_parts.append(
+                                read_any_text(
+                                    p, self._max_file_read_chars
+                                )
+                            )
+                        elif ext == ".docx":
+                            # В .md конвертируем docx → markdown
+                            # через docx_to_markdown (если есть)
+                            # или как plain text.
+                            md_parts.append(
+                                self._docx_to_markdown(p)
+                            )
+                        else:
+                            md_parts.append(
+                                read_any_text(
+                                    p, self._max_file_read_chars
+                                )
+                                or b.get("fallback_text") or ""
+                            )
+                    else:
+                        md_parts.append(b.get("fallback_text") or "")
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(md_parts))
+            log.info("Промпт сохранён (md): %s", path)
+            return path
+
+        # ------------------------------------------------------------------
+        # DOCX: собираем Document с сохранением форматирования
+        # ------------------------------------------------------------------
+        path = os.path.join(session_dir, f"{base_name}.docx")
+        try:
+            from docx import Document  # type: ignore
+        except ImportError:
+            log.warning(
+                "python-docx не установлен. Сохраняю .txt вместо .docx"
+            )
+            path_txt = os.path.join(session_dir, f"{base_name}.txt")
+            # Рекурсивно вызываем себя с fmt=txt
+            return self._export_prompt_file(
+                session_dir=session_dir,
+                blocks=blocks,
+                fmt="txt",
+            )
+
+        try:
             doc = Document()
-            for line in full_text.splitlines():
-                doc.add_paragraph(line)
+            self._render_blocks_to_docx(blocks, doc)
             doc.save(path)
-            log.info("Промпт сохранён (docx): %s (%d символов)",
-                     path, len(full_text))
+            log.info(
+                "Промпт сохранён (docx): %s (блоков: %d)",
+                path, len(blocks),
+            )
             return path
         except Exception as exc:
             log.exception("Ошибка сохранения промпта: %s", exc)
             return ""
+
+    @staticmethod
+    def _docx_to_markdown(docx_path: str) -> str:
+        """
+        Простейшая конвертация .docx → Markdown.
+
+        Сохраняет заголовки (Heading N), списки, жирный/курсив.
+        Используется, когда DeepSeek-промпт сохраняется в .md,
+        но содержит .docx-вложение/протокол.
+        """
+        try:
+            from docx import Document  # type: ignore
+        except ImportError:
+            return ""
+
+        try:
+            doc = Document(docx_path)
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать docx %s: %s", docx_path, exc
+            )
+            return ""
+
+        lines: List[str] = []
+        for para in doc.paragraphs:
+            text = para.text or ""
+            style = (para.style.name if para.style else "") or ""
+
+            if style.startswith("Heading "):
+                try:
+                    level = int(style.split(" ")[1])
+                    level = max(1, min(level, 6))
+                except (IndexError, ValueError):
+                    level = 1
+                lines.append("#" * level + " " + text)
+                continue
+
+            if style == "List Bullet":
+                lines.append(f"- {text}")
+                continue
+            if style == "List Number":
+                lines.append(f"1. {text}")
+                continue
+            if style in ("Quote", "Intense Quote"):
+                lines.append(f"> {text}")
+                continue
+
+            # Инлайн-форматирование — грубо, по runs.
+            if para.runs:
+                parts: List[str] = []
+                for run in para.runs:
+                    t = run.text or ""
+                    if not t:
+                        continue
+                    if run.bold and run.italic:
+                        t = f"***{t}***"
+                    elif run.bold:
+                        t = f"**{t}**"
+                    elif run.italic:
+                        t = f"*{t}*"
+                    parts.append(t)
+                lines.append("".join(parts))
+            else:
+                lines.append(text)
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Управление
