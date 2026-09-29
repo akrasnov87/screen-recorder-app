@@ -4,21 +4,32 @@
   • _send_to_bitrix() использует config.default_chat_id.
   • Добавлена колонка «Теги» и поддержка редактирования тегов
     через карточку метаданных.
+  • Интеграция с синхронизацией:
+      – пункт меню «Файл → Синхронизация с сервером…»;
+      – пункт меню «Файл → Синхронизировать выбранную запись…»;
+      – кнопка «Синхронизировать…» на нижней панели;
+      – контекстное меню с «Синхронизировать…»;
+      – колонка «Синхр.»;
+      – диалог SyncOneRecordDialog с выбором передавать ли медиа,
+        ссылку file://, удалять ли локальные медиа после загрузки.
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import os
 import shutil
+import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QMenu, QMenuBar, QMessageBox,
+    QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog,
+    QLabel, QMenu, QMenuBar, QMessageBox, QPlainTextEdit,
     QProgressDialog, QPushButton, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -29,6 +40,10 @@ from .markdown_docx import markdown_to_docx
 from .markdown_editor import MarkdownEditorDialog, MarkdownViewerDialog
 from .markdown_to_bitrix import markdown_to_plain, markdown_to_plain_with_bb
 from .metadata_dialog import MetadataDialog
+from .screc_client import ScrecError
+from .sync_manager import (
+    SyncManager, get_record_id, is_record_published,
+)
 from .task_queue import TaskQueue
 
 log = get_logger(__name__)
@@ -236,6 +251,9 @@ class SessionsScanThread(QThread):
             summary_bb = str(meta.get("summary_bb") or "")
             tags = self._extract_tags(meta)
 
+            published = is_record_published(session_dir)
+            record_id = get_record_id(session_dir)
+
             rows.append({
                 "dir": session_dir,
                 "name": meta.get("name") or name,
@@ -245,19 +263,337 @@ class SessionsScanThread(QThread):
                 "is_scrum": bool(meta.get("is_scrum", False)),
                 "datetime": f"{date_str} {time_str}".strip(),
                 "video_path": video_path,
+                "audio_path": audio_path,
                 "has_video": has_video,
+                "has_audio": has_audio,
                 "task_id": task_id,
                 "prompt_path": prompt_path,
                 "attachments": attachments,
                 "manual_protocol_path": manual_protocol_path,
                 "summary_bb": summary_bb,
                 "tags": tags,
+                "published": published,
+                "record_id": record_id,
             })
 
         rows.sort(key=lambda r: r["datetime"], reverse=True)
         return rows
 
 
+# ---------------------------------------------------------------------------
+# Фоновый воркер для синхронизации одной записи
+# ---------------------------------------------------------------------------
+class _OneSyncWorker(QThread):
+    """Синхронизирует одну запись с сервером."""
+
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        manager: SyncManager,
+        session_dir: str,
+        include_media: bool,
+        send_video_link: bool,
+        delete_media_after_upload: bool,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._manager = manager
+        self._session_dir = session_dir
+        self._include_media = include_media
+        self._send_video_link = send_video_link
+        self._delete_after = delete_media_after_upload
+
+    def run(self) -> None:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(
+                    self._manager.sync_one(
+                        self._session_dir,
+                        include_media=self._include_media,
+                        send_video_link=self._send_video_link,
+                        delete_media_after_upload=self._delete_after,
+                        progress_cb=self._emit_progress,
+                    )
+                )
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
+            self.finished_ok.emit(result)
+        except ScrecError as exc:
+            log.error("OneSyncWorker: ScrecError: %s", exc)
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            log.exception("OneSyncWorker: ошибка: %s", exc)
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+    def _emit_progress(self, message: str) -> None:
+        self.progress.emit(message)
+
+
+# ---------------------------------------------------------------------------
+# Диалог синхронизации одной записи
+# ---------------------------------------------------------------------------
+class SyncOneRecordDialog(QDialog):
+    """
+    Диалог настройки публикации одной записи на сервер.
+
+    Показывает список локальных файлов и позволяет выбрать:
+      • передавать ли медиа (видео и аудио);
+      • передавать ли ссылку на видео (file://);
+      • удалять ли локальные медиа после успешной загрузки.
+    """
+
+    def __init__(
+        self,
+        row: Dict[str, Any],
+        sync_settings: Dict[str, Any],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._row = row
+        self._sync_settings = sync_settings or {}
+
+        self.setWindowTitle("Синхронизация записи")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+
+        self._result_data: Dict[str, Any] = {}
+
+        self._build_ui()
+        self._populate()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+
+        # --- Заголовок ---
+        name = self._row.get("name") or "(без названия)"
+        project = self._row.get("project") or "—"
+        dt = self._row.get("datetime") or "—"
+        published = bool(self._row.get("published"))
+        record_id = self._row.get("record_id") or ""
+
+        status_html = (
+            f"<span style='color:#2E7D32'><b>Опубликована</b> "
+            f"(record_id: {html.escape(record_id[:8])}…)</span>"
+            if published else
+            "<span style='color:#B8860B'><b>Ещё не опубликована</b></span>"
+        )
+
+        header = QLabel(
+            f"<b>{html.escape(name)}</b><br>"
+            f"<span style='color:#666'>Проект:</span> "
+            f"{html.escape(project)} &nbsp;|&nbsp; "
+            f"<span style='color:#666'>Дата:</span> "
+            f"{html.escape(dt)}<br>"
+            f"<span style='color:#666'>Статус:</span> {status_html}"
+        )
+        header.setWordWrap(True)
+        root.addWidget(header)
+
+        # --- Список файлов ---
+        files_label = QLabel("<b>Локальные файлы:</b>")
+        root.addWidget(files_label)
+
+        self.files_view = QPlainTextEdit()
+        self.files_view.setReadOnly(True)
+        self.files_view.setMaximumHeight(140)
+        root.addWidget(self.files_view)
+
+        # --- Чекбоксы ---
+        self.send_media_check = QCheckBox(
+            "Передавать медиа (видео и аудио) на сервер"
+        )
+        self.send_media_check.setToolTip(
+            "Если включено — видео и аудио уйдут на сервер "
+            "как артефакты (kind=video / kind=audio).\n\n"
+            "Если выключено — на сервер уйдут только метаданные "
+            "и текстовые артефакты (стенограмма, протокол, "
+            "summary, промпт, вложения)."
+        )
+        self.send_media_check.setChecked(
+            bool(self._sync_settings.get("send_media_to_server", False))
+        )
+        root.addWidget(self.send_media_check)
+
+        self.send_video_link_check = QCheckBox(
+            "Передавать ссылку на видео (file://…)"
+        )
+        self.send_video_link_check.setToolTip(
+            "Сохраняет в метаданных записи на сервере ссылку "
+            "file:///путь/к/video.mp4. На другом устройстве "
+            "ссылка не откроется, но она документирует, где "
+            "изначально лежал файл."
+        )
+        self.send_video_link_check.setChecked(
+            bool(self._sync_settings.get("send_video_link", True))
+        )
+        root.addWidget(self.send_video_link_check)
+
+        self.delete_after_check = QCheckBox(
+            "Удалить локальные медиа после успешной загрузки "
+            "на сервер"
+        )
+        self.delete_after_check.setToolTip(
+            "Работает только если включена передача медиа.\n\n"
+            "После успешной загрузки видео/аудио на сервер "
+            "локальная копия удаляется. Файл можно будет "
+            "скачать обратно через окно «Синхронизация»."
+        )
+        self.delete_after_check.setChecked(
+            bool(
+                self._sync_settings.get(
+                    "delete_local_media_after_media_upload", False
+                )
+            )
+        )
+        root.addWidget(self.delete_after_check)
+
+        # Связываем: delete_after доступен только при send_media.
+        self.send_media_check.toggled.connect(
+            self.delete_after_check.setEnabled
+        )
+        self.delete_after_check.setEnabled(
+            self.send_media_check.isChecked()
+        )
+
+        # --- Инфо о лимите ---
+        max_mb = int(
+            self._sync_settings.get("max_artifact_mb", 50)
+        )
+        limit_label = QLabel(
+            f"<span style='color:#666'>Максимальный размер "
+            f"одного артефакта: <b>{max_mb} МБ</b>. Файлы больше "
+            f"лимита будут пропущены.</span>"
+        )
+        limit_label.setWordWrap(True)
+        root.addWidget(limit_label)
+
+        # --- Кнопки ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        ).setText("Синхронизировать")
+        buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        ).setText("Отмена")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _populate(self) -> None:
+        """Показывает список локальных файлов с размерами."""
+        lines: List[str] = []
+        session_dir = self._row.get("dir") or ""
+
+        # Медиа
+        for kind, exts in (
+            ("video", (".mp4", ".mkv", ".mov", ".avi", ".webm",
+                       ".flv", ".wmv")),
+            ("audio", (".mp3", ".wav", ".m4a", ".aac",
+                       ".opus", ".ogg")),
+        ):
+            for ext in exts:
+                p = os.path.join(session_dir, f"video{ext}")
+                if os.path.isfile(p):
+                    try:
+                        size = os.path.getsize(p) / 1024 / 1024
+                    except OSError:
+                        size = 0
+                    lines.append(
+                        f"  [{kind}]  video{ext}  —  {size:.2f} МБ"
+                    )
+                    break
+
+        # Текстовые артефакты
+        text_files = [
+            ("transcript", "video.txt"),
+            ("summary", "video_summary.md"),
+            ("summary", "summary.md"),
+            ("protocol", "protocol.docx"),
+            ("protocol", "protocol.md"),
+            ("protocol", "protocol.txt"),
+            ("manual_protocol", "manual_protocol.docx"),
+            ("manual_protocol", "manual_protocol.md"),
+            ("manual_protocol", "manual_protocol.txt"),
+            ("manual_protocol", "manual_protocol.pdf"),
+            ("deepseek_prompt", "deepseek_prompt.docx"),
+            ("deepseek_prompt", "deepseek_prompt.md"),
+            ("deepseek_prompt", "deepseek_prompt.txt"),
+        ]
+        seen_kinds: set = set()
+        for kind, fname in text_files:
+            if kind in seen_kinds:
+                continue
+            p = os.path.join(session_dir, fname)
+            if os.path.isfile(p):
+                try:
+                    size = os.path.getsize(p) / 1024
+                except OSError:
+                    size = 0
+                lines.append(
+                    f"  [{kind}]  {fname}  —  {size:.1f} КБ"
+                )
+                seen_kinds.add(kind)
+
+        # Вложения
+        att_dir = os.path.join(session_dir, "attachments")
+        if os.path.isdir(att_dir):
+            try:
+                for name in sorted(os.listdir(att_dir)):
+                    p = os.path.join(att_dir, name)
+                    if os.path.isfile(p):
+                        try:
+                            size = os.path.getsize(p) / 1024
+                        except OSError:
+                            size = 0
+                        lines.append(
+                            f"  [attachment]  {name}  —  "
+                            f"{size:.1f} КБ"
+                        )
+            except OSError:
+                pass
+
+        if not lines:
+            lines = ["  (нет локальных файлов)"]
+
+        self.files_view.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Результат
+    # ------------------------------------------------------------------
+    def _on_accept(self) -> None:
+        self._result_data = {
+            "include_media": bool(self.send_media_check.isChecked()),
+            "send_video_link": bool(
+                self.send_video_link_check.isChecked()
+            ),
+            "delete_media_after_upload": bool(
+                self.delete_after_check.isChecked()
+            ),
+        }
+        self.accept()
+
+    def result_data(self) -> Dict[str, Any]:
+        return dict(self._result_data)
+
+
+# ---------------------------------------------------------------------------
+# Основное окно
+# ---------------------------------------------------------------------------
 class SessionsWindow(QDialog):
     """Список всех записей в папке sessions/."""
 
@@ -277,10 +613,12 @@ class SessionsWindow(QDialog):
         self.processor = processor
         self.config_manager = config_manager
         self.setWindowTitle("Записи")
-        self.setMinimumSize(1500, 780)
+        self.setMinimumSize(1600, 800)
         self.setModal(False)
         self._rows: List[Dict[str, Any]] = []
         self._thread: Optional[SessionsScanThread] = None
+        self._sync_worker: Optional[_OneSyncWorker] = None
+        self._sync_progress_dlg: Optional[QProgressDialog] = None
 
         self._build_ui()
         self._build_menu_bar()
@@ -310,11 +648,11 @@ class SessionsWindow(QDialog):
         header.addWidget(self.refresh_indicator)
         root.addLayout(header)
 
-        self.table = QTableWidget(0, 11)
+        self.table = QTableWidget(0, 12)
         self.table.setHorizontalHeaderLabels([
             "Дата и время", "Название", "Проект", "Теги",
             "Статус", "Источник", "Скрам", "Вложения",
-            "Summary", "Task ID", "Папка",
+            "Summary", "Синхр.", "Task ID", "Папка",
         ])
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -352,7 +690,10 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             9, QHeaderView.ResizeMode.ResizeToContents
         )
-        hv.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            10, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(
             self._on_selection_changed
         )
@@ -368,6 +709,19 @@ class SessionsWindow(QDialog):
 
         bottom = QHBoxLayout()
         bottom.addStretch()
+
+        self.sync_btn = QPushButton("Синхронизировать…")
+        self.sync_btn.setToolTip(
+            "Опубликовать выбранную запись на сервер "
+            "синхронизации.\n\n"
+            "Откроется диалог, где можно выбрать:\n"
+            "  • передавать ли медиа (видео и аудио);\n"
+            "  • передавать ли ссылку file://;\n"
+            "  • удалять ли локальные медиа после загрузки.\n\n"
+            "Горячая клавиша: Ctrl+Shift+S"
+        )
+        self.sync_btn.clicked.connect(self._sync_one_record)
+        bottom.addWidget(self.sync_btn)
 
         self.refresh_btn = QPushButton("Обновить")
         self.refresh_btn.clicked.connect(self.refresh)
@@ -434,6 +788,38 @@ class SessionsWindow(QDialog):
         act_import.setShortcut(QKeySequence("Ctrl+I"))
         act_import.triggered.connect(self._on_import_requested)
         m_file.addAction(act_import)
+
+        m_file.addSeparator()
+
+        act_sync = QAction("Синхронизация с сервером…", self)
+        act_sync.setShortcut(QKeySequence("Ctrl+Shift+Y"))
+        act_sync.setToolTip(
+            "Открыть окно синхронизации: публикация, скачивание, "
+            "дельта-синхронизация"
+        )
+        act_sync.triggered.connect(self._open_sync_window)
+        m_file.addAction(act_sync)
+
+        act_sync_record = QAction(
+            "Синхронизировать выбранную запись…", self
+        )
+        act_sync_record.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        act_sync_record.setToolTip(
+            "Опубликовать выбранную запись на сервер "
+            "с выбором параметров (медиа, ссылка, удаление)"
+        )
+        act_sync_record.triggered.connect(self._sync_one_record)
+        m_file.addAction(act_sync_record)
+
+        act_sync_pull = QAction(
+            "Подтянуть изменения с сервера", self
+        )
+        act_sync_pull.setToolTip(
+            "Запросить /sync/changes и применить изменения "
+            "локально"
+        )
+        act_sync_pull.triggered.connect(self._pull_changes)
+        m_file.addAction(act_sync_pull)
 
         m_file.addSeparator()
 
@@ -714,7 +1100,9 @@ class SessionsWindow(QDialog):
         r = self._selected_row()
         if not r:
             self.selection_label.setText("")
+            self.sync_btn.setEnabled(False)
             return
+
         parts = [f"<b>{r['name']}</b>"]
         if r.get("project"):
             parts.append(f"проект: {r['project']}")
@@ -727,7 +1115,14 @@ class SessionsWindow(QDialog):
             parts.append("протокол: прикреплён")
         if (r.get("summary_bb") or "").strip():
             parts.append("summary: есть")
+        if r.get("published"):
+            parts.append(
+                f"на сервере: {r.get('record_id', '')[:8]}"
+            )
         self.selection_label.setText(" | ".join(parts))
+
+        # Кнопка синхронизации доступна, если есть папка сессии.
+        self.sync_btn.setEnabled(bool(r.get("dir")))
 
     # ------------------------------------------------------------------
     # Обновление
@@ -790,11 +1185,12 @@ class SessionsWindow(QDialog):
         errors = sum(
             1 for r in rows if r["status"] == STATUS_ERROR
         )
+        published = sum(1 for r in rows if r.get("published"))
 
         self.summary_label.setText(
             f"Всего: {total} | Обработан: {processed} | "
             f"Сохранено: {uploaded} | В обработке: {in_progress} | "
-            f"Ошибок: {errors}"
+            f"Ошибок: {errors} | На сервере: {published}"
         )
         self._on_selection_changed()
 
@@ -863,11 +1259,227 @@ class SessionsWindow(QDialog):
                 summary_item = QTableWidgetItem("—")
             self.table.setItem(row, 8, summary_item)
 
+            published = bool(r.get("published"))
+            sync_text = "да" if published else "—"
+            sync_item = QTableWidgetItem(sync_text)
+            if published:
+                sync_item.setForeground(Qt.GlobalColor.darkGreen)
+                sync_item.setToolTip(
+                    f"Record ID: {r.get('record_id', '')}"
+                )
+            else:
+                sync_item.setForeground(Qt.GlobalColor.gray)
+                sync_item.setToolTip("Запись ещё не опубликована")
+            self.table.setItem(row, 9, sync_item)
+
             self.table.setItem(
-                row, 9,
+                row, 10,
                 QTableWidgetItem(r["task_id"] or "—"),
             )
-            self.table.setItem(row, 10, QTableWidgetItem(r["dir"]))
+            self.table.setItem(row, 11, QTableWidgetItem(r["dir"]))
+
+    # ------------------------------------------------------------------
+    # Синхронизация одной записи
+    # ------------------------------------------------------------------
+    def _sync_one_record(self) -> None:
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "Синхронизация",
+                "Нет доступа к настройкам (ConfigManager)."
+            )
+            return
+
+        cfg = self.config_manager.get_sync_settings()
+        if not (cfg.get("enabled") and cfg.get("base_url")
+                and cfg.get("api_key")):
+            QMessageBox.warning(
+                self, "Синхронизация",
+                "Синхронизация не настроена.\n\n"
+                "Откройте Настройки → Синхронизация, "
+                "укажите Base URL и API-ключ.",
+            )
+            return
+
+        # Открываем диалог выбора опций.
+        dlg = SyncOneRecordDialog(
+            row=r,
+            sync_settings=cfg,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        opts = dlg.result_data()
+        manager = SyncManager(
+            sessions_root=self.sessions_root,
+            sync_settings=cfg,
+            config_manager=self.config_manager,
+        )
+
+        # Прогресс-диалог.
+        self._sync_progress_dlg = QProgressDialog(
+            f"Синхронизация: {r['name']}…",
+            "Отмена",
+            0, 0, self,
+        )
+        self._sync_progress_dlg.setWindowTitle("Синхронизация")
+        self._sync_progress_dlg.setWindowModality(
+            Qt.WindowModality.WindowModal
+        )
+        self._sync_progress_dlg.setMinimumDuration(0)
+        self._sync_progress_dlg.setCancelButton(None)  # пока нельзя отменить
+        self._sync_progress_dlg.show()
+
+        # Воркер.
+        self._sync_worker = _OneSyncWorker(
+            manager=manager,
+            session_dir=r["dir"],
+            include_media=bool(opts.get("include_media")),
+            send_video_link=bool(opts.get("send_video_link")),
+            delete_media_after_upload=bool(
+                opts.get("delete_media_after_upload")
+            ),
+            parent=self,
+        )
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        self._sync_worker.finished_ok.connect(self._on_sync_finished)
+        self._sync_worker.failed.connect(self._on_sync_failed)
+        self._sync_worker.finished.connect(
+            self._on_sync_worker_done
+        )
+        self._sync_worker.start()
+
+    def _on_sync_progress(self, message: str) -> None:
+        if self._sync_progress_dlg is not None:
+            self._sync_progress_dlg.setLabelText(message)
+
+    def _on_sync_finished(self, result: Dict[str, Any]) -> None:
+        if self._sync_progress_dlg is not None:
+            self._sync_progress_dlg.close()
+            self._sync_progress_dlg = None
+
+        action = result.get("action") or "—"
+        record_id = result.get("record_id") or "—"
+        revision = result.get("revision") or 0
+        media_up = result.get("media_uploaded") or []
+        media_skip = result.get("media_skipped") or []
+
+        lines: List[str] = []
+        lines.append(f"<b>Запись успешно синхронизирована.</b><br><br>")
+        lines.append(f"Действие: <b>{action}</b><br>")
+        lines.append(f"Record ID: <code>{record_id}</code><br>")
+        lines.append(f"Ревизия: {revision}<br>")
+        lines.append(
+            f"Передача медиа: "
+            f"{'да' if result.get('include_media') else 'нет'}<br>"
+        )
+        lines.append(
+            f"Ссылка file://: "
+            f"{'да' if result.get('send_video_link') else 'нет'}<br>"
+        )
+        if result.get("include_media"):
+            lines.append(f"<br>Медиа загружено: {len(media_up)}<br>")
+            for m in media_up:
+                size_mb = int(m.get("size_bytes") or 0) / 1024 / 1024
+                lines.append(
+                    f"&nbsp;&nbsp;• {m['filename']} "
+                    f"({m['kind']}, {size_mb:.1f} МБ)<br>"
+                )
+            if media_skip:
+                lines.append(
+                    f"<br><span style='color:#c62828'>"
+                    f"Медиа пропущено: {len(media_skip)}</span><br>"
+                )
+                for m in media_skip:
+                    reason = m.get("reason") or "—"
+                    lines.append(
+                        f"&nbsp;&nbsp;• {m['filename']} — "
+                        f"{reason[:80]}<br>"
+                    )
+
+        QMessageBox.information(
+            self, "Синхронизация", "".join(lines),
+        )
+
+        # Обновляем список, чтобы колонка «Синхр.» обновилась.
+        self.refresh()
+
+    def _on_sync_failed(self, error: str) -> None:
+        if self._sync_progress_dlg is not None:
+            self._sync_progress_dlg.close()
+            self._sync_progress_dlg = None
+        log.error("Синхронизация одной записи не удалась: %s", error)
+        QMessageBox.critical(
+            self, "Синхронизация",
+            f"Не удалось синхронизировать запись:\n\n{error}",
+        )
+
+    def _on_sync_worker_done(self) -> None:
+        self._sync_worker = None
+
+    def _open_sync_window(self) -> None:
+        try:
+            from .sync_window import SyncWindow
+            dlg = SyncWindow(
+                sessions_root=self.sessions_root,
+                config_manager=self.config_manager,
+                parent=self,
+            )
+            dlg.exec()
+            self.refresh()
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть окно синхронизации: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Синхронизация",
+                f"Ошибка открытия окна:\n{exc}",
+            )
+
+    def _pull_changes(self) -> None:
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "Синхронизация", "Нет ConfigManager"
+            )
+            return
+
+        cfg = self.config_manager.get_sync_settings()
+        if not (cfg.get("enabled") and cfg.get("base_url")
+                and cfg.get("api_key")):
+            QMessageBox.warning(
+                self, "Синхронизация",
+                "Синхронизация не настроена.\n\n"
+                "Настройки → Синхронизация.",
+            )
+            return
+
+        manager = SyncManager(
+            sessions_root=self.sessions_root,
+            sync_settings=cfg,
+            config_manager=self.config_manager,
+        )
+
+        try:
+            result = asyncio.run(manager.pull_changes())
+        except Exception as exc:
+            log.exception("Ошибка pull changes: %s", exc)
+            QMessageBox.critical(
+                self, "Синхронизация",
+                f"Не удалось подтянуть изменения:\n{exc}",
+            )
+            return
+
+        QMessageBox.information(
+            self, "Синхронизация",
+            f"Применено изменений: {result['applied']}\n"
+            f"Новая ревизия: {result['last_revision']}\n"
+            f"Ошибок: {len(result['errors'])}",
+        )
+        self.refresh()
 
     # ------------------------------------------------------------------
     # Bitrix24
@@ -910,13 +1522,6 @@ class SessionsWindow(QDialog):
                 log.info(
                     "Bitrix24: используется чат проекта «%s» (%s)",
                     project, chat_id,
-                )
-            else:
-                log.info(
-                    "Для проекта «%s» не задан ID чата и не задан "
-                    "чат по умолчанию — пользователь выберет "
-                    "получателя вручную",
-                    project or "—",
                 )
 
         session_info = {
@@ -1006,7 +1611,6 @@ class SessionsWindow(QDialog):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Сохраняем только теги — остальные поля не трогаем.
         new_tags = dlg.result_data.get("tags", [])
         meta["tags"] = list(new_tags)
         if not self._write_json(session_json, meta):
@@ -1114,10 +1718,7 @@ class SessionsWindow(QDialog):
             else:
                 QMessageBox.information(
                     self, "Экспорт в DOCX",
-                    "К записи не прикреплён протокол.\n\n"
-                    "Используйте «Протокол → Создать/редактировать "
-                    "протокол (Markdown)…» или «Прикрепить файл "
-                    "протокола…».",
+                    "К записи не прикреплён протокол.",
                 )
                 return
 
@@ -1181,9 +1782,7 @@ class SessionsWindow(QDialog):
             QMessageBox.information(
                 self, "Экспорт в DOCX",
                 f"Документ сохранён и прикреплён к записи:\n"
-                f"{target}\n\n"
-                "Теперь его можно отправить в Bitrix24 через "
-                "«Bitrix24 → Отправить в чат…».",
+                f"{target}",
             )
             self.refresh()
         else:
@@ -2083,6 +2682,18 @@ class SessionsWindow(QDialog):
         if not r:
             return
         menu = QMenu(self)
+
+        # --- Синхронизация ---
+        act_sync = menu.addAction(
+            "Синхронизировать…", self._sync_one_record
+        )
+        act_sync.setToolTip(
+            "Опубликовать выбранную запись на сервер "
+            "с выбором параметров (медиа, ссылка, удаление)"
+        )
+
+        menu.addSeparator()
+
         menu.addAction(
             "Редактировать метаданные и перезапустить…",
             self._edit_metadata_and_restart,
@@ -2355,6 +2966,8 @@ class SessionsWindow(QDialog):
             self,
             "Горячие клавиши",
             "Ctrl+I        — импорт материалов\n"
+            "Ctrl+Shift+Y  — окно синхронизации\n"
+            "Ctrl+Shift+S  — синхронизировать выбранную запись\n"
             "Ctrl+M        — создать/редактировать протокол\n"
             "Ctrl+Shift+M  — экспорт протокола в DOCX\n"
             "Ctrl+B        — отправить протокол/summary в Bitrix24\n"

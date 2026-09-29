@@ -6,6 +6,10 @@
     новых записей.
   • Добавлена поддержка тегов: передача справочника в
     MetadataDialog, сохранение новых тегов в config.
+  • Добавлена интеграция с удалённым сервером синхронизации:
+      – окно «Синхронизация» (SyncWindow);
+      – автопубликация записи после успешной обработки;
+      – фоновый воркер дельта-синхронизации.
 """
 from __future__ import annotations
 
@@ -41,6 +45,8 @@ if __package__ in (None, ""):
     from src.recorder import ScreenRecorder
     from src.sessions_window import SessionsWindow
     from src.settings_window import SettingsWindow
+    from src.sync_manager import SyncManager, is_record_published
+    from src.sync_window import SyncWindow
     from src.task_queue import TaskQueue
     from src.tray_manager import TrayManager
     from src.utils import check_ffmpeg_installed, get_system_monitors
@@ -63,6 +69,8 @@ else:
     from .recorder import ScreenRecorder
     from .sessions_window import SessionsWindow
     from .settings_window import SettingsWindow
+    from .sync_manager import SyncManager, is_record_published
+    from .sync_window import SyncWindow
     from .task_queue import TaskQueue
     from .tray_manager import TrayManager
     from .utils import check_ffmpeg_installed, get_system_monitors
@@ -121,6 +129,7 @@ class ScreenRecorderApp(QObject):
         self.queue_window: Optional[QueueWindow] = None
         self.sessions_window: Optional[SessionsWindow] = None
         self.library_window: Optional[LibraryWindow] = None
+        self.sync_window: Optional[SyncWindow] = None
 
         self.hotkey_manager = GlobalHotkeyManager(
             self.recorder,
@@ -133,11 +142,13 @@ class ScreenRecorderApp(QObject):
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._processing_task: Optional[asyncio.Task] = None
+        self._sync_pull_task: Optional[asyncio.Task] = None
 
         self._current_session_meta: Dict[str, Any] = {}
 
         self._connect_signals()
         self._start_async_loop()
+        self._maybe_start_sync_puller()
         log.info("ScreenRecorderApp инициализирован (локальный режим)")
 
     # ------------------------------------------------------------------
@@ -187,6 +198,9 @@ class ScreenRecorderApp(QObject):
         )
         self.tray_manager.open_library_requested.connect(
             self._open_library
+        )
+        self.tray_manager.open_sync_requested.connect(
+            self._open_sync
         )
         self.tray_manager.import_requested.connect(self._open_import)
         self.tray_manager.upload_video_requested.connect(
@@ -249,6 +263,54 @@ class ScreenRecorderApp(QObject):
 
         self.hotkey_manager.set_loop(self._loop)
         log.info("asyncio-loop запущен в фоновом потоке")
+
+    # ------------------------------------------------------------------
+    # Фоновый воркер синхронизации
+    # ------------------------------------------------------------------
+    def _maybe_start_sync_puller(self) -> None:
+        """Запускает фоновый дельта-синк, если он включён в настройках."""
+        try:
+            cfg = self.config_manager.get_sync_settings()
+        except Exception as exc:
+            log.warning("Не удалось прочитать sync-настройки: %s", exc)
+            return
+
+        if not (cfg.get("enabled") and cfg.get("auto_pull_enabled")):
+            log.debug("Фоновый sync-puller не запускается (выключен)")
+            return
+        if not (cfg.get("base_url") and cfg.get("api_key")):
+            log.debug("Фоновый sync-puller не запускается (нет base_url/api_key)")
+            return
+
+        interval = int(cfg.get("auto_pull_interval", 300))
+        log.info(
+            "Запуск фонового sync-puller (интервал=%d сек)", interval
+        )
+
+        async def _pull_loop() -> None:
+            manager = SyncManager(
+                sessions_root=self._sessions_root(),
+                sync_settings=cfg,
+                config_manager=self.config_manager,
+            )
+            while True:
+                try:
+                    await asyncio.sleep(interval)
+                    res = await manager.pull_changes()
+                    if res.get("applied"):
+                        log.info(
+                            "Фоновый sync: применено %d изменений, "
+                            "ревизия=%d",
+                            res["applied"], res["last_revision"],
+                        )
+                except asyncio.CancelledError:
+                    log.info("Фоновый sync-puller остановлен")
+                    raise
+                except Exception as exc:
+                    log.warning("Ошибка фонового sync: %s", exc)
+
+        if self._loop is not None:
+            self._sync_pull_task = self._loop.create_task(_pull_loop())
 
     # ------------------------------------------------------------------
     # Геттеры конфига
@@ -1042,6 +1104,10 @@ class ScreenRecorderApp(QObject):
                 hide_after, self.overlay_panel.hide_panel
             )
 
+        # Автопубликация на сервер синхронизации.
+        if output_dir:
+            self._auto_publish_after_processing(task_id, output_dir)
+
     def _on_task_failed(self, task_id: str, error: str) -> None:
         log.error("Задача %s провалена: %s", task_id, error)
         if not self._is_recording():
@@ -1053,7 +1119,70 @@ class ScreenRecorderApp(QObject):
         )
 
     # ------------------------------------------------------------------
-    # Настройки, очередь, записи, библиотека
+    # Автопубликация на сервер
+    # ------------------------------------------------------------------
+    def _auto_publish_after_processing(
+        self, task_id: str, output_dir: str
+    ) -> None:
+        """Публикует запись на сервер, если это включено в настройках."""
+        try:
+            cfg = self.config_manager.get_sync_settings()
+        except Exception as exc:
+            log.warning("Не удалось прочитать sync-настройки: %s", exc)
+            return
+
+        if not cfg.get("enabled"):
+            return
+        if not cfg.get("auto_upload_after_processing"):
+            return
+        if not (cfg.get("base_url") and cfg.get("api_key")):
+            log.debug("Автопубликация пропущена: нет base_url/api_key")
+            return
+
+        if not output_dir or not os.path.isdir(output_dir):
+            log.warning(
+                "Автопубликация: папка не найдена: %s", output_dir
+            )
+            return
+
+        log.info(
+            "Автопубликация записи %s на сервер (%s)",
+            task_id, output_dir,
+        )
+
+        manager = SyncManager(
+            sessions_root=self._sessions_root(),
+            sync_settings=cfg,
+            config_manager=self.config_manager,
+        )
+
+        async def _publish():
+            try:
+                res = await manager.publish_session(output_dir)
+                log.info(
+                    "Автопубликация %s: action=%s, id=%s",
+                    task_id, res.get("action"), res.get("id"),
+                )
+                self._notify(
+                    "Синхронизация",
+                    f"Запись опубликована на сервер "
+                    f"({res.get('action')})",
+                )
+            except Exception as exc:
+                log.exception(
+                    "Автопубликация %s не удалась: %s", task_id, exc
+                )
+                self._notify(
+                    "Синхронизация",
+                    f"Не удалось опубликовать запись: {exc}"[:100],
+                    QSystemTrayIcon.MessageIcon.Warning,
+                )
+
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(_publish(), self._loop)
+
+    # ------------------------------------------------------------------
+    # Настройки, очередь, записи, библиотека, синхронизация
     # ------------------------------------------------------------------
     def _open_settings(self) -> None:
         self.settings_window = SettingsWindow(self.config_manager)
@@ -1101,6 +1230,23 @@ class ScreenRecorderApp(QObject):
                 f"Не удалось открыть окно поиска:\n{exc}",
             )
 
+    def _open_sync(self) -> None:
+        try:
+            self.sync_window = SyncWindow(
+                sessions_root=self._sessions_root(),
+                config_manager=self.config_manager,
+                parent=None,
+            )
+            self.sync_window.show()
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть окно «Синхронизация»: %s", exc
+            )
+            QMessageBox.critical(
+                None, "Синхронизация",
+                f"Не удалось открыть окно синхронизации:\n{exc}",
+            )
+
     def _open_yandex_vm(self) -> None:
         """Открывает окно «ВМ Yandex»."""
         yandex_cfg = self.config_manager.get_yandex_vm_settings()
@@ -1141,6 +1287,14 @@ class ScreenRecorderApp(QObject):
         self.hotkey_manager.unregister_hotkeys()
 
         if self._loop is not None:
+            if self._sync_pull_task is not None:
+                try:
+                    self._loop.call_soon_threadsafe(
+                        self._sync_pull_task.cancel
+                    )
+                except Exception:
+                    pass
+
             if self._processing_task is not None:
                 try:
                     self._loop.call_soon_threadsafe(

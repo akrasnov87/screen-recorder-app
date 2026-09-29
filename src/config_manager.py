@@ -1,12 +1,15 @@
 """Управление настройками с шифрованием паролей.
 
 Изменения:
-  • Добавлены ключи default_project и default_chat_id —
-    имя проекта по умолчанию и ID чата по умолчанию.
-  • Добавлены методы get_default_project/set_default_project
-    и get_default_chat_id/set_default_chat_id.
-  • Добавлен справочник тегов: секция config["tags"],
-    методы get_tags()/get_tag_names()/add_tag()/set_tags().
+  • Добавлены ключи default_project и default_chat_id.
+  • Добавлен справочник тегов: секция config["tags"].
+  • Секция config["sync"] дополнена ключами:
+      – send_media_to_server — передавать ли видео/аудио на сервер
+        как артефакты (kind=video / kind=audio);
+      – delete_local_on_server_delete — удалять ли локальную папку
+        при delete на сервере;
+      – force_overwrite_on_download — перезаписывать ли локальные
+        артефакты при скачивании (умная стратегия по sha256).
 """
 from __future__ import annotations
 
@@ -62,37 +65,22 @@ DEFAULT_NAME_TEMPLATES: List[Dict[str, str]] = [
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "yandex_vm": {
-        # Корневая папка, в подпапках которой лежат конфиги ВМ.
-        # Каждая подпапка = одна ВМ.
-        # Внутри ожидаются:
-        #   schedule.cron  — расписание работы ВМ;
-        #   exceptions.txt — исключения (переопределения).
         "root_path": "",
     },
-    # --- Проекты (новый формат: name + chat_id) ---
     "projects": [
         {"name": "Россети",     "chat_id": ""},
         {"name": "iserv",       "chat_id": ""},
         {"name": "Внутренние",  "chat_id": ""},
         {"name": "Тестовые",    "chat_id": ""},
     ],
-    # --- Справочник тегов ---
-    # Каждый тег: {"name": str, "color": "#RRGGBB"}
-    # color — необязательный, используется для подсветки в UI.
     "tags": [
         {"name": "важное",       "color": "#C62828"},
         {"name": "риски",        "color": "#EF6C00"},
         {"name": "решения",      "color": "#2E7D32"},
         {"name": "для клиента",  "color": "#1565C0"},
     ],
-    # --- Настройки по умолчанию для новых записей ---
-    # Имя проекта, которое подставляется в карточку метаданных
-    # для новых записей. Если пусто — берётся первый из projects.
     "default_project": "",
-    # ID чата Bitrix24, куда отправлять протоколы/summary
-    # по умолчанию. Если пусто — берётся чат проекта записи.
     "default_chat_id": "",
-    # --- Сотрудники ---
     "employees": [],
     "metadata": {
         "prompts": [
@@ -216,6 +204,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "file_message_max_chars": 3000,
         "upload_folder_id": 0,
         "max_message_chars": 15000,
+        "retry_count": 3,
+        "retry_delay": 2.0,
+    },
+    "sync": {
+        "enabled": False,
+        "base_url": "",
+        "api_key": "",
+        "connect_timeout": 15,
+        "read_timeout": 120,
+        "auto_upload_after_processing": True,
+        "auto_pull_enabled": True,
+        "auto_pull_interval": 300,
+        "sync_page_size": 200,
+        "max_artifact_mb": 50,
+        "send_video_link": True,
+        "allow_delete_local_media_after_upload": False,
+        "sync_projects_and_tags": True,
+        "delete_local_on_server_delete": False,
+        "force_overwrite_on_download": False,
+        # NEW: передавать ли видео/аудио на сервер как артефакты
+        # kind=video / kind=audio.
+        "send_media_to_server": False,
+        # NEW: удалять ли локальное медиа после успешной публикации
+        # (работает только если send_media_to_server = True и
+        # сервер подтвердил загрузку).
+        "delete_local_media_after_media_upload": False,
         "retry_count": 3,
         "retry_delay": 2.0,
     },
@@ -682,14 +696,6 @@ class ConfigManager:
     # Теги
     # ------------------------------------------------------------------
     def get_tags(self) -> List[Dict[str, str]]:
-        """
-        Возвращает список тегов из справочника.
-
-        Каждый элемент: {"name": str, "color": str}.
-        Поддерживается обратная совместимость: старые записи,
-        где tags был просто списком строк, автоматически
-        превращаются в словари с пустым цветом.
-        """
         raw = self.config.get("tags", []) or []
         result: List[Dict[str, str]] = []
         seen = set()
@@ -721,11 +727,6 @@ class ConfigManager:
         return ""
 
     def add_tag(self, name: str, color: str = "") -> bool:
-        """
-        Добавляет тег в справочник. Если тег с таким именем уже
-        есть — обновляет цвет. Возвращает True, если что-то
-        изменилось.
-        """
         name = (name or "").strip()
         if not name:
             return False
@@ -757,7 +758,6 @@ class ConfigManager:
         return True
 
     def set_tags(self, tags: List[Dict[str, str]]) -> None:
-        """Полностью заменяет справочник тегов."""
         cleaned: List[Dict[str, str]] = []
         seen = set()
         for item in tags or []:
@@ -776,6 +776,26 @@ class ConfigManager:
         self.config["tags"] = cleaned
         self.save()
         log.info("Справочник тегов обновлён: %d шт.", len(cleaned))
+
+    def set_projects(self, projects: List[Dict[str, str]]) -> None:
+        cleaned: List[Dict[str, str]] = []
+        seen = set()
+        for item in projects or []:
+            if isinstance(item, str):
+                name = item.strip()
+                chat_id = ""
+            elif isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                chat_id = str(item.get("chat_id") or "").strip()
+            else:
+                continue
+            if not name or name in seen:
+                continue
+            cleaned.append({"name": name, "chat_id": chat_id})
+            seen.add(name)
+        self.config["projects"] = cleaned
+        self.save()
+        log.info("Справочник проектов обновлён: %d шт.", len(cleaned))
 
     # ------------------------------------------------------------------
     # Bitrix24
@@ -802,3 +822,105 @@ class ConfigManager:
             "retry_count": int(cfg.get("retry_count", 3)),
             "retry_delay": float(cfg.get("retry_delay", 2.0)),
         }
+
+    # ------------------------------------------------------------------
+    # Синхронизация с удалённым сервером (screc-server)
+    # ------------------------------------------------------------------
+    def get_sync_settings(self) -> Dict[str, Any]:
+        cfg = self.config.get("sync", {}) or {}
+
+        raw_key = str(cfg.get("api_key", "") or "")
+        if raw_key.startswith("enc:"):
+            api_key = self.decrypt(raw_key[4:])
+        else:
+            api_key = raw_key
+
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "base_url": str(cfg.get("base_url", "")).strip().rstrip("/"),
+            "api_key": api_key,
+            "connect_timeout": float(cfg.get("connect_timeout", 15)),
+            "read_timeout": float(cfg.get("read_timeout", 120)),
+            "auto_upload_after_processing": bool(
+                cfg.get("auto_upload_after_processing", True)
+            ),
+            "auto_pull_enabled": bool(
+                cfg.get("auto_pull_enabled", True)
+            ),
+            "auto_pull_interval": int(
+                cfg.get("auto_pull_interval", 300)
+            ),
+            "sync_page_size": int(cfg.get("sync_page_size", 200)),
+            "max_artifact_mb": int(cfg.get("max_artifact_mb", 50)),
+            "send_video_link": bool(cfg.get("send_video_link", True)),
+            "allow_delete_local_media_after_upload": bool(
+                cfg.get("allow_delete_local_media_after_upload", False)
+            ),
+            "sync_projects_and_tags": bool(
+                cfg.get("sync_projects_and_tags", True)
+            ),
+            "delete_local_on_server_delete": bool(
+                cfg.get("delete_local_on_server_delete", False)
+            ),
+            "force_overwrite_on_download": bool(
+                cfg.get("force_overwrite_on_download", False)
+            ),
+            "send_media_to_server": bool(
+                cfg.get("send_media_to_server", False)
+            ),
+            "delete_local_media_after_media_upload": bool(
+                cfg.get(
+                    "delete_local_media_after_media_upload", False
+                )
+            ),
+            "retry_count": int(cfg.get("retry_count", 3)),
+            "retry_delay": float(cfg.get("retry_delay", 2.0)),
+        }
+
+    def set_sync_settings(self, settings: Dict[str, Any]) -> None:
+        cfg = self.config.setdefault("sync", {})
+
+        api_key = str(settings.get("api_key", "") or "")
+        if api_key:
+            cfg["api_key"] = "enc:" + self.encrypt(api_key)
+        else:
+            cfg["api_key"] = ""
+
+        for key in (
+            "enabled", "base_url",
+            "connect_timeout", "read_timeout",
+            "auto_upload_after_processing", "auto_pull_enabled",
+            "auto_pull_interval", "sync_page_size",
+            "max_artifact_mb", "send_video_link",
+            "allow_delete_local_media_after_upload",
+            "sync_projects_and_tags",
+            "delete_local_on_server_delete",
+            "force_overwrite_on_download",
+            "send_media_to_server",
+            "delete_local_media_after_media_upload",
+            "retry_count", "retry_delay",
+        ):
+            if key in settings:
+                cfg[key] = settings[key]
+
+        self.save()
+        log.info(
+            "Настройки синхронизации сохранены: enabled=%s, "
+            "base_url=%r, auto_upload=%s, auto_pull=%s, "
+            "send_media=%s, delete_local_on_delete=%s, "
+            "force_overwrite=%s",
+            cfg.get("enabled"), cfg.get("base_url"),
+            cfg.get("auto_upload_after_processing"),
+            cfg.get("auto_pull_enabled"),
+            cfg.get("send_media_to_server"),
+            cfg.get("delete_local_on_server_delete"),
+            cfg.get("force_overwrite_on_download"),
+        )
+
+    def is_sync_enabled(self) -> bool:
+        cfg = self.get_sync_settings()
+        return bool(
+            cfg.get("enabled")
+            and cfg.get("base_url")
+            and cfg.get("api_key")
+        )

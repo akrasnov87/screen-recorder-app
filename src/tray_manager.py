@@ -4,6 +4,8 @@
   • Таймаут уведомлений и максимальные длины берутся из
     config["app"]: notification_timeout_ms,
     notification_max_title, notification_max_message.
+  • Добавлен пункт меню «Синхронизация» и сигнал
+    open_sync_requested.
 """
 from __future__ import annotations
 
@@ -40,6 +42,7 @@ class TrayManager(QObject):
     open_queue_requested = Signal()
     open_sessions_requested = Signal()
     open_library_requested = Signal()
+    open_sync_requested = Signal()
     import_requested = Signal()
     upload_video_requested = Signal()
     quit_requested = Signal()
@@ -130,6 +133,14 @@ class TrayManager(QObject):
         queue_action.triggered.connect(self.open_queue)
         menu.addAction(queue_action)
 
+        sync_action = QAction("Синхронизация с сервером", menu)
+        sync_action.setToolTip(
+            "Публикация записей на удалённый сервер, скачивание "
+            "изменений и дельта-синхронизация"
+        )
+        sync_action.triggered.connect(self.open_sync)
+        menu.addAction(sync_action)
+
         menu.addSeparator()
 
         settings_action = QAction("Настройки", menu)
@@ -207,6 +218,10 @@ class TrayManager(QObject):
     def open_library(self) -> None:
         log.debug("Клик: открыть библиотеку")
         self.open_library_requested.emit()
+
+    def open_sync(self) -> None:
+        log.debug("Клик: открыть синхронизацию")
+        self.open_sync_requested.emit()
 
     def open_import(self) -> None:
         log.debug("Клик: открыть импорт материалов")

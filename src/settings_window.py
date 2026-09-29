@@ -3,9 +3,13 @@
 Изменения:
   • На вкладке «Проекты и чаты Bitrix24» добавлен блок
     «Проект и чат по умолчанию».
-  • Добавлена вкладка «Теги» — справочник меток для записей.
-  • В правом нижнем углу окна выводится версия приложения
-    (клик — копирование в буфер обмена).
+  • Добавлена вкладка «Теги» — справочник меток.
+  • В правом нижнем углу — версия приложения.
+  • Вкладка «Синхронизация» дополнена опциями:
+      – «Передавать видео и аудио на сервер» (send_media_to_server);
+      – «Удалять локальные медиа после загрузки на сервер»
+        (delete_local_media_after_media_upload);
+      – «Макс. размер артефакта» до 10240 МБ.
 """
 from __future__ import annotations
 
@@ -29,6 +33,8 @@ from PySide6.QtWidgets import (
 
 from .config_manager import ConfigManager, DEFAULT_NAME_TEMPLATES
 from .logger import get_current_log_path, get_logger
+from .screc_client import ScrecClient, ScrecError
+from .sync_window import SyncWindow
 from .tooltips import attach_tooltip, make_info_icon, with_info
 from .transcribe_client import TranscribeClient
 from .utils import get_system_monitors
@@ -65,6 +71,9 @@ class SettingsWindow(QDialog):
         self.tabs.addTab(self._build_tags_tab(), "Теги")
         self.tabs.addTab(self._build_employees_tab(), "Сотрудники")
         self.tabs.addTab(self._build_bitrix_tab(), "Bitrix24")
+        self.tabs.addTab(
+            self._build_sync_tab(), "Синхронизация"
+        )
         self.tabs.addTab(self._build_metadata_tab(), "Промпты и имена")
         self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
         self.tabs.addTab(self._build_summarizer_tab(), "Суммаризация")
@@ -111,7 +120,6 @@ class SettingsWindow(QDialog):
         buttons.addWidget(self.close_btn)
         root.addLayout(buttons)
 
-        # --- Строка с версией приложения ---
         version_row = QHBoxLayout()
         version_row.setContentsMargins(0, 0, 4, 0)
         version_row.addStretch()
@@ -122,13 +130,6 @@ class SettingsWindow(QDialog):
     # Версия приложения
     # ------------------------------------------------------------------
     def _build_version_label(self) -> QLabel:
-        """
-        Маленькая серая плашка «Версия X.Y.Z» в правом нижнем
-        углу окна настроек.
-
-        По клику версия копируется в буфер обмена. По наведению
-        показывается подробная подсказка (settings_version).
-        """
         label = QLabel(f"Версия {__version__}")
         label.setStyleSheet(
             "QLabel {"
@@ -147,9 +148,6 @@ class SettingsWindow(QDialog):
         return label
 
     def _on_version_click(self, event) -> None:
-        """
-        Клик по плашке версии — копируем номер в буфер обмена.
-        """
         try:
             from PySide6.QtWidgets import QApplication
             QApplication.clipboard().setText(__version__)
@@ -310,7 +308,6 @@ class SettingsWindow(QDialog):
         btns.addStretch()
         layout.addLayout(btns)
 
-        # --- Блок «Проект и чат по умолчанию» ---
         sep = QLabel("<hr>")
         layout.addWidget(sep)
 
@@ -602,7 +599,6 @@ class SettingsWindow(QDialog):
         else:
             current_item.setText(hex_color)
 
-        # Подсветим превью-плашку в ячейке цвета
         pixmap = QColor(hex_color)
         current_item.setBackground(pixmap)
         name_item = self.tags_table.item(row, 0)
@@ -947,6 +943,366 @@ class SettingsWindow(QDialog):
             self, "Bitrix24",
             f"Подключение успешно.\n\nПользователь вебхука: {name}",
         )
+
+    # ------------------------------------------------------------------
+    # Синхронизация с удалённым сервером
+    # ------------------------------------------------------------------
+    def _build_sync_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "Синхронизация записей с удалённым сервером "
+            "<code>screc-server</code> (см. DOCS.md).\n\n"
+            "На сервер передаются метаданные и текстовые артефакты: "
+            "стенограмма, протокол, summary, промпт DeepSeek, "
+            "вложения. Опционально — видео и аудио (см. галочку "
+            "«Передавать видео и аудио на сервер»)."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        conn_header = QHBoxLayout()
+        conn_header.addWidget(QLabel("<b>Подключение</b>"))
+        conn_header.addStretch()
+        layout.addLayout(conn_header)
+
+        form = QFormLayout()
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.sync_enabled_check = QCheckBox(
+            "Включить синхронизацию с сервером"
+        )
+        attach_tooltip(self.sync_enabled_check, "sync_enabled")
+        form.addRow("", self.sync_enabled_check)
+
+        self.sync_url_input = QLineEdit()
+        self.sync_url_input.setPlaceholderText(
+            "http://localhost:8000"
+        )
+        form.addRow(
+            "Base URL:",
+            with_info(self.sync_url_input, "sync_base_url"),
+        )
+
+        self.sync_key_input = QLineEdit()
+        self.sync_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sync_key_input.setPlaceholderText(
+            "X-API-Key (сохраняется в зашифрованном виде)"
+        )
+
+        self.sync_show_key = QCheckBox("Показать")
+        self.sync_show_key.toggled.connect(
+            lambda checked: self.sync_key_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked
+                else QLineEdit.EchoMode.Password
+            )
+        )
+
+        key_row = QWidget()
+        key_layout = QHBoxLayout(key_row)
+        key_layout.setContentsMargins(0, 0, 0, 0)
+        key_layout.setSpacing(6)
+        key_layout.addWidget(self.sync_key_input, 1)
+        key_layout.addWidget(self.sync_show_key, 0)
+        form.addRow(
+            "API-ключ:",
+            with_info(key_row, "sync_api_key"),
+        )
+
+        self.sync_connect_timeout = QSpinBox()
+        self.sync_connect_timeout.setRange(1, 600)
+        self.sync_connect_timeout.setSuffix(" сек")
+        self.sync_connect_timeout.setValue(15)
+        form.addRow(
+            "Таймаут соединения:",
+            with_info(
+                self.sync_connect_timeout, "sync_connect_timeout"
+            ),
+        )
+
+        self.sync_read_timeout = QSpinBox()
+        self.sync_read_timeout.setRange(10, 36000)
+        self.sync_read_timeout.setSuffix(" сек")
+        self.sync_read_timeout.setValue(120)
+        form.addRow(
+            "Таймаут чтения:",
+            with_info(
+                self.sync_read_timeout, "sync_read_timeout"
+            ),
+        )
+
+        layout.addLayout(form)
+
+        # --- Поведение ---
+        behavior_header = QHBoxLayout()
+        behavior_header.addWidget(QLabel("<b>Поведение</b>"))
+        behavior_header.addStretch()
+        layout.addLayout(behavior_header)
+
+        behavior_form = QFormLayout()
+        behavior_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.sync_auto_upload_check = QCheckBox(
+            "Автоматически публиковать запись после обработки"
+        )
+        attach_tooltip(
+            self.sync_auto_upload_check,
+            "sync_auto_upload_after_processing",
+        )
+        behavior_form.addRow("", self.sync_auto_upload_check)
+
+        self.sync_auto_pull_check = QCheckBox(
+            "Автоматически подтягивать изменения в фоне"
+        )
+        attach_tooltip(
+            self.sync_auto_pull_check, "sync_auto_pull_enabled"
+        )
+        behavior_form.addRow("", self.sync_auto_pull_check)
+
+        self.sync_auto_pull_interval = QSpinBox()
+        self.sync_auto_pull_interval.setRange(30, 24 * 3600)
+        self.sync_auto_pull_interval.setSuffix(" сек")
+        self.sync_auto_pull_interval.setValue(300)
+        behavior_form.addRow(
+            "Интервал фоновой синхронизации:",
+            with_info(
+                self.sync_auto_pull_interval,
+                "sync_auto_pull_interval",
+            ),
+        )
+
+        self.sync_send_video_link_check = QCheckBox(
+            "Передавать на сервер ссылку на видео (file://…)"
+        )
+        attach_tooltip(
+            self.sync_send_video_link_check, "sync_send_video_link"
+        )
+        behavior_form.addRow("", self.sync_send_video_link_check)
+
+        # NEW: передавать медиа как артефакты
+        self.sync_send_media_check = QCheckBox(
+            "Передавать видео и аудио на сервер "
+            "(как артефакты kind=video/audio)"
+        )
+        self.sync_send_media_check.setToolTip(
+            "Если включено — при публикации записи видео и аудио "
+            "загружаются на сервер как обычные артефакты.\n\n"
+            "При скачивании записи на другом устройстве они "
+            "придут вместе с остальными файлами и будут "
+            "разложены как video.<ext>.\n\n"
+            "ВНИМАНИЕ: большие видеофайлы могут занять много "
+            "времени и места. Учитывайте лимит "
+            "«Макс. размер артефакта» и SCREC_MAX_ARTIFACT_MB "
+            "на сервере."
+        )
+        attach_tooltip(
+            self.sync_send_media_check, "sync_send_media_to_server"
+        )
+        behavior_form.addRow("", self.sync_send_media_check)
+
+        # NEW: удалять локальные медиа после загрузки
+        self.sync_delete_media_after_upload_check = QCheckBox(
+            "Удалять локальные видео/аудио после успешной "
+            "загрузки на сервер"
+        )
+        self.sync_delete_media_after_upload_check.setToolTip(
+            "Работает только если включена передача медиа на "
+            "сервер.\n\n"
+            "После успешной загрузки файла на сервер локальная "
+            "копия удаляется. Ссылка file:// перестанет "
+            "работать, но файл можно скачать с сервера."
+        )
+        attach_tooltip(
+            self.sync_delete_media_after_upload_check,
+            "sync_delete_local_media_after_media_upload",
+        )
+        behavior_form.addRow(
+            "", self.sync_delete_media_after_upload_check
+        )
+
+        self.sync_delete_media_check = QCheckBox(
+            "Удалять локальные аудио/видео после публикации "
+            "(старое поведение)"
+        )
+        attach_tooltip(
+            self.sync_delete_media_check,
+            "sync_allow_delete_local_media_after_upload",
+        )
+        behavior_form.addRow("", self.sync_delete_media_check)
+
+        layout.addLayout(behavior_form)
+
+        # --- Тонкие настройки ---
+        adv_header = QHBoxLayout()
+        adv_header.addWidget(QLabel("<b>Тонкие настройки</b>"))
+        adv_header.addStretch()
+        layout.addLayout(adv_header)
+
+        adv_form = QFormLayout()
+        adv_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.sync_page_size = QSpinBox()
+        self.sync_page_size.setRange(10, 1000)
+        self.sync_page_size.setValue(200)
+        adv_form.addRow(
+            "Размер страницы sync:",
+            with_info(self.sync_page_size, "sync_page_size"),
+        )
+
+        # Увеличенный лимит: до 10 ГБ.
+        self.sync_max_artifact_mb = QSpinBox()
+        self.sync_max_artifact_mb.setRange(1, 10240)
+        self.sync_max_artifact_mb.setSingleStep(50)
+        self.sync_max_artifact_mb.setSuffix(" МБ")
+        self.sync_max_artifact_mb.setValue(50)
+        self.sync_max_artifact_mb.setToolTip(
+            "Максимальный размер одного артефакта в мегабайтах.\n\n"
+            "Применяется и к текстовым артефактам, и к видео/аудио "
+            "(если они передаются).\n\n"
+            "Не должен превышать SCREC_MAX_ARTIFACT_MB на сервере "
+            "(по умолчанию 50 МБ). Если задать больше — сервер "
+            "вернёт ошибку 413 (Payload Too Large)."
+        )
+        adv_form.addRow(
+            "Макс. размер артефакта:",
+            with_info(
+                self.sync_max_artifact_mb, "sync_max_artifact_mb"
+            ),
+        )
+
+        self.sync_retry_count = QSpinBox()
+        self.sync_retry_count.setRange(0, 20)
+        self.sync_retry_count.setValue(3)
+        adv_form.addRow(
+            "Попыток при ошибке:",
+            with_info(self.sync_retry_count, "sync_retry_count"),
+        )
+
+        self.sync_retry_delay = QDoubleSpinBox()
+        self.sync_retry_delay.setRange(0.5, 60.0)
+        self.sync_retry_delay.setSingleStep(0.5)
+        self.sync_retry_delay.setDecimals(1)
+        self.sync_retry_delay.setSuffix(" сек")
+        self.sync_retry_delay.setValue(2.0)
+        adv_form.addRow(
+            "Пауза между повторами:",
+            with_info(self.sync_retry_delay, "sync_retry_delay"),
+        )
+
+        layout.addLayout(adv_form)
+
+        # --- Кнопки ---
+        btn_row = QHBoxLayout()
+
+        self.sync_test_btn = QPushButton("Проверить подключение")
+        attach_tooltip(self.sync_test_btn, "sync_test_connection")
+        self.sync_test_btn.clicked.connect(
+            self._test_sync_connection
+        )
+        btn_row.addWidget(self.sync_test_btn)
+
+        self.sync_open_window_btn = QPushButton(
+            "Открыть окно синхронизации…"
+        )
+        self.sync_open_window_btn.setToolTip(
+            "Открыть полное окно управления синхронизацией:\n"
+            "публикация, скачивание, дельта, журнал"
+        )
+        self.sync_open_window_btn.clicked.connect(
+            self._open_sync_window
+        )
+        btn_row.addWidget(self.sync_open_window_btn)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        layout.addStretch()
+        return w
+
+    def _test_sync_connection(self) -> None:
+        base_url = self.sync_url_input.text().strip()
+        api_key = self.sync_key_input.text()
+        if not base_url or not api_key:
+            QMessageBox.warning(
+                self, "Синхронизация",
+                "Укажите Base URL и API-ключ.",
+            )
+            return
+
+        connect_timeout = float(self.sync_connect_timeout.value())
+        read_timeout = float(self.sync_read_timeout.value())
+
+        QGuiApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
+
+        async def _run_ping() -> str:
+            async with ScrecClient(
+                base_url=base_url,
+                api_key=api_key,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            ) as client:
+                return await client.ping()
+
+        try:
+            result = asyncio.run(_run_ping())
+        except ScrecError as exc:
+            log.warning("Проверка sync-сервера не удалась: %s", exc)
+            QMessageBox.warning(
+                self, "Синхронизация",
+                f"Не удалось подключиться:\n\n{exc}",
+            )
+            return
+        except Exception as exc:
+            log.exception(
+                "Ошибка при проверке sync-сервера: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Синхронизация", f"Ошибка:\n{exc}"
+            )
+            return
+        finally:
+            if QGuiApplication.overrideCursor() is not None:
+                QGuiApplication.restoreOverrideCursor()
+
+        QMessageBox.information(
+            self, "Синхронизация",
+            f"Подключение успешно.\n\n{result}",
+        )
+
+    def _open_sync_window(self) -> None:
+        try:
+            sessions_root = os.path.join(
+                self.config_manager.config.get(
+                    "storage", {}
+                ).get("temp_path", "/tmp/screen-recorder"),
+                "sessions",
+            )
+            dlg = SyncWindow(
+                sessions_root=sessions_root,
+                config_manager=self.config_manager,
+                parent=self,
+            )
+            dlg.exec()
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть окно синхронизации: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Синхронизация",
+                f"Ошибка открытия окна:\n{exc}",
+            )
 
     # ------------------------------------------------------------------
     # Промпты и шаблоны имён
@@ -1935,7 +2291,6 @@ class SettingsWindow(QDialog):
                 row, 1, QTableWidgetItem(p["chat_id"])
             )
 
-        # --- Проект и чат по умолчанию ---
         default_project = self.config_manager.get_default_project()
         self._refresh_default_project_combo(current=default_project)
         self.default_chat_id_input.setText(
@@ -2017,6 +2372,47 @@ class SettingsWindow(QDialog):
         self.bitrix_retry_delay.setValue(
             float(bitrix.get("retry_delay", 2.0))
         )
+
+        # --- Синхронизация ---
+        sync = self.config_manager.get_sync_settings()
+        self.sync_enabled_check.setChecked(sync["enabled"])
+        self.sync_url_input.setText(sync["base_url"])
+        self.sync_key_input.setText(sync["api_key"])
+        self.sync_connect_timeout.setValue(
+            int(sync["connect_timeout"])
+        )
+        self.sync_read_timeout.setValue(int(sync["read_timeout"]))
+        self.sync_auto_upload_check.setChecked(
+            bool(sync["auto_upload_after_processing"])
+        )
+        self.sync_auto_pull_check.setChecked(
+            bool(sync["auto_pull_enabled"])
+        )
+        self.sync_auto_pull_interval.setValue(
+            int(sync["auto_pull_interval"])
+        )
+        self.sync_send_video_link_check.setChecked(
+            bool(sync["send_video_link"])
+        )
+        self.sync_send_media_check.setChecked(
+            bool(sync.get("send_media_to_server", False))
+        )
+        self.sync_delete_media_after_upload_check.setChecked(
+            bool(
+                sync.get(
+                    "delete_local_media_after_media_upload", False
+                )
+            )
+        )
+        self.sync_delete_media_check.setChecked(
+            bool(sync["allow_delete_local_media_after_upload"])
+        )
+        self.sync_page_size.setValue(int(sync["sync_page_size"]))
+        self.sync_max_artifact_mb.setValue(
+            int(sync["max_artifact_mb"])
+        )
+        self.sync_retry_count.setValue(int(sync["retry_count"]))
+        self.sync_retry_delay.setValue(float(sync["retry_delay"]))
 
         # --- Промпты ---
         prompts = self.config_manager.get_prompts()
@@ -2230,10 +2626,13 @@ class SettingsWindow(QDialog):
         log.info(
             "Настройки загружены в окно: projects=%d, "
             "default_project=%r, default_chat_id=%r, "
-            "tags=%d, employees=%d, prompts=%d",
+            "tags=%d, employees=%d, prompts=%d, "
+            "sync_enabled=%s, sync_url=%r, send_media=%s",
             len(projects), default_project,
             self.config_manager.get_default_chat_id(),
             len(tags), len(employees), len(prompts),
+            sync.get("enabled"), sync.get("base_url"),
+            sync.get("send_media_to_server"),
         )
 
     def _apply_form_to_config(self) -> Dict[str, Any]:
@@ -2256,7 +2655,6 @@ class SettingsWindow(QDialog):
             "root_path": self.yandex_vm_root_input.text().strip(),
         }
 
-        # --- Проект и чат по умолчанию ---
         default_project = (
             self.default_project_combo.currentData() or ""
         )
@@ -2321,6 +2719,45 @@ class SettingsWindow(QDialog):
             "retry_delay": float(self.bitrix_retry_delay.value()),
         }
 
+        # --- Синхронизация ---
+        self.config_manager.set_sync_settings({
+            "enabled": self.sync_enabled_check.isChecked(),
+            "base_url": self.sync_url_input.text().strip().rstrip("/"),
+            "api_key": self.sync_key_input.text(),
+            "connect_timeout": int(
+                self.sync_connect_timeout.value()
+            ),
+            "read_timeout": int(self.sync_read_timeout.value()),
+            "auto_upload_after_processing": (
+                self.sync_auto_upload_check.isChecked()
+            ),
+            "auto_pull_enabled": (
+                self.sync_auto_pull_check.isChecked()
+            ),
+            "auto_pull_interval": int(
+                self.sync_auto_pull_interval.value()
+            ),
+            "sync_page_size": int(self.sync_page_size.value()),
+            "max_artifact_mb": int(
+                self.sync_max_artifact_mb.value()
+            ),
+            "send_video_link": (
+                self.sync_send_video_link_check.isChecked()
+            ),
+            "send_media_to_server": (
+                self.sync_send_media_check.isChecked()
+            ),
+            "delete_local_media_after_media_upload": (
+                self.sync_delete_media_after_upload_check.isChecked()
+            ),
+            "allow_delete_local_media_after_upload": (
+                self.sync_delete_media_check.isChecked()
+            ),
+            "sync_projects_and_tags": True,
+            "retry_count": int(self.sync_retry_count.value()),
+            "retry_delay": float(self.sync_retry_delay.value()),
+        })
+
         # --- Промпты ---
         prompts: List[dict] = []
         for row in range(self.prompts_table.rowCount()):
@@ -2334,7 +2771,6 @@ class SettingsWindow(QDialog):
                 name = f"Промпт {row + 1}"
             prompts.append({"name": name, "text": text})
 
-        # --- Шаблоны названий ---
         name_templates: List[dict] = []
         for row in range(self.name_templates_table.rowCount()):
             label_item = self.name_templates_table.item(row, 0)
@@ -2519,11 +2955,15 @@ class SettingsWindow(QDialog):
 
             log.info(
                 "Настройки сохранены: projects=%d, "
-                "default_project=%r, default_chat_id=%r, tags=%d",
+                "default_project=%r, default_chat_id=%r, tags=%d, "
+                "sync_enabled=%s, sync_url=%r, send_media=%s",
                 len(cfg.get("projects", [])),
                 cfg.get("default_project"),
                 cfg.get("default_chat_id"),
                 len(cfg.get("tags", [])),
+                cfg.get("sync", {}).get("enabled"),
+                cfg.get("sync", {}).get("base_url"),
+                cfg.get("sync", {}).get("send_media_to_server"),
             )
 
             current = get_current_log_path()
@@ -2927,6 +3367,35 @@ class SettingsWindow(QDialog):
         "Bitrix24": (
             "<b>Bitrix24 — параметры подключения</b><br><br>"
             "Параметры вебхука, таймауты, форматы сообщений."
+        ),
+        "Синхронизация": (
+            "<b>Синхронизация с сервером</b><br><br>"
+            "Интеграция с сервисом <code>screc-server</code> "
+            "(см. DOCS.md).<br><br>"
+            "На сервер передаются <b>метаданные и текстовые "
+            "артефакты</b>: стенограмма (video.txt), протокол, "
+            "summary, промпт DeepSeek, вложения.<br><br>"
+            "<b>Передача медиа.</b> Если включена галочка "
+            "«Передавать видео и аудио на сервер» — медиафайлы "
+            "загружаются на сервер как артефакты "
+            "(<code>kind=video</code> / <code>kind=audio</code>). "
+            "При скачивании записи на другом устройстве они "
+            "вернутся как <code>video.&lt;ext&gt;</code>.<br><br>"
+            "Ограничения:<br>"
+            "• Медиафайл не может превышать <b>«Макс. размер "
+            "артефакта»</b> (и <code>SCREC_MAX_ARTIFACT_MB</code> "
+            "на сервере).<br>"
+            "• Загрузка больших видео может занимать минуты.<br>"
+            "• Файл хранится и локально, и на сервере, если "
+            "не включено удаление после загрузки.<br><br>"
+            "<b>Автопубликация</b> — сразу после успешной "
+            "обработки запись уходит на сервер.<br>"
+            "<b>Автоподтягивание</b> — фоновая дельта-"
+            "синхронизация через <code>/sync/changes</code>.<br><br>"
+            "Кнопка <b>«Открыть окно синхронизации…»</b> "
+            "открывает полноценный менеджер: публикация выбранных "
+            "записей, скачивание с сервера, дельта-синхронизация, "
+            "справочники проектов и тегов и журнал операций."
         ),
         "Промпты и имена": (
             "<b>Промпты и шаблоны имён</b>"
