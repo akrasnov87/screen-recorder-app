@@ -6,10 +6,11 @@
   • Добавлен блок «Теги» (на вкладке «Основное»).
   • Вкладка «Промпт» содержит библиотеку промптов и контекст
     записи в промпте.
-  • Вкладка «Скрам и DeepSeek» объединяет summary, DeepSeek
-    и скрам-поля.
-  • Вкладка «Вложения» — список вложений и флаги, куда их
-    передавать.
+  • Чекбоксы контекста записи («Название», «Проект»,
+    «Комментарий», «Теги») включены по умолчанию.
+  • Если в initial нет prompt_name, но prompt/default_prompt
+    совпадает с одним из промптов библиотеки — этот промпт
+    автоматически выбирается в комбобоксе.
 """
 from __future__ import annotations
 
@@ -582,16 +583,20 @@ class MetadataDialog(QDialog):
             "<span style='color:#666'>Выберите, что из карточки "
             "записи добавить в промпт. Информация добавляется "
             "отдельным блоком «КОНТЕКСТ ЗАПИСИ» перед инструкцией. "
-            "Это помогает ИИ корректнее писать результат.</span>"
+            "Это помогает ИИ корректнее писать результат. "
+            "По умолчанию включены все четыре пункта — "
+            "снимите галочки, если не нужно.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         ctx_row = QHBoxLayout()
+
         self.include_name_check = QCheckBox("Название записи")
         attach_tooltip(
             self.include_name_check, "meta_include_name_in_prompt"
         )
+        self.include_name_check.setChecked(True)
         ctx_row.addWidget(self.include_name_check)
 
         self.include_project_check = QCheckBox("Проект")
@@ -599,6 +604,7 @@ class MetadataDialog(QDialog):
             self.include_project_check,
             "meta_include_project_in_prompt",
         )
+        self.include_project_check.setChecked(True)
         ctx_row.addWidget(self.include_project_check)
 
         self.include_comment_check = QCheckBox("Комментарий")
@@ -606,6 +612,7 @@ class MetadataDialog(QDialog):
             self.include_comment_check,
             "meta_include_comment_in_prompt",
         )
+        self.include_comment_check.setChecked(True)
         ctx_row.addWidget(self.include_comment_check)
 
         self.include_tags_check = QCheckBox("Теги")
@@ -613,6 +620,7 @@ class MetadataDialog(QDialog):
             self.include_tags_check,
             "meta_include_tags_in_prompt",
         )
+        self.include_tags_check.setChecked(True)
         ctx_row.addWidget(self.include_tags_check)
 
         ctx_row.addStretch()
@@ -626,8 +634,25 @@ class MetadataDialog(QDialog):
         )
         ctx_row.addWidget(self.context_all_btn)
 
+        self.context_none_btn = QPushButton("Снять всё")
+        self.context_none_btn.setToolTip(
+            "Снять все галочки контекста — в промпт пойдёт "
+            "только текст инструкции"
+        )
+        self.context_none_btn.clicked.connect(
+            self._on_context_disable_all
+        )
+        ctx_row.addWidget(self.context_none_btn)
+
         layout.addLayout(ctx_row)
         return box
+
+    def _on_context_disable_all(self) -> None:
+        self.include_name_check.setChecked(False)
+        self.include_project_check.setChecked(False)
+        self.include_comment_check.setChecked(False)
+        self.include_tags_check.setChecked(False)
+        log.info("Сняты все чекбоксы контекста записи")
 
     # ------------------------------------------------------------------
     # Вкладка «Скрам и DeepSeek»
@@ -1247,16 +1272,52 @@ class MetadataDialog(QDialog):
             gen = True
         self.generate_deepseek_check.setChecked(gen)
 
-        # --- Промпт ---
+        # ------------------------------------------------------------------
+        # Промпт: если явного текста нет — берём default_prompt;
+        # если он совпадает с одним из промптов библиотеки —
+        # выбираем его в комбобоксе.
+        # ------------------------------------------------------------------
         prompt_text = (
             init.get("prompt", "") or self._default_prompt
         )
         prompt_name = init.get("prompt_name", "")
+
+        # 1) Если prompt_name задан явно — просто выбираем его.
         if prompt_name:
             idx = self.prompt_combo.findText(prompt_name)
             if idx >= 0:
                 self.prompt_combo.blockSignals(True)
                 self.prompt_combo.setCurrentIndex(idx)
+                self.prompt_combo.blockSignals(False)
+                # Синхронизируем текст из библиотеки, если
+                # в initial не был указан собственный prompt.
+                if not init.get("prompt", "").strip():
+                    lib_text = self.prompt_combo.itemData(idx) or ""
+                    if lib_text:
+                        prompt_text = lib_text
+        else:
+            # 2) Явного имени нет. Пробуем найти в библиотеке
+            #    промпт с текстом, равным prompt_text.
+            found_idx = -1
+            if prompt_text:
+                for i in range(self.prompt_combo.count()):
+                    data = self.prompt_combo.itemData(i)
+                    if data and data.strip() == prompt_text.strip():
+                        found_idx = i
+                        break
+            if found_idx >= 0:
+                self.prompt_combo.blockSignals(True)
+                self.prompt_combo.setCurrentIndex(found_idx)
+                self.prompt_combo.blockSignals(False)
+                log.debug(
+                    "Промпт по умолчанию совпал с библиотечным: "
+                    "%r", self.prompt_combo.itemText(found_idx),
+                )
+            else:
+                # Ничего не нашли — оставляем «— не выбрано —»,
+                # но текст всё равно подставим в редактор.
+                self.prompt_combo.blockSignals(True)
+                self.prompt_combo.setCurrentIndex(0)
                 self.prompt_combo.blockSignals(False)
 
         self.prompt_input.blockSignals(True)
@@ -1264,19 +1325,40 @@ class MetadataDialog(QDialog):
         self.prompt_input.blockSignals(False)
         self._prompt_edited = False
 
-        # --- Контекст в промпт ---
-        self.include_name_check.setChecked(
-            bool(init.get("include_name_in_prompt", False))
-        )
-        self.include_project_check.setChecked(
-            bool(init.get("include_project_in_prompt", False))
-        )
-        self.include_comment_check.setChecked(
-            bool(init.get("include_comment_in_prompt", False))
-        )
-        self.include_tags_check.setChecked(
-            bool(init.get("include_tags_in_prompt", False))
-        )
+        # ------------------------------------------------------------------
+        # Контекст в промпт.
+        # По умолчанию (если в initial нет соответствующих ключей)
+        # все четыре галочки включены.
+        # ------------------------------------------------------------------
+        default_ctx = True
+
+        if "include_name_in_prompt" in init:
+            self.include_name_check.setChecked(
+                bool(init["include_name_in_prompt"])
+            )
+        else:
+            self.include_name_check.setChecked(default_ctx)
+
+        if "include_project_in_prompt" in init:
+            self.include_project_check.setChecked(
+                bool(init["include_project_in_prompt"])
+            )
+        else:
+            self.include_project_check.setChecked(default_ctx)
+
+        if "include_comment_in_prompt" in init:
+            self.include_comment_check.setChecked(
+                bool(init["include_comment_in_prompt"])
+            )
+        else:
+            self.include_comment_check.setChecked(default_ctx)
+
+        if "include_tags_in_prompt" in init:
+            self.include_tags_check.setChecked(
+                bool(init["include_tags_in_prompt"])
+            )
+        else:
+            self.include_tags_check.setChecked(default_ctx)
 
         # --- Скрам ---
         is_scrum = bool(init.get("is_scrum", False))
@@ -1303,13 +1385,15 @@ class MetadataDialog(QDialog):
         log.debug(
             "Начальные значения применены: project=%r, name=%r, "
             "template=%r, abbr=%r, tags=%s, generate_summary=%s, "
-            "prompt=%d символов, is_scrum=%s, "
+            "prompt=%d символов (combo=%r), is_scrum=%s, "
             "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
             "ctx_comment=%s, ctx_tags=%s, attachments=%d",
             project, init_name, init_template, init_abbr,
             self._selected_tags,
             self.generate_summary_check.isChecked(),
-            len(prompt_text), is_scrum, gen,
+            len(prompt_text),
+            self.prompt_combo.currentText(),
+            is_scrum, gen,
             self.include_name_check.isChecked(),
             self.include_project_check.isChecked(),
             self.include_comment_check.isChecked(),

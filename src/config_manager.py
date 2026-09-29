@@ -128,8 +128,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         ],
         "default_prompt": (
             "Составь краткое содержание записи на русском языке. "
-            "Выдели ключевые темы, решения и задачи с ответственными. "
-            "В конце — список action items."
+            "Выдели ключевые темы и решения. В конце — список "
+            "action items."
         ),
         "name_templates": DEFAULT_NAME_TEMPLATES,
     },

@@ -368,6 +368,9 @@ class ScreenRecorderApp(QObject):
 
         Проект берётся через _resolve_default_project():
         сначала config.default_project, потом первый из списка.
+
+        Чекбоксы контекста записи в промпте («Название»,
+        «Проект», «Комментарий», «Теги») включены по умолчанию.
         """
         default_project = self._resolve_default_project()
         now_str = f"{datetime.now():%Y-%m-%d %H-%M}"
@@ -389,18 +392,23 @@ class ScreenRecorderApp(QObject):
             "generate_summary": default_generate_summary,
             "is_scrum": False,
             "generate_deepseek_prompt": True,
-            "include_name_in_prompt": False,
-            "include_project_in_prompt": False,
-            "include_comment_in_prompt": False,
-            "include_tags_in_prompt": False,
+            "include_name_in_prompt": True,
+            "include_project_in_prompt": True,
+            "include_comment_in_prompt": True,
+            "include_tags_in_prompt": True,
             "previous_protocol_path": "",
             "attachments": [],
             "send_attachments_to_transcribe": False,
             "send_attachments_to_deepseek": False,
         }
         log.debug(
-            "Сформированы метаданные по умолчанию: project=%r",
+            "Сформированы метаданные по умолчанию: project=%r, "
+            "ctx: name=%s project=%s comment=%s tags=%s",
             default_project,
+            meta["include_name_in_prompt"],
+            meta["include_project_in_prompt"],
+            meta["include_comment_in_prompt"],
+            meta["include_tags_in_prompt"],
         )
         return meta
 
@@ -622,8 +630,13 @@ class ScreenRecorderApp(QObject):
             return
 
         initial = {
-            "name": os.path.splitext(os.path.basename(file_path))[0]
+            "name": os.path.splitext(os.path.basename(file_path))[0],
+            "include_name_in_prompt": True,
+            "include_project_in_prompt": True,
+            "include_comment_in_prompt": True,
+            "include_tags_in_prompt": True,
         }
+        
         meta = self._ask_metadata(
             title="Метаданные загружаемого видео",
             initial=initial,
@@ -829,10 +842,10 @@ class ScreenRecorderApp(QObject):
             "generate_summary": default_generate_summary,
             "is_scrum": False,
             "generate_deepseek_prompt": True,
-            "include_name_in_prompt": False,
-            "include_project_in_prompt": False,
-            "include_comment_in_prompt": False,
-            "include_tags_in_prompt": False,
+            "include_name_in_prompt": True,
+            "include_project_in_prompt": True,
+            "include_comment_in_prompt": True,
+            "include_tags_in_prompt": True,
             "previous_protocol_path": protocol_dst,
             "manual_protocol_path": protocol_dst,
             "attachments": [],
