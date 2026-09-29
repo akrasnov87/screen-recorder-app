@@ -1,8 +1,9 @@
 """Окно со списком всех записей (сессий).
 
 Изменения:
-  • _send_to_bitrix() использует config.default_chat_id как
-    основной ID чата. Если он пустой — берётся чат проекта записи.
+  • _send_to_bitrix() использует config.default_chat_id.
+  • Добавлена колонка «Теги» и поддержка редактирования тегов
+    через карточку метаданных.
 """
 from __future__ import annotations
 
@@ -106,6 +107,26 @@ class SessionsScanThread(QThread):
             if os.path.exists(p):
                 return p
         return ""
+
+    @staticmethod
+    def _extract_tags(meta: Dict[str, Any]) -> List[str]:
+        raw = meta.get("tags")
+        if not raw:
+            return []
+        result: List[str] = []
+        seen = set()
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str):
+                    name = item.strip()
+                elif isinstance(item, dict):
+                    name = str(item.get("name") or "").strip()
+                else:
+                    continue
+                if name and name not in seen:
+                    result.append(name)
+                    seen.add(name)
+        return result
 
     def _collect(
         self,
@@ -213,6 +234,7 @@ class SessionsScanThread(QThread):
                 manual_protocol_path = ""
 
             summary_bb = str(meta.get("summary_bb") or "")
+            tags = self._extract_tags(meta)
 
             rows.append({
                 "dir": session_dir,
@@ -229,6 +251,7 @@ class SessionsScanThread(QThread):
                 "attachments": attachments,
                 "manual_protocol_path": manual_protocol_path,
                 "summary_bb": summary_bb,
+                "tags": tags,
             })
 
         rows.sort(key=lambda r: r["datetime"], reverse=True)
@@ -254,7 +277,7 @@ class SessionsWindow(QDialog):
         self.processor = processor
         self.config_manager = config_manager
         self.setWindowTitle("Записи")
-        self.setMinimumSize(1400, 780)
+        self.setMinimumSize(1500, 780)
         self.setModal(False)
         self._rows: List[Dict[str, Any]] = []
         self._thread: Optional[SessionsScanThread] = None
@@ -287,11 +310,11 @@ class SessionsWindow(QDialog):
         header.addWidget(self.refresh_indicator)
         root.addLayout(header)
 
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels([
-            "Дата и время", "Название", "Проект", "Статус",
-            "Источник", "Скрам", "Вложения", "Summary",
-            "Task ID", "Папка",
+            "Дата и время", "Название", "Проект", "Теги",
+            "Статус", "Источник", "Скрам", "Вложения",
+            "Summary", "Task ID", "Папка",
         ])
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -322,11 +345,14 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             6, QHeaderView.ResizeMode.ResizeToContents
         )
-        hv.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(
-            8, QHeaderView.ResizeMode.ResizeToContents
+            7, QHeaderView.ResizeMode.ResizeToContents
         )
-        hv.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            9, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(
             self._on_selection_changed
         )
@@ -439,6 +465,57 @@ class SessionsWindow(QDialog):
         act_close.setShortcut(QKeySequence("Ctrl+W"))
         act_close.triggered.connect(self.close)
         m_file.addAction(act_close)
+
+        m_meta = bar.addMenu("Метаданные")
+
+        act_edit_meta = QAction(
+            "Изменить метаданные и перезапустить…", self
+        )
+        act_edit_meta.setShortcut(QKeySequence("Ctrl+E"))
+        act_edit_meta.triggered.connect(
+            self._edit_metadata_and_restart
+        )
+        m_meta.addAction(act_edit_meta)
+
+        act_edit_tags = QAction("Изменить теги…", self)
+        act_edit_tags.setShortcut(QKeySequence("Ctrl+T"))
+        act_edit_tags.triggered.connect(self._edit_tags)
+        m_meta.addAction(act_edit_tags)
+
+        m_meta.addSeparator()
+
+        act_restart = QAction("Перезапустить обработку", self)
+        act_restart.setShortcut(QKeySequence("Ctrl+R"))
+        act_restart.triggered.connect(self._restart_processing)
+        m_meta.addAction(act_restart)
+
+        act_enqueue = QAction("Поставить в очередь", self)
+        act_enqueue.triggered.connect(self._enqueue_current)
+        m_meta.addAction(act_enqueue)
+
+        m_meta.addSeparator()
+
+        act_status_uploaded = QAction(
+            "Пометить: «Сохранено»", self
+        )
+        act_status_uploaded.triggered.connect(
+            lambda: self._change_status(STATUS_UPLOADED)
+        )
+        m_meta.addAction(act_status_uploaded)
+
+        act_status_processed = QAction(
+            "Пометить: «Обработан»", self
+        )
+        act_status_processed.triggered.connect(
+            lambda: self._change_status(STATUS_PROCESSED)
+        )
+        m_meta.addAction(act_status_processed)
+
+        act_status_error = QAction("Пометить: «Ошибка»", self)
+        act_status_error.triggered.connect(
+            lambda: self._change_status(STATUS_ERROR)
+        )
+        m_meta.addAction(act_status_error)
 
         m_protocol = bar.addMenu("Протокол")
 
@@ -556,52 +633,6 @@ class SessionsWindow(QDialog):
         )
         m_attach.addAction(act_add_attachment)
 
-        m_queue = bar.addMenu("Очередь")
-
-        act_edit_meta = QAction(
-            "Редактировать метаданные и перезапустить…", self
-        )
-        act_edit_meta.setShortcut(QKeySequence("Ctrl+E"))
-        act_edit_meta.triggered.connect(
-            self._edit_metadata_and_restart
-        )
-        m_queue.addAction(act_edit_meta)
-
-        m_queue.addSeparator()
-
-        act_restart = QAction("Перезапустить обработку", self)
-        act_restart.setShortcut(QKeySequence("Ctrl+R"))
-        act_restart.triggered.connect(self._restart_processing)
-        m_queue.addAction(act_restart)
-
-        act_enqueue = QAction("Поставить в очередь", self)
-        act_enqueue.triggered.connect(self._enqueue_current)
-        m_queue.addAction(act_enqueue)
-
-        m_queue.addSeparator()
-
-        act_status_uploaded = QAction(
-            "Пометить: «Сохранено»", self
-        )
-        act_status_uploaded.triggered.connect(
-            lambda: self._change_status(STATUS_UPLOADED)
-        )
-        m_queue.addAction(act_status_uploaded)
-
-        act_status_processed = QAction(
-            "Пометить: «Обработан»", self
-        )
-        act_status_processed.triggered.connect(
-            lambda: self._change_status(STATUS_PROCESSED)
-        )
-        m_queue.addAction(act_status_processed)
-
-        act_status_error = QAction("Пометить: «Ошибка»", self)
-        act_status_error.triggered.connect(
-            lambda: self._change_status(STATUS_ERROR)
-        )
-        m_queue.addAction(act_status_error)
-
         m_utils = bar.addMenu("Утилиты")
 
         act_stats = QAction(
@@ -687,6 +718,10 @@ class SessionsWindow(QDialog):
         parts = [f"<b>{r['name']}</b>"]
         if r.get("project"):
             parts.append(f"проект: {r['project']}")
+        if r.get("tags"):
+            parts.append(
+                f"теги: {', '.join(r['tags'])}"
+            )
         parts.append(f"статус: {r['status']}")
         if r.get("manual_protocol_path"):
             parts.append("протокол: прикреплён")
@@ -779,6 +814,15 @@ class SessionsWindow(QDialog):
                 row, 2, QTableWidgetItem(r["project"])
             )
 
+            tags = r.get("tags") or []
+            tags_text = ", ".join(tags) if tags else "—"
+            tags_item = QTableWidgetItem(tags_text)
+            if tags:
+                tags_item.setToolTip(
+                    "Теги записи: " + ", ".join(tags)
+                )
+            self.table.setItem(row, 3, tags_item)
+
             status_item = QTableWidgetItem(r["status"])
             if r["status"] == STATUS_ERROR:
                 status_item.setForeground(Qt.GlobalColor.red)
@@ -786,7 +830,7 @@ class SessionsWindow(QDialog):
                 status_item.setForeground(Qt.GlobalColor.darkGreen)
             elif r["status"] == STATUS_TRANSCRIBING:
                 status_item.setForeground(Qt.GlobalColor.darkYellow)
-            self.table.setItem(row, 3, status_item)
+            self.table.setItem(row, 4, status_item)
 
             src_map = {
                 "record": "Запись",
@@ -794,15 +838,15 @@ class SessionsWindow(QDialog):
                 "import": "Импорт",
             }
             src = src_map.get(r["source"], r["source"] or "—")
-            self.table.setItem(row, 4, QTableWidgetItem(src))
+            self.table.setItem(row, 5, QTableWidgetItem(src))
             self.table.setItem(
-                row, 5,
+                row, 6,
                 QTableWidgetItem("да" if r["is_scrum"] else "—"),
             )
 
             att_count = len(r.get("attachments", []) or [])
             self.table.setItem(
-                row, 6,
+                row, 7,
                 QTableWidgetItem(
                     str(att_count) if att_count else "—"
                 ),
@@ -817,26 +861,18 @@ class SessionsWindow(QDialog):
                 summary_item.setToolTip(summary_bb[:1000])
             else:
                 summary_item = QTableWidgetItem("—")
-            self.table.setItem(row, 7, summary_item)
+            self.table.setItem(row, 8, summary_item)
 
             self.table.setItem(
-                row, 8,
+                row, 9,
                 QTableWidgetItem(r["task_id"] or "—"),
             )
-            self.table.setItem(row, 9, QTableWidgetItem(r["dir"]))
+            self.table.setItem(row, 10, QTableWidgetItem(r["dir"]))
 
     # ------------------------------------------------------------------
     # Bitrix24
     # ------------------------------------------------------------------
     def _send_to_bitrix(self, default: str = "") -> None:
-        """
-        Открывает диалог отправки протокола/summary в Bitrix24.
-
-        ID чата выбирается в порядке приоритета:
-          1) config.default_chat_id (задано в Настройках);
-          2) чат проекта записи;
-          3) пусто — пользователь выберет вручную в диалоге.
-        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -859,7 +895,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # --- Выбор chat_id по приоритетам ---
         chat_id = self.config_manager.get_default_chat_id()
         project = r.get("project") or ""
 
@@ -896,6 +931,7 @@ class SessionsWindow(QDialog):
             "summary_bb": r.get("summary_bb") or "",
             "comment": "",
             "session_dir": r.get("dir") or "",
+            "tags": list(r.get("tags") or []),
         }
 
         try:
@@ -920,6 +956,81 @@ class SessionsWindow(QDialog):
             parent=self,
         )
         dlg.exec()
+
+    # ------------------------------------------------------------------
+    # Быстрое редактирование тегов
+    # ------------------------------------------------------------------
+    def _edit_tags(self) -> None:
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "Теги",
+                "Нет доступа к настройкам.",
+            )
+            return
+
+        session_json = os.path.join(r["dir"], "session.json")
+        meta = read_json_file(session_json) or {}
+
+        projects = self.config_manager.get_project_names()
+        prompts = self.config_manager.get_prompts()
+        default_prompt = self.config_manager.get_default_prompt()
+        name_templates = self.config_manager.get_name_templates()
+        tags = self.config_manager.get_tags()
+
+        project = meta.get("project")
+        if project and project not in projects:
+            projects = [project] + projects
+
+        dlg = MetadataDialog(
+            projects=projects,
+            prompts=prompts,
+            title=f"Теги записи — {r['name']}",
+            initial=meta,
+            default_prompt=default_prompt,
+            sessions_root=self.sessions_root,
+            on_save_prompt=self._on_save_prompt_to_config,
+            get_prompts=self.config_manager.get_prompts,
+            name_templates=name_templates,
+            on_save_name_template=self._on_save_name_template,
+            get_name_templates=self.config_manager.get_name_templates,
+            tags=tags,
+            on_save_tag=self._on_save_tag_to_config,
+            get_tags=self.config_manager.get_tags,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # Сохраняем только теги — остальные поля не трогаем.
+        new_tags = dlg.result_data.get("tags", [])
+        meta["tags"] = list(new_tags)
+        if not self._write_json(session_json, meta):
+            QMessageBox.critical(
+                self, "Теги",
+                "Не удалось сохранить теги в session.json",
+            )
+            return
+
+        log.info(
+            "Теги записи «%s» обновлены: %s",
+            r["name"], new_tags,
+        )
+        self.refresh()
+
+    def _on_save_tag_to_config(self, name: str, color: str = "") -> None:
+        try:
+            name = (name or "").strip()
+            if not name:
+                return
+            self.config_manager.add_tag(name, color)
+        except Exception as exc:
+            log.exception("Ошибка сохранения тега: %s", exc)
+            raise
 
     # ------------------------------------------------------------------
     # Протокол
@@ -1768,6 +1879,7 @@ class SessionsWindow(QDialog):
         prompts = self.config_manager.get_prompts()
         default_prompt = self.config_manager.get_default_prompt()
         name_templates = self.config_manager.get_name_templates()
+        tags = self.config_manager.get_tags()
 
         project = meta.get("project")
         if project and project not in projects:
@@ -1785,6 +1897,9 @@ class SessionsWindow(QDialog):
             name_templates=name_templates,
             on_save_name_template=self._on_save_name_template,
             get_name_templates=self.config_manager.get_name_templates,
+            tags=tags,
+            on_save_tag=self._on_save_tag_to_config,
+            get_tags=self.config_manager.get_tags,
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -1971,6 +2086,9 @@ class SessionsWindow(QDialog):
         menu.addAction(
             "Редактировать метаданные и перезапустить…",
             self._edit_metadata_and_restart,
+        )
+        menu.addAction(
+            "Изменить теги…", self._edit_tags
         )
         menu.addSeparator()
         menu.addAction(
@@ -2241,6 +2359,7 @@ class SessionsWindow(QDialog):
             "Ctrl+Shift+M  — экспорт протокола в DOCX\n"
             "Ctrl+B        — отправить протокол/summary в Bitrix24\n"
             "Ctrl+E        — редактировать метаданные и перезапустить\n"
+            "Ctrl+T        — изменить теги\n"
             "Ctrl+Shift+E  — открыть папку записи\n"
             "Ctrl+Shift+V  — открыть видео\n"
             "Ctrl+P        — изменить summary (Markdown)\n"

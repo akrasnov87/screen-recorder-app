@@ -4,6 +4,8 @@
   • _build_default_meta() и _ask_metadata() учитывают
     config.default_project — имя проекта по умолчанию для
     новых записей.
+  • Добавлена поддержка тегов: передача справочника в
+    MetadataDialog, сохранение новых тегов в config.
 """
 from __future__ import annotations
 
@@ -303,6 +305,7 @@ class ScreenRecorderApp(QObject):
         prompts = self.config_manager.get_prompts()
         default_prompt = self.config_manager.get_default_prompt()
         name_templates = self.config_manager.get_name_templates()
+        tags = self.config_manager.get_tags()
 
         init = dict(initial or {})
 
@@ -316,10 +319,10 @@ class ScreenRecorderApp(QObject):
 
         log.debug(
             "Открытие диалога метаданных: title=%r, projects=%d, "
-            "prompts=%d, name_templates=%d, initial_keys=%s, "
-            "default_project=%r",
+            "prompts=%d, name_templates=%d, tags=%d, "
+            "initial_keys=%s, default_project=%r",
             title, len(projects), len(prompts), len(name_templates),
-            list(init.keys()), init.get("project"),
+            len(tags), list(init.keys()), init.get("project"),
         )
 
         dlg = MetadataDialog(
@@ -334,6 +337,9 @@ class ScreenRecorderApp(QObject):
             name_templates=name_templates,
             on_save_name_template=self._add_name_template,
             get_name_templates=self.config_manager.get_name_templates,
+            tags=tags,
+            on_save_tag=self._add_tag_to_library,
+            get_tags=self.config_manager.get_tags,
             parent=None,
         )
         if dlg.exec() == dlg.DialogCode.Accepted:
@@ -369,6 +375,7 @@ class ScreenRecorderApp(QObject):
             "name_template": "",
             "name_abbr": "",
             "comment": "",
+            "tags": [],
             "prompt": self.config_manager.get_default_prompt(),
             "prompt_name": "",
             "prompt_edited": False,
@@ -378,6 +385,7 @@ class ScreenRecorderApp(QObject):
             "include_name_in_prompt": False,
             "include_project_in_prompt": False,
             "include_comment_in_prompt": False,
+            "include_tags_in_prompt": False,
             "previous_protocol_path": "",
             "attachments": [],
             "send_attachments_to_transcribe": False,
@@ -431,6 +439,21 @@ class ScreenRecorderApp(QObject):
             )
         except Exception as exc:
             log.exception("Ошибка сохранения шаблона имени: %s", exc)
+
+    def _add_tag_to_library(self, name: str, color: str = "") -> None:
+        """Сохраняет новый тег в справочник config["tags"]."""
+        try:
+            name = (name or "").strip()
+            if not name:
+                log.warning("Имя тега пустое, сохранение отменено")
+                return
+            self.config_manager.add_tag(name, color)
+            self._notify(
+                "Теги",
+                f"Тег «{name}» добавлен в справочник",
+            )
+        except Exception as exc:
+            log.exception("Ошибка сохранения тега: %s", exc)
 
     @staticmethod
     def _copy_attachments_to_session(
@@ -664,11 +687,15 @@ class ScreenRecorderApp(QObject):
     def _open_import(self) -> None:
         log.info("Запрос на импорт материалов")
         projects = self.config_manager.get_project_names()
+        tags = self.config_manager.get_tags()
 
         dlg = ImportWindow(
             projects=projects,
             sessions_root=self._sessions_root(),
             parent=None,
+            tags=tags,
+            on_save_tag=self._add_tag_to_library,
+            get_tags=self.config_manager.get_tags,
         )
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
@@ -774,6 +801,7 @@ class ScreenRecorderApp(QObject):
             "date": date_dt.strftime("%Y-%m-%d"),
             "time": date_dt.strftime("%H:%M:%S"),
             "comment": comment,
+            "tags": list(data.get("tags") or []),
             "source": "import",
             "source_files": {
                 "video": video_src,
@@ -797,6 +825,7 @@ class ScreenRecorderApp(QObject):
             "include_name_in_prompt": False,
             "include_project_in_prompt": False,
             "include_comment_in_prompt": False,
+            "include_tags_in_prompt": False,
             "previous_protocol_path": protocol_dst,
             "manual_protocol_path": protocol_dst,
             "attachments": [],

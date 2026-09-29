@@ -1,18 +1,24 @@
-"""Окно импорта готовых материалов: видео/аудио, стенограмма, протокол."""
+"""Окно импорта готовых материалов: видео/аудио, стенограмма, протокол.
+
+Изменения:
+  • Добавлен блок «Теги» — можно сразу проставить метки
+    на импортируемую запись. Теги попадают в session.json
+    и участвуют в фильтре раздела «Библиотека».
+"""
 from __future__ import annotations
 
 import os
 import shutil
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import QDate, Qt
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QDate, Qt, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
+    QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
 from .logger import get_logger
@@ -40,8 +46,8 @@ class ImportWindow(QDialog):
     Результат: self.result_data (dict) заполняется при «Импортировать».
     В нём:
         video_path, transcript_path, protocol_path,
-        date (datetime), name, project, comment,
-        enqueue (bool)
+        date (datetime), name, project, comment, tags (list[str]),
+        enqueue (bool), open_folder (bool)
     """
 
     def __init__(
@@ -49,20 +55,33 @@ class ImportWindow(QDialog):
         projects: List[str],
         sessions_root: str,
         parent: Optional[QWidget] = None,
+        tags: Optional[List[Dict[str, str]]] = None,
+        on_save_tag: Optional[Callable[[str, str], None]] = None,
+        get_tags: Optional[
+            Callable[[], List[Dict[str, str]]]
+        ] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Импорт материалов")
         self.setModal(True)
-        self.setMinimumWidth(760)
+        self.setMinimumWidth(820)
 
         self._projects = list(projects or [])
         self._sessions_root = sessions_root
         self.result_data: Dict[str, Any] = {}
 
+        self._tags: List[Dict[str, str]] = list(tags or [])
+        self._on_save_tag_cb = on_save_tag
+        self._get_tags_cb = get_tags
+        self._selected_tags: List[str] = []
+
         self._build_ui()
         self._refresh_ok_state()
-        log.debug("ImportWindow открыто, проектов=%d, sessions_root=%s",
-                  len(self._projects), sessions_root)
+        log.debug(
+            "ImportWindow открыто, проектов=%d, тегов=%d, "
+            "sessions_root=%s",
+            len(self._projects), len(self._tags), sessions_root,
+        )
 
     # ------------------------------------------------------------------
     # UI
@@ -158,9 +177,10 @@ class ImportWindow(QDialog):
 
         form.addRow("Протокол:", with_info(pr_row, "imp_protocol"))
 
+        root.addLayout(form)
+
         # --- Разделитель ---
         sep = QLabel("<hr>")
-        root.addLayout(form)
         root.addWidget(sep)
 
         # --- Метаданные ---
@@ -196,9 +216,14 @@ class ImportWindow(QDialog):
             "Необязательный комментарий к импортируемой записи…"
         )
         self.comment_input.setFixedHeight(70)
-        meta_form.addRow("Комментарий:", with_info(self.comment_input, "imp_comment"))
+        meta_form.addRow(
+            "Комментарий:", with_info(self.comment_input, "imp_comment")
+        )
 
         root.addLayout(meta_form)
+
+        # --- Теги ---
+        root.addWidget(self._build_tags_section())
 
         # --- Опции ---
         opts_row = QHBoxLayout()
@@ -214,9 +239,12 @@ class ImportWindow(QDialog):
             "обработка не запустится."
         )
         self.enqueue_check.setChecked(False)
+        self.enqueue_check.toggled.connect(self._refresh_ok_state)
         opts_row.addWidget(self.enqueue_check)
 
-        self.open_folder_check = QCheckBox("Открыть папку записи после импорта")
+        self.open_folder_check = QCheckBox(
+            "Открыть папку записи после импорта"
+        )
         self.open_folder_check.setChecked(True)
         self.open_folder_check.setToolTip(
             "После импорта открыть папку сессии в файловом менеджере."
@@ -234,10 +262,232 @@ class ImportWindow(QDialog):
         )
         self.ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self.ok_btn.setText("Импортировать")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        ).setText("Отмена")
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    # ------------------------------------------------------------------
+    # Блок тегов
+    # ------------------------------------------------------------------
+    def _build_tags_section(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Теги</b>"))
+        header.addStretch()
+        icon = make_info_icon("imp_tags")
+        if icon is not None:
+            header.addWidget(icon)
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "<span style='color:#666'>Отметьте один или несколько "
+            "тегов из справочника — они будут присвоены "
+            "импортируемой записи. Новый тег можно добавить "
+            "кнопкой ниже. Снять все теги — кнопкой "
+            "«Снять все».</span>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.tags_list = QListWidget()
+        self.tags_list.setMinimumHeight(110)
+        self.tags_list.setSelectionMode(
+            QListWidget.SelectionMode.NoSelection
+        )
+        self.tags_list.setAlternatingRowColors(True)
+        attach_tooltip(self.tags_list, "imp_tags_list")
+        self.tags_list.itemChanged.connect(
+            self._on_tag_item_changed
+        )
+        self._populate_tags_list()
+        layout.addWidget(self.tags_list)
+
+        btns = QHBoxLayout()
+
+        self.add_tag_btn = QPushButton("Добавить новый тег…")
+        self.add_tag_btn.setToolTip(
+            "Добавить тег, которого нет в справочнике.\n"
+            "После сохранения он появится в Настройки → Теги "
+            "и сразу будет отмечен у записи."
+        )
+        self.add_tag_btn.clicked.connect(self._on_add_new_tag)
+        btns.addWidget(self.add_tag_btn)
+
+        self.clear_tags_btn = QPushButton("Снять все")
+        self.clear_tags_btn.clicked.connect(self._on_clear_tags)
+        btns.addWidget(self.clear_tags_btn)
+
+        btns.addStretch()
+
+        self.tags_count_label = QLabel("")
+        self.tags_count_label.setStyleSheet(
+            "QLabel { color: #444; font-weight: bold; }"
+        )
+        btns.addWidget(self.tags_count_label)
+
+        layout.addLayout(btns)
+
+        self._update_tags_count()
+        return box
+
+    def _populate_tags_list(self) -> None:
+        if not hasattr(self, "tags_list"):
+            return
+        self.tags_list.blockSignals(True)
+        self.tags_list.clear()
+
+        selected = set(self._selected_tags)
+
+        for tag in self._tags:
+            name = tag.get("name") or ""
+            if not name:
+                continue
+            item = QListWidgetItem(name)
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            item.setCheckState(
+                Qt.CheckState.Checked if name in selected
+                else Qt.CheckState.Unchecked
+            )
+            item.setData(Qt.ItemDataRole.UserRole, name)
+
+            color = (tag.get("color") or "").strip()
+            if color:
+                try:
+                    qcolor = QColor(color)
+                    if qcolor.isValid():
+                        item.setForeground(qcolor)
+                        item.setBackground(
+                            QColor(
+                                qcolor.red(), qcolor.green(),
+                                qcolor.blue(), 30,
+                            )
+                        )
+                except Exception:
+                    pass
+
+            self.tags_list.addItem(item)
+
+        self.tags_list.blockSignals(False)
+        self._update_tags_count()
+
+    def _refresh_tags_list(
+        self, selected_names: Optional[List[str]] = None,
+    ) -> None:
+        if self._get_tags_cb is not None:
+            try:
+                fresh = self._get_tags_cb() or []
+                if isinstance(fresh, list):
+                    self._tags = fresh
+            except Exception as exc:
+                log.warning(
+                    "Не удалось получить справочник тегов: %s", exc
+                )
+
+        if selected_names is not None:
+            self._selected_tags = list(selected_names)
+
+        self._populate_tags_list()
+
+    def _update_tags_count(self) -> None:
+        if not hasattr(self, "tags_count_label"):
+            return
+        n = len(self._selected_tags)
+        if n == 0:
+            self.tags_count_label.setText("Теги не выбраны")
+        elif n == 1:
+            self.tags_count_label.setText(
+                f"Выбран: {self._selected_tags[0]}"
+            )
+        else:
+            self.tags_count_label.setText(f"Выбрано: {n}")
+
+    def _on_tag_item_changed(self, item: QListWidgetItem) -> None:
+        name = item.data(Qt.ItemDataRole.UserRole) or ""
+        if not name:
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            if name not in self._selected_tags:
+                self._selected_tags.append(name)
+        else:
+            self._selected_tags = [
+                t for t in self._selected_tags if t != name
+            ]
+        self._update_tags_count()
+        log.debug("Теги импорта: %s", self._selected_tags)
+
+    def _on_add_new_tag(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "Новый тег",
+            "Имя тега (например, «важное», «риски», "
+            "«для клиента»):",
+        )
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.warning(
+                self, "Тег", "Имя тега не может быть пустым."
+            )
+            return
+
+        existing = [t.get("name") for t in self._tags]
+        if name in existing:
+            QMessageBox.information(
+                self, "Тег",
+                f"Тег «{name}» уже есть в справочнике.",
+            )
+        else:
+            if self._on_save_tag_cb is not None:
+                try:
+                    self._on_save_tag_cb(name, "")
+                except Exception as exc:
+                    log.exception(
+                        "Ошибка сохранения тега: %s", exc
+                    )
+                    QMessageBox.critical(
+                        self, "Тег",
+                        f"Не удалось сохранить тег:\n{exc}",
+                    )
+                    return
+            else:
+                self._tags.append({"name": name, "color": ""})
+
+        if name not in self._selected_tags:
+            self._selected_tags.append(name)
+
+        self._refresh_tags_list(
+            selected_names=list(self._selected_tags)
+        )
+        log.info("Тег «%s» добавлен и выбран у импорта", name)
+
+    def _on_clear_tags(self) -> None:
+        self._selected_tags = []
+        self._populate_tags_list()
+        log.debug("Все теги импорта сняты")
+
+    def _ordered_selected_tags(self) -> List[str]:
+        """Возвращает выбранные теги в порядке справочника."""
+        selected_set = set(self._selected_tags)
+        ordered: List[str] = []
+        for tag in self._tags:
+            name = tag.get("name") or ""
+            if name and name in selected_set:
+                ordered.append(name)
+        for name in self._selected_tags:
+            if name and name not in ordered:
+                ordered.append(name)
+        return ordered
 
     # ------------------------------------------------------------------
     # Выбор файлов
@@ -292,12 +542,13 @@ class ImportWindow(QDialog):
         has_protocol = bool(self.protocol_input.text().strip())
         has_name = bool(self.name_input.text().strip())
 
-        # Хотя бы один файл — обязателен
         at_least_one_file = has_video or has_transcript or has_protocol
 
         if not at_least_one_file:
             self.ok_btn.setEnabled(False)
-            self.ok_btn.setToolTip("Выберите хотя бы один файл для импорта")
+            self.ok_btn.setToolTip(
+                "Выберите хотя бы один файл для импорта"
+            )
             return
 
         if not has_name:
@@ -305,11 +556,11 @@ class ImportWindow(QDialog):
             self.ok_btn.setToolTip("Введите название записи")
             return
 
-        # Если включена очередь — нужен видео/аудио файл, иначе обрабатывать нечего
         if self.enqueue_check.isChecked() and not has_video:
             self.ok_btn.setEnabled(False)
             self.ok_btn.setToolTip(
-                "Для постановки в очередь нужно выбрать видео или аудио"
+                "Для постановки в очередь нужно выбрать видео "
+                "или аудио"
             )
             return
 
@@ -324,9 +575,11 @@ class ImportWindow(QDialog):
         transcript = self.transcript_input.text().strip()
         protocol = self.protocol_input.text().strip()
 
-        # Проверяем существование
-        for label, path in (("видео", video), ("стенограмма", transcript),
-                            ("протокол", protocol)):
+        for label, path in (
+            ("видео", video),
+            ("стенограмма", transcript),
+            ("протокол", protocol),
+        ):
             if path and not os.path.isfile(path):
                 QMessageBox.warning(
                     self, "Импорт",
@@ -337,22 +590,30 @@ class ImportWindow(QDialog):
         qd = self.date_edit.date()
         date_dt = datetime(qd.year(), qd.month(), qd.day())
 
+        selected_tags = self._ordered_selected_tags()
+
         self.result_data = {
             "video_path": video,
             "transcript_path": transcript,
             "protocol_path": protocol,
             "date": date_dt,
             "name": self.name_input.text().strip(),
-            "project": self.project_combo.currentText().strip() or "Default",
+            "project": (
+                self.project_combo.currentText().strip()
+                or "Default"
+            ),
             "comment": self.comment_input.toPlainText().strip(),
+            "tags": selected_tags,
             "enqueue": self.enqueue_check.isChecked(),
             "open_folder": self.open_folder_check.isChecked(),
         }
         log.info(
             "Импорт подтверждён: date=%s, name=%r, project=%r, "
-            "video=%s, transcript=%s, protocol=%s, enqueue=%s",
+            "tags=%s, video=%s, transcript=%s, protocol=%s, "
+            "enqueue=%s",
             date_dt.strftime("%Y-%m-%d"),
             self.result_data["name"], self.result_data["project"],
+            selected_tags,
             bool(video), bool(transcript), bool(protocol),
             self.result_data["enqueue"],
         )

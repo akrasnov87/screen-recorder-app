@@ -2,6 +2,8 @@
 
 Изменения:
   • Удалена неиспользуемая константа _NAME_PLACEHOLDERS.
+  • Добавлен блок «Теги»: список тегов из справочника с
+    чекбоксами + возможность ввести новый тег вручную.
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
@@ -66,7 +69,8 @@ class MetadataDialog(QDialog):
     """
     Окно ввода метаданных: проект, название, комментарий, промпт,
     скрам, вложения, формирование промпта для DeepSeek, контекст
-    в промпте, флаг формирования summary для конкретной записи.
+    в промпте, флаг формирования summary для конкретной записи,
+    теги.
     """
 
     def __init__(
@@ -88,13 +92,18 @@ class MetadataDialog(QDialog):
         get_name_templates: Optional[
             Callable[[], List[Dict[str, str]]]
         ] = None,
+        tags: Optional[List[Dict[str, str]]] = None,
+        on_save_tag: Optional[Callable[[str, str], None]] = None,
+        get_tags: Optional[
+            Callable[[], List[Dict[str, str]]]
+        ] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
         self.setMinimumWidth(920)
-        self.setMinimumHeight(950)
+        self.setMinimumHeight(1050)
 
         self._projects = projects or []
         self._prompts = list(prompts or [])
@@ -110,15 +119,21 @@ class MetadataDialog(QDialog):
         self._on_save_name_template_cb = on_save_name_template
         self._get_name_templates_cb = get_name_templates
 
+        self._tags: List[Dict[str, str]] = list(tags or [])
+        self._on_save_tag_cb = on_save_tag
+        self._get_tags_cb = get_tags
+        self._selected_tags: List[str] = []
+
         self.result_data: Dict[str, Any] = {}
         self._prompt_edited = False
         self._attachments: List[str] = []
 
         log.debug(
             "MetadataDialog: title=%r, projects=%d, prompts=%d, "
-            "name_templates=%d, sessions_root=%s",
+            "name_templates=%d, tags=%d, sessions_root=%s",
             title, len(self._projects), len(self._prompts),
-            len(self._name_templates), sessions_root or "—",
+            len(self._name_templates), len(self._tags),
+            sessions_root or "—",
         )
 
         self._build_ui()
@@ -214,6 +229,9 @@ class MetadataDialog(QDialog):
         )
 
         root.addLayout(form)
+
+        # --- Теги ---
+        root.addWidget(self._build_tags_section())
 
         # --- Формирование summary ---
         summary_header = QHBoxLayout()
@@ -322,11 +340,18 @@ class MetadataDialog(QDialog):
         )
         ctx_box.addWidget(self.include_comment_check)
 
+        self.include_tags_check = QCheckBox("Теги")
+        attach_tooltip(
+            self.include_tags_check,
+            "meta_include_tags_in_prompt",
+        )
+        ctx_box.addWidget(self.include_tags_check)
+
         ctx_box.addStretch()
 
         self.context_all_btn = QPushButton("Включить всё")
         self.context_all_btn.setToolTip(
-            "Проставить все три галочки контекста"
+            "Проставить все галочки контекста"
         )
         self.context_all_btn.clicked.connect(
             self._on_context_enable_all
@@ -506,6 +531,208 @@ class MetadataDialog(QDialog):
         buttons.rejected.connect(self._on_reject)
         root.addWidget(buttons)
 
+    # ------------------------------------------------------------------
+    # Блок тегов
+    # ------------------------------------------------------------------
+    def _build_tags_section(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Теги</b>"))
+        header.addStretch()
+        icon = make_info_icon("meta_tags")
+        if icon is not None:
+            header.addWidget(icon)
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "<span style='color:#666'>Отметьте один или несколько "
+            "тегов из справочника. Можно добавить новый тег — он "
+            "попадёт в справочник (Настройки → Теги). Снять все "
+            "теги — кнопкой «Снять все».</span>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.tags_list = QListWidget()
+        self.tags_list.setMinimumHeight(110)
+        self.tags_list.setSelectionMode(
+            QListWidget.SelectionMode.NoSelection
+        )
+        self.tags_list.setAlternatingRowColors(True)
+        attach_tooltip(self.tags_list, "meta_tags_list")
+        self._populate_tags_list()
+        layout.addWidget(self.tags_list)
+
+        btns = QHBoxLayout()
+        self.add_tag_btn = QPushButton("Добавить новый тег…")
+        self.add_tag_btn.setToolTip(
+            "Добавить тег, которого нет в справочнике.\n"
+            "После сохранения он появится в Настройки → Теги "
+            "и сразу будет отмечен у записи."
+        )
+        self.add_tag_btn.clicked.connect(self._on_add_new_tag)
+        btns.addWidget(self.add_tag_btn)
+
+        self.clear_tags_btn = QPushButton("Снять все")
+        self.clear_tags_btn.clicked.connect(self._on_clear_tags)
+        btns.addWidget(self.clear_tags_btn)
+
+        btns.addStretch()
+
+        self.tags_count_label = QLabel("")
+        self.tags_count_label.setStyleSheet(
+            "QLabel { color: #444; font-weight: bold; }"
+        )
+        btns.addWidget(self.tags_count_label)
+
+        layout.addLayout(btns)
+
+        self._update_tags_count()
+        return box
+
+    def _populate_tags_list(self) -> None:
+        """Заполняет список тегов чекбоксами."""
+        if not hasattr(self, "tags_list"):
+            return
+        self.tags_list.blockSignals(True)
+        self.tags_list.clear()
+
+        selected = set(self._selected_tags)
+
+        for tag in self._tags:
+            name = tag.get("name") or ""
+            if not name:
+                continue
+            item = QListWidgetItem(name)
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            item.setCheckState(
+                Qt.CheckState.Checked if name in selected
+                else Qt.CheckState.Unchecked
+            )
+            item.setData(Qt.ItemDataRole.UserRole, name)
+
+            color = (tag.get("color") or "").strip()
+            if color:
+                try:
+                    qcolor = QColor(color)
+                    if qcolor.isValid():
+                        item.setForeground(qcolor)
+                        item.setBackground(
+                            QColor(qcolor.red(), qcolor.green(),
+                                   qcolor.blue(), 30)
+                        )
+                except Exception:
+                    pass
+
+            self.tags_list.addItem(item)
+
+        self.tags_list.blockSignals(False)
+        self._update_tags_count()
+
+    def _refresh_tags_list(
+        self, selected_names: Optional[List[str]] = None,
+    ) -> None:
+        """Перечитывает справочник тегов и перезаполняет список."""
+        if self._get_tags_cb is not None:
+            try:
+                fresh = self._get_tags_cb() or []
+                if isinstance(fresh, list):
+                    self._tags = fresh
+            except Exception as exc:
+                log.warning(
+                    "Не удалось получить справочник тегов: %s", exc
+                )
+
+        if selected_names is not None:
+            self._selected_tags = list(selected_names)
+
+        self._populate_tags_list()
+
+    def _update_tags_count(self) -> None:
+        if not hasattr(self, "tags_count_label"):
+            return
+        n = len(self._selected_tags)
+        if n == 0:
+            self.tags_count_label.setText("Теги не выбраны")
+        elif n == 1:
+            self.tags_count_label.setText(f"Выбран: {self._selected_tags[0]}")
+        else:
+            self.tags_count_label.setText(f"Выбрано: {n}")
+
+    def _on_tag_item_changed(self, item: QListWidgetItem) -> None:
+        name = item.data(Qt.ItemDataRole.UserRole) or ""
+        if not name:
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            if name not in self._selected_tags:
+                self._selected_tags.append(name)
+        else:
+            self._selected_tags = [
+                t for t in self._selected_tags if t != name
+            ]
+        self._update_tags_count()
+        log.debug("Теги записи: %s", self._selected_tags)
+
+    def _on_add_new_tag(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "Новый тег",
+            "Имя тега (например, «важное», «риски», «для клиента»):",
+        )
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.warning(
+                self, "Тег", "Имя тега не может быть пустым."
+            )
+            return
+
+        existing = [t.get("name") for t in self._tags]
+        if name in existing:
+            QMessageBox.information(
+                self, "Тег",
+                f"Тег «{name}» уже есть в справочнике.",
+            )
+        else:
+            if self._on_save_tag_cb is not None:
+                try:
+                    self._on_save_tag_cb(name, "")
+                except Exception as exc:
+                    log.exception(
+                        "Ошибка сохранения тега: %s", exc
+                    )
+                    QMessageBox.critical(
+                        self, "Тег",
+                        f"Не удалось сохранить тег:\n{exc}",
+                    )
+                    return
+            else:
+                self._tags.append({"name": name, "color": ""})
+
+        if name not in self._selected_tags:
+            self._selected_tags.append(name)
+
+        self._refresh_tags_list(
+            selected_names=list(self._selected_tags)
+        )
+        log.info("Тег «%s» добавлен и выбран у записи", name)
+
+    def _on_clear_tags(self) -> None:
+        self._selected_tags = []
+        self._populate_tags_list()
+        log.debug("Все теги сняты")
+
+    # ------------------------------------------------------------------
+    # Подключение сигналов
+    # ------------------------------------------------------------------
     def _connect_signals(self) -> None:
         self.prompt_combo.currentIndexChanged.connect(
             self._on_prompt_selected
@@ -526,6 +753,11 @@ class MetadataDialog(QDialog):
 
         self.is_scrum_check.toggled.connect(self._on_scrum_toggled)
 
+        if hasattr(self, "tags_list"):
+            self.tags_list.itemChanged.connect(
+                self._on_tag_item_changed
+            )
+
     # ------------------------------------------------------------------
     # Контекст в промпте
     # ------------------------------------------------------------------
@@ -533,6 +765,7 @@ class MetadataDialog(QDialog):
         self.include_name_check.setChecked(True)
         self.include_project_check.setChecked(True)
         self.include_comment_check.setChecked(True)
+        self.include_tags_check.setChecked(True)
         log.info("Включены все чекбоксы контекста записи")
 
     # ------------------------------------------------------------------
@@ -862,6 +1095,20 @@ class MetadataDialog(QDialog):
             init.get("comment", "")
         )
 
+        # --- Теги ---
+        raw_tags = init.get("tags", []) or []
+        selected_tags: List[str] = []
+        if isinstance(raw_tags, list):
+            for t in raw_tags:
+                if isinstance(t, str) and t.strip():
+                    selected_tags.append(t.strip())
+                elif isinstance(t, dict):
+                    name = str(t.get("name") or "").strip()
+                    if name:
+                        selected_tags.append(name)
+        self._selected_tags = selected_tags
+        self._populate_tags_list()
+
         self.generate_summary_check.blockSignals(True)
         self.generate_summary_check.setChecked(
             bool(init.get("generate_summary", False))
@@ -908,6 +1155,9 @@ class MetadataDialog(QDialog):
         self.include_comment_check.setChecked(
             bool(init.get("include_comment_in_prompt", False))
         )
+        self.include_tags_check.setChecked(
+            bool(init.get("include_tags_in_prompt", False))
+        )
 
         self._attachments = list(
             init.get("attachments", []) or []
@@ -922,16 +1172,18 @@ class MetadataDialog(QDialog):
 
         log.debug(
             "Начальные значения применены: project=%r, name=%r, "
-            "template=%r, abbr=%r, generate_summary=%s, "
+            "template=%r, abbr=%r, tags=%s, generate_summary=%s, "
             "prompt=%d символов, is_scrum=%s, "
             "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
-            "ctx_comment=%s, attachments=%d",
+            "ctx_comment=%s, ctx_tags=%s, attachments=%d",
             project, init_name, init_template, init_abbr,
+            self._selected_tags,
             self.generate_summary_check.isChecked(),
             len(prompt_text), is_scrum, gen,
             self.include_name_check.isChecked(),
             self.include_project_check.isChecked(),
             self.include_comment_check.isChecked(),
+            self.include_tags_check.isChecked(),
             len(self._attachments),
         )
 
@@ -1117,6 +1369,20 @@ class MetadataDialog(QDialog):
 
         is_scrum = bool(self.is_scrum_check.isChecked())
 
+        # Собираем итоговый список тегов: только те, что отмечены
+        # в чекбоксах, в порядке справочника.
+        selected_set = set(self._selected_tags)
+        ordered_tags: List[str] = []
+        for tag in self._tags:
+            name = tag.get("name") or ""
+            if name and name in selected_set:
+                ordered_tags.append(name)
+        # Дополняем тегами, которые выбраны, но отсутствуют
+        # в справочнике (например, добавлены вручную).
+        for name in self._selected_tags:
+            if name and name not in ordered_tags:
+                ordered_tags.append(name)
+
         result: Dict[str, Any] = {
             "project": project,
             "name": final_name,
@@ -1124,6 +1390,7 @@ class MetadataDialog(QDialog):
             "name_template": template,
             "name_abbr": abbr,
             "comment": comment,
+            "tags": ordered_tags,
             "prompt": prompt,
             "prompt_name": prompt_name,
             "prompt_edited": bool(self._prompt_edited),
@@ -1146,6 +1413,9 @@ class MetadataDialog(QDialog):
             "include_comment_in_prompt": bool(
                 self.include_comment_check.isChecked()
             ),
+            "include_tags_in_prompt": bool(
+                self.include_tags_check.isChecked()
+            ),
             "attachments": list(self._attachments),
             "send_attachments_to_transcribe": bool(
                 self.send_attachments_to_transcribe_check.isChecked()
@@ -1160,13 +1430,14 @@ class MetadataDialog(QDialog):
         self.result_data = result
         log.info(
             "Метаданные подтверждены: project=%s, name=%s, "
-            "template=%r, abbr=%r, prompt=%d символов "
+            "template=%r, abbr=%r, tags=%s, prompt=%d символов "
             "(изменён: %s), generate_summary=%s, "
             "is_scrum=%s, generate_deepseek=%s, "
             "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
-            "protocol=%s, attachments=%d, "
+            "ctx_tags=%s, protocol=%s, attachments=%d, "
             "send_to_transcribe=%s, send_to_deepseek=%s",
-            project, final_name, template, abbr, len(prompt),
+            project, final_name, template, abbr, ordered_tags,
+            len(prompt),
             result["prompt_edited"],
             result["generate_summary"],
             is_scrum,
@@ -1174,6 +1445,7 @@ class MetadataDialog(QDialog):
             result["include_name_in_prompt"],
             result["include_project_in_prompt"],
             result["include_comment_in_prompt"],
+            result["include_tags_in_prompt"],
             os.path.basename(
                 result["previous_protocol_path"]
             ) or "—",

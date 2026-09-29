@@ -2,19 +2,20 @@
 
 Изменения:
   • Удалены неиспользуемые SearchHit.token_count и _SUMMARY_KEYS.
-  • Добавлено поле SearchFilters.fuzzy_max_word_distance —
-    максимальное расстояние между словами запроса, при котором
-    они считаются одним совпадением (читается из
-    config["app"]["fuzzy_max_word_distance"]).
+  • Добавлено поле SearchFilters.fuzzy_max_word_distance.
+  • Добавлены поля SearchHit.tags и SearchFilters.tag /
+    tag_includes_untagged.
 """
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import (
+    Any, Callable, Dict, Iterable, List, Optional, Tuple,
+)
 
 from .file_readers import read_any_text, read_json_file
 from .logger import get_logger
@@ -38,6 +39,7 @@ class SearchHit:
     snippet: str
     score: float
     match_kind: str        # "exact" | "fuzzy"
+    tags: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -55,6 +57,13 @@ class SearchFilters:
     max_results: int = 500
     context_chars: int = 120
     fuzzy_max_word_distance: int = 200
+    # --- Новый фильтр по тегу ---
+    # Если пусто — фильтр не применяется.
+    # Если задан — оставляем только записи, у которых есть
+    # указанный тег.
+    tag: str = ""
+    # Если True и tag == "" — оставляем только записи БЕЗ тегов.
+    tag_includes_untagged: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +96,27 @@ def _load_session_meta(session_dir: str) -> Dict[str, Any]:
     path = os.path.join(session_dir, "session.json")
     data = read_json_file(path)
     return data or {}
+
+
+def _extract_tags_from_meta(meta: Dict[str, Any]) -> Tuple[str, ...]:
+    """Достаёт список тегов из session.json. Всегда возвращает кортеж."""
+    raw = meta.get("tags")
+    if not raw:
+        return ()
+    result: List[str] = []
+    seen = set()
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+            else:
+                continue
+            if name and name not in seen:
+                result.append(name)
+                seen.add(name)
+    return tuple(result)
 
 
 def _parse_session_date(
@@ -125,6 +155,21 @@ def list_projects(sessions_root: str) -> List[str]:
         if p:
             projects.add(p)
     return sorted(projects)
+
+
+def list_tags(sessions_root: str) -> List[str]:
+    """
+    Возвращает уникальные теги из всех сессий.
+
+    Дополнительно можно объединять со справочником тегов —
+    это делает вызывающий код.
+    """
+    tags = set()
+    for d in _iter_session_dirs(sessions_root):
+        meta = _load_session_meta(d)
+        for t in _extract_tags_from_meta(meta):
+            tags.add(t)
+    return sorted(tags)
 
 
 # ---------------------------------------------------------------------------
@@ -190,9 +235,6 @@ def _fuzzy_search_words(
 ) -> List[Tuple[float, int, int, str, int]]:
     """
     Fuzzy-поиск по отдельным словам запроса.
-
-    Возвращает список: (score, start, end, snippet,
-    matched_words_count).
     """
     q_words = [w for w in _tokenize(query) if len(w) >= 3]
     if not q_words:
@@ -305,6 +347,12 @@ def search(
     total = len(sessions)
     hits: List[SearchHit] = []
 
+    # --- Нормализация фильтра по тегу ---
+    filter_tag = (filters.tag or "").strip()
+    only_untagged = bool(
+        not filter_tag and filters.tag_includes_untagged
+    )
+
     for i, session_dir in enumerate(sessions):
         if is_cancelled is not None:
             try:
@@ -329,10 +377,21 @@ def search(
 
         meta = _load_session_meta(session_dir)
 
+        # --- Фильтр по проекту ---
         if filters.project:
             if (meta.get("project") or "") != filters.project:
                 continue
 
+        # --- Фильтр по тегу ---
+        session_tags = _extract_tags_from_meta(meta)
+        if filter_tag:
+            if filter_tag not in session_tags:
+                continue
+        elif only_untagged:
+            if session_tags:
+                continue
+
+        # --- Фильтр по дате ---
         sdate = _parse_session_date(session_dir, meta)
         if (filters.date_from and sdate
                 and sdate.date() < filters.date_from.date()):
@@ -371,6 +430,7 @@ def search(
                         snippet=snippet,
                         score=score,
                         match_kind=kind,
+                        tags=session_tags,
                     ))
                     if len(hits) >= filters.max_results:
                         break
@@ -398,6 +458,7 @@ def search(
                         snippet=snippet,
                         score=score,
                         match_kind=kind,
+                        tags=session_tags,
                     ))
                     if len(hits) >= filters.max_results:
                         break
@@ -428,6 +489,7 @@ def search(
                         snippet=snippet,
                         score=score,
                         match_kind=kind,
+                        tags=session_tags,
                     ))
                     if len(hits) >= filters.max_results:
                         break
@@ -459,6 +521,7 @@ def search(
                             snippet=snippet,
                             score=score,
                             match_kind=kind,
+                            tags=session_tags,
                         ))
                         if len(hits) >= filters.max_results:
                             break
@@ -703,9 +766,11 @@ def build_prompt_from_hits(
             date = ctxs[0].hit.date or "—"
             project = ctxs[0].hit.project or "—"
             file_label = ctxs[0].hit.file_label
+            tags = ", ".join(ctxs[0].hit.tags) if ctxs[0].hit.tags else ""
+            tags_part = f", теги: {tags}" if tags else ""
             parts.append(
                 f"{i}. **{sname}** — {date}, проект: {project} "
-                f"({src_label}, файл: `{file_label}`, "
+                f"({src_label}, файл: `{file_label}`{tags_part}, "
                 f"совпадений: {len(ctxs)})"
             )
         parts.append("")
@@ -735,6 +800,10 @@ def build_prompt_from_hits(
             f"*Дата:* {date} · *Проект:* {project} · "
             f"*Тип:* {src_label} · *Файл:* `{file_label}`"
         )
+        if ctxs[0].hit.tags:
+            parts.append(
+                f"*Теги:* {', '.join(ctxs[0].hit.tags)}"
+            )
         parts.append("")
 
         for j, c in enumerate(ctxs, start=1):

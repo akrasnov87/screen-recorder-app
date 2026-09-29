@@ -2,9 +2,11 @@
 
 Изменения:
   • Дефолтные значения полей поиска (fuzzy, context, max_hits)
-    читаются из config["app"] через config_manager.get_app_settings().
-  • search_cancel_wait_ms тоже берётся из конфига.
+    читаются из config["app"].
   • SearchFilters получает fuzzy_max_word_distance.
+  • Добавлен фильтр по тегу: ComboBox tag_combo + чекбокс
+    tag_enabled. Тег можно выбрать из справочника
+    (Настройки → Теги) или из уже использованных в записях.
 """
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ from PySide6.QtWidgets import (
 
 from .library_search import (
     SearchFilters, SearchHit, build_prompt_from_hits, list_projects,
-    save_prompt_docx, save_prompt_markdown, search,
+    list_tags, save_prompt_docx, save_prompt_markdown, search,
 )
 from .logger import get_logger
 from .tooltips import (
@@ -107,11 +109,12 @@ class LibraryWindow(QDialog):
                 self._app_cfg = {}
 
         self.setWindowTitle("Библиотека — поиск по записям")
-        self.setMinimumSize(1280, 860)
+        self.setMinimumSize(1280, 900)
         self.setModal(False)
 
         self._build_ui()
         self._reload_projects()
+        self._reload_tags()
         log.info(
             "LibraryWindow открыто, sessions_root=%s", sessions_root
         )
@@ -130,10 +133,10 @@ class LibraryWindow(QDialog):
 
         m_file = bar.addMenu("Файл")
         act_refresh = QAction(
-            "Обновить список проектов", self
+            "Обновить список проектов и тегов", self
         )
         act_refresh.setShortcut(QKeySequence("F5"))
-        act_refresh.triggered.connect(self._reload_projects)
+        act_refresh.triggered.connect(self._on_refresh_meta)
         m_file.addAction(act_refresh)
 
         act_close = QAction("Закрыть окно", self)
@@ -153,7 +156,7 @@ class LibraryWindow(QDialog):
             "по файлам в папке <code>sessions/</code> — без базы "
             "данных. Для стенограмм используется нечёткий поиск, "
             "устойчивый к опечаткам. Сузьте область фильтрами "
-            "«Проект» и «Период», чтобы ускорить работу."
+            "«Проект», «Тег» и «Период», чтобы ускорить работу."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: #666; }")
@@ -241,6 +244,20 @@ class LibraryWindow(QDialog):
         )
 
         row3.addSpacing(12)
+        self.tag_enabled = QCheckBox("Тег:")
+        self.tag_enabled.setChecked(False)
+        attach_tooltip(self.tag_enabled, "lib_tag_enabled")
+        self.tag_enabled.toggled.connect(
+            self._on_tag_enabled_toggled
+        )
+        row3.addWidget(self.tag_enabled)
+
+        self.tag_combo = QComboBox()
+        self.tag_combo.setMinimumWidth(180)
+        attach_tooltip(self.tag_combo, "lib_tag")
+        row3.addWidget(self.tag_combo)
+
+        row3.addSpacing(12)
         self.date_from = QDateEdit()
         self.date_from.setCalendarPopup(True)
         self.date_from.setDisplayFormat("yyyy-MM-dd")
@@ -300,9 +317,9 @@ class LibraryWindow(QDialog):
             left_header.addWidget(results_icon)
         left_layout.addLayout(left_header)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels([
-            "Дата", "Название", "Проект", "Где",
+            "Дата", "Название", "Проект", "Теги", "Где",
             "Совпадение", "Файл",
         ])
         self.table.setSelectionBehavior(
@@ -338,9 +355,12 @@ class LibraryWindow(QDialog):
         hv.setSectionResizeMode(
             3, QHeaderView.ResizeMode.ResizeToContents
         )
-        hv.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(
-            5, QHeaderView.ResizeMode.ResizeToContents
+            4, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            6, QHeaderView.ResizeMode.ResizeToContents
         )
         left_layout.addWidget(self.table, 1)
 
@@ -365,7 +385,7 @@ class LibraryWindow(QDialog):
 
         splitter.addWidget(right_container)
 
-        splitter.setSizes([760, 520])
+        splitter.setSizes([860, 520])
         root.addWidget(splitter, 1)
 
         # --- Панель формирования промпта ---
@@ -796,8 +816,12 @@ class LibraryWindow(QDialog):
         return QDate.currentDate()
 
     # ------------------------------------------------------------------
-    # Проекты
+    # Проекты и теги
     # ------------------------------------------------------------------
+    def _on_refresh_meta(self) -> None:
+        self._reload_projects()
+        self._reload_tags()
+
     def _reload_projects(self) -> None:
         try:
             projects = list_projects(self.sessions_root)
@@ -817,6 +841,64 @@ class LibraryWindow(QDialog):
             self.project_combo.setCurrentIndex(idx)
         self.project_combo.blockSignals(False)
         log.debug("Проекты обновлены: %d", len(projects))
+
+    def _reload_tags(self) -> None:
+        """
+        Заполняет выпадающий список тегов.
+
+        Объединяет справочник из настроек и теги, реально
+        встречающиеся в сохранённых записях.
+        """
+        tags_from_config: List[str] = []
+        if self.config_manager is not None:
+            try:
+                tags_from_config = self.config_manager.get_tag_names()
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать справочник тегов: %s",
+                    exc,
+                )
+
+        try:
+            tags_from_sessions = list_tags(self.sessions_root)
+        except Exception as exc:
+            log.warning(
+                "Не удалось получить теги из сессий: %s", exc
+            )
+            tags_from_sessions = []
+
+        # Объединяем, сохраняя порядок: сначала справочник,
+        # потом теги из записей, которых нет в справочнике.
+        merged: List[str] = []
+        seen = set()
+        for t in tags_from_config + tags_from_sessions:
+            t = (t or "").strip()
+            if t and t not in seen:
+                merged.append(t)
+                seen.add(t)
+
+        current = self.tag_combo.currentData() or ""
+
+        self.tag_combo.blockSignals(True)
+        self.tag_combo.clear()
+        self.tag_combo.addItem("— без тега —", "__untagged__")
+        for t in merged:
+            self.tag_combo.addItem(t, t)
+        idx = self.tag_combo.findData(current)
+        if idx >= 0:
+            self.tag_combo.setCurrentIndex(idx)
+        self.tag_combo.blockSignals(False)
+
+        self.tag_combo.setEnabled(self.tag_enabled.isChecked())
+        log.debug(
+            "Теги обновлены: из справочника %d, из сессий %d, "
+            "итого %d",
+            len(tags_from_config), len(tags_from_sessions),
+            len(merged),
+        )
+
+    def _on_tag_enabled_toggled(self, enabled: bool) -> None:
+        self.tag_combo.setEnabled(enabled)
 
     # ------------------------------------------------------------------
     # Поиск
@@ -844,6 +926,18 @@ class LibraryWindow(QDialog):
         f.fuzzy_max_word_distance = int(
             self._app_cfg.get("fuzzy_max_word_distance", 200)
         )
+
+        # --- Фильтр по тегу ---
+        if self.tag_enabled.isChecked():
+            tag_data = self.tag_combo.currentData() or ""
+            if tag_data == "__untagged__":
+                # «— без тега —»: оставляем только записи без тегов.
+                f.tag = ""
+                f.tag_includes_untagged = True
+            else:
+                f.tag = str(tag_data).strip()
+                f.tag_includes_untagged = False
+
         return f
 
     def _start_search(self) -> None:
@@ -869,13 +963,14 @@ class LibraryWindow(QDialog):
         log.info(
             "Поиск: query=%r, проекты=%s, даты=%s..%s, "
             "транскрипт=%s, протокол=%s, summary=%s, вложения=%s, "
-            "fuzzy=%.2f, mwd=%d",
+            "fuzzy=%.2f, mwd=%d, tag=%r, untagged=%s",
             filters.query, filters.project or "все",
             filters.date_from.date() if filters.date_from else "—",
             filters.date_to.date() if filters.date_to else "—",
             filters.search_transcripts, filters.search_protocols,
             filters.search_summaries, filters.search_attachments,
             filters.fuzzy_threshold, filters.fuzzy_max_word_distance,
+            filters.tag, filters.tag_includes_untagged,
         )
 
         self._thread = SearchThread(
@@ -944,6 +1039,14 @@ class LibraryWindow(QDialog):
                 row, 2, QTableWidgetItem(h.project)
             )
 
+            tags_text = ", ".join(h.tags) if h.tags else "—"
+            tags_item = QTableWidgetItem(tags_text)
+            if h.tags:
+                tags_item.setToolTip(
+                    "Теги записи: " + ", ".join(h.tags)
+                )
+            self.table.setItem(row, 3, tags_item)
+
             source_item = QTableWidgetItem(
                 SOURCE_LABELS.get(h.source, h.source)
             )
@@ -959,7 +1062,7 @@ class LibraryWindow(QDialog):
                 source_item.setForeground(
                     Qt.GlobalColor.darkMagenta
                 )
-            self.table.setItem(row, 3, source_item)
+            self.table.setItem(row, 4, source_item)
 
             kind = (
                 "точное" if h.match_kind == "exact"
@@ -969,11 +1072,11 @@ class LibraryWindow(QDialog):
                 f"[{kind}] {h.snippet}"
             )
             snippet_item.setToolTip(h.snippet)
-            self.table.setItem(row, 4, snippet_item)
+            self.table.setItem(row, 5, snippet_item)
 
             file_item = QTableWidgetItem(h.file_label)
             file_item.setToolTip(h.file_path)
-            self.table.setItem(row, 5, file_item)
+            self.table.setItem(row, 6, file_item)
 
         if self._hits:
             self.table.selectRow(0)
@@ -993,10 +1096,17 @@ class LibraryWindow(QDialog):
             self.preview.clear()
             return
 
+        tags_html = ""
+        if h.tags:
+            tags_html = (
+                f"<p><b>Теги:</b> {', '.join(h.tags)}</p>"
+            )
+
         html = [
             f"<h3>{h.session_name}</h3>",
             f"<p><b>Проект:</b> {h.project or '—'} &nbsp; "
             f"<b>Дата:</b> {h.date or '—'}</p>",
+            tags_html,
             f"<p><b>Где найдено:</b> "
             f"{SOURCE_LABELS.get(h.source, h.source)} "
             f"({h.file_label})</p>",
@@ -1157,8 +1267,14 @@ class LibraryWindow(QDialog):
             "  • 82% — разумный баланс;\n"
             "  • ниже — больше совпадений, но выше шум;\n"
             "  • 100% — только точные слова.\n\n"
-            "Фильтры по проекту и датам сужают область поиска, "
-            "что ускоряет работу на больших архивах.\n\n"
+            "Фильтры по проекту, тегу и датам сужают область "
+            "поиска, что ускоряет работу на больших архивах.\n\n"
+            "Фильтр «Тег»:\n"
+            "  • отметьте галочку «Тег:», чтобы включить фильтр;\n"
+            "  • выберите нужный тег из списка — поиск идёт "
+            "только по записям с этим тегом;\n"
+            "  • «— без тега —» оставляет только записи без "
+            "тегов.\n\n"
             "Кнопка «Стоп» прерывает поиск немедленно — "
             "будут показаны уже найденные результаты.\n\n"
             "Двойной клик по результату открывает папку записи."

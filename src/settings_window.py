@@ -2,15 +2,8 @@
 
 Изменения:
   • На вкладке «Проекты и чаты Bitrix24» добавлен блок
-    «Проект и чат по умолчанию»:
-      - default_project_combo — выбор проекта по умолчанию
-        для новых записей;
-      - default_chat_id_input — ID чата, куда по умолчанию
-        отправляются протоколы/summary.
-  • load_settings() / _apply_form_to_config() читают и сохраняют
-    эти поля.
-  • ComboBox обновляется при добавлении/удалении проектов
-    (через _refresh_default_project_combo).
+    «Проект и чат по умолчанию».
+  • Добавлена вкладка «Теги» — справочник меток для записей.
 """
 from __future__ import annotations
 
@@ -23,13 +16,13 @@ from typing import Dict, List, Optional
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
-    QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDialog,
+    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+    QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QTableWidget,
+    QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .config_manager import ConfigManager, DEFAULT_NAME_TEMPLATES
@@ -66,6 +59,7 @@ class SettingsWindow(QDialog):
         self.tabs.addTab(
             self._build_projects_tab(), "Проекты и чаты Bitrix24"
         )
+        self.tabs.addTab(self._build_tags_tab(), "Теги")
         self.tabs.addTab(self._build_employees_tab(), "Сотрудники")
         self.tabs.addTab(self._build_bitrix_tab(), "Bitrix24")
         self.tabs.addTab(self._build_metadata_tab(), "Промпты и имена")
@@ -211,7 +205,6 @@ class SettingsWindow(QDialog):
         self.default_project_combo = QComboBox()
         self.default_project_combo.setEditable(False)
         self.default_project_combo.setMinimumWidth(280)
-        # Заполняется в _refresh_default_project_combo
         default_form.addRow(
             "Проект по умолчанию:",
             with_info(
@@ -238,10 +231,6 @@ class SettingsWindow(QDialog):
     def _refresh_default_project_combo(
         self, current: str = "",
     ) -> None:
-        """
-        Перезаполняет выпадающий список проектов по умолчанию
-        на основе текущего содержимого таблицы проектов.
-        """
         if not hasattr(self, "default_project_combo"):
             return
 
@@ -308,6 +297,185 @@ class SettingsWindow(QDialog):
             current=self.default_project_combo.currentData() or ""
         )
         log.debug("Проект перемещён: %d → %d", row, new_row)
+
+    # ------------------------------------------------------------------
+    # Теги
+    # ------------------------------------------------------------------
+    def _build_tags_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        info = QLabel(
+            "Справочник тегов — меток, которыми можно помечать "
+            "записи. Теги используются в карточке метаданных "
+            "(можно выбрать несколько) и в фильтре раздела "
+            "«Библиотека»."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        hint = QLabel(
+            "Название тега — произвольное, например: «важное», "
+            "«риски», «для клиента», «решения».<br>"
+            "Цвет используется для подсветки тега в интерфейсе — "
+            "двойной клик по ячейке «Цвет» открывает палитру.<br>"
+            "Порядок тегов в таблице влияет на порядок в списке "
+            "карточки метаданных."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(hint)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Теги</b>"))
+        header.addStretch()
+        header.addWidget(make_info_icon("tags_list"))
+        layout.addLayout(header)
+
+        self.tags_table = QTableWidget(0, 2)
+        self.tags_table.setHorizontalHeaderLabels([
+            "Тег", "Цвет",
+        ])
+        self.tags_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.tags_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.tags_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        hv = self.tags_table.horizontalHeader()
+        hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tags_table.setMinimumHeight(320)
+        self.tags_table.cellDoubleClicked.connect(
+            self._on_tag_cell_double_clicked
+        )
+        layout.addWidget(self.tags_table)
+
+        btns = QHBoxLayout()
+        add_btn = QPushButton("Добавить")
+        add_btn.clicked.connect(self._tag_add)
+        del_btn = QPushButton("Удалить")
+        del_btn.clicked.connect(self._tag_delete)
+        up_btn = QPushButton("Вверх")
+        up_btn.clicked.connect(lambda: self._tag_move(-1))
+        down_btn = QPushButton("Вниз")
+        down_btn.clicked.connect(lambda: self._tag_move(1))
+        color_btn = QPushButton("Выбрать цвет…")
+        color_btn.setToolTip(
+            "Открыть палитру для выбранного тега"
+        )
+        color_btn.clicked.connect(self._tag_pick_color)
+        btns.addWidget(add_btn)
+        btns.addWidget(del_btn)
+        btns.addWidget(up_btn)
+        btns.addWidget(down_btn)
+        btns.addSpacing(12)
+        btns.addWidget(color_btn)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        layout.addStretch()
+        return w
+
+    def _tag_add(self) -> None:
+        row = self.tags_table.rowCount()
+        self.tags_table.insertRow(row)
+        self.tags_table.setItem(
+            row, 0, QTableWidgetItem("новый-тег")
+        )
+        color_item = QTableWidgetItem("")
+        color_item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+        )
+        self.tags_table.setItem(row, 1, color_item)
+        self.tags_table.editItem(self.tags_table.item(row, 0))
+        log.debug("Добавлен пустой тег (строка %d)", row)
+
+    def _tag_delete(self) -> None:
+        row = self.tags_table.currentRow()
+        if row < 0:
+            return
+        item = self.tags_table.item(row, 0)
+        name = item.text() if item else ""
+        if QMessageBox.question(
+            self, "Удалить тег",
+            f"Удалить тег «{name}» из справочника?\n\n"
+            f"У уже сохранённых записей метка останется, "
+            f"но исчезнет из списка для выбора.",
+        ) == QMessageBox.StandardButton.Yes:
+            log.info("Удаление тега «%s» (строка %d)", name, row)
+            self.tags_table.removeRow(row)
+
+    def _tag_move(self, delta: int) -> None:
+        row = self.tags_table.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= self.tags_table.rowCount():
+            return
+        for col in range(self.tags_table.columnCount()):
+            a = self.tags_table.takeItem(row, col)
+            b = self.tags_table.takeItem(new_row, col)
+            self.tags_table.setItem(row, col, b)
+            self.tags_table.setItem(new_row, col, a)
+        self.tags_table.setCurrentCell(new_row, 0)
+
+    def _on_tag_cell_double_clicked(self, row: int, col: int) -> None:
+        if col == 1:
+            self._tag_pick_color()
+
+    def _tag_pick_color(self) -> None:
+        row = self.tags_table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self, "Теги", "Выберите тег в таблице."
+            )
+            return
+
+        current_item = self.tags_table.item(row, 1)
+        current = current_item.text().strip() if current_item else ""
+
+        initial = QColor("#4a90d9")
+        if current:
+            c = QColor(current)
+            if c.isValid():
+                initial = c
+
+        color = QColorDialog.getColor(
+            initial, self, "Выберите цвет тега"
+        )
+        if not color.isValid():
+            return
+
+        hex_color = color.name()
+        if current_item is None:
+            current_item = QTableWidgetItem(hex_color)
+            current_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            self.tags_table.setItem(row, 1, current_item)
+        else:
+            current_item.setText(hex_color)
+
+        # Подсветим превью-плашку в ячейке цвета
+        pixmap = QColor(hex_color)
+        current_item.setBackground(pixmap)
+        name_item = self.tags_table.item(row, 0)
+        if name_item:
+            name_item.setForeground(
+                QColor("#FFFFFF")
+                if pixmap.lightness() < 128
+                else QColor("#000000")
+            )
+
+        log.info("Цвет тега «%s»: %s",
+                 name_item.text() if name_item else "—", hex_color)
 
     # ------------------------------------------------------------------
     # Сотрудники
@@ -1635,6 +1803,35 @@ class SettingsWindow(QDialog):
             self.config_manager.get_default_chat_id()
         )
 
+        # --- Теги ---
+        tags = self.config_manager.get_tags()
+        self.tags_table.setRowCount(0)
+        for t in tags:
+            row = self.tags_table.rowCount()
+            self.tags_table.insertRow(row)
+            name_item = QTableWidgetItem(t.get("name", ""))
+            self.tags_table.setItem(row, 0, name_item)
+
+            color = (t.get("color") or "").strip()
+            color_item = QTableWidgetItem(color)
+            color_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            if color:
+                try:
+                    qcolor = QColor(color)
+                    if qcolor.isValid():
+                        color_item.setBackground(qcolor)
+                        name_item.setForeground(
+                            QColor("#FFFFFF")
+                            if qcolor.lightness() < 128
+                            else QColor("#000000")
+                        )
+                except Exception:
+                    pass
+            self.tags_table.setItem(row, 1, color_item)
+
         # --- Сотрудники ---
         employees = self.config_manager.get_employees()
         self.employees_table.setRowCount(0)
@@ -1888,10 +2085,10 @@ class SettingsWindow(QDialog):
         log.info(
             "Настройки загружены в окно: projects=%d, "
             "default_project=%r, default_chat_id=%r, "
-            "employees=%d, prompts=%d",
+            "tags=%d, employees=%d, prompts=%d",
             len(projects), default_project,
             self.config_manager.get_default_chat_id(),
-            len(employees), len(prompts),
+            len(tags), len(employees), len(prompts),
         )
 
     def _apply_form_to_config(self) -> Dict[str, Any]:
@@ -1918,6 +2115,20 @@ class SettingsWindow(QDialog):
         cfg["default_chat_id"] = (
             self.default_chat_id_input.text().strip()
         )
+
+        # --- Теги ---
+        tags: List[Dict[str, str]] = []
+        seen = set()
+        for row in range(self.tags_table.rowCount()):
+            name_item = self.tags_table.item(row, 0)
+            color_item = self.tags_table.item(row, 1)
+            name = name_item.text().strip() if name_item else ""
+            color = color_item.text().strip() if color_item else ""
+            if not name or name in seen:
+                continue
+            tags.append({"name": name, "color": color})
+            seen.add(name)
+        cfg["tags"] = tags
 
         # --- Сотрудники ---
         employees: List[Dict[str, str]] = []
@@ -2159,10 +2370,11 @@ class SettingsWindow(QDialog):
 
             log.info(
                 "Настройки сохранены: projects=%d, "
-                "default_project=%r, default_chat_id=%r",
+                "default_project=%r, default_chat_id=%r, tags=%d",
                 len(cfg.get("projects", [])),
                 cfg.get("default_project"),
                 cfg.get("default_chat_id"),
+                len(cfg.get("tags", [])),
             )
 
             current = get_current_log_path()
@@ -2529,6 +2741,24 @@ class SettingsWindow(QDialog):
             "• <b>Чат по умолчанию</b> — ID чата Bitrix24, куда "
             "по умолчанию отправляются протоколы и summary. "
             "Если пусто — используется чат проекта записи."
+        ),
+        "Теги": (
+            "<b>Справочник тегов</b><br><br>"
+            "Теги — произвольные метки, которыми можно помечать "
+            "записи. Одна запись может иметь несколько тегов.<br><br>"
+            "<b>Где используются:</b><br>"
+            "• В карточке метаданных записи — блок «Теги» "
+            "с чекбоксами.<br>"
+            "• В фильтре раздела «Библиотека» — можно искать "
+            "только среди записей с выбранным тегом.<br><br>"
+            "<b>Столбцы таблицы:</b><br>"
+            "• <b>Тег</b> — название. Двойной клик — редактирование.<br>"
+            "• <b>Цвет</b> — HEX-код цвета (например "
+            "<code>#C62828</code>). Двойной клик открывает "
+            "палитру. Цвет используется для подсветки тега "
+            "в интерфейсе.<br><br>"
+            "Порядок тегов в таблице влияет на порядок в списке "
+            "карточки метаданных."
         ),
         "Сотрудники": (
             "<b>Сотрудники</b><br><br>"

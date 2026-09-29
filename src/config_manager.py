@@ -5,6 +5,8 @@
     имя проекта по умолчанию и ID чата по умолчанию.
   • Добавлены методы get_default_project/set_default_project
     и get_default_chat_id/set_default_chat_id.
+  • Добавлен справочник тегов: секция config["tags"],
+    методы get_tags()/get_tag_names()/add_tag()/set_tags().
 """
 from __future__ import annotations
 
@@ -65,6 +67,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         {"name": "iserv",       "chat_id": ""},
         {"name": "Внутренние",  "chat_id": ""},
         {"name": "Тестовые",    "chat_id": ""},
+    ],
+    # --- Справочник тегов ---
+    # Каждый тег: {"name": str, "color": "#RRGGBB"}
+    # color — необязательный, используется для подсветки в UI.
+    "tags": [
+        {"name": "важное",       "color": "#C62828"},
+        {"name": "риски",        "color": "#EF6C00"},
+        {"name": "решения",      "color": "#2E7D32"},
+        {"name": "для клиента",  "color": "#1565C0"},
     ],
     # --- Настройки по умолчанию для новых записей ---
     # Имя проекта, которое подставляется в карточку метаданных
@@ -590,53 +601,30 @@ class ConfigManager:
     # Проект и чат по умолчанию
     # ------------------------------------------------------------------
     def get_default_project(self) -> str:
-        """
-        Имя проекта, которое подставляется в карточку метаданных
-        для новых записей.
-
-        Если значение пустое или проект не найден в списке — возвращает
-        пустую строку; вызывающий код может взять первый проект из
-        get_project_names() как fallback.
-        """
         value = str(
             self.config.get("default_project") or ""
         ).strip()
         return value
 
     def set_default_project(self, name: str) -> None:
-        """Сохраняет имя проекта по умолчанию."""
         self.config["default_project"] = (name or "").strip()
         self.save()
         log.info("Проект по умолчанию: %r",
                  self.config["default_project"])
 
     def get_default_chat_id(self) -> str:
-        """
-        ID чата Bitrix24, куда отправлять протоколы/summary по
-        умолчанию.
-
-        Если пусто — вызывающий код должен использовать чат проекта
-        записи (get_project_chat_id).
-        """
         value = str(
             self.config.get("default_chat_id") or ""
         ).strip()
         return value
 
     def set_default_chat_id(self, chat_id: str) -> None:
-        """Сохраняет ID чата по умолчанию."""
         self.config["default_chat_id"] = (chat_id or "").strip()
         self.save()
         log.info("Чат по умолчанию: %r",
                  self.config["default_chat_id"])
 
     def get_resolved_default_chat_id(self) -> str:
-        """
-        Разрешает ID чата по умолчанию с fallback-логикой:
-          1) default_chat_id, если не пустой;
-          2) chat_id проекта default_project, если он есть;
-          3) пустая строка.
-        """
         explicit = self.get_default_chat_id()
         if explicit:
             return explicit
@@ -675,6 +663,105 @@ class ConfigManager:
             if e["name"] == name:
                 return e["chat_id"]
         return ""
+
+    # ------------------------------------------------------------------
+    # Теги
+    # ------------------------------------------------------------------
+    def get_tags(self) -> List[Dict[str, str]]:
+        """
+        Возвращает список тегов из справочника.
+
+        Каждый элемент: {"name": str, "color": str}.
+        Поддерживается обратная совместимость: старые записи,
+        где tags был просто списком строк, автоматически
+        превращаются в словари с пустым цветом.
+        """
+        raw = self.config.get("tags", []) or []
+        result: List[Dict[str, str]] = []
+        seen = set()
+        for item in raw:
+            if isinstance(item, str):
+                name = item.strip()
+                if name and name not in seen:
+                    result.append({"name": name, "color": ""})
+                    seen.add(name)
+            elif isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if not name or name in seen:
+                    continue
+                color = str(item.get("color") or "").strip()
+                result.append({"name": name, "color": color})
+                seen.add(name)
+        return result
+
+    def get_tag_names(self) -> List[str]:
+        return [t["name"] for t in self.get_tags()]
+
+    def get_tag_color(self, name: str) -> str:
+        if not name:
+            return ""
+        target = name.strip()
+        for t in self.get_tags():
+            if t["name"] == target:
+                return t.get("color") or ""
+        return ""
+
+    def add_tag(self, name: str, color: str = "") -> bool:
+        """
+        Добавляет тег в справочник. Если тег с таким именем уже
+        есть — обновляет цвет. Возвращает True, если что-то
+        изменилось.
+        """
+        name = (name or "").strip()
+        if not name:
+            return False
+        color = (color or "").strip()
+
+        tags = self.config.setdefault("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+            self.config["tags"] = tags
+
+        for i, item in enumerate(tags):
+            if isinstance(item, dict):
+                existing = str(item.get("name") or "").strip()
+            elif isinstance(item, str):
+                existing = item.strip()
+            else:
+                existing = ""
+            if existing == name:
+                new_item = {"name": name, "color": color}
+                if tags[i] != new_item:
+                    tags[i] = new_item
+                    self.save()
+                    log.info("Тег обновлён: %r (цвет=%r)", name, color)
+                return True
+
+        tags.append({"name": name, "color": color})
+        self.save()
+        log.info("Тег добавлен: %r (цвет=%r)", name, color)
+        return True
+
+    def set_tags(self, tags: List[Dict[str, str]]) -> None:
+        """Полностью заменяет справочник тегов."""
+        cleaned: List[Dict[str, str]] = []
+        seen = set()
+        for item in tags or []:
+            if isinstance(item, str):
+                name = item.strip()
+                color = ""
+            elif isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                color = str(item.get("color") or "").strip()
+            else:
+                continue
+            if not name or name in seen:
+                continue
+            cleaned.append({"name": name, "color": color})
+            seen.add(name)
+        self.config["tags"] = cleaned
+        self.save()
+        log.info("Справочник тегов обновлён: %d шт.", len(cleaned))
 
     # ------------------------------------------------------------------
     # Bitrix24
