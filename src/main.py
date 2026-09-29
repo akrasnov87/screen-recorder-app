@@ -1,10 +1,9 @@
 """Точка входа приложения Screen Recorder & Transcriber.
 
 Изменения:
-  • Убран мёртвый атрибут _pump.
-  • setup_logger() получает max_bytes / backup_count из конфига.
-  • OverlayPanel и TrayManager создаются с config.
-  • Учтён параметр queue.pause_when_recording.
+  • _build_default_meta() и _ask_metadata() учитывают
+    config.default_project — имя проекта по умолчанию для
+    новых записей.
 """
 from __future__ import annotations
 
@@ -155,7 +154,9 @@ class ScreenRecorderApp(QObject):
         """Возвращает True, если идёт запись (в т.ч. на паузе)."""
         try:
             return bool(
-                self.recorder.get_recording_status().get("recording", False)
+                self.recorder.get_recording_status().get(
+                    "recording", False
+                )
             )
         except Exception:
             return False
@@ -184,9 +185,15 @@ class ScreenRecorderApp(QObject):
         )
         self.tray_manager.quit_requested.connect(self._quit)
 
-        self.recorder.recording_started.connect(self._on_recording_started)
-        self.recorder.recording_paused.connect(self._on_recording_paused)
-        self.recorder.recording_resumed.connect(self._on_recording_resumed)
+        self.recorder.recording_started.connect(
+            self._on_recording_started
+        )
+        self.recorder.recording_paused.connect(
+            self._on_recording_paused
+        )
+        self.recorder.recording_resumed.connect(
+            self._on_recording_resumed
+        )
         self.recorder.recording_stopped.connect(
             self._on_recording_stopped
         )
@@ -202,19 +209,16 @@ class ScreenRecorderApp(QObject):
         self.processor.task_completed.connect(self._on_task_completed)
         self.processor.task_failed.connect(self._on_task_failed)
 
-        self.overlay_panel.start_requested.connect(self._start_recording)
+        self.overlay_panel.start_requested.connect(
+            self._start_recording
+        )
         self.overlay_panel.pause_requested.connect(self._toggle_pause)
         self.overlay_panel.stop_requested.connect(self._stop_recording)
 
         register_gui_handler(self._on_log_to_gui)
 
     def _start_async_loop(self) -> None:
-        """
-        Запуск asyncio-loop в фоновом потоке.
-
-        GUI-поток общается с ним через asyncio.run_coroutine_threadsafe
-        и loop.call_soon_threadsafe.
-        """
+        """Запуск asyncio-loop в фоновом потоке."""
         import threading
 
         log.debug("Запуск asyncio-loop в фоновом потоке")
@@ -235,8 +239,7 @@ class ScreenRecorderApp(QObject):
         self._async_thread.start()
 
         self.hotkey_manager.set_loop(self._loop)
-        log.info("asyncio-loop запущен в фоновом потоке, "
-                 "воркер обработки стартовал")
+        log.info("asyncio-loop запущен в фоновом потоке")
 
     # ------------------------------------------------------------------
     # Геттеры конфига
@@ -263,6 +266,34 @@ class ScreenRecorderApp(QObject):
     # ------------------------------------------------------------------
     # Метаданные
     # ------------------------------------------------------------------
+    def _resolve_default_project(self) -> str:
+        """
+        Возвращает проект для новых записей.
+
+        Приоритеты:
+          1) config.default_project, если он есть в списке проектов;
+          2) первый проект из get_project_names();
+          3) "Default".
+        """
+        projects = self.config_manager.get_project_names()
+        default_project = (
+            self.config_manager.get_default_project()
+        )
+
+        if default_project and default_project in projects:
+            return default_project
+
+        if default_project and default_project not in projects:
+            log.warning(
+                "Проект по умолчанию %r не найден в списке "
+                "проектов — используется первый из списка",
+                default_project,
+            )
+
+        if projects:
+            return projects[0]
+        return "Default"
+
     def _ask_metadata(
         self,
         title: str = "Метаданные записи",
@@ -274,15 +305,21 @@ class ScreenRecorderApp(QObject):
         name_templates = self.config_manager.get_name_templates()
 
         init = dict(initial or {})
+
+        # Если проект не задан явно — подставляем проект по умолчанию
+        if not init.get("project"):
+            init["project"] = self._resolve_default_project()
+
         project = init.get("project")
         if project and project not in projects:
             projects = [project] + projects
 
         log.debug(
             "Открытие диалога метаданных: title=%r, projects=%d, "
-            "prompts=%d, name_templates=%d, initial_keys=%s",
+            "prompts=%d, name_templates=%d, initial_keys=%s, "
+            "default_project=%r",
             title, len(projects), len(prompts), len(name_templates),
-            list(init.keys()),
+            list(init.keys()), init.get("project"),
         )
 
         dlg = MetadataDialog(
@@ -313,8 +350,13 @@ class ScreenRecorderApp(QObject):
         return None
 
     def _build_default_meta(self) -> Dict[str, Any]:
-        projects = self.config_manager.get_project_names()
-        default_project = projects[0] if projects else "Default"
+        """
+        Формирует метаданные по умолчанию.
+
+        Проект берётся через _resolve_default_project():
+        сначала config.default_project, потом первый из списка.
+        """
+        default_project = self._resolve_default_project()
         now_str = f"{datetime.now():%Y-%m-%d %H-%M}"
 
         sum_cfg = self.config_manager.get_summarizer_settings()
@@ -341,7 +383,10 @@ class ScreenRecorderApp(QObject):
             "send_attachments_to_transcribe": False,
             "send_attachments_to_deepseek": False,
         }
-        log.debug("Сформированы метаданные по умолчанию: %s", meta)
+        log.debug(
+            "Сформированы метаданные по умолчанию: project=%r",
+            default_project,
+        )
         return meta
 
     def _add_prompt_to_library(self, name: str, text: str) -> None:
@@ -365,14 +410,6 @@ class ScreenRecorderApp(QObject):
                 prompts.append({"name": name, "text": text})
 
             self.config_manager.save()
-            log.info(
-                "Промпт «%s» %s в библиотеку (текст %d символов, "
-                "всего промптов: %d)",
-                name,
-                "обновлён" if replaced else "добавлен",
-                len(text),
-                len(prompts),
-            )
             self._notify(
                 "Промпты",
                 f"Промпт «{name}» сохранён в библиотеку",
@@ -385,11 +422,9 @@ class ScreenRecorderApp(QObject):
             label = (label or "").strip()
             template = (template or "").strip()
             if not template:
-                log.warning("Шаблон имени пустой, сохранение отменено")
+                log.warning("Шаблон имени пустой")
                 return
             self.config_manager.add_name_template(label, template)
-            log.info("Шаблон имени сохранён: label=%r, template=%r",
-                     label, template)
             self._notify(
                 "Шаблоны имён",
                 f"Шаблон «{label or template}» сохранён",
@@ -434,7 +469,7 @@ class ScreenRecorderApp(QObject):
                 )
 
         meta["attachments"] = new_paths
-        log.info("Вложений успешно скопировано: %d/%d",
+        log.info("Вложений скопировано: %d/%d",
                  len(new_paths), len(src_paths))
 
     @staticmethod
@@ -487,27 +522,11 @@ class ScreenRecorderApp(QObject):
             meta = self._build_default_meta()
 
         self._current_session_meta = meta
-        log.info(
-            "Метаданные для записи получены: project=%s, name=%s, "
-            "template=%r, abbr=%r, generate_summary=%s, is_scrum=%s, "
-            "generate_deepseek=%s, prompt=%d символов, attachments=%d, "
-            "send_to_transcribe=%s, send_to_deepseek=%s",
-            meta.get("project"), meta.get("name"),
-            meta.get("name_template", ""), meta.get("name_abbr", ""),
-            meta.get("generate_summary"),
-            meta.get("is_scrum"), meta.get("generate_deepseek_prompt"),
-            len(meta.get("prompt", "") or ""),
-            len(meta.get("attachments", []) or []),
-            meta.get("send_attachments_to_transcribe"),
-            meta.get("send_attachments_to_deepseek"),
-        )
 
         monitors = get_system_monitors()
         idx = int(rec.get("monitor", 0))
         display = (monitors[idx]["display"]
                    if 0 <= idx < len(monitors) else ":0.0+0,0")
-        log.info("Старт записи: monitor_idx=%d, display=%s, mic=%s",
-                 idx, display, rec.get("with_microphone", True))
 
         self.recorder.set_overlay_text(
             f"{meta.get('name', 'ScreenRecorder')} "
@@ -523,7 +542,6 @@ class ScreenRecorderApp(QObject):
 
     def _toggle_recording(self) -> None:
         status = self.recorder.get_recording_status()
-        log.debug("Переключение записи: status=%s", status)
         if status["recording"]:
             self._stop_recording()
         else:
@@ -534,12 +552,10 @@ class ScreenRecorderApp(QObject):
         if not status["recording"]:
             return
         if status["paused"]:
-            log.info("Возобновление записи (UI)")
             asyncio.run_coroutine_threadsafe(
                 self.recorder.resume_recording(), self._loop
             )
         else:
-            log.info("Пауза записи (UI)")
             asyncio.run_coroutine_threadsafe(
                 self.recorder.pause_recording(), self._loop
             )
@@ -562,21 +578,18 @@ class ScreenRecorderApp(QObject):
             None,
             "Выберите видеофайл",
             os.path.expanduser("~"),
-            "Video files (*.mp4 *.mkv *.mov *.avi *.webm *.flv *.wmv);;"
-            "All files (*)",
+            "Video files (*.mp4 *.mkv *.mov *.avi *.webm *.flv "
+            "*.wmv);;All files (*)",
         )
         if not file_path:
-            log.info("Загрузка видео отменена пользователем")
             return
 
         if not os.path.isfile(file_path):
-            QMessageBox.warning(None, "Загрузить видео",
-                                f"Файл не найден:\n{file_path}")
+            QMessageBox.warning(
+                None, "Загрузить видео",
+                f"Файл не найден:\n{file_path}",
+            )
             return
-
-        src_size_mb = os.path.getsize(file_path) / 1024 / 1024
-        log.info("Выбран файл для загрузки: %s (%.2f МБ)",
-                 file_path, src_size_mb)
 
         initial = {
             "name": os.path.splitext(os.path.basename(file_path))[0]
@@ -586,36 +599,32 @@ class ScreenRecorderApp(QObject):
             initial=initial,
         )
         if meta is None:
-            log.info("Загрузка видео отменена на этапе метаданных")
             return
 
         session_dir = self._new_session_dir()
-        log.info("Папка сессии: %s", session_dir)
 
         target_video = os.path.join(session_dir, "video.mp4")
         try:
             src_abs = os.path.abspath(file_path)
             dst_abs = os.path.abspath(target_video)
             if src_abs == dst_abs:
-                log.info("Файл уже в папке сессии, копирование не нужно")
+                log.info("Файл уже в папке сессии")
             else:
-                log.info("Копирование %s → %s", src_abs, dst_abs)
                 shutil.copy2(src_abs, dst_abs)
         except Exception as exc:
             log.exception("Ошибка копирования файла: %s", exc)
-            QMessageBox.critical(None, "Загрузить видео",
-                                 f"Не удалось скопировать файл:\n{exc}")
+            QMessageBox.critical(
+                None, "Загрузить видео",
+                f"Не удалось скопировать файл:\n{exc}",
+            )
             return
 
         if not os.path.exists(target_video):
-            log.error("Файл после копирования не найден: %s", target_video)
-            QMessageBox.critical(None, "Загрузить видео",
-                                 "Файл не был скопирован")
+            QMessageBox.critical(
+                None, "Загрузить видео",
+                "Файл не был скопирован",
+            )
             return
-
-        size_mb = os.path.getsize(target_video) / 1024 / 1024
-        log.info("Файл скопирован (%.2f МБ), сессия: %s",
-                 size_mb, session_dir)
 
         meta["date"] = datetime.now().strftime("%Y-%m-%d")
         meta["monitor"] = (
@@ -634,20 +643,22 @@ class ScreenRecorderApp(QObject):
             task_id = self.task_queue.add_task(
                 {"video_path": target_video, "metadata": meta}
             )
-            log.info("Задача %s добавлена в очередь (загрузка)", task_id)
+            log.info("Задача %s добавлена в очередь", task_id)
             self._notify(
                 "Загрузить видео",
                 f"Файл добавлен в очередь: {meta.get('name', '')}",
             )
         except Exception as exc:
-            log.exception("Не удалось добавить задачу в очередь: %s", exc)
+            log.exception(
+                "Не удалось добавить задачу в очередь: %s", exc
+            )
             QMessageBox.critical(
                 None, "Загрузить видео",
                 f"Не удалось добавить в очередь:\n{exc}",
             )
 
     # ------------------------------------------------------------------
-    # Импорт готовых материалов
+    # Импорт
     # ------------------------------------------------------------------
     @Slot()
     def _open_import(self) -> None:
@@ -660,14 +671,12 @@ class ScreenRecorderApp(QObject):
             parent=None,
         )
         if dlg.exec() != dlg.DialogCode.Accepted:
-            log.info("Импорт отменён пользователем")
             return
 
         data = dlg.result_data
         self._perform_import(data)
 
     def _perform_import(self, data: Dict[str, Any]) -> None:
-        """Копирует файлы, создаёт сессию и (опц.) ставит задачу в очередь."""
         date_dt: datetime = data["date"]
         video_src = data.get("video_path") or ""
         transcript_src = data.get("transcript_path") or ""
@@ -694,34 +703,31 @@ class ScreenRecorderApp(QObject):
             i += 1
         os.makedirs(session_dir, exist_ok=True)
 
-        log.info("Импорт: создана папка сессии %s", session_dir)
-
         video_dst = ""
         if video_src and os.path.isfile(video_src):
             ext = os.path.splitext(video_src)[1].lower() or ".mp4"
             video_dst = os.path.join(session_dir, f"video{ext}")
             try:
                 shutil.copy2(video_src, video_dst)
-                log.info("Импорт: видео скопировано %s → %s",
-                         video_src, video_dst)
             except Exception as exc:
-                log.exception("Импорт: ошибка копирования видео: %s", exc)
+                log.exception(
+                    "Импорт: ошибка копирования видео: %s", exc
+                )
                 video_dst = ""
 
         transcript_dst = ""
         if transcript_src and os.path.isfile(transcript_src):
             ext = os.path.splitext(transcript_src)[1].lower()
             if ext == ".txt":
-                transcript_dst = os.path.join(session_dir, "video.txt")
+                transcript_dst = os.path.join(
+                    session_dir, "video.txt"
+                )
                 try:
                     shutil.copy2(transcript_src, transcript_dst)
-                    log.info(
-                        "Импорт: стенограмма скопирована %s → %s",
-                        transcript_src, transcript_dst,
-                    )
                 except Exception as exc:
                     log.exception(
-                        "Импорт: ошибка копирования стенограммы: %s", exc
+                        "Импорт: ошибка копирования стенограммы: %s",
+                        exc,
                     )
                     transcript_dst = ""
             else:
@@ -731,30 +737,27 @@ class ScreenRecorderApp(QObject):
                         session_dir, "video.txt"
                     )
                     try:
-                        with open(transcript_dst, "w",
-                                  encoding="utf-8") as f:
+                        with open(
+                            transcript_dst, "w", encoding="utf-8"
+                        ) as f:
                             f.write(text)
-                        log.info(
-                            "Импорт: стенограмма извлечена %s → %s "
-                            "(%d символов)",
-                            transcript_src, transcript_dst, len(text),
-                        )
                     except Exception as exc:
                         log.exception(
-                            "Импорт: ошибка записи стенограммы: %s", exc
+                            "Импорт: ошибка записи стенограммы: %s",
+                            exc,
                         )
                         transcript_dst = ""
 
         protocol_dst = ""
         if protocol_src and os.path.isfile(protocol_src):
-            ext = os.path.splitext(protocol_src)[1].lower() or ".txt"
+            ext = (
+                os.path.splitext(protocol_src)[1].lower() or ".txt"
+            )
             protocol_dst = os.path.join(
                 session_dir, f"manual_protocol{ext}"
             )
             try:
                 shutil.copy2(protocol_src, protocol_dst)
-                log.info("Импорт: протокол скопирован %s → %s",
-                         protocol_src, protocol_dst)
             except Exception as exc:
                 log.exception(
                     "Импорт: ошибка копирования протокола: %s", exc
@@ -811,7 +814,6 @@ class ScreenRecorderApp(QObject):
                     "metadata": dict(meta),
                 }
                 task_id = self.task_queue.add_task(task_payload)
-                log.info("Импорт: задача %s добавлена в очередь", task_id)
             except Exception as exc:
                 log.exception(
                     "Импорт: не удалось добавить в очередь: %s", exc
@@ -844,11 +846,12 @@ class ScreenRecorderApp(QObject):
                     QUrl.fromLocalFile(session_dir)
                 )
             except Exception as exc:
-                log.warning("Импорт: не удалось открыть папку: %s", exc)
+                log.warning(
+                    "Импорт: не удалось открыть папку: %s", exc
+                )
 
     @staticmethod
     def _read_imported_text(path: str) -> str:
-        """Читает текст стенограммы (обёртка над file_readers)."""
         from .file_readers import read_any_text
         return read_any_text(path)
 
@@ -857,7 +860,6 @@ class ScreenRecorderApp(QObject):
     # ------------------------------------------------------------------
     def _hotkey_start_recording(self) -> None:
         status = self.recorder.get_recording_status()
-        log.debug("Хоткей start/пауза: status=%s", status)
         if status["recording"]:
             if status["paused"]:
                 QTimer.singleShot(
@@ -875,7 +877,6 @@ class ScreenRecorderApp(QObject):
             QTimer.singleShot(0, self._start_recording)
 
     def _hotkey_stop_recording(self) -> None:
-        log.debug("Хоткей stop")
         QTimer.singleShot(0, self._stop_recording)
 
     # ------------------------------------------------------------------
@@ -934,10 +935,6 @@ class ScreenRecorderApp(QObject):
             )
             if meta is None:
                 meta = initial or self._build_default_meta()
-                log.info(
-                    "Метаданные при остановке не подтверждены — "
-                    "используем начальные"
-                )
         else:
             meta = (dict(self._current_session_meta)
                     or self._build_default_meta())
@@ -955,19 +952,6 @@ class ScreenRecorderApp(QObject):
         self._copy_attachments_to_session(meta, session_dir)
         self._save_session_metadata(meta, session_dir)
 
-        size_mb = (os.path.getsize(path) / 1024 / 1024
-                   if os.path.exists(path) else 0)
-        log.info(
-            "Сессия сохранена: dir=%s, video=%s (%.2f МБ), "
-            "name=%s, generate_summary=%s, is_scrum=%s, "
-            "generate_deepseek=%s, attachments=%d",
-            session_dir, os.path.basename(path), size_mb,
-            meta.get("name"), meta.get("generate_summary"),
-            meta.get("is_scrum", False),
-            meta.get("generate_deepseek_prompt", False),
-            len(meta.get("attachments", []) or []),
-        )
-
         task_id = self.task_queue.add_task(
             {"video_path": path, "metadata": meta}
         )
@@ -980,23 +964,16 @@ class ScreenRecorderApp(QObject):
     # ------------------------------------------------------------------
     def _on_task_started(self, task_id: str) -> None:
         if self._is_recording():
-            log.debug(
-                "Запись идёт — трей не меняем на processing (task=%s)",
-                task_id,
-            )
             return
-        log.info("Задача %s: трей → processing", task_id)
         self._set_state(AppState.PROCESSING)
         self.tray_manager.set_recording_state("processing")
 
     def _on_task_progress(self, task_id: str, progress: int,
                           stage: str) -> None:
-        log.debug("Прогресс %s: %d%% (%s)", task_id, progress, stage)
         if self._show_overlay():
             self.overlay_panel.update_progress(progress, stage)
 
     def _on_task_completed(self, task_id: str, result: dict) -> None:
-        log.info("Задача %s завершена: %s", task_id, list(result.keys()))
         if not self._is_recording():
             self._set_state(AppState.IDLE)
             self.tray_manager.set_recording_state("idle")
@@ -1012,7 +989,9 @@ class ScreenRecorderApp(QObject):
             hide_after = int(
                 self.app_cfg.get("overlay_hide_after_task_ms", 3000)
             )
-            QTimer.singleShot(hide_after, self.overlay_panel.hide_panel)
+            QTimer.singleShot(
+                hide_after, self.overlay_panel.hide_panel
+            )
 
     def _on_task_failed(self, task_id: str, error: str) -> None:
         log.error("Задача %s провалена: %s", task_id, error)
@@ -1023,45 +1002,40 @@ class ScreenRecorderApp(QObject):
             "Ошибка обработки", error[:100],
             QSystemTrayIcon.MessageIcon.Critical,
         )
-        if self._show_overlay():
-            self.overlay_panel.add_log(f"ERROR: {error}")
 
     # ------------------------------------------------------------------
     # Настройки, очередь, записи, библиотека
     # ------------------------------------------------------------------
     def _open_settings(self) -> None:
-        log.info("Открытие окна настроек")
         self.settings_window = SettingsWindow(self.config_manager)
         if self.settings_window.exec():
-            log.info("Настройки сохранены, перезагрузка конфигурации")
             self.config_manager.load()
             self.app_cfg = self.config_manager.get_app_settings()
             self.recorder.config = self.config_manager.config
             self.processor.config = self.config_manager.config
-            self.hotkey_manager.update_hotkeys(self.config_manager.config)
-            log.info("Конфигурация перечитана, "
-                     "горячие клавиши обновлены")
-        else:
-            log.debug("Окно настроек закрыто без сохранения")
+            self.hotkey_manager.update_hotkeys(
+                self.config_manager.config
+            )
 
     def _open_queue(self) -> None:
-        log.info("Открытие окна очереди задач")
-        self.queue_window = QueueWindow(self.task_queue, self.processor)
+        self.queue_window = QueueWindow(
+            self.task_queue, self.processor
+        )
         self.queue_window.show()
 
     def _open_sessions(self) -> None:
-        log.info("Открытие окна списка записей")
         self.sessions_window = SessionsWindow(
             self._sessions_root(),
             self.task_queue,
             self.processor,
             config_manager=self.config_manager,
         )
-        self.sessions_window.import_requested.connect(self._open_import)
+        self.sessions_window.import_requested.connect(
+            self._open_import
+        )
         self.sessions_window.show()
 
     def _open_library(self) -> None:
-        log.info("Открытие окна «Библиотека»")
         try:
             self.library_window = LibraryWindow(
                 sessions_root=self._sessions_root(),
@@ -1101,11 +1075,6 @@ class ScreenRecorderApp(QObject):
     def _quit(self) -> None:
         log.info("Завершение работы приложения")
         self._set_state(AppState.QUITTING)
-        try:
-            status = self.task_queue.get_queue_status()
-            log.info("Состояние очереди на момент выхода: %s", status)
-        except Exception as exc:
-            log.warning("Не удалось получить статус очереди: %s", exc)
 
         self.task_queue.save_queue()
         self.hotkey_manager.unregister_hotkeys()
@@ -1116,28 +1085,23 @@ class ScreenRecorderApp(QObject):
                     self._loop.call_soon_threadsafe(
                         self._processing_task.cancel
                     )
-                except Exception as exc:
-                    log.debug(
-                        "Не удалось отменить processing_task: %s", exc
-                    )
+                except Exception:
+                    pass
 
             try:
                 self.processor.stop()
-            except Exception as exc:
-                log.debug("Не удалось остановить processor: %s", exc)
+            except Exception:
+                pass
 
             try:
                 self._loop.call_soon_threadsafe(self._loop.stop)
-            except Exception as exc:
-                log.debug(
-                    "Не удалось остановить asyncio-loop: %s", exc
-                )
+            except Exception:
+                pass
 
         log.info("Приложение остановлено")
         self.app.quit()
 
     def startup(self) -> None:
-        log.info("Запуск приложения")
         self.tray_manager.create_tray_icon()
         self.hotkey_manager.register_hotkeys()
         self._notify(
@@ -1147,7 +1111,9 @@ class ScreenRecorderApp(QObject):
 
 
 def main() -> int:
-    log_level = os.environ.get("SCREEN_RECORDER_LOG_LEVEL", "DEBUG")
+    log_level = os.environ.get(
+        "SCREEN_RECORDER_LOG_LEVEL", "DEBUG"
+    )
     max_bytes = 10 * 1024 * 1024
     backup_count = 5
     try:
@@ -1188,7 +1154,6 @@ def main() -> int:
         try:
             with open(qss_path, "r", encoding="utf-8") as f:
                 app.setStyleSheet(f.read())
-            log.info("Стили загружены: %s", qss_path)
         except Exception as exc:
             log.warning("Не удалось загрузить стили: %s", exc)
 

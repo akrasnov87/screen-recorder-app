@@ -1,16 +1,10 @@
 """Управление настройками с шифрованием паролей.
 
 Изменения:
-  • Удалён сломанный export_key() — используйте get_raw_key().
-  • Удалён неиспользуемый _derive_key_from_passphrase().
-  • Удалены set_projects() / set_employees() — не используются.
-  • Убран неиспользуемый импорт secrets.
-  • Добавлены настройки: bitrix.retry_count/retry_delay,
-    logging.max_bytes_mb/backup_count, queue.pause_when_recording,
-    а также расширенная секция app с параметрами ffmpeg,
-    overlay, уведомлений, подсказок и поиска.
-  • Убраны мёртвые ключи app.async_pump_interval_ms и
-    app.async_idle_tick_seconds.
+  • Добавлены ключи default_project и default_chat_id —
+    имя проекта по умолчанию и ID чата по умолчанию.
+  • Добавлены методы get_default_project/set_default_project
+    и get_default_chat_id/set_default_chat_id.
 """
 from __future__ import annotations
 
@@ -31,7 +25,6 @@ from .logger import get_logger
 log = get_logger(__name__)
 
 
-# Дефолтный шаблон промпта для DeepSeek
 DEFAULT_SCRUM_PROMPT = (
     "Во вложении стенограмма статусного совещания с командой. "
     "Так же во вложении протокол предыдущего созвона. "
@@ -54,7 +47,6 @@ DEFAULT_SCRUM_PROMPT = (
     "не было озвучено в стенограмме."
 )
 
-# Дефолтные шаблоны названия записи.
 DEFAULT_NAME_TEMPLATES: List[Dict[str, str]] = [
     {"label": "Название + дата", "template": "{name} — {date}"},
     {"label": "Название + дата и время", "template": "{name} — {date} {time}"},
@@ -74,7 +66,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         {"name": "Внутренние",  "chat_id": ""},
         {"name": "Тестовые",    "chat_id": ""},
     ],
-    # --- Сотрудники (ФИО + chat_id личного диалога) ---
+    # --- Настройки по умолчанию для новых записей ---
+    # Имя проекта, которое подставляется в карточку метаданных
+    # для новых записей. Если пусто — берётся первый из projects.
+    "default_project": "",
+    # ID чата Bitrix24, куда отправлять протоколы/summary
+    # по умолчанию. Если пусто — берётся чат проекта записи.
+    "default_chat_id": "",
+    # --- Сотрудники ---
     "employees": [],
     "metadata": {
         "prompts": [
@@ -137,7 +136,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "auto_retry_enabled": True,
         "retry_interval_minutes": 5,
         "max_retries": 10,
-        # Не брать задачи из очереди, пока идёт запись
         "pause_when_recording": True,
     },
     "compression": {
@@ -153,19 +151,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "logging": {
         "log_path": "/tmp/screen-recorder/app.log",
         "level": "DEBUG",
-        # Ротация логов
         "max_bytes_mb": 10,
         "backup_count": 5,
     },
-    # --- Скрам-митинги ---
     "scrum": {
         "prompt_template": DEFAULT_SCRUM_PROMPT,
         "export_format": "docx",
     },
-    # --- Формирование протокола (резюме) ---
     "summarizer": {
         "enabled": False,
-        "provider": "server",          # server | litellm
+        "provider": "server",
         "litellm": {
             "base_url": "http://localhost:4000",
             "api_key": "",
@@ -183,7 +178,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             ),
         },
     },
-    # --- Глоссарий терминов ---
     "glossary": {
         "terms": [
             {"term": "ЕЖД", "description": "Единый журнал дежурств"},
@@ -191,58 +185,39 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "send_to_summarizer": True,
         "send_to_deepseek": True,
     },
-    # --- Bitrix24 ---
     "bitrix": {
         "enabled": False,
         "webhook_url": "",
         "connect_timeout": 15,
         "read_timeout": 60,
-        "default_send": "protocol",     # protocol | summary | both
+        "default_send": "protocol",
         "include_header": True,
         "system_message": False,
         "disable_url_preview": False,
-        # Автоматически отправлять файлом, если текст длиннее порога
         "file_message_max_chars": 3000,
-        # ID папки на Диске для загрузки (0 = папка чата / корень)
         "upload_folder_id": 0,
-        # Лимит длины одного сообщения (Bitrix24 ~20000, оставляем запас)
         "max_message_chars": 15000,
-        # Повторы при сетевых сбоях
         "retry_count": 3,
         "retry_delay": 2.0,
     },
-    # --- Приложение (ранее хардкод в модулях) ---
     "app": {
-        # --- Чтение/запись файлов ---
         "max_file_read_chars": 5_000_000,
-
-        # --- ffmpeg ---
         "ffmpeg_start_check_delay": 0.3,
         "ffmpeg_stop_timeout": 10,
         "ffmpeg_kill_timeout": 5,
-
-        # --- Обработка очереди ---
         "processor_poll_interval": 2.0,
         "processor_retry_check_interval": 300,
-
-        # --- Overlay panel ---
         "overlay_hide_delay_ms": 5000,
         "overlay_hide_after_task_ms": 3000,
         "overlay_log_lines": 5,
         "overlay_width": 340,
         "overlay_height": 190,
-
-        # --- Уведомления трея ---
         "notification_timeout_ms": 4000,
         "notification_max_title": 50,
         "notification_max_message": 100,
-
-        # --- Подсказки ---
         "tooltip_toast_max_width": 420,
         "tooltip_toast_threshold": 120,
         "tooltip_toast_hide_delay_ms": 120,
-
-        # --- Библиотека (поиск) ---
         "search_default_fuzzy": 82,
         "search_default_context_chars": 400,
         "search_default_max_prompt_hits": 100,
@@ -257,21 +232,7 @@ _KEY_FILE_NAME = ".fernet_key"
 
 
 class ConfigManager:
-    """
-    Менеджер конфигурации.
-
-    Отвечает за:
-      • загрузку/сохранение config.json;
-      • шифрование чувствительных полей (мастер-ключ Fernet);
-      • предоставление типизированных getters.
-
-    Шифрование:
-      • Мастер-ключ хранится в keyring под сервисом _SERVICE_NAME.
-      • Если keyring недоступен — ключ сохраняется в файл
-        <config_dir>/.fernet_key с правами 0600.
-      • Метод get_raw_key() возвращает base64-ключ для переноса
-        на другую машину; import_key() восстанавливает из base64.
-    """
+    """Менеджер конфигурации."""
 
     def __init__(self, config_path: str | None = None) -> None:
         if config_path is None:
@@ -290,7 +251,7 @@ class ConfigManager:
         self.load()
 
     # ------------------------------------------------------------------
-    # Шифрование / ключи
+    # Шифрование
     # ------------------------------------------------------------------
     def _load_key_from_keyring(self) -> Optional[str]:
         try:
@@ -331,14 +292,6 @@ class ConfigManager:
             return False
 
     def _ensure_fernet(self) -> Fernet:
-        """
-        Ленивая инициализация Fernet.
-
-        Приоритет источников ключа:
-          1) keyring;
-          2) файл .fernet_key рядом с config.json;
-          3) генерация нового ключа + сохранение в оба места.
-        """
         if self._fernet is not None:
             return self._fernet
 
@@ -351,9 +304,7 @@ class ConfigManager:
         if not key:
             key = Fernet.generate_key().decode("ascii")
             log.warning(
-                "Мастер-ключ шифрования не найден — сгенерирован новый. "
-                "Если у вас были сохранены секреты, восстановите их "
-                "из экспортированного ключа (get_raw_key/import_key)."
+                "Мастер-ключ шифрования не найден — сгенерирован новый."
             )
             self._save_key_to_keyring(key)
             self._save_key_to_file(key)
@@ -370,10 +321,6 @@ class ConfigManager:
         return self._fernet
 
     def get_raw_key(self) -> str:
-        """
-        Возвращает base64-строку текущего мастер-ключа.
-        Храните в тайне. Для восстановления используйте import_key().
-        """
         key = self._load_key_from_keyring() or self._load_key_from_file()
         if not key:
             self._ensure_fernet()
@@ -381,12 +328,6 @@ class ConfigManager:
         return key or ""
 
     def import_key(self, key_b64: str) -> bool:
-        """
-        Восстанавливает мастер-ключ из base64-строки.
-
-        Returns:
-            True, если ключ валиден и сохранён; иначе False.
-        """
         key_b64 = (key_b64 or "").strip()
         if not key_b64:
             return False
@@ -403,21 +344,19 @@ class ConfigManager:
         return True
 
     def encrypt(self, plaintext: str) -> str:
-        """Шифрует строку. Возвращает base64-токен."""
         if not plaintext:
             return ""
         token = self._ensure_fernet().encrypt(plaintext.encode("utf-8"))
         return token.decode("ascii")
 
     def decrypt(self, token_b64: str) -> str:
-        """Расшифровывает токен. Возвращает пустую строку при ошибке."""
         if not token_b64:
             return ""
         try:
             raw = self._ensure_fernet().decrypt(token_b64.encode("ascii"))
             return raw.decode("utf-8")
         except InvalidToken:
-            log.error("decrypt: недействительный токен — ключ не подходит")
+            log.error("decrypt: недействительный токен")
             return ""
         except Exception as exc:
             log.error("decrypt: ошибка: %s", exc)
@@ -427,7 +366,6 @@ class ConfigManager:
     # Загрузка / сохранение
     # ------------------------------------------------------------------
     def get_defaults(self) -> Dict[str, Any]:
-        """Возвращает копию DEFAULT_CONFIG (без общих ссылок)."""
         return json.loads(json.dumps(DEFAULT_CONFIG))
 
     def load(self) -> Dict[str, Any]:
@@ -493,7 +431,6 @@ class ConfigManager:
     def get_default_prompt(self) -> str:
         return self.config.get("metadata", {}).get("default_prompt", "") or ""
 
-    # --- Шаблоны названий ---
     def get_name_templates(self) -> List[Dict[str, str]]:
         meta = self.config.get("metadata", {}) or {}
         raw = meta.get("name_templates", [])
@@ -614,16 +551,12 @@ class ConfigManager:
         }
 
     def get_app_settings(self) -> Dict[str, Any]:
-        """
-        Возвращает прикладные настройки (лимиты, таймауты, интервалы).
-        Значения из DEFAULT_CONFIG["app"], могут быть переопределены.
-        """
         a = self.config.get("app", {}) or {}
         d = DEFAULT_CONFIG["app"]
         return {k: a.get(k, v) for k, v in d.items()}
 
     # ------------------------------------------------------------------
-    # Проекты (name + chat_id)
+    # Проекты
     # ------------------------------------------------------------------
     def get_projects(self) -> List[Dict[str, str]]:
         raw = self.config.get("projects", []) or []
@@ -651,6 +584,65 @@ class ConfigManager:
         for p in self.get_projects():
             if p["name"] == name:
                 return p["chat_id"]
+        return ""
+
+    # ------------------------------------------------------------------
+    # Проект и чат по умолчанию
+    # ------------------------------------------------------------------
+    def get_default_project(self) -> str:
+        """
+        Имя проекта, которое подставляется в карточку метаданных
+        для новых записей.
+
+        Если значение пустое или проект не найден в списке — возвращает
+        пустую строку; вызывающий код может взять первый проект из
+        get_project_names() как fallback.
+        """
+        value = str(
+            self.config.get("default_project") or ""
+        ).strip()
+        return value
+
+    def set_default_project(self, name: str) -> None:
+        """Сохраняет имя проекта по умолчанию."""
+        self.config["default_project"] = (name or "").strip()
+        self.save()
+        log.info("Проект по умолчанию: %r",
+                 self.config["default_project"])
+
+    def get_default_chat_id(self) -> str:
+        """
+        ID чата Bitrix24, куда отправлять протоколы/summary по
+        умолчанию.
+
+        Если пусто — вызывающий код должен использовать чат проекта
+        записи (get_project_chat_id).
+        """
+        value = str(
+            self.config.get("default_chat_id") or ""
+        ).strip()
+        return value
+
+    def set_default_chat_id(self, chat_id: str) -> None:
+        """Сохраняет ID чата по умолчанию."""
+        self.config["default_chat_id"] = (chat_id or "").strip()
+        self.save()
+        log.info("Чат по умолчанию: %r",
+                 self.config["default_chat_id"])
+
+    def get_resolved_default_chat_id(self) -> str:
+        """
+        Разрешает ID чата по умолчанию с fallback-логикой:
+          1) default_chat_id, если не пустой;
+          2) chat_id проекта default_project, если он есть;
+          3) пустая строка.
+        """
+        explicit = self.get_default_chat_id()
+        if explicit:
+            return explicit
+        default_project = self.get_default_project()
+        if default_project:
+            return self.get_project_chat_id(default_project)
         return ""
 
     # ------------------------------------------------------------------

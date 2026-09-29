@@ -1,15 +1,16 @@
 """Окно настроек с вкладками (локальный режим).
 
 Изменения:
-  • На вкладку «Запись» добавлены поля ffmpeg и Overlay:
-    ffmpeg_start_check_delay, ffmpeg_stop_timeout,
-    ffmpeg_kill_timeout, overlay_hide_delay_ms, overlay_log_lines.
-  • На вкладку «Логи» добавлены: log_max_bytes_mb, log_backup_count.
-  • На вкладку «Bitrix24» добавлены: bitrix_max_message_chars,
-    bitrix_retry_count, bitrix_retry_delay.
-  • На вкладку «Очередь» добавлен: queue_pause_when_recording.
-  • load_settings() / _apply_form_to_config() обновлены
-    для новых параметров.
+  • На вкладке «Проекты и чаты Bitrix24» добавлен блок
+    «Проект и чат по умолчанию»:
+      - default_project_combo — выбор проекта по умолчанию
+        для новых записей;
+      - default_chat_id_input — ID чата, куда по умолчанию
+        отправляются протоколы/summary.
+  • load_settings() / _apply_form_to_config() читают и сохраняют
+    эти поля.
+  • ComboBox обновляется при добавлении/удалении проектов
+    (через _refresh_default_project_combo).
 """
 from __future__ import annotations
 
@@ -132,11 +133,7 @@ class SettingsWindow(QDialog):
             "<code>im.recent.get</code> или из URL чата в "
             "веб-интерфейсе.<br><br>"
             "Формат: <code>chat2101</code> или просто "
-            "<code>2101</code>. Обычно достаточно указать число — "
-            "метод <code>im.message.add</code> примет оба варианта."
-            "<br><br>"
-            "Если чат не задан — отправка в Bitrix24 для этого "
-            "проекта будет недоступна."
+            "<code>2101</code>."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: #666; }")
@@ -161,7 +158,7 @@ class SettingsWindow(QDialog):
         hv = self.projects_table.horizontalHeader()
         hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.projects_table.setMinimumHeight(320)
+        self.projects_table.setMinimumHeight(240)
         layout.addWidget(self.projects_table)
 
         btns = QHBoxLayout()
@@ -180,8 +177,90 @@ class SettingsWindow(QDialog):
         btns.addStretch()
         layout.addLayout(btns)
 
+        # --- Блок «Проект и чат по умолчанию» ---
+        sep = QLabel("<hr>")
+        layout.addWidget(sep)
+
+        default_header = QHBoxLayout()
+        default_header.addWidget(
+            QLabel("<b>Проект и чат по умолчанию</b>")
+        )
+        default_header.addStretch()
+        layout.addLayout(default_header)
+
+        default_hint = QLabel(
+            "Эти значения используются при создании НОВЫХ записей "
+            "и при отправке протоколов/summary в Bitrix24.<br><br>"
+            "• <b>Проект по умолчанию</b> — какой проект подставлять "
+            "в карточку метаданных. Если выбрать «— первый из списка —», "
+            "берётся проект, стоящий первым в таблице выше.<br>"
+            "• <b>Чат по умолчанию</b> — ID чата Bitrix24, куда "
+            "уходят протоколы и summary. Если пусто — используется "
+            "чат, привязанный к проекту записи."
+        )
+        default_hint.setWordWrap(True)
+        default_hint.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(default_hint)
+
+        default_form = QFormLayout()
+        default_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.default_project_combo = QComboBox()
+        self.default_project_combo.setEditable(False)
+        self.default_project_combo.setMinimumWidth(280)
+        # Заполняется в _refresh_default_project_combo
+        default_form.addRow(
+            "Проект по умолчанию:",
+            with_info(
+                self.default_project_combo, "default_project"
+            ),
+        )
+
+        self.default_chat_id_input = QLineEdit()
+        self.default_chat_id_input.setPlaceholderText(
+            "Например: chat2101 или 2101 — оставьте пустым, чтобы "
+            "использовать чат проекта записи"
+        )
+        default_form.addRow(
+            "Чат по умолчанию:",
+            with_info(
+                self.default_chat_id_input, "default_chat_id"
+            ),
+        )
+
+        layout.addLayout(default_form)
         layout.addStretch()
         return w
+
+    def _refresh_default_project_combo(
+        self, current: str = "",
+    ) -> None:
+        """
+        Перезаполняет выпадающий список проектов по умолчанию
+        на основе текущего содержимого таблицы проектов.
+        """
+        if not hasattr(self, "default_project_combo"):
+            return
+
+        self.default_project_combo.blockSignals(True)
+        self.default_project_combo.clear()
+        self.default_project_combo.addItem(
+            "— первый из списка —", ""
+        )
+        for row in range(self.projects_table.rowCount()):
+            item = self.projects_table.item(row, 0)
+            name = item.text().strip() if item else ""
+            if name:
+                self.default_project_combo.addItem(name, name)
+
+        if current:
+            idx = self.default_project_combo.findData(current)
+            if idx >= 0:
+                self.default_project_combo.setCurrentIndex(idx)
+        self.default_project_combo.blockSignals(False)
 
     def _project_add(self) -> None:
         row = self.projects_table.rowCount()
@@ -191,6 +270,9 @@ class SettingsWindow(QDialog):
         )
         self.projects_table.setItem(row, 1, QTableWidgetItem(""))
         self.projects_table.editItem(self.projects_table.item(row, 0))
+        self._refresh_default_project_combo(
+            current=self.default_project_combo.currentData() or ""
+        )
         log.debug("Добавлен пустой проект (строка %d)", row)
 
     def _project_delete(self) -> None:
@@ -205,6 +287,9 @@ class SettingsWindow(QDialog):
         ) == QMessageBox.StandardButton.Yes:
             log.info("Удаление проекта «%s» (строка %d)", name, row)
             self.projects_table.removeRow(row)
+            self._refresh_default_project_combo(
+                current=self.default_project_combo.currentData() or ""
+            )
 
     def _project_move(self, delta: int) -> None:
         row = self.projects_table.currentRow()
@@ -219,6 +304,9 @@ class SettingsWindow(QDialog):
             self.projects_table.setItem(row, col, b)
             self.projects_table.setItem(new_row, col, a)
         self.projects_table.setCurrentCell(new_row, 0)
+        self._refresh_default_project_combo(
+            current=self.default_project_combo.currentData() or ""
+        )
         log.debug("Проект перемещён: %d → %d", row, new_row)
 
     # ------------------------------------------------------------------
@@ -239,10 +327,8 @@ class SettingsWindow(QDialog):
         hint = QLabel(
             "ID чата — идентификатор личного диалога с сотрудником в "
             "Bitrix24. Найти его можно через API методом "
-            "<code>im.recent.get</code> (ищите диалог типа "
-            "<code>user</code>) или из URL открытого чата.<br><br>"
-            "Формат: <code>123</code> — числовой ID пользователя "
-            "(без префикса <code>chat</code>)."
+            "<code>im.recent.get</code>.<br><br>"
+            "Формат: <code>123</code> — числовой ID пользователя."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: #666; }")
@@ -299,7 +385,6 @@ class SettingsWindow(QDialog):
         self.employees_table.editItem(
             self.employees_table.item(row, 0)
         )
-        log.debug("Добавлен пустой сотрудник (строка %d)", row)
 
     def _employee_delete(self) -> None:
         row = self.employees_table.currentRow()
@@ -311,8 +396,6 @@ class SettingsWindow(QDialog):
             self, "Удалить сотрудника",
             f"Удалить сотрудника «{name}»?",
         ) == QMessageBox.StandardButton.Yes:
-            log.info("Удаление сотрудника «%s» (строка %d)",
-                     name, row)
             self.employees_table.removeRow(row)
 
     def _employee_move(self, delta: int) -> None:
@@ -328,7 +411,6 @@ class SettingsWindow(QDialog):
             self.employees_table.setItem(row, col, b)
             self.employees_table.setItem(new_row, col, a)
         self.employees_table.setCurrentCell(new_row, 0)
-        log.debug("Сотрудник перемещён: %d → %d", row, new_row)
 
     # ------------------------------------------------------------------
     # Bitrix24
@@ -430,7 +512,6 @@ class SettingsWindow(QDialog):
         )
         form.addRow("", self.bitrix_no_preview_check)
 
-        # --- Загрузка файлов ---
         files_header = QHBoxLayout()
         files_header.addWidget(QLabel("<b>Отправка файлов</b>"))
         files_header.addStretch()
@@ -498,7 +579,6 @@ class SettingsWindow(QDialog):
             with_info(self.bitrix_retry_delay, "bitrix_retry_delay"),
         )
 
-        # --- Кнопка проверки ---
         self.bitrix_test_btn = QPushButton("Проверить подключение")
         self.bitrix_test_btn.clicked.connect(
             self._test_bitrix_connection
@@ -569,9 +649,7 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Библиотека промптов и шаблоны названий записи. "
-            "Промпты используются в диалоге метаданных, "
-            "шаблоны — для быстрого формирования имени записи."
+            "Библиотека промптов и шаблоны названий записи."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -631,20 +709,6 @@ class SettingsWindow(QDialog):
         names_header.addWidget(make_info_icon("name_templates"))
         layout.addLayout(names_header)
 
-        names_hint = QLabel(
-            "Используются в окне метаданных записи — выпадающий "
-            "список «Название». Плейсхолдеры: "
-            "<code>{name}</code> / <code>{название}</code> — "
-            "введённое имя, "
-            "<code>{abbr}</code> / <code>{сокр}</code> — сокращение, "
-            "<code>{date}</code> / <code>{дата}</code> — YYYY-MM-DD, "
-            "<code>{time}</code> / <code>{время}</code> — HH-MM, "
-            "<code>{datetime}</code> — дата и время."
-        )
-        names_hint.setWordWrap(True)
-        names_hint.setStyleSheet("QLabel { color: #666; }")
-        layout.addWidget(names_hint)
-
         self.name_templates_table = QTableWidget(0, 2)
         self.name_templates_table.setHorizontalHeaderLabels(
             ["Название", "Шаблон"]
@@ -670,10 +734,6 @@ class SettingsWindow(QDialog):
         n_down_btn = QPushButton("Вниз")
         n_down_btn.clicked.connect(lambda: self._name_tpl_move(1))
         n_default_btn = QPushButton("Вернуть стандартные")
-        n_default_btn.setToolTip(
-            "Заменить текущий список стандартными шаблонами "
-            "из поставки"
-        )
         n_default_btn.clicked.connect(
             self._name_tpl_restore_defaults
         )
@@ -707,7 +767,6 @@ class SettingsWindow(QDialog):
             self, "Удалить промпт",
             f"Удалить промпт «{name}»?",
         ) == QMessageBox.StandardButton.Yes:
-            log.info("Удаление промпта «%s» (строка %d)", name, row)
             self.prompts_table.removeRow(row)
 
     def _prompt_move(self, delta: int) -> None:
@@ -723,11 +782,7 @@ class SettingsWindow(QDialog):
             self.prompts_table.setItem(row, col, b)
             self.prompts_table.setItem(new_row, col, a)
         self.prompts_table.setCurrentCell(new_row, 0)
-        log.debug("Промпт перемещён: %d → %d", row, new_row)
 
-    # ------------------------------------------------------------------
-    # Шаблоны названий
-    # ------------------------------------------------------------------
     def _name_tpl_add(self) -> None:
         row = self.name_templates_table.rowCount()
         self.name_templates_table.insertRow(row)
@@ -740,9 +795,6 @@ class SettingsWindow(QDialog):
         self.name_templates_table.editItem(
             self.name_templates_table.item(row, 0)
         )
-        log.debug(
-            "Добавлена пустая строка шаблона имени (строка %d)", row
-        )
 
     def _name_tpl_delete(self) -> None:
         row = self.name_templates_table.currentRow()
@@ -754,8 +806,6 @@ class SettingsWindow(QDialog):
             self, "Удалить шаблон",
             f"Удалить шаблон «{label}»?",
         ) == QMessageBox.StandardButton.Yes:
-            log.info("Удаление шаблона имени «%s» (строка %d)",
-                     label, row)
             self.name_templates_table.removeRow(row)
 
     def _name_tpl_move(self, delta: int) -> None:
@@ -772,13 +822,11 @@ class SettingsWindow(QDialog):
             self.name_templates_table.setItem(row, col, b)
             self.name_templates_table.setItem(new_row, col, a)
         self.name_templates_table.setCurrentCell(new_row, 0)
-        log.debug("Шаблон имени перемещён: %d → %d", row, new_row)
 
     def _name_tpl_restore_defaults(self) -> None:
         if QMessageBox.question(
             self, "Стандартные шаблоны",
-            "Заменить текущий список шаблонов стандартными "
-            "из поставки?",
+            "Заменить текущий список шаблонов стандартными?",
         ) != QMessageBox.StandardButton.Yes:
             return
         self.name_templates_table.setRowCount(0)
@@ -791,10 +839,6 @@ class SettingsWindow(QDialog):
             self.name_templates_table.setItem(
                 row, 1, QTableWidgetItem(item.get("template", ""))
             )
-        log.info(
-            "Шаблоны имён сброшены к стандартным (%d шт.)",
-            len(DEFAULT_NAME_TEMPLATES),
-        )
 
     # ------------------------------------------------------------------
     # Транскрибация
@@ -804,9 +848,7 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Параметры подключения к серверу транскрибации. "
-            "Если URL пустой — шаг транскрибации пропускается, "
-            "остаётся только конвертация видео в аудио."
+            "Параметры подключения к серверу транскрибации."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -880,27 +922,17 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Выберите, где формируется протокол/резюме (summary) "
-            "записи. Транскрибация всегда выполняется на сервере."
+            "Выберите, где формируется протокол/резюме (summary)."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
         self.sum_enabled_check = QCheckBox(
-            "Формировать summary (краткое содержание) "
-            "для новых записей"
+            "Формировать summary для новых записей"
         )
         self.sum_enabled_check.setChecked(False)
         attach_tooltip(self.sum_enabled_check, "sum_enabled")
         layout.addWidget(self.sum_enabled_check)
-
-        sum_hint = QLabel(
-            "<span style='color:#666'>Значение по умолчанию для новых "
-            "записей. В карточке конкретной записи пользователь может "
-            "переопределить этот флаг.</span>"
-        )
-        sum_hint.setWordWrap(True)
-        layout.addWidget(sum_hint)
 
         form_top = QFormLayout()
         self.sum_provider_combo = QComboBox()
@@ -1029,9 +1061,6 @@ class SettingsWindow(QDialog):
             )
             return
 
-        log.info("Тест LiteLLM (ping): url=%s, model=%s",
-                 base_url, model)
-
         from .litellm_client import LiteLLMClient, LiteLLMError
 
         connect_timeout = float(
@@ -1077,17 +1106,15 @@ class SettingsWindow(QDialog):
         if method == "models":
             msg = (
                 "Подключение успешно.\n\n"
-                "Проверено через GET /v1/models (быстрая проверка "
-                "связности и авторизации)."
+                "Проверено через GET /v1/models."
             )
         else:
             msg = (
                 "Подключение успешно.\n\n"
                 "Сервер не поддерживает /v1/models — проверено "
-                "коротким запросом генерации (1 токен)."
+                "коротким запросом генерации."
             )
 
-        log.info("Тест LiteLLM: успех (метод=%s)", method)
         QMessageBox.information(self, "Суммаризация", msg)
 
     # ------------------------------------------------------------------
@@ -1098,25 +1125,11 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Список терминов и аббревиатур, которые будут переданы "
-            "ИИ. Помогает модели правильно понимать специфику: "
-            "названия систем, сокращения, ФИО и т.п."
+            "Список терминов и аббревиатур, которые будут "
+            "переданы ИИ."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
-
-        hint = QLabel(
-            "Формат: «Термин» — как модель должна писать это слово; "
-            "«Пояснение» — что это значит. Пояснение можно оставить "
-            "пустым, тогда в промпт уйдёт только термин.\n\n"
-            "Примеры:\n"
-            "  • ЕЖД — Единый журнал дежурств\n"
-            "  • vNext — платформа vNext\n"
-            "  • ПЛ — Планирование\n"
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("QLabel { color: #666; }")
-        layout.addWidget(hint)
 
         terms_header = QHBoxLayout()
         terms_header.addWidget(QLabel("<b>Термины</b>"))
@@ -1166,8 +1179,7 @@ class SettingsWindow(QDialog):
         layout.addLayout(send_header)
 
         self.glossary_send_to_summarizer_check = QCheckBox(
-            "Передавать в суммаризацию "
-            "(сервер транскрибации или LiteLLM)"
+            "Передавать в суммаризацию"
         )
         attach_tooltip(
             self.glossary_send_to_summarizer_check,
@@ -1176,7 +1188,7 @@ class SettingsWindow(QDialog):
         layout.addWidget(self.glossary_send_to_summarizer_check)
 
         self.glossary_send_to_deepseek_check = QCheckBox(
-            "Передавать в файл промпта DeepSeek (deepseek_prompt.*)"
+            "Передавать в файл промпта DeepSeek"
         )
         attach_tooltip(
             self.glossary_send_to_deepseek_check,
@@ -1195,9 +1207,6 @@ class SettingsWindow(QDialog):
         self.glossary_table.editItem(
             self.glossary_table.item(row, 0)
         )
-        log.debug(
-            "Добавлена пустая строка в глоссарий (строка %d)", row
-        )
 
     def _glossary_delete(self) -> None:
         row = self.glossary_table.currentRow()
@@ -1209,7 +1218,6 @@ class SettingsWindow(QDialog):
             self, "Удалить термин",
             f"Удалить термин «{term}» из глоссария?",
         ) == QMessageBox.StandardButton.Yes:
-            log.info("Удаление термина «%s» (строка %d)", term, row)
             self.glossary_table.removeRow(row)
 
     def _glossary_move(self, delta: int) -> None:
@@ -1225,7 +1233,6 @@ class SettingsWindow(QDialog):
             self.glossary_table.setItem(row, col, b)
             self.glossary_table.setItem(new_row, col, a)
         self.glossary_table.setCurrentCell(new_row, 0)
-        log.debug("Термин перемещён: %d → %d", row, new_row)
 
     # ------------------------------------------------------------------
     # Запись
@@ -1270,7 +1277,7 @@ class SettingsWindow(QDialog):
         )
 
         self.overlay_panel_check = QCheckBox(
-            "Показывать плавающую панель управления поверх экрана"
+            "Показывать плавающую панель управления"
         )
         attach_tooltip(self.overlay_panel_check, "overlay_panel")
 
@@ -1300,7 +1307,6 @@ class SettingsWindow(QDialog):
         layout.addRow("", self.overlay_panel_check)
         layout.addRow("", self.start_notification_check)
 
-        # --- Параметры ffmpeg ---
         self.ffmpeg_start_check_delay = QDoubleSpinBox()
         self.ffmpeg_start_check_delay.setRange(0.05, 5.0)
         self.ffmpeg_start_check_delay.setSingleStep(0.05)
@@ -1340,7 +1346,6 @@ class SettingsWindow(QDialog):
             ),
         )
 
-        # --- Overlay ---
         self.overlay_hide_delay_ms = QSpinBox()
         self.overlay_hide_delay_ms.setRange(0, 60000)
         self.overlay_hide_delay_ms.setSuffix(" мс")
@@ -1375,8 +1380,7 @@ class SettingsWindow(QDialog):
         w = QWidget()
         layout = QVBoxLayout(w)
         info = QLabel(
-            "Настройки автоматической обработки очереди. "
-            "Неудачные задачи будут повторяться автоматически."
+            "Настройки автоматической обработки очереди."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -1428,11 +1432,7 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Шаблон промпта для DeepSeek и формат файла, в котором "
-            "сохраняется готовый промпт.<br>"
-            "Промпт собирается автоматически при обработке "
-            "скрам-митинга (галочка «Это скрам-митинг» в окне "
-            "метаданных записи)."
+            "Шаблон промпта для DeepSeek и формат файла."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -1445,10 +1445,6 @@ class SettingsWindow(QDialog):
 
         self.scrum_template_edit = QPlainTextEdit()
         self.scrum_template_edit.setMinimumHeight(260)
-        self.scrum_template_edit.setPlaceholderText(
-            "Во вложении стенограмма статусного совещания с "
-            "командой..."
-        )
         layout.addWidget(self.scrum_template_edit)
 
         form = QFormLayout()
@@ -1459,14 +1455,6 @@ class SettingsWindow(QDialog):
             with_info(self.scrum_format_combo, "scrum_format"),
         )
         layout.addLayout(form)
-
-        hint = QLabel(
-            "Формат экспорта можно изменить в окне «Записи…» при "
-            "нажатии «Экспорт промпта…» — этот параметр "
-            "используется как значение по умолчанию."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
 
         layout.addStretch()
         return w
@@ -1612,8 +1600,8 @@ class SettingsWindow(QDialog):
 
         current = get_current_log_path()
         self.current_log_label = QLabel(
-            f"<span style='color: gray;'>"
-            f"Текущий логгер пишет в:</span> <code>{current}</code>"
+            f"<span style='color: gray;'>Текущий логгер пишет в:</span> "
+            f"<code>{current}</code>"
         )
         self.current_log_label.setWordWrap(True)
         layout.addWidget(self.current_log_label)
@@ -1639,6 +1627,13 @@ class SettingsWindow(QDialog):
             self.projects_table.setItem(
                 row, 1, QTableWidgetItem(p["chat_id"])
             )
+
+        # --- Проект и чат по умолчанию ---
+        default_project = self.config_manager.get_default_project()
+        self._refresh_default_project_combo(current=default_project)
+        self.default_chat_id_input.setText(
+            self.config_manager.get_default_chat_id()
+        )
 
         # --- Сотрудники ---
         employees = self.config_manager.get_employees()
@@ -1891,19 +1886,16 @@ class SettingsWindow(QDialog):
         )
 
         log.info(
-            "Настройки загружены в окно: projects=%d, employees=%d, "
-            "prompts=%d, name_templates=%d, summarizer=%s, "
-            "glossary_terms=%d, bitrix_enabled=%s, log_level=%s",
-            len(projects), len(employees), len(prompts), len(name_tpls),
-            sum_cfg["provider"], len(g["terms"]),
-            bitrix["enabled"], level,
+            "Настройки загружены в окно: projects=%d, "
+            "default_project=%r, default_chat_id=%r, "
+            "employees=%d, prompts=%d",
+            len(projects), default_project,
+            self.config_manager.get_default_chat_id(),
+            len(employees), len(prompts),
         )
 
     def _apply_form_to_config(self) -> Dict[str, Any]:
-        """
-        Собирает значения из формы в self.config_manager.config.
-        НЕ сохраняет на диск. Возвращает обновлённый конфиг.
-        """
+        """Собирает значения из формы в self.config_manager.config."""
         cfg = self.config_manager.config
 
         # --- Проекты ---
@@ -1917,6 +1909,15 @@ class SettingsWindow(QDialog):
                 continue
             projects.append({"name": name, "chat_id": chat_id})
         cfg["projects"] = projects
+
+        # --- Проект и чат по умолчанию ---
+        default_project = (
+            self.default_project_combo.currentData() or ""
+        )
+        cfg["default_project"] = str(default_project).strip()
+        cfg["default_chat_id"] = (
+            self.default_chat_id_input.text().strip()
+        )
 
         # --- Сотрудники ---
         employees: List[Dict[str, str]] = []
@@ -2157,22 +2158,11 @@ class SettingsWindow(QDialog):
             self.config_manager.save(cfg)
 
             log.info(
-                "Настройки сохранены: projects=%d, employees=%d, "
-                "prompts=%d, name_templates=%d, summarizer=%s, "
-                "glossary_terms=%d, bitrix_enabled=%s, monitor=%d, "
-                "log_level=%s, temp_path=%s",
+                "Настройки сохранены: projects=%d, "
+                "default_project=%r, default_chat_id=%r",
                 len(cfg.get("projects", [])),
-                len(cfg.get("employees", [])),
-                len(cfg.get("metadata", {}).get("prompts", [])),
-                len(cfg.get("metadata", {}).get(
-                    "name_templates", []
-                )),
-                cfg.get("summarizer", {}).get("provider"),
-                len(cfg.get("glossary", {}).get("terms", [])),
-                cfg.get("bitrix", {}).get("enabled"),
-                cfg.get("recording", {}).get("monitor"),
-                cfg.get("logging", {}).get("level"),
-                cfg.get("storage", {}).get("temp_path"),
+                cfg.get("default_project"),
+                cfg.get("default_chat_id"),
             )
 
             current = get_current_log_path()
@@ -2315,8 +2305,7 @@ class SettingsWindow(QDialog):
         if not isinstance(imported, dict):
             QMessageBox.warning(
                 self, "Импорт настроек",
-                "Файл не похож на конфиг приложения: "
-                "ожидался объект JSON.",
+                "Файл не похож на конфиг приложения.",
             )
             return
 
@@ -2332,18 +2321,15 @@ class SettingsWindow(QDialog):
             f"Секций верхнего уровня: <b>{len(top_keys)}</b><br>"
             f"<span style='color:#666'>Ключи: "
             f"{html.escape(preview_keys)}</span><br><br>"
-            "<b>Внимание:</b> текущие настройки будут перезаписаны. "
-            "Перед импортом сохраним резервную копию рядом с "
-            "<code>config.json</code>.<br><br>"
+            "<b>Внимание:</b> текущие настройки будут "
+            "перезаписаны.<br><br>"
             "Продолжить?",
             QMessageBox.StandardButton.Yes
             | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
-            log.info(
-                "Импорт настроек отменён на этапе подтверждения"
-            )
+            log.info("Импорт настроек отменён")
             return
 
         try:
@@ -2405,17 +2391,14 @@ class SettingsWindow(QDialog):
             self, "Импорт настроек",
             "Настройки успешно импортированы.\n\n"
             "Перезапустите приложение, чтобы изменения "
-            "(особенно путь к логам, горячие клавиши и клиенты "
-            "транскрибации/суммаризации) вступили в силу.",
+            "вступили в силу.",
         )
 
     # ------------------------------------------------------------------
     # Действия
     # ------------------------------------------------------------------
     def reset_to_defaults(self) -> None:
-        log.warning(
-            "Сброс настроек к значениям по умолчанию (в окне)"
-        )
+        log.warning("Сброс настроек к значениям по умолчанию")
         self.config_manager.config = (
             self.config_manager.get_defaults()
         )
@@ -2434,7 +2417,6 @@ class SettingsWindow(QDialog):
             self, "Выберите папку"
         )
         if folder:
-            log.info("Выбрана папка: %s", folder)
             self.temp_path_input.setText(folder)
 
     def browse_log_file(self) -> None:
@@ -2447,7 +2429,6 @@ class SettingsWindow(QDialog):
             "Log files (*.log *.txt);;All files (*)",
         )
         if filename:
-            log.info("Выбран файл лога: %s", filename)
             self.log_path_input.setText(filename)
 
     def open_log_file(self) -> None:
@@ -2461,7 +2442,6 @@ class SettingsWindow(QDialog):
                 self, "Лог", f"Файл не найден:\n{path}"
             )
             return
-        log.info("Открытие файла лога: %s", path)
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def open_log_folder(self) -> None:
@@ -2476,7 +2456,6 @@ class SettingsWindow(QDialog):
                 self, "Лог", f"Папка не найдена:\n{folder}"
             )
             return
-        log.info("Открытие папки логов: %s", folder)
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def clear_log_file(self) -> None:
@@ -2498,12 +2477,8 @@ class SettingsWindow(QDialog):
         try:
             with open(path, "w", encoding="utf-8"):
                 pass
-            log.info("Файл лога очищен: %s", path)
             QMessageBox.information(self, "Лог", "Файл очищен")
         except Exception as exc:
-            log.exception(
-                "Не удалось очистить лог %s: %s", path, exc
-            )
             QMessageBox.critical(
                 self, "Ошибка", f"Не удалось очистить: {exc}"
             )
@@ -2517,15 +2492,9 @@ class SettingsWindow(QDialog):
         if not url:
             QMessageBox.warning(
                 self, "Транскрибация",
-                "URL сервера пустой. Шаг будет пропускаться.",
+                "URL сервера пустой.",
             )
             return
-
-        log.info(
-            "Тест подключения к транскрибации: url=%s, "
-            "connect=%.0f, read=%.0f",
-            url, connect_timeout, read_timeout,
-        )
 
         async def _run():
             async with TranscribeClient(
@@ -2537,14 +2506,10 @@ class SettingsWindow(QDialog):
 
         try:
             asyncio.run(_run())
-            log.info("Тест подключения успешен: %s", url)
             QMessageBox.information(
                 self, "Транскрибация", "Подключение успешно"
             )
         except Exception as exc:
-            log.warning(
-                "Тест подключения провален (%s): %s", url, exc
-            )
             QMessageBox.warning(
                 self, "Транскрибация", f"Ошибка: {exc}"
             )
@@ -2555,130 +2520,63 @@ class SettingsWindow(QDialog):
     _HELP_TEXTS: Dict[str, str] = {
         "Проекты и чаты Bitrix24": (
             "<b>Проекты и чаты Bitrix24</b><br><br>"
-            "Таблица «Проект | Чат Bitrix24» — это реестр проектов "
-            "компании и привязка каждого к конкретному чату "
-            "Bitrix24.<br><br>"
-            "<b>Зачем это нужно:</b><br>"
-            "Когда вы в окне «Записи» нажмёте «Bitrix24 → Отправить "
-            "в чат…», программа возьмёт проект записи и по этой "
-            "таблице определит, <i>в какой именно чат</i> отправлять "
-            "протокол или summary.<br><br>"
-            "<b>Как заполнять:</b><br>"
-            "• <b>Проект</b> — произвольное название (Россети, "
-            "iserv, Внутренние и т.п.).<br>"
-            "• <b>Чат Bitrix24</b> — ID чата. Формат: "
-            "<code>chat2101</code> или просто <code>2101</code>."
-            "<br><br>"
-            "<b>Порядок важен:</b> проект, стоящий первым в таблице, "
-            "выбирается по умолчанию при старте новой записи.<br><br>"
-            "<b>Кнопки:</b> «Добавить», «Удалить», «Вверх», «Вниз»."
+            "Таблица «Проект | Чат Bitrix24» — это реестр "
+            "проектов и привязка каждого к конкретному чату.<br><br>"
+            "<b>Блок «Проект и чат по умолчанию»:</b><br>"
+            "• <b>Проект по умолчанию</b> — какой проект "
+            "подставлять в карточку метаданных для новых "
+            "записей.<br>"
+            "• <b>Чат по умолчанию</b> — ID чата Bitrix24, куда "
+            "по умолчанию отправляются протоколы и summary. "
+            "Если пусто — используется чат проекта записи."
         ),
         "Сотрудники": (
             "<b>Сотрудники</b><br><br>"
-            "Справочник сотрудников с их личными чатами Bitrix24."
-            "<br><br>"
-            "<b>Зачем это нужно:</b><br>"
-            "Помимо отправки в чат команды (по проекту), вы можете "
-            "отправить протокол или summary в <i>личный диалог</i> "
-            "с конкретным сотрудником.<br><br>"
-            "<b>Как заполнять:</b><br>"
-            "• <b>ФИО</b> — как показывать сотрудника в списке.<br>"
-            "• <b>Чат Bitrix24 (ID пользователя)</b> — числовой "
-            "идентификатор пользователя в Bitrix24. Формат: "
-            "<code>123</code> (без префикса <code>chat</code>)."
+            "Справочник сотрудников с личными чатами Bitrix24."
         ),
         "Bitrix24": (
             "<b>Bitrix24 — параметры подключения</b><br><br>"
-            "<b>Вебхук</b> — URL входящего вебхука, созданного в "
-            "Bitrix24 через «Приложения → Разработчикам → Вебхуки»."
-            "<br><br>"
-            "<b>Права вебхука:</b> в Bitrix24 должны быть разрешены "
-            "методы <code>im</code>, <code>disk</code> и "
-            "<code>im.disk</code>.<br><br>"
-            "<b>Максимальная длина сообщения</b> — обрезает длинные "
-            "протоколы до указанного количества символов. Реальный "
-            "лимит портала ~20 000.<br><br>"
-            "<b>Попыток при ошибке</b> и <b>Пауза между повторами</b> "
-            "— автоматический ретрай при сетевых сбоях."
+            "Параметры вебхука, таймауты, форматы сообщений."
         ),
         "Промпты и имена": (
-            "<b>Промпты и шаблоны имён</b><br><br>"
-            "<b>Библиотека промптов</b> — набор готовых инструкций "
-            "для сервера транскрибации или для LiteLLM.<br><br>"
-            "<b>Плейсхолдеры шаблонов:</b> "
-            "<code>{name}</code> / <code>{название}</code>, "
-            "<code>{abbr}</code> / <code>{сокр}</code>, "
-            "<code>{date}</code> / <code>{дата}</code>, "
-            "<code>{time}</code> / <code>{время}</code>, "
-            "<code>{datetime}</code>."
+            "<b>Промпты и шаблоны имён</b>"
         ),
         "Транскрибация": (
-            "<b>Транскрибация</b><br><br>"
-            "Параметры подключения к серверу AI-транскрибатора "
-            "(обычно Whisper). Если URL пустой — шаг пропускается."
+            "<b>Транскрибация</b>"
         ),
         "Суммаризация": (
-            "<b>Суммаризация</b><br><br>"
-            "Выбор того, где формируется протокол или краткое "
-            "содержание (summary) записи."
+            "<b>Суммаризация</b>"
         ),
         "Глоссарий": (
-            "<b>Глоссарий терминов</b><br><br>"
-            "Список терминов и аббревиатур, которые ИИ должен "
-            "распознавать и использовать единообразно."
+            "<b>Глоссарий терминов</b>"
         ),
         "Запись": (
-            "<b>Запись экрана</b><br><br>"
-            "<b>Монитор</b>, <b>микрофон</b>, <b>водяной знак</b>, "
-            "<b>горячие клавиши</b> и параметры ffmpeg.<br><br>"
-            "<b>Задержка проверки ffmpeg</b> — пауза после старта "
-            "ffmpeg перед проверкой.<br><br>"
-            "<b>Таймаут остановки ffmpeg</b> — сколько ждать "
-            "корректного завершения перед SIGKILL.<br><br>"
-            "<b>Плавающая панель</b> — размеры, автоскрытие и "
-            "строки лога."
+            "<b>Запись экрана</b>"
         ),
         "Очередь": (
-            "<b>Очередь задач</b><br><br>"
-            "Настройки автоматической обработки видеофайлов в фоне."
-            "<br><br>"
-            "<b>Не обрабатывать очередь во время записи</b> — "
-            "воркер ждёт завершения записи, чтобы не перегружать CPU."
+            "<b>Очередь задач</b>"
         ),
         "Скрам": (
-            "<b>Скрам</b><br><br>"
-            "Шаблон промпта и формат файла для сценария "
-            "«скрам-митинг»."
+            "<b>Скрам</b>"
         ),
         "Форматы и сжатие": (
-            "<b>Форматы и сжатие</b><br><br>"
-            "Настройки конвертации видео в аудио и параметров "
-            "сжатия видео."
+            "<b>Форматы и сжатие</b>"
         ),
         "Хранилище": (
-            "<b>Хранилище</b><br><br>"
-            "<b>Временная папка</b> — корень для записей и очереди."
+            "<b>Хранилище</b>"
         ),
         "Логи": (
-            "<b>Логи</b><br><br>"
-            "<b>Максимальный размер лога</b> — размер файла, после "
-            "которого он ротируется.<br><br>"
-            "<b>Сколько архивов хранить</b> — лимит старых файлов "
-            "лога (app.log.1 … app.log.N).<br><br>"
-            "Изменения вступят в силу после перезапуска."
+            "<b>Логи</b>"
         ),
     }
 
     _HELP_DEFAULT: str = (
         "<b>Screen Recorder & Transcriber</b><br><br>"
-        "Универсальный рекордер экрана с расшифровкой и "
-        "суммаризацией записей.<br><br>"
         "Наведите курсор на иконку <b>ⓘ</b> рядом с любым полем — "
-        "появится краткая справка по этому параметру."
+        "появится краткая справка."
     )
 
     def _show_help(self) -> None:
-        """Открывает справку по активной вкладке настроек."""
         idx = self.tabs.currentIndex()
         title = self.tabs.tabText(idx) if idx >= 0 else ""
         text = self._HELP_TEXTS.get(title, self._HELP_DEFAULT)

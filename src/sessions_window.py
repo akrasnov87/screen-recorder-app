@@ -1,9 +1,8 @@
 """Окно со списком всех записей (сессий).
 
 Изменения:
-  • Сканирование папки sessions/ вынесено в отдельный QThread
-    (SessionsScanThread) — UI остаётся отзывчивым на большом архиве.
-  • Чтение текста через file_readers.
+  • _send_to_bitrix() использует config.default_chat_id как
+    основной ID чата. Если он пустой — берётся чат проекта записи.
 """
 from __future__ import annotations
 
@@ -17,9 +16,10 @@ from typing import Any, Dict, List, Optional
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QMenu, QMenuBar, QMessageBox, QProgressDialog,
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout,
+    QHeaderView, QInputDialog, QLabel, QMenu, QMenuBar, QMessageBox,
+    QProgressDialog, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from .file_readers import read_any_text, read_json_file
@@ -50,19 +50,17 @@ STATUS_COLORS = {
 }
 
 
-# Расширения видео/аудио, которые ищем в папке сессии.
 _VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv",
                ".mp3", ".wav", ".m4a", ".aac", ".opus", ".ogg")
 
-# Расширения аудио, наличие которого считаем признаком обработки.
 _AUDIO_EXTS = (".mp3", ".aac", ".wav", ".opus", ".ogg", ".m4a")
 
 
 # ---------------------------------------------------------------------------
-# Поток сканирования сессий
+# Поток сканирования
 # ---------------------------------------------------------------------------
 class SessionsScanThread(QThread):
-    """Фоновое сканирование папки sessions/ и сбор метаданных записей."""
+    """Фоновое сканирование папки sessions/."""
 
     finished_ok = Signal(list)
     failed = Signal(str)
@@ -76,15 +74,14 @@ class SessionsScanThread(QThread):
 
     def run(self) -> None:
         try:
-            rows = self._collect(self._sessions_root, self._tasks_index)
+            rows = self._collect(
+                self._sessions_root, self._tasks_index
+            )
             self.finished_ok.emit(rows)
         except Exception as exc:
             log.exception("Ошибка сканирования сессий: %s", exc)
             self.failed.emit(str(exc))
 
-    # ------------------------------------------------------------------
-    # Сбор данных
-    # ------------------------------------------------------------------
     @staticmethod
     def _find_first_video(session_dir: str) -> str:
         for ext in _VIDEO_EXTS:
@@ -117,13 +114,14 @@ class SessionsScanThread(QThread):
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         if not os.path.isdir(sessions_root):
-            log.warning("Папка сессий не найдена: %s", sessions_root)
             return rows
 
         try:
             entries = sorted(os.listdir(sessions_root))
         except OSError as exc:
-            log.error("Не удалось прочитать %s: %s", sessions_root, exc)
+            log.error(
+                "Не удалось прочитать %s: %s", sessions_root, exc
+            )
             return rows
 
         for name in entries:
@@ -142,8 +140,10 @@ class SessionsScanThread(QThread):
             audio_path = self._find_first_audio(session_dir)
             has_audio = bool(audio_path)
 
-            task = (tasks_index.get(os.path.abspath(video_path))
-                    if video_path else None)
+            task = (
+                tasks_index.get(os.path.abspath(video_path))
+                if video_path else None
+            )
             task_id = (task or {}).get("task_id", "")
 
             if task is not None:
@@ -194,7 +194,9 @@ class SessionsScanThread(QThread):
                 try:
                     attachments = [
                         os.path.join(attachments_dir, f)
-                        for f in sorted(os.listdir(attachments_dir))
+                        for f in sorted(
+                            os.listdir(attachments_dir)
+                        )
                         if os.path.isfile(
                             os.path.join(attachments_dir, f)
                         )
@@ -202,7 +204,9 @@ class SessionsScanThread(QThread):
                 except OSError:
                     attachments = []
 
-            manual_protocol_path = meta.get("manual_protocol_path") or ""
+            manual_protocol_path = (
+                meta.get("manual_protocol_path") or ""
+            )
             if manual_protocol_path and not os.path.exists(
                 manual_protocol_path
             ):
@@ -299,15 +303,29 @@ class SessionsWindow(QDialog):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         hv = self.table.horizontalHeader()
-        hv.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
         hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            5, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            6, QHeaderView.ResizeMode.ResizeToContents
+        )
         hv.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
-        hv.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(
+            8, QHeaderView.ResizeMode.ResizeToContents
+        )
         hv.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(
             self._on_selection_changed
@@ -384,14 +402,10 @@ class SessionsWindow(QDialog):
         layout: QVBoxLayout = self.layout()
         layout.insertWidget(0, bar)
 
-        # ---------------- Файл ----------------
         m_file = bar.addMenu("Файл")
 
         act_import = QAction("Импорт материалов…", self)
         act_import.setShortcut(QKeySequence("Ctrl+I"))
-        act_import.setToolTip(
-            "Импортировать готовое видео, стенограмму или протокол"
-        )
         act_import.triggered.connect(self._on_import_requested)
         m_file.addAction(act_import)
 
@@ -426,33 +440,22 @@ class SessionsWindow(QDialog):
         act_close.triggered.connect(self.close)
         m_file.addAction(act_close)
 
-        # ---------------- Протокол ----------------
         m_protocol = bar.addMenu("Протокол")
 
         act_edit_protocol_md = QAction(
             "Создать/редактировать протокол (Markdown)…", self
         )
         act_edit_protocol_md.setShortcut(QKeySequence("Ctrl+M"))
-        act_edit_protocol_md.setToolTip(
-            "Открыть встроенный Markdown-редактор. Слева — исходный "
-            "текст, справа — готовый документ.\n"
-            "Файл сохраняется как manual_protocol.md и прикрепляется "
-            "к записи."
+        act_edit_protocol_md.triggered.connect(
+            self._edit_manual_protocol_md
         )
-        act_edit_protocol_md.triggered.connect(self._edit_manual_protocol_md)
         m_protocol.addAction(act_edit_protocol_md)
 
         act_export_protocol_docx = QAction(
             "Экспорт протокола в DOCX…", self
         )
-        act_export_protocol_docx.setShortcut(QKeySequence("Ctrl+Shift+M"))
-        act_export_protocol_docx.setToolTip(
-            "Сконвертировать прикреплённый протокол (Markdown или "
-            "текст) в документ .docx.\n\n"
-            "По умолчанию результат сохраняется как "
-            "<session_dir>/manual_protocol.docx и прикрепляется к "
-            "записи — после этого «Отправить в чат…» (Bitrix24) "
-            "сможет отправить именно DOCX."
+        act_export_protocol_docx.setShortcut(
+            QKeySequence("Ctrl+Shift+M")
         )
         act_export_protocol_docx.triggered.connect(
             self._export_protocol_docx
@@ -461,47 +464,40 @@ class SessionsWindow(QDialog):
 
         m_protocol.addSeparator()
 
-        act_attach_protocol = QAction("Прикрепить файл протокола…", self)
-        act_attach_protocol.setToolTip(
-            "Загрузить вручную подготовленный протокол "
-            "(.docx/.txt/.md/.pdf) и прикрепить его к записи"
+        act_attach_protocol = QAction(
+            "Прикрепить файл протокола…", self
         )
-        act_attach_protocol.triggered.connect(self._attach_manual_protocol)
+        act_attach_protocol.triggered.connect(
+            self._attach_manual_protocol
+        )
         m_protocol.addAction(act_attach_protocol)
 
-        act_open_protocol = QAction("Открыть прикреплённый протокол", self)
-        act_open_protocol.triggered.connect(self._open_manual_protocol)
+        act_open_protocol = QAction(
+            "Открыть прикреплённый протокол", self
+        )
+        act_open_protocol.triggered.connect(
+            self._open_manual_protocol
+        )
         m_protocol.addAction(act_open_protocol)
 
-        # ---------------- Summary ----------------
         m_summary = bar.addMenu("Summary")
 
-        act_edit_summary = QAction("Изменить summary (Markdown)…", self)
-        act_edit_summary.setShortcut(QKeySequence("Ctrl+P"))
-        act_edit_summary.setToolTip(
-            "Открыть Markdown-редактор для краткого описания записи.\n"
-            "При отправке в Bitrix24 Markdown конвертируется в BB-код."
+        act_edit_summary = QAction(
+            "Изменить summary (Markdown)…", self
         )
+        act_edit_summary.setShortcut(QKeySequence("Ctrl+P"))
         act_edit_summary.triggered.connect(self._edit_summary_bb)
         m_summary.addAction(act_edit_summary)
 
         act_view_summary = QAction("Просмотр summary", self)
         act_view_summary.setShortcut(QKeySequence("Ctrl+Shift+P"))
-        act_view_summary.setToolTip(
-            "Открыть краткое описание в режиме только для чтения "
-            "(с отрендеренным Markdown)"
-        )
         act_view_summary.triggered.connect(self._view_summary)
         m_summary.addAction(act_view_summary)
 
         act_export_summary = QAction("Экспорт summary…", self)
-        act_export_summary.setToolTip(
-            "Сохранить краткое описание в .docx / .html / .md / .txt"
-        )
         act_export_summary.triggered.connect(self._export_summary)
         m_summary.addAction(act_export_summary)
 
-        # ---------------- DeepSeek ----------------
         m_deepseek = bar.addMenu("DeepSeek")
 
         act_open_prompt = QAction("Открыть промпт DeepSeek", self)
@@ -516,23 +512,19 @@ class SessionsWindow(QDialog):
 
         m_deepseek.addSeparator()
 
-        act_save_downloads = QAction("Сохранить промпт в Загрузки", self)
-        act_save_downloads.setShortcut(QKeySequence("Ctrl+Alt+D"))
-        act_save_downloads.setToolTip(
-            "Скопировать файлы промпта (deepseek_prompt.*) в папку "
-            "«Загрузки» без запроса пути"
+        act_save_downloads = QAction(
+            "Сохранить промпт в Загрузки", self
         )
-        act_save_downloads.triggered.connect(self._save_prompt_to_downloads)
+        act_save_downloads.setShortcut(QKeySequence("Ctrl+Alt+D"))
+        act_save_downloads.triggered.connect(
+            self._save_prompt_to_downloads
+        )
         m_deepseek.addAction(act_save_downloads)
 
-        # ---------------- Bitrix24 ----------------
         m_bitrix = bar.addMenu("Bitrix24")
 
         act_send = QAction("Отправить в чат…", self)
         act_send.setShortcut(QKeySequence("Ctrl+B"))
-        act_send.setToolTip(
-            "Отправить протокол и/или summary записи в чат Bitrix24"
-        )
         act_send.triggered.connect(self._send_to_bitrix)
         m_bitrix.addAction(act_send)
 
@@ -548,43 +540,37 @@ class SessionsWindow(QDialog):
         )
         m_bitrix.addAction(act_send_summary)
 
-        # ---------------- Вложения ----------------
         m_attach = bar.addMenu("Вложения")
 
-        act_open_attachments = QAction("Открыть папку вложений", self)
-        act_open_attachments.triggered.connect(self._open_attachments)
+        act_open_attachments = QAction(
+            "Открыть папку вложений", self
+        )
+        act_open_attachments.triggered.connect(
+            self._open_attachments
+        )
         m_attach.addAction(act_open_attachments)
 
         act_add_attachment = QAction("Добавить вложение…", self)
-        act_add_attachment.triggered.connect(self._add_attachment_to_session)
+        act_add_attachment.triggered.connect(
+            self._add_attachment_to_session
+        )
         m_attach.addAction(act_add_attachment)
 
-        # ---------------- Очередь и статус ----------------
         m_queue = bar.addMenu("Очередь")
 
         act_edit_meta = QAction(
             "Редактировать метаданные и перезапустить…", self
         )
         act_edit_meta.setShortcut(QKeySequence("Ctrl+E"))
-        act_edit_meta.setToolTip(
-            "Открыть карточку записи с текущими параметрами.\n"
-            "Изменённые настройки (скрам, промпт DeepSeek, вложения, "
-            "контекст в промпте) сохранятся в session.json, и запись "
-            "будет поставлена в очередь на повторную обработку.\n\n"
-            "Удобно, если при первичной обработке забыли включить "
-            "«Сформировать файл промпта для DeepSeek»."
+        act_edit_meta.triggered.connect(
+            self._edit_metadata_and_restart
         )
-        act_edit_meta.triggered.connect(self._edit_metadata_and_restart)
         m_queue.addAction(act_edit_meta)
 
         m_queue.addSeparator()
 
         act_restart = QAction("Перезапустить обработку", self)
         act_restart.setShortcut(QKeySequence("Ctrl+R"))
-        act_restart.setToolTip(
-            "Перезапустить обработку с текущими метаданными "
-            "(без открытия карточки)"
-        )
         act_restart.triggered.connect(self._restart_processing)
         m_queue.addAction(act_restart)
 
@@ -594,13 +580,17 @@ class SessionsWindow(QDialog):
 
         m_queue.addSeparator()
 
-        act_status_uploaded = QAction("Пометить: «Сохранено»", self)
+        act_status_uploaded = QAction(
+            "Пометить: «Сохранено»", self
+        )
         act_status_uploaded.triggered.connect(
             lambda: self._change_status(STATUS_UPLOADED)
         )
         m_queue.addAction(act_status_uploaded)
 
-        act_status_processed = QAction("Пометить: «Обработан»", self)
+        act_status_processed = QAction(
+            "Пометить: «Обработан»", self
+        )
         act_status_processed.triggered.connect(
             lambda: self._change_status(STATUS_PROCESSED)
         )
@@ -612,12 +602,10 @@ class SessionsWindow(QDialog):
         )
         m_queue.addAction(act_status_error)
 
-        # ---------------- Утилиты ----------------
         m_utils = bar.addMenu("Утилиты")
 
-        act_stats = QAction("Показать размер видеофайлов…", self)
-        act_stats.setToolTip(
-            "Посчитать, сколько места занимают video.mp4 во всех сессиях"
+        act_stats = QAction(
+            "Показать размер видеофайлов…", self
         )
         act_stats.triggered.connect(self._show_video_stats)
         m_utils.addAction(act_stats)
@@ -627,26 +615,16 @@ class SessionsWindow(QDialog):
         act_del_video = QAction(
             "Удалить видеофайлы (оставить только аудио)…", self
         )
-        act_del_video.setToolTip(
-            "Удалить video.mp4 из всех сессий, где уже есть аудиофайл.\n"
-            "Помогает освободить дисковое пространство.\n"
-            "Требует подтверждения."
-        )
         act_del_video.triggered.connect(self._delete_video_files)
         m_utils.addAction(act_del_video)
 
-        # ---------------- Справка ----------------
         m_help = bar.addMenu("Справка")
 
         act_shortcuts = QAction("Горячие клавиши…", self)
         act_shortcuts.triggered.connect(self._show_shortcuts)
         m_help.addAction(act_shortcuts)
 
-    # ------------------------------------------------------------------
-    # Сигнал импорта
-    # ------------------------------------------------------------------
     def _on_import_requested(self) -> None:
-        log.debug("Запрошен импорт из окна «Записи»")
         self.import_requested.emit()
 
     # ------------------------------------------------------------------
@@ -665,14 +643,11 @@ class SessionsWindow(QDialog):
 
         layout.addWidget(QLabel("<b>Статусы:</b>"))
         items = [
-            (STATUS_UPLOADED, "видео сохранено, обработка не выполнялась"),
-            (STATUS_TRANSCRIBING,
-             "задача в очереди: конвертация/транскрибация"),
-            (STATUS_PROCESSED,
-             "все шаги завершены — есть audio и/или transcript"),
-            (STATUS_ERROR,
-             "задача завершилась с ошибкой; доступен ручной перезапуск"),
-            (STATUS_UNKNOWN, "не удалось определить состояние"),
+            (STATUS_UPLOADED, "видео сохранено"),
+            (STATUS_TRANSCRIBING, "задача в очереди"),
+            (STATUS_PROCESSED, "все шаги завершены"),
+            (STATUS_ERROR, "ошибка обработки"),
+            (STATUS_UNKNOWN, "состояние неизвестно"),
         ]
         for status, hint in items:
             layout.addWidget(self._make_legend_item(status, hint))
@@ -689,7 +664,8 @@ class SessionsWindow(QDialog):
         swatch = QLabel()
         swatch.setFixedSize(12, 12)
         swatch.setStyleSheet(
-            f"background-color: {STATUS_COLORS.get(status, '#616161')}; "
+            f"background-color: "
+            f"{STATUS_COLORS.get(status, '#616161')}; "
             f"border-radius: 2px;"
         )
         row.addWidget(swatch)
@@ -703,9 +679,6 @@ class SessionsWindow(QDialog):
         row.addWidget(hint_lbl)
         return w
 
-    # ------------------------------------------------------------------
-    # Выбор строки
-    # ------------------------------------------------------------------
     def _on_selection_changed(self) -> None:
         r = self._selected_row()
         if not r:
@@ -737,7 +710,6 @@ class SessionsWindow(QDialog):
 
     def refresh(self) -> None:
         if self._thread is not None and self._thread.isRunning():
-            log.debug("Сканирование уже идёт, пропускаем refresh")
             return
 
         self.refresh_indicator.setText("Сканирование…")
@@ -759,8 +731,9 @@ class SessionsWindow(QDialog):
 
     def _on_scan_failed(self, error: str) -> None:
         log.error("Сканирование сессий провалено: %s", error)
-        QMessageBox.warning(self, "Записи",
-                            f"Ошибка сканирования:\n{error}")
+        QMessageBox.warning(
+            self, "Записи", f"Ошибка сканирования:\n{error}"
+        )
 
     def _on_scan_thread_done(self) -> None:
         self.refresh_indicator.setText("")
@@ -770,20 +743,24 @@ class SessionsWindow(QDialog):
     def _update_summary(self) -> None:
         rows = self._rows
         total = len(rows)
-        processed = sum(1 for r in rows
-                        if r["status"] == STATUS_PROCESSED)
-        uploaded = sum(1 for r in rows
-                       if r["status"] == STATUS_UPLOADED)
-        in_progress = sum(1 for r in rows
-                          if r["status"] == STATUS_TRANSCRIBING)
-        errors = sum(1 for r in rows if r["status"] == STATUS_ERROR)
+        processed = sum(
+            1 for r in rows if r["status"] == STATUS_PROCESSED
+        )
+        uploaded = sum(
+            1 for r in rows if r["status"] == STATUS_UPLOADED
+        )
+        in_progress = sum(
+            1 for r in rows if r["status"] == STATUS_TRANSCRIBING
+        )
+        errors = sum(
+            1 for r in rows if r["status"] == STATUS_ERROR
+        )
 
         self.summary_label.setText(
             f"Всего: {total} | Обработан: {processed} | "
             f"Сохранено: {uploaded} | В обработке: {in_progress} | "
             f"Ошибок: {errors}"
         )
-        log.debug("Список записей обновлён: %d сессий", total)
         self._on_selection_changed()
 
     def _render_rows(self) -> None:
@@ -792,9 +769,15 @@ class SessionsWindow(QDialog):
             row = self.table.rowCount()
             self.table.insertRow(row)
 
-            self.table.setItem(row, 0, QTableWidgetItem(r["datetime"]))
-            self.table.setItem(row, 1, QTableWidgetItem(r["name"]))
-            self.table.setItem(row, 2, QTableWidgetItem(r["project"]))
+            self.table.setItem(
+                row, 0, QTableWidgetItem(r["datetime"])
+            )
+            self.table.setItem(
+                row, 1, QTableWidgetItem(r["name"])
+            )
+            self.table.setItem(
+                row, 2, QTableWidgetItem(r["project"])
+            )
 
             status_item = QTableWidgetItem(r["status"])
             if r["status"] == STATUS_ERROR:
@@ -812,14 +795,17 @@ class SessionsWindow(QDialog):
             }
             src = src_map.get(r["source"], r["source"] or "—")
             self.table.setItem(row, 4, QTableWidgetItem(src))
-            self.table.setItem(row, 5,
-                               QTableWidgetItem("да" if r["is_scrum"]
-                                                else "—"))
+            self.table.setItem(
+                row, 5,
+                QTableWidgetItem("да" if r["is_scrum"] else "—"),
+            )
 
             att_count = len(r.get("attachments", []) or [])
             self.table.setItem(
                 row, 6,
-                QTableWidgetItem(str(att_count) if att_count else "—")
+                QTableWidgetItem(
+                    str(att_count) if att_count else "—"
+                ),
             )
 
             summary_bb = (r.get("summary_bb") or "").strip()
@@ -833,14 +819,24 @@ class SessionsWindow(QDialog):
                 summary_item = QTableWidgetItem("—")
             self.table.setItem(row, 7, summary_item)
 
-            self.table.setItem(row, 8,
-                               QTableWidgetItem(r["task_id"] or "—"))
+            self.table.setItem(
+                row, 8,
+                QTableWidgetItem(r["task_id"] or "—"),
+            )
             self.table.setItem(row, 9, QTableWidgetItem(r["dir"]))
 
     # ------------------------------------------------------------------
     # Bitrix24
     # ------------------------------------------------------------------
     def _send_to_bitrix(self, default: str = "") -> None:
+        """
+        Открывает диалог отправки протокола/summary в Bitrix24.
+
+        ID чата выбирается в порядке приоритета:
+          1) config.default_chat_id (задано в Настройках);
+          2) чат проекта записи;
+          3) пусто — пользователь выберет вручную в диалоге.
+        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -849,7 +845,8 @@ class SessionsWindow(QDialog):
         if self.config_manager is None:
             QMessageBox.warning(
                 self, "Bitrix24",
-                "Нет доступа к настройкам — ConfigManager не передан.",
+                "Нет доступа к настройкам — ConfigManager "
+                "не передан.",
             )
             return
 
@@ -862,14 +859,30 @@ class SessionsWindow(QDialog):
             )
             return
 
+        # --- Выбор chat_id по приоритетам ---
+        chat_id = self.config_manager.get_default_chat_id()
         project = r.get("project") or ""
-        chat_id = self.config_manager.get_project_chat_id(project)
-        if not chat_id:
+
+        if chat_id:
             log.info(
-                "Для проекта «%s» не задан ID чата — "
-                "пользователь выберет получателя вручную",
-                project or "—",
+                "Bitrix24: используется чат по умолчанию из настроек "
+                "(%s) вместо чата проекта %r",
+                chat_id, project or "—",
             )
+        else:
+            chat_id = self.config_manager.get_project_chat_id(project)
+            if chat_id:
+                log.info(
+                    "Bitrix24: используется чат проекта «%s» (%s)",
+                    project, chat_id,
+                )
+            else:
+                log.info(
+                    "Для проекта «%s» не задан ID чата и не задан "
+                    "чат по умолчанию — пользователь выберет "
+                    "получателя вручную",
+                    project or "—",
+                )
 
         session_info = {
             "name": r.get("name") or "",
@@ -927,7 +940,9 @@ class SessionsWindow(QDialog):
             if existing and os.path.exists(existing):
                 initial_text = self._read_protocol_as_text(existing)
 
-        default_docx = os.path.join(r["dir"], "manual_protocol.docx")
+        default_docx = os.path.join(
+            r["dir"], "manual_protocol.docx"
+        )
 
         dlg = MarkdownEditorDialog(
             text=initial_text,
@@ -936,7 +951,6 @@ class SessionsWindow(QDialog):
             default_docx_path=default_docx,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            log.debug("Markdown-редактор протокола закрыт без сохранения")
             return
 
         new_text = dlg.result_text()
@@ -944,10 +958,10 @@ class SessionsWindow(QDialog):
         try:
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(new_text)
-            log.info("Markdown-протокол сохранён: %s (%d символов)",
-                     md_path, len(new_text))
         except Exception as exc:
-            log.exception("Не удалось записать %s: %s", md_path, exc)
+            log.exception(
+                "Не удалось записать %s: %s", md_path, exc
+            )
             QMessageBox.critical(
                 self, "Протокол",
                 f"Не удалось сохранить протокол:\n{exc}",
@@ -968,7 +982,8 @@ class SessionsWindow(QDialog):
         self.refresh()
         QMessageBox.information(
             self, "Протокол",
-            f"Протокол сохранён и прикреплён к записи:\n{md_path}\n\n"
+            f"Протокол сохранён и прикреплён к записи:\n"
+            f"{md_path}\n\n"
             "Чтобы получить .docx для отправки в чат — "
             "используйте «Протокол → Экспорт протокола в DOCX…».",
         )
@@ -1008,12 +1023,13 @@ class SessionsWindow(QDialog):
         if not md_text.strip():
             QMessageBox.warning(
                 self, "Экспорт в DOCX",
-                "Не удалось извлечь текст из исходного файла.\n"
-                "Поддерживаются .md, .txt, .docx, .pdf.",
+                "Не удалось извлечь текст из исходного файла.",
             )
             return
 
-        default_path = os.path.join(r["dir"], "manual_protocol.docx")
+        default_path = os.path.join(
+            r["dir"], "manual_protocol.docx"
+        )
         target, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить протокол как DOCX",
@@ -1039,25 +1055,27 @@ class SessionsWindow(QDialog):
             return
 
         attach = False
-        if os.path.abspath(target) == os.path.abspath(default_path):
-            session_json = os.path.join(r["dir"], "session.json")
+        if os.path.abspath(target) == os.path.abspath(
+            default_path
+        ):
+            session_json = os.path.join(
+                r["dir"], "session.json"
+            )
             meta = read_json_file(session_json) or {}
             meta["manual_protocol_path"] = target
             if self._write_json(session_json, meta):
                 attach = True
 
         if attach:
-            log.info("Протокол DOCX сохранён и прикреплён к записи: %s",
-                     target)
             QMessageBox.information(
                 self, "Экспорт в DOCX",
-                f"Документ сохранён и прикреплён к записи:\n{target}\n\n"
+                f"Документ сохранён и прикреплён к записи:\n"
+                f"{target}\n\n"
                 "Теперь его можно отправить в Bitrix24 через "
                 "«Bitrix24 → Отправить в чат…».",
             )
             self.refresh()
         else:
-            log.info("Протокол DOCX сохранён отдельно: %s", target)
             QMessageBox.information(
                 self, "Экспорт в DOCX",
                 f"Документ сохранён:\n{target}",
@@ -1095,29 +1113,34 @@ class SessionsWindow(QDialog):
             return
 
         if not os.path.isfile(file_path):
-            QMessageBox.warning(self, "Протокол",
-                                f"Файл не найден:\n{file_path}")
+            QMessageBox.warning(
+                self, "Протокол", f"Файл не найден:\n{file_path}"
+            )
             return
 
         ext = os.path.splitext(file_path)[1].lower() or ".bin"
-        target = os.path.join(r["dir"], f"manual_protocol{ext}")
+        target = os.path.join(
+            r["dir"], f"manual_protocol{ext}"
+        )
 
         try:
             shutil.copy2(file_path, target)
-            log.info("Ручной протокол скопирован: %s → %s",
-                     file_path, target)
         except Exception as exc:
             log.exception("Ошибка копирования протокола: %s", exc)
-            QMessageBox.critical(self, "Протокол",
-                                 f"Не удалось скопировать файл:\n{exc}")
+            QMessageBox.critical(
+                self, "Протокол",
+                f"Не удалось скопировать файл:\n{exc}",
+            )
             return
 
         session_json = os.path.join(r["dir"], "session.json")
         meta = read_json_file(session_json) or {}
         meta["manual_protocol_path"] = target
         if not self._write_json(session_json, meta):
-            QMessageBox.critical(self, "Протокол",
-                                 "Не удалось обновить session.json")
+            QMessageBox.critical(
+                self, "Протокол",
+                "Не удалось обновить session.json",
+            )
             return
 
         QMessageBox.information(
@@ -1135,16 +1158,13 @@ class SessionsWindow(QDialog):
         if not path or not os.path.exists(path):
             QMessageBox.information(
                 self, "Протокол",
-                "К этой записи не прикреплён ручной протокол.\n\n"
-                "Меню «Протокол» → «Создать/редактировать протокол "
-                "(Markdown)…» или «Прикрепить файл протокола…».",
+                "К этой записи не прикреплён ручной протокол.",
             )
             return
-        log.info("Открытие ручного протокола: %s", path)
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     # ------------------------------------------------------------------
-    # Summary (Markdown)
+    # Summary
     # ------------------------------------------------------------------
     def _edit_summary_bb(self) -> None:
         r = self._selected_row()
@@ -1158,7 +1178,6 @@ class SessionsWindow(QDialog):
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            log.debug("Markdown-редактор summary закрыт без сохранения")
             return
 
         new_text = dlg.result_text()
@@ -1173,16 +1192,14 @@ class SessionsWindow(QDialog):
             return
 
         try:
-            summary_md_path = os.path.join(r["dir"], "summary.md")
+            summary_md_path = os.path.join(
+                r["dir"], "summary.md"
+            )
             with open(summary_md_path, "w", encoding="utf-8") as f:
                 f.write(new_text)
-            log.info("Summary-Markdown сохранён: %s (%d символов)",
-                     summary_md_path, len(new_text))
         except Exception as exc:
             log.warning("Не удалось сохранить summary.md: %s", exc)
 
-        log.info("Summary обновлён для %s (%d символов)",
-                 r["dir"], len(new_text))
         self.refresh()
 
     def _view_summary(self) -> None:
@@ -1194,8 +1211,7 @@ class SessionsWindow(QDialog):
         if not text.strip():
             QMessageBox.information(
                 self, "Summary",
-                "У этой записи ещё нет краткого описания.\n\n"
-                "Меню «Summary» → «Изменить summary (Markdown)…»",
+                "У этой записи ещё нет краткого описания.",
             )
             return
         dlg = MarkdownViewerDialog(
@@ -1243,17 +1259,23 @@ class SessionsWindow(QDialog):
         try:
             if fmt == "docx":
                 markdown_to_docx(
-                    text_md, target_path, title=r.get("name") or ""
+                    text_md, target_path,
+                    title=r.get("name") or "",
                 )
             elif fmt == "html":
-                self._export_summary_html_md(text_md, target_path)
+                self._export_summary_html_md(
+                    text_md, target_path
+                )
             elif fmt == "md":
-                with open(target_path, "w", encoding="utf-8") as f:
+                with open(
+                    target_path, "w", encoding="utf-8"
+                ) as f:
                     f.write(text_md)
             else:
-                with open(target_path, "w", encoding="utf-8") as f:
+                with open(
+                    target_path, "w", encoding="utf-8"
+                ) as f:
                     f.write(markdown_to_plain(text_md))
-            log.info("Summary экспортирован (%s): %s", fmt, target_path)
             QMessageBox.information(
                 self, "Экспорт summary",
                 f"Файл сохранён:\n{target_path}",
@@ -1277,13 +1299,14 @@ class SessionsWindow(QDialog):
     @staticmethod
     def _safe_name(name: str) -> str:
         bad = '<>:"/\\|?*\n\r\t'
-        cleaned = "".join(("_" if c in bad else c)
-                          for c in (name or "summary"))
+        cleaned = "".join(
+            ("_" if c in bad else c) for c in (name or "summary")
+        )
         cleaned = cleaned.strip() or "summary"
         return cleaned[:60]
 
     # ------------------------------------------------------------------
-    # Быстрое сохранение промпта в «Загрузки»
+    # Быстрое сохранение промпта
     # ------------------------------------------------------------------
     @staticmethod
     def _downloads_dir() -> str:
@@ -1323,10 +1346,7 @@ class SessionsWindow(QDialog):
             QMessageBox.information(
                 self, "DeepSeek",
                 "Для этой записи промпт не сформирован.\n\n"
-                "Промпт создаётся при обработке, если в метаданных записи "
-                "включён флаг «Сформировать файл промпта для DeepSeek».\n\n"
-                "Если флаг не стоял — используйте «Очередь → "
-                "Редактировать метаданные и перезапустить…» (Ctrl+E).",
+                "Промпт создаётся при обработке.",
             )
             return
 
@@ -1363,22 +1383,22 @@ class SessionsWindow(QDialog):
             try:
                 shutil.copy2(src, dst)
                 saved.append(dst)
-                log.info("Промпт сохранён в Загрузки: %s → %s", src, dst)
             except Exception as exc:
-                log.exception("Ошибка сохранения промпта %s: %s", src, exc)
+                log.exception(
+                    "Ошибка сохранения промпта %s: %s", src, exc
+                )
                 errors.append(f"{base}: {exc}")
 
         if saved and not errors:
-            lines = "\n".join(saved)
             QMessageBox.information(
                 self, "DeepSeek",
-                f"Файлы промпта сохранены в «Загрузки»:\n\n{lines}",
+                f"Файлы промпта сохранены в «Загрузки»:\n\n"
+                + "\n".join(saved),
             )
         elif saved and errors:
             QMessageBox.warning(
                 self, "DeepSeek",
                 "Часть файлов сохранена, часть — с ошибкой:\n\n"
-                + "Сохранено:\n"
                 + "\n".join(saved)
                 + "\n\nОшибки:\n"
                 + "\n".join(errors),
@@ -1408,7 +1428,10 @@ class SessionsWindow(QDialog):
         try:
             entries = sorted(os.listdir(self.sessions_root))
         except OSError as exc:
-            log.error("Не удалось прочитать %s: %s", self.sessions_root, exc)
+            log.error(
+                "Не удалось прочитать %s: %s",
+                self.sessions_root, exc,
+            )
             return []
 
         result: List[str] = []
@@ -1491,17 +1514,14 @@ class SessionsWindow(QDialog):
         msg = (
             f"<b>Всего сессий:</b> {total}<br>"
             f"<b>Сессий с video.mp4:</b> {with_video}<br>"
-            f"<b>Сессий без аудио (удалять нельзя):</b> {without_audio}<br>"
-            f"<br>"
+            f"<b>Сессий без аудио (удалять нельзя):</b> "
+            f"{without_audio}<br><br>"
             f"<b>Можно удалить video.mp4:</b> {deletable} шт.<br>"
             f"<b>Освободится:</b> {total_size}"
         )
 
-        QMessageBox.information(self, "Размер видеофайлов", msg)
-        log.info(
-            "Статистика видеофайлов: всего сессий=%d, с видео=%d, "
-            "без аудио=%d, можно удалить=%d (%s)",
-            total, with_video, without_audio, deletable, total_size,
+        QMessageBox.information(
+            self, "Размер видеофайлов", msg
         )
 
     def _delete_video_files(self) -> None:
@@ -1511,10 +1531,7 @@ class SessionsWindow(QDialog):
         if not deletable:
             QMessageBox.information(
                 self, "Удаление видеофайлов",
-                "Нет сессий, где можно удалить video.mp4.\n\n"
-                "Удаляются только сессии, в которых уже есть аудиофайл "
-                "(video.mp3 / .aac / .wav / .opus / .ogg / .m4a).\n"
-                "Сессии без аудио не трогаются, чтобы не потерять запись.",
+                "Нет сессий, где можно удалить video.mp4.",
             )
             return
 
@@ -1525,7 +1542,8 @@ class SessionsWindow(QDialog):
         for i, item in enumerate(deletable):
             if i >= preview_limit:
                 preview_lines.append(
-                    f"… и ещё {len(deletable) - preview_limit} сессий"
+                    f"… и ещё "
+                    f"{len(deletable) - preview_limit} сессий"
                 )
                 break
             size_str = self._format_size(item["video_size"])
@@ -1534,11 +1552,11 @@ class SessionsWindow(QDialog):
         preview = "\n".join(preview_lines)
 
         msg = (
-            f"<b>Будет удалён video.mp4 из сессий:</b> {len(deletable)} шт.<br>"
+            f"<b>Будет удалён video.mp4 из сессий:</b> "
+            f"{len(deletable)} шт.<br>"
             f"<b>Освободится места:</b> {total_size_str}<br>"
             f"<br>"
             f"Аудиофайлы (video.mp3 и др.) <b>останутся</b>.<br>"
-            f"Сессии без аудио не трогаются.<br>"
             f"<br>"
             f"<b>Сессии к удалению:</b><br>"
             f"<pre style='font-family:monospace'>{preview}</pre>"
@@ -1551,11 +1569,11 @@ class SessionsWindow(QDialog):
             self,
             "Подтверждение удаления",
             msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
-            log.info("Удаление видеофайлов отменено пользователем")
             return
 
         progress = QProgressDialog(
@@ -1575,8 +1593,6 @@ class SessionsWindow(QDialog):
 
         for i, item in enumerate(deletable):
             if progress.wasCanceled():
-                log.warning("Удаление видеофайлов отменено пользователем "
-                            "на шаге %d/%d", i, len(deletable))
                 break
 
             video_path = item["video"]
@@ -1587,8 +1603,6 @@ class SessionsWindow(QDialog):
                 errors.append(
                     f"{item['name']}: аудио исчезло, пропуск"
                 )
-                log.warning("Пропуск %s: аудио исчезло перед удалением",
-                            video_path)
                 progress.setValue(i + 1)
                 continue
 
@@ -1596,11 +1610,8 @@ class SessionsWindow(QDialog):
                 os.remove(video_path)
                 removed += 1
                 freed_bytes += size
-                log.info("Удалён видеофайл: %s (%s)",
-                         video_path, self._format_size(size))
             except Exception as exc:
                 errors.append(f"{item['name']}: {exc}")
-                log.exception("Не удалось удалить %s: %s", video_path, exc)
 
             progress.setValue(i + 1)
 
@@ -1624,12 +1635,6 @@ class SessionsWindow(QDialog):
                 f"Освобождено: {freed_str}",
             )
 
-        log.info(
-            "Удаление видеофайлов завершено: удалено=%d, освобождено=%s, "
-            "ошибок=%d",
-            removed, freed_str, len(errors),
-        )
-
         self.refresh()
 
     # ------------------------------------------------------------------
@@ -1640,10 +1645,11 @@ class SessionsWindow(QDialog):
             return False
         try:
             self.task_queue.remove_task(task_id)
-            log.info("Задача %s удалена из очереди", task_id)
             return True
         except Exception as exc:
-            log.warning("Не удалось удалить задачу %s: %s", task_id, exc)
+            log.warning(
+                "Не удалось удалить задачу %s: %s", task_id, exc
+            )
             return False
 
     def _delete_processed_files(self, session_dir: str) -> None:
@@ -1653,9 +1659,10 @@ class SessionsWindow(QDialog):
             if os.path.exists(p):
                 try:
                     os.remove(p)
-                    log.info("Удалён файл: %s", p)
                 except Exception as exc:
-                    log.warning("Не удалось удалить %s: %s", p, exc)
+                    log.warning(
+                        "Не удалось удалить %s: %s", p, exc
+                    )
 
     def _remove_processed_artifacts(self, session_dir: str) -> None:
         patterns = [
@@ -1672,15 +1679,18 @@ class SessionsWindow(QDialog):
             if os.path.exists(p):
                 try:
                     os.remove(p)
-                    log.info("Удалён артефакт обработки: %s", p)
                 except Exception as exc:
-                    log.warning("Не удалось удалить %s: %s", p, exc)
+                    log.warning(
+                        "Не удалось удалить %s: %s", p, exc
+                    )
 
     def _enqueue_session(self, r: Dict[str, Any]) -> Optional[str]:
         if not os.path.exists(r["video_path"]):
             log.error("Видео не найдено: %s", r["video_path"])
             return None
-        meta = read_json_file(os.path.join(r["dir"], "session.json")) or {}
+        meta = read_json_file(
+            os.path.join(r["dir"], "session.json")
+        ) or {}
         meta["video_path"] = r["video_path"]
         meta["session_dir"] = r["dir"]
         meta.pop("task_id", None)
@@ -1688,8 +1698,6 @@ class SessionsWindow(QDialog):
             task_id = self.task_queue.add_task(
                 {"video_path": r["video_path"], "metadata": meta}
             )
-            log.info("Задача %s добавлена в очередь (session=%s)",
-                     task_id, r["dir"])
             return task_id
         except Exception as exc:
             log.exception("Не удалось добавить задачу: %s", exc)
@@ -1704,16 +1712,14 @@ class SessionsWindow(QDialog):
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
         if not r["video_path"] or not os.path.exists(r["video_path"]):
-            QMessageBox.warning(self, "Записи",
-                                f"Видео не найдено:\n{r['video_path']}")
+            QMessageBox.warning(
+                self, "Записи",
+                f"Видео не найдено:\n{r['video_path']}",
+            )
             return
         if QMessageBox.question(
             self, "Перезапустить обработку",
-            f"Запись «{r['name']}» будет обработана заново с текущими "
-            "параметрами:\n"
-            "• старая задача удалится из очереди,\n"
-            "• файлы video.mp3 / video.txt / deepseek_prompt.* удалятся,\n"
-            "• запись добавится в очередь заново.\n\nПродолжить?",
+            f"Запись «{r['name']}» будет обработана заново.",
         ) != QMessageBox.StandardButton.Yes:
             return
         if r["task_id"]:
@@ -1721,12 +1727,16 @@ class SessionsWindow(QDialog):
         self._remove_processed_artifacts(r["dir"])
         task_id = self._enqueue_session(r)
         if task_id:
-            QMessageBox.information(self, "Записи",
-                                    f"Запись добавлена в очередь: {task_id}")
+            QMessageBox.information(
+                self, "Записи",
+                f"Запись добавлена в очередь: {task_id}",
+            )
             self.refresh()
         else:
-            QMessageBox.critical(self, "Ошибка",
-                                 "Не удалось добавить запись в очередь")
+            QMessageBox.critical(
+                self, "Ошибка",
+                "Не удалось добавить запись в очередь",
+            )
 
     def _edit_metadata_and_restart(self) -> None:
         r = self._selected_row()
@@ -1734,7 +1744,9 @@ class SessionsWindow(QDialog):
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
 
-        if not r["video_path"] or not os.path.exists(r["video_path"]):
+        if not r["video_path"] or not os.path.exists(
+            r["video_path"]
+        ):
             QMessageBox.warning(
                 self, "Записи",
                 f"Видео не найдено:\n"
@@ -1745,7 +1757,7 @@ class SessionsWindow(QDialog):
         if self.config_manager is None:
             QMessageBox.warning(
                 self, "Записи",
-                "Нет доступа к настройкам — ConfigManager не передан.",
+                "Нет доступа к настройкам.",
             )
             return
 
@@ -1776,7 +1788,6 @@ class SessionsWindow(QDialog):
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            log.info("Редактирование метаданных отменено пользователем")
             return
 
         new_meta = dlg.result_data
@@ -1798,24 +1809,13 @@ class SessionsWindow(QDialog):
         reply = QMessageBox.question(
             self,
             "Перезапустить обработку",
-            f"Запись «{r['name']}» будет обработана заново с новыми "
-            f"параметрами:<br><br>"
-            f"• скрам-митинг: "
-            f"<b>{'да' if new_meta.get('is_scrum') else 'нет'}</b><br>"
-            f"• формировать summary: "
-            f"<b>{'да' if new_meta.get('generate_summary') else 'нет'}</b>"
-            f"<br>"
-            f"• сформировать промпт DeepSeek: "
-            f"<b>{'да' if new_meta.get('generate_deepseek_prompt') else 'нет'}</b>"
-            f"<br><br>"
-            f"Старые файлы обработки (video.txt, video.mp3, "
-            f"deepseek_prompt.*) будут удалены.<br><br>"
-            f"Продолжить?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            f"Запись «{r['name']}» будет обработана заново с "
+            f"новыми параметрами.<br><br>Продолжить?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if reply != QMessageBox.StandardButton.Yes:
-            log.info("Перезапуск с новыми метаданными отменён")
             return
 
         if not self._write_json(session_json, new_meta):
@@ -1824,14 +1824,6 @@ class SessionsWindow(QDialog):
                 "Не удалось сохранить session.json",
             )
             return
-        log.info(
-            "Метаданные записи обновлены: %s (is_scrum=%s, "
-            "generate_summary=%s, generate_deepseek=%s)",
-            r["dir"],
-            new_meta.get("is_scrum"),
-            new_meta.get("generate_summary"),
-            new_meta.get("generate_deepseek_prompt"),
-        )
 
         self._remove_processed_artifacts(r["dir"])
 
@@ -1845,8 +1837,8 @@ class SessionsWindow(QDialog):
         if not task_id:
             QMessageBox.critical(
                 self, "Записи",
-                "Метаданные сохранены, но не удалось поставить запись "
-                "в очередь. Проверьте лог.",
+                "Метаданные сохранены, но не удалось поставить "
+                "запись в очередь.",
             )
             return
 
@@ -1877,25 +1869,23 @@ class SessionsWindow(QDialog):
             if not replaced:
                 prompts.append({"name": name, "text": text})
             self.config_manager.save()
-            log.info(
-                "Промпт «%s» %s в библиотеку (%d символов)",
-                name, "обновлён" if replaced else "добавлен", len(text),
-            )
         except Exception as exc:
             log.exception("Ошибка сохранения промпта: %s", exc)
             raise
 
-    def _on_save_name_template(self, label: str, template: str) -> None:
+    def _on_save_name_template(
+        self, label: str, template: str,
+    ) -> None:
         try:
             label = (label or "").strip()
             template = (template or "").strip()
             if not template:
                 return
             self.config_manager.add_name_template(label, template)
-            log.info("Шаблон имени сохранён: label=%r, template=%r",
-                     label, template)
         except Exception as exc:
-            log.exception("Ошибка сохранения шаблона имени: %s", exc)
+            log.exception(
+                "Ошибка сохранения шаблона имени: %s", exc
+            )
             raise
 
     # ------------------------------------------------------------------
@@ -1908,20 +1898,15 @@ class SessionsWindow(QDialog):
             return
         confirm_msg = {
             STATUS_UPLOADED:
-                f"Сбросить статус «{r['name']}» в «Сохранено»?\n\n"
-                "• задача удалится из очереди,\n"
-                "• файлы video.mp3 / video.txt удалятся.",
+                f"Сбросить статус «{r['name']}» в «Сохранено»?",
             STATUS_PROCESSED:
-                f"Пометить «{r['name']}» как «Обработан»?\n\n"
-                "• задача удалится из очереди,\n"
-                "• файлы video.mp3 / video.txt останутся.",
+                f"Пометить «{r['name']}» как «Обработан»?",
             STATUS_ERROR:
-                f"Пометить «{r['name']}» как «Ошибка»?\n\n"
-                "• задача удалится из очереди,\n"
-                "• файлы видео и транскрипта останутся.",
+                f"Пометить «{r['name']}» как «Ошибка»?",
         }.get(new_status, f"Изменить статус на «{new_status}»?")
-        if QMessageBox.question(self, "Изменить статус", confirm_msg) != \
-                QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(
+            self, "Изменить статус", confirm_msg
+        ) != QMessageBox.StandardButton.Yes:
             return
         if r["task_id"]:
             self._remove_from_queue(r["task_id"])
@@ -1937,15 +1922,10 @@ class SessionsWindow(QDialog):
             if not (has_audio or has_txt):
                 QMessageBox.warning(
                     self, "Записи",
-                    "Не найдены video.mp3 или video.txt — файлы "
-                    "обработки отсутствуют.\n\nСтатус изменён не будет. "
-                    "Используйте «Перезапустить», если нужно обработать "
-                    "запись.",
+                    "Не найдены video.mp3 или video.txt.",
                 )
                 self.refresh()
                 return
-        log.info("Ручное изменение статуса %s: %s → %s",
-                 r["dir"], r["status"], new_status)
         self.refresh()
 
     def _enqueue_current(self) -> None:
@@ -1954,24 +1934,34 @@ class SessionsWindow(QDialog):
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
         if r["task_id"]:
-            QMessageBox.information(self, "Записи",
-                                    f"Запись уже в очереди: {r['task_id']}")
+            QMessageBox.information(
+                self, "Записи",
+                f"Запись уже в очереди: {r['task_id']}",
+            )
             return
-        if not r["video_path"] or not os.path.exists(r["video_path"]):
-            QMessageBox.warning(self, "Записи",
-                                f"Видео не найдено:\n{r['video_path']}")
+        if not r["video_path"] or not os.path.exists(
+            r["video_path"]
+        ):
+            QMessageBox.warning(
+                self, "Записи",
+                f"Видео не найдено:\n{r['video_path']}",
+            )
             return
         task_id = self._enqueue_session(r)
         if task_id:
-            QMessageBox.information(self, "Записи",
-                                    f"Запись добавлена в очередь: {task_id}")
+            QMessageBox.information(
+                self, "Записи",
+                f"Запись добавлена в очередь: {task_id}",
+            )
             self.refresh()
         else:
-            QMessageBox.critical(self, "Ошибка",
-                                 "Не удалось добавить запись в очередь")
+            QMessageBox.critical(
+                self, "Ошибка",
+                "Не удалось добавить запись в очередь",
+            )
 
     # ------------------------------------------------------------------
-    # Контекстное меню по правому клику
+    # Контекстное меню
     # ------------------------------------------------------------------
     def _show_context_menu(self, pos) -> None:
         r = self._selected_row()
@@ -1983,8 +1973,12 @@ class SessionsWindow(QDialog):
             self._edit_metadata_and_restart,
         )
         menu.addSeparator()
-        menu.addAction("Перезапустить обработку", self._restart_processing)
-        menu.addAction("Поставить в очередь", self._enqueue_current)
+        menu.addAction(
+            "Перезапустить обработку", self._restart_processing
+        )
+        menu.addAction(
+            "Поставить в очередь", self._enqueue_current
+        )
         menu.addSeparator()
         menu.addAction("Открыть папку записи", self._open_folder)
         menu.addAction("Открыть видео", self._open_video)
@@ -2010,14 +2004,9 @@ class SessionsWindow(QDialog):
         if not path or not os.path.exists(path):
             QMessageBox.information(
                 self, "DeepSeek",
-                "Для этой записи промпт не сформирован.\n\n"
-                "Промпт создаётся при обработке, если в метаданных записи "
-                "включён флаг «Сформировать файл промпта для DeepSeek».\n\n"
-                "Если флаг не стоял — используйте «Очередь → "
-                "Редактировать метаданные и перезапустить…» (Ctrl+E).",
+                "Для этой записи промпт не сформирован.",
             )
             return
-        log.info("Открытие DeepSeek-промпта: %s", path)
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _export_prompt(self) -> None:
@@ -2029,17 +2018,16 @@ class SessionsWindow(QDialog):
         if not path or not os.path.exists(path):
             QMessageBox.information(
                 self, "DeepSeek",
-                "Для этой записи промпт не сформирован.\n\n"
-                "Если флаг не стоял — используйте «Очередь → "
-                "Редактировать метаданные и перезапустить…» (Ctrl+E).",
+                "Для этой записи промпт не сформирован.",
             )
             return
 
         preferred = "docx"
         if self.config_manager is not None:
             try:
-                preferred = self.config_manager.get_scrum_settings().get(
-                    "export_format", "docx"
+                preferred = (
+                    self.config_manager.get_scrum_settings()
+                    .get("export_format", "docx")
                 )
             except Exception:
                 pass
@@ -2060,18 +2048,20 @@ class SessionsWindow(QDialog):
         text = read_any_text(path)
         if not text.strip():
             QMessageBox.warning(
-                self, "Экспорт",
-                "Не удалось прочитать промпт.",
+                self, "Экспорт", "Не удалось прочитать промпт.",
             )
             return
 
         base_name = os.path.splitext(os.path.basename(path))[0]
-        default_path = os.path.join(r["dir"], f"{base_name}.{fmt}")
+        default_path = os.path.join(
+            r["dir"], f"{base_name}.{fmt}"
+        )
         target_path, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить промпт как",
             default_path,
-            "Word (*.docx);;Markdown (*.md);;Text (*.txt);;All files (*)",
+            "Word (*.docx);;Markdown (*.md);;Text (*.txt);;"
+            "All files (*)",
         )
         if not target_path:
             return
@@ -2084,15 +2074,20 @@ class SessionsWindow(QDialog):
                     doc.add_paragraph(line)
                 doc.save(target_path)
             else:
-                with open(target_path, "w", encoding="utf-8") as f:
+                with open(
+                    target_path, "w", encoding="utf-8"
+                ) as f:
                     f.write(text)
-            log.info("Промпт экспортирован: %s", target_path)
-            QMessageBox.information(self, "Экспорт",
-                                    f"Файл сохранён:\n{target_path}")
+            QMessageBox.information(
+                self, "Экспорт",
+                f"Файл сохранён:\n{target_path}",
+            )
         except Exception as exc:
             log.exception("Ошибка сохранения промпта: %s", exc)
-            QMessageBox.critical(self, "Экспорт",
-                                 f"Не удалось сохранить: {exc}")
+            QMessageBox.critical(
+                self, "Экспорт",
+                f"Не удалось сохранить: {exc}",
+            )
 
     # ------------------------------------------------------------------
     # Вложения
@@ -2109,7 +2104,6 @@ class SessionsWindow(QDialog):
                 "У этой записи нет вложений.",
             )
             return
-        log.info("Открытие папки вложений: %s", att_dir)
         QDesktopServices.openUrl(QUrl.fromLocalFile(att_dir))
 
     def _add_attachment_to_session(self) -> None:
@@ -2145,30 +2139,30 @@ class SessionsWindow(QDialog):
                 stem, ext = os.path.splitext(base)
                 i = 1
                 while os.path.exists(dst):
-                    dst = os.path.join(att_dir, f"{stem}_{i}{ext}")
+                    dst = os.path.join(
+                        att_dir, f"{stem}_{i}{ext}"
+                    )
                     i += 1
             try:
                 shutil.copy2(src, dst)
                 current.append(dst)
                 added += 1
-                log.info("Добавлено вложение: %s → %s", src, dst)
             except Exception as exc:
-                log.exception("Ошибка копирования вложения %s: %s",
-                              src, exc)
+                log.exception(
+                    "Ошибка копирования вложения %s: %s", src, exc
+                )
 
         if added:
             meta["attachments"] = current
             if not self._write_json(session_json, meta):
-                QMessageBox.critical(self, "Ошибка",
-                                     "Не удалось обновить session.json")
+                QMessageBox.critical(
+                    self, "Ошибка",
+                    "Не удалось обновить session.json",
+                )
                 return
             QMessageBox.information(
                 self, "Вложения",
-                f"Добавлено файлов: {added}\n\n"
-                "Чтобы вложения попали в транскрибацию или промпт "
-                "DeepSeek, установите соответствующие флаги в "
-                "метаданных через «Очередь → Редактировать метаданные "
-                "и перезапустить…».",
+                f"Добавлено файлов: {added}",
             )
             self.refresh()
 
@@ -2188,10 +2182,11 @@ class SessionsWindow(QDialog):
             return
         folder = r["dir"]
         if not os.path.isdir(folder):
-            QMessageBox.warning(self, "Записи",
-                                f"Папка не найдена:\n{folder}")
+            QMessageBox.warning(
+                self, "Записи",
+                f"Папка не найдена:\n{folder}",
+            )
             return
-        log.info("Открытие папки сессии: %s", folder)
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def _open_video(self) -> None:
@@ -2201,10 +2196,11 @@ class SessionsWindow(QDialog):
             return
         video = r["video_path"]
         if not video or not os.path.exists(video):
-            QMessageBox.warning(self, "Записи",
-                                f"Видео не найдено:\n{video}")
+            QMessageBox.warning(
+                self, "Записи",
+                f"Видео не найдено:\n{video}",
+            )
             return
-        log.info("Открытие видео: %s", video)
         QDesktopServices.openUrl(QUrl.fromLocalFile(video))
 
     def _delete_session(self) -> None:
@@ -2214,7 +2210,8 @@ class SessionsWindow(QDialog):
             return
         if QMessageBox.question(
             self, "Удалить запись",
-            f"Удалить папку записи «{r['name']}» со всем содержимым?\n\n"
+            f"Удалить папку записи «{r['name']}» "
+            f"со всем содержимым?\n\n"
             f"{r['dir']}\n\nДействие необратимо.",
         ) != QMessageBox.StandardButton.Yes:
             return
@@ -2222,12 +2219,15 @@ class SessionsWindow(QDialog):
             self._remove_from_queue(r["task_id"])
         try:
             shutil.rmtree(r["dir"])
-            log.warning("Папка сессии удалена: %s", r["dir"])
             self.refresh()
         except Exception as exc:
-            log.exception("Не удалось удалить %s: %s", r["dir"], exc)
-            QMessageBox.critical(self, "Ошибка",
-                                 f"Не удалось удалить: {exc}")
+            log.exception(
+                "Не удалось удалить %s: %s", r["dir"], exc
+            )
+            QMessageBox.critical(
+                self, "Ошибка",
+                f"Не удалось удалить: {exc}",
+            )
 
     # ------------------------------------------------------------------
     # Справка
@@ -2237,7 +2237,7 @@ class SessionsWindow(QDialog):
             self,
             "Горячие клавиши",
             "Ctrl+I        — импорт материалов\n"
-            "Ctrl+M        — создать/редактировать протокол (Markdown)\n"
+            "Ctrl+M        — создать/редактировать протокол\n"
             "Ctrl+Shift+M  — экспорт протокола в DOCX\n"
             "Ctrl+B        — отправить протокол/summary в Bitrix24\n"
             "Ctrl+E        — редактировать метаданные и перезапустить\n"
@@ -2251,8 +2251,5 @@ class SessionsWindow(QDialog):
             "Ctrl+R        — перезапустить обработку\n"
             "F5            — обновить список\n"
             "Ctrl+Delete   — удалить запись\n"
-            "Ctrl+W        — закрыть окно\n"
-            "\n"
-            "Утилиты → «Удалить видеофайлы» — освободить место, "
-            "оставив только аудио (с подтверждением).",
+            "Ctrl+W        — закрыть окно",
         )
