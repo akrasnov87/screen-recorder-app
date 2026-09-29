@@ -10,14 +10,15 @@ from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
-    QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMenu, QMenuBar, QMessageBox, QProgressBar, QPushButton,
-    QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTextBrowser,
-    QVBoxLayout, QWidget,
+    QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMenu, QMenuBar, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
+    QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .library_search import (
-    SearchFilters, SearchHit, list_projects, search,
+    SearchFilters, SearchHit, build_prompt_from_hits, list_projects,
+    save_prompt_docx, save_prompt_markdown, search,
 )
 from .logger import get_logger
 from .tooltips import (
@@ -45,7 +46,15 @@ class SearchThread(QThread):
             def cb(cur: int, total: int) -> None:
                 self.progress.emit(cur, total)
 
-            hits = search(self.sessions_root, self.filters, progress_cb=cb)
+            def is_cancelled() -> bool:
+                return self.isInterruptionRequested()
+
+            hits = search(
+                self.sessions_root,
+                self.filters,
+                progress_cb=cb,
+                is_cancelled=is_cancelled,
+            )
             self.finished_ok.emit(hits)
         except Exception as exc:
             log.exception("Ошибка поиска: %s", exc)
@@ -79,7 +88,7 @@ class LibraryWindow(QDialog):
         self._thread: Optional[SearchThread] = None
 
         self.setWindowTitle("Библиотека — поиск по записям")
-        self.setMinimumSize(1280, 820)
+        self.setMinimumSize(1280, 860)
         self.setModal(False)
 
         self._build_ui()
@@ -246,7 +255,6 @@ class LibraryWindow(QDialog):
         # --- Сплиттер: слева результаты, справа превью ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Левая часть: заголовок с иконкой + таблица
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -293,7 +301,6 @@ class LibraryWindow(QDialog):
 
         splitter.addWidget(left_container)
 
-        # Правая часть: заголовок с иконкой + превью
         right_container = QWidget()
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -315,6 +322,9 @@ class LibraryWindow(QDialog):
 
         splitter.setSizes([760, 520])
         root.addWidget(splitter, 1)
+
+        # --- Панель формирования промпта ---
+        root.addWidget(self._build_prompt_panel())
 
         # --- Нижняя строка ---
         bottom = QHBoxLayout()
@@ -343,6 +353,332 @@ class LibraryWindow(QDialog):
         bottom.addWidget(self.close_btn)
 
         root.addLayout(bottom)
+
+    # ------------------------------------------------------------------
+    # Панель формирования промпта
+    # ------------------------------------------------------------------
+    def _build_prompt_panel(self) -> QWidget:
+        box = QGroupBox("Формирование промпта из результатов поиска")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(10, 6, 10, 8)
+        layout.setSpacing(6)
+
+        # --- Строка 1: параметры контекста ---
+        params_row = QHBoxLayout()
+
+        self.prompt_enabled_check = QCheckBox(
+            "Формировать промпт по совпадениям"
+        )
+        attach_tooltip(self.prompt_enabled_check, "lib_prompt_enabled")
+        self.prompt_enabled_check.setChecked(True)
+        params_row.addWidget(self.prompt_enabled_check)
+
+        params_row.addSpacing(16)
+
+        params_row.addWidget(QLabel("Контекст до:"))
+        self.prompt_before_spin = QSpinBox()
+        self.prompt_before_spin.setRange(0, 5000)
+        self.prompt_before_spin.setSingleStep(50)
+        self.prompt_before_spin.setValue(400)
+        self.prompt_before_spin.setSuffix(" симв.")
+        params_row.addWidget(
+            with_info(self.prompt_before_spin, "lib_prompt_before",
+                      stretch=False)
+        )
+
+        params_row.addSpacing(8)
+        params_row.addWidget(QLabel("после:"))
+        self.prompt_after_spin = QSpinBox()
+        self.prompt_after_spin.setRange(0, 5000)
+        self.prompt_after_spin.setSingleStep(50)
+        self.prompt_after_spin.setValue(400)
+        self.prompt_after_spin.setSuffix(" симв.")
+        params_row.addWidget(
+            with_info(self.prompt_after_spin, "lib_prompt_after",
+                      stretch=False)
+        )
+
+        params_row.addSpacing(16)
+        params_row.addWidget(QLabel("Максимум фрагментов:"))
+        self.prompt_max_spin = QSpinBox()
+        self.prompt_max_spin.setRange(1, 500)
+        self.prompt_max_spin.setValue(100)
+        params_row.addWidget(
+            with_info(self.prompt_max_spin, "lib_prompt_max",
+                      stretch=False)
+        )
+
+        params_row.addSpacing(16)
+        self.prompt_dedup_check = QCheckBox("Схлопывать дубликаты")
+        attach_tooltip(self.prompt_dedup_check, "lib_prompt_dedup")
+        self.prompt_dedup_check.setChecked(True)
+        params_row.addWidget(self.prompt_dedup_check)
+
+        params_row.addStretch()
+        layout.addLayout(params_row)
+
+        # --- Строка 2: инструкция ---
+        instr_row = QHBoxLayout()
+        instr_row.addWidget(QLabel("Инструкция для ИИ:"))
+        self.prompt_instruction_input = QPlainTextEdit()
+        self.prompt_instruction_input.setPlaceholderText(
+            "Например: проанализируй найденные фрагменты и составь "
+            "сводку по упоминаниям рисков с указанием дат и ответственных."
+        )
+        self.prompt_instruction_input.setFixedHeight(60)
+        instr_row.addWidget(
+            with_info(self.prompt_instruction_input, "lib_prompt_instruction"),
+            1,
+        )
+        layout.addLayout(instr_row)
+
+        # --- Строка 3: кнопки ---
+        btn_row = QHBoxLayout()
+
+        self.prompt_preview_btn = QPushButton("Показать промпт…")
+        self.prompt_preview_btn.setToolTip(
+            "Показать сформированный промпт в отдельном окне — "
+            "удобно проверить содержимое перед сохранением."
+        )
+        self.prompt_preview_btn.clicked.connect(self._preview_prompt)
+        btn_row.addWidget(self.prompt_preview_btn)
+
+        self.prompt_save_docx_btn = QPushButton("Скачать промпт (DOCX)…")
+        attach_tooltip(self.prompt_save_docx_btn, "lib_prompt_save_docx")
+        self.prompt_save_docx_btn.clicked.connect(self._save_prompt_docx)
+        btn_row.addWidget(self.prompt_save_docx_btn)
+
+        self.prompt_save_md_btn = QPushButton("Скачать промпт (Markdown)…")
+        attach_tooltip(self.prompt_save_md_btn, "lib_prompt_save_md")
+        self.prompt_save_md_btn.clicked.connect(self._save_prompt_md)
+        btn_row.addWidget(self.prompt_save_md_btn)
+
+        btn_row.addStretch()
+
+        self.prompt_info_label = QLabel(
+            "<span style='color:#666'>Промпт формируется из текущих "
+            "результатов поиска. Сначала выполните поиск.</span>"
+        )
+        self.prompt_info_label.setWordWrap(True)
+        btn_row.addWidget(self.prompt_info_label, 1)
+
+        layout.addLayout(btn_row)
+
+        # Связываем чекбокс с доступностью кнопок
+        self.prompt_enabled_check.toggled.connect(self._on_prompt_enabled_toggled)
+        self._on_prompt_enabled_toggled(self.prompt_enabled_check.isChecked())
+
+        return box
+
+    def _on_prompt_enabled_toggled(self, enabled: bool) -> None:
+        for w in (
+            self.prompt_before_spin,
+            self.prompt_after_spin,
+            self.prompt_max_spin,
+            self.prompt_dedup_check,
+            self.prompt_instruction_input,
+        ):
+            w.setEnabled(enabled)
+        self._update_prompt_buttons_state()
+
+    def _update_prompt_buttons_state(self) -> None:
+        enabled = (
+            self.prompt_enabled_check.isChecked() and bool(self._hits)
+        )
+        for btn in (
+            self.prompt_preview_btn,
+            self.prompt_save_docx_btn,
+            self.prompt_save_md_btn,
+        ):
+            btn.setEnabled(enabled)
+
+        if not self._hits:
+            self.prompt_info_label.setText(
+                "<span style='color:#666'>Промпт формируется из текущих "
+                "результатов поиска. Сначала выполните поиск.</span>"
+            )
+        else:
+            self.prompt_info_label.setText(
+                f"<span style='color:#666'>Доступно совпадений для "
+                f"промпта: <b>{len(self._hits)}</b>.</span>"
+            )
+
+    # ------------------------------------------------------------------
+    # Формирование промпта
+    # ------------------------------------------------------------------
+    def _build_prompt_text(self) -> str:
+        """
+        Собирает текст промпта по текущим результатам поиска.
+        Возвращает пустую строку, если нечего собирать.
+        """
+        if not self._hits:
+            return ""
+
+        query = self.query_input.text().strip()
+        instruction = self.prompt_instruction_input.toPlainText().strip()
+        before = self.prompt_before_spin.value()
+        after = self.prompt_after_spin.value()
+        max_hits = self.prompt_max_spin.value()
+        dedup = self.prompt_dedup_check.isChecked()
+
+        try:
+            text = build_prompt_from_hits(
+                hits=self._hits,
+                query=query,
+                user_instruction=instruction,
+                before_chars=before,
+                after_chars=after,
+                max_hits=max_hits,
+                deduplicate=dedup,
+                include_meta=True,
+            )
+        except Exception as exc:
+            log.exception("Ошибка сборки промпта: %s", exc)
+            QMessageBox.critical(
+                self, "Библиотека",
+                f"Не удалось сформировать промпт:\n{exc}",
+            )
+            return ""
+
+        if not text:
+            QMessageBox.warning(
+                self, "Библиотека",
+                "Не удалось извлечь контекст ни из одного совпадения.\n\n"
+                "Возможные причины:\n"
+                "  • файлы совпадений были перемещены или удалены;\n"
+                "  • в результатах только нечитаемые форматы.",
+            )
+            return ""
+
+        return text
+
+    def _preview_prompt(self) -> None:
+        """Показывает промпт в отдельном окне только для чтения."""
+        text = self._build_prompt_text()
+        if not text:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Промпт по результатам поиска")
+        dlg.setModal(True)
+        dlg.setMinimumSize(900, 700)
+
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Предпросмотр сформированного промпта. Текст можно "
+            "выделить и скопировать. Для сохранения файла закройте "
+            "окно и используйте кнопки «Скачать промпт»."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        # Рендерим как Markdown, чтобы было видно структуру
+        browser.setMarkdown(text)
+        layout.addWidget(browser, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        copy_btn = QPushButton("Скопировать в буфер")
+        def _copy():
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(text)
+            self.status_label.setText("Промпт скопирован в буфер обмена")
+        copy_btn.clicked.connect(_copy)
+        btn_row.addWidget(copy_btn)
+
+        close_btn = QPushButton("Закрыть")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+
+        layout.addLayout(btn_row)
+        dlg.exec()
+
+    def _default_prompt_filename(self, ext: str) -> str:
+        """Формирует имя файла промпта с датой и временем."""
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        return os.path.join(
+            os.path.expanduser("~"),
+            f"prompt_search_{stamp}.{ext}",
+        )
+
+    def _save_prompt_docx(self) -> None:
+        text = self._build_prompt_text()
+        if not text:
+            return
+
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить промпт как DOCX",
+            self._default_prompt_filename("docx"),
+            "Документы Word (*.docx);;Все файлы (*)",
+        )
+        if not target:
+            return
+        if not target.lower().endswith(".docx"):
+            target += ".docx"
+
+        try:
+            save_prompt_docx(text, target,
+                             title="Промпт по результатам поиска")
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Сохранение промпта",
+                f"Не удалось сохранить DOCX:\n{exc}",
+            )
+            return
+
+        log.info("Промпт сохранён (DOCX): %s", target)
+        self.status_label.setText(f"Промпт сохранён: {target}")
+
+        reply = QMessageBox.question(
+            self, "Промпт сохранён",
+            f"Документ сохранён:\n{target}\n\nОткрыть его сейчас?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(target))
+
+    def _save_prompt_md(self) -> None:
+        text = self._build_prompt_text()
+        if not text:
+            return
+
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить промпт как Markdown",
+            self._default_prompt_filename("md"),
+            "Markdown (*.md);;Все файлы (*)",
+        )
+        if not target:
+            return
+        if not target.lower().endswith(".md"):
+            target += ".md"
+
+        try:
+            save_prompt_markdown(text, target)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Сохранение промпта",
+                f"Не удалось сохранить Markdown:\n{exc}",
+            )
+            return
+
+        log.info("Промпт сохранён (Markdown): %s", target)
+        self.status_label.setText(f"Промпт сохранён: {target}")
+
+        reply = QMessageBox.question(
+            self, "Промпт сохранён",
+            f"Файл сохранён:\n{target}\n\nОткрыть его сейчас?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(target))
 
     # ------------------------------------------------------------------
     # Даты по умолчанию
@@ -414,6 +750,7 @@ class LibraryWindow(QDialog):
         self.search_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.status_label.setText("Поиск…")
+        self._update_prompt_buttons_state()
 
         log.info(
             "Поиск: query=%r, проекты=%s, даты=%s..%s, "
@@ -437,8 +774,7 @@ class LibraryWindow(QDialog):
         if self._thread is not None and self._thread.isRunning():
             log.info("Запрошена отмена поиска")
             self._thread.requestInterruption()
-            self._thread.quit()
-            self._thread.wait(2000)
+            self._thread.wait(3000)
         self._on_search_cancelled()
 
     def _on_search_progress(self, cur: int, total: int) -> None:
@@ -450,15 +786,18 @@ class LibraryWindow(QDialog):
         self._hits = list(hits or [])
         self._render_hits()
         self._on_search_done(len(self._hits))
+        self._update_prompt_buttons_state()
 
     def _on_search_failed(self, error: str) -> None:
         log.error("Поиск провален: %s", error)
         QMessageBox.critical(self, "Библиотека", f"Ошибка поиска:\n{error}")
         self._on_search_done(-1)
+        self._update_prompt_buttons_state()
 
     def _on_search_cancelled(self) -> None:
         log.info("Поиск отменён пользователем")
         self._on_search_done(-1)
+        self._update_prompt_buttons_state()
 
     def _on_search_done(self, count: int) -> None:
         self.progress.setVisible(False)
@@ -647,5 +986,14 @@ class LibraryWindow(QDialog):
             "  • 100% — только точные слова.\n\n"
             "Фильтры по проекту и датам сужают область поиска, что "
             "ускоряет работу на больших архивах.\n\n"
-            "Двойной клик по результату открывает папку записи.",
+            "Кнопка «Стоп» прерывает поиск немедленно — "
+            "будут показаны уже найденные результаты.\n\n"
+            "Двойной клик по результату открывает папку записи.\n\n"
+            "---\n\n"
+            "Формирование промпта:\n"
+            "Из результатов поиска можно собрать структурированный "
+            "промпт для ИИ — с расширенным контекстом до и после "
+            "каждого совпадения. Промпт можно сохранить в DOCX или "
+            "Markdown. Полезно для задач вида «найди все упоминания "
+            "рисков и составь сводку».",
         )

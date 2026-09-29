@@ -7,16 +7,20 @@
     (старые записи, где summary_bb хранился как BB).
   • Нечёткий поиск (fuzzy) для стенограмм, устойчивый к опечаткам.
   • Фильтры по проекту, датам и области поиска.
+  • Поддержка отмены: search() принимает callable `is_cancelled`.
+  • Формирование промпта: extract_hit_context() + build_prompt_from_hits()
+    позволяют собрать из найденных совпадений структурированный
+    текст с расширенным контекстом — для передачи в ИИ.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .logger import get_logger
 
@@ -125,7 +129,6 @@ def _parse_session_date(session_dir: str, meta: Dict[str, Any]) -> Optional[date
     date_str = meta.get("date") or ""
     name = os.path.basename(session_dir)
     if not date_str:
-        # имя папки: 2026-09-25_14-30-00
         m = re.match(r"(\d{4}-\d{2}-\d{2})", name)
         if m:
             date_str = m.group(1)
@@ -161,15 +164,14 @@ def list_projects(sessions_root: str) -> List[str]:
 # Нормализация и токенизация
 # ---------------------------------------------------------------------------
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
-_WORD_SEP_RE = re.compile(r"\s+")
 
 
 def _normalize_word(w: str) -> str:
-    """Lowercase, убираем пунктуацию. Для fuzzy-сравнения — ещё и
-    схлопываем повторяющиеся буквы (опечатки типа 'оооочень')."""
+    """
+    Lowercase + схлопывание повторяющихся букв (устойчивость к
+    растяжкам типа «оооочень»).
+    """
     w = w.lower().strip()
-    w = _TOKEN_RE.sub("", w) if not _TOKEN_RE.match(w) else w
-    # схлопываем 3+ одинаковые буквы в 1 (устойчивость к растяжкам)
     w = re.sub(r"(.)\1{2,}", r"\1", w)
     return w
 
@@ -220,27 +222,18 @@ def _fuzzy_search_words(
     """
     Fuzzy-поиск по отдельным словам запроса.
 
-    Возвращает список:
-        (score, start, end, snippet, matched_words_count)
-
-    Алгоритм: разбиваем текст на слова с сохранением позиций, каждое
-    слово нормализуем. Для каждого слова запроса ищем лучший матч среди
-    слов текста через SequenceMatcher. Если схожесть >= threshold —
-    считаем слово найденным.
+    Возвращает список: (score, start, end, snippet, matched_words_count).
     """
     q_words = [w for w in _tokenize(query) if len(w) >= 3]
     if not q_words:
         return []
 
-    # word -> list[(start, end)]
     word_positions: List[Tuple[str, int, int]] = []
     for m in _TOKEN_RE.finditer(text):
         w = _normalize_word(m.group())
         if w:
             word_positions.append((w, m.start(), m.end()))
 
-    # Для каждого слова запроса ищем лучшие совпадения
-    # score_per_word[word_idx] = (best_score, best_start, best_end)
     matched_per_word: List[List[Tuple[float, int, int]]] = [[] for _ in q_words]
 
     for wi, qw in enumerate(q_words):
@@ -249,11 +242,7 @@ def _fuzzy_search_words(
             if r >= threshold:
                 matched_per_word[wi].append((r, s, e))
 
-    # Объединяем по близким позициям: если слова запроса встречаются рядом,
-    # это более сильное совпадение.
-    # Упрощённо: собираем все совпадения, группируем по «окну» 200 символов,
-    # для каждой группы считаем score = среднее * (matched_words / total_words)
-    all_matches: List[Tuple[float, int, int, int]] = []  # score, s, e, word_idx
+    all_matches: List[Tuple[float, int, int, int]] = []
     for wi, matches in enumerate(matched_per_word):
         for r, s, e in matches:
             all_matches.append((r, s, e, wi))
@@ -261,7 +250,7 @@ def _fuzzy_search_words(
     if not all_matches:
         return []
 
-    all_matches.sort(key=lambda x: x[1])  # по позиции
+    all_matches.sort(key=lambda x: x[1])
 
     grouped: List[List[Tuple[float, int, int, int]]] = []
     cur: List[Tuple[float, int, int, int]] = []
@@ -279,7 +268,6 @@ def _fuzzy_search_words(
     for group in grouped:
         words_found = {m[3] for m in group}
         if len(words_found) < max(1, total_q // 2):
-            # должно совпасть хотя бы половина слов запроса
             continue
         avg = sum(m[0] for m in group) / len(group)
         coverage = len(words_found) / total_q
@@ -299,9 +287,8 @@ def _search_in_text(
     context_chars: int,
 ) -> List[Tuple[float, str, str]]:
     """
-    Ищет в тексте. Сначала — точные совпадения. Если их нет или мало —
+    Ищет в тексте. Сначала — точные совпадения. Если их нет —
     добавляет fuzzy-совпадения.
-    Возвращает список (score, snippet, match_kind).
     """
     results: List[Tuple[float, str, str]] = []
 
@@ -311,7 +298,6 @@ def _search_in_text(
 
     if not exact:
         fuzzy = _fuzzy_search_words(text, query, fuzzy_threshold, context_chars)
-        # дедуп по началу сниппета
         seen = set()
         for score, _s, _e, snippet, _wc in fuzzy:
             key = snippet[:80]
@@ -320,7 +306,6 @@ def _search_in_text(
             seen.add(key)
             results.append((score, snippet, "fuzzy"))
 
-    # сортируем по score убыв.
     results.sort(key=lambda x: x[0], reverse=True)
     return results
 
@@ -331,12 +316,11 @@ def _search_in_text(
 def search(
     sessions_root: str,
     filters: SearchFilters,
-    progress_cb=None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> List[SearchHit]:
     """
     Ищет по всем сессиям в sessions_root согласно фильтрам.
-
-    progress_cb(current, total) — необязательный колбэк для UI.
     """
     query = (filters.query or "").strip()
     if not query:
@@ -347,6 +331,18 @@ def search(
     hits: List[SearchHit] = []
 
     for i, session_dir in enumerate(sessions):
+        if is_cancelled is not None:
+            try:
+                if is_cancelled():
+                    log.info(
+                        "Поиск прерван пользователем: обработано %d/%d сессий, "
+                        "найдено %d hits",
+                        i, total, len(hits),
+                    )
+                    break
+            except Exception as exc:
+                log.warning("Ошибка в is_cancelled: %s", exc)
+
         if progress_cb is not None:
             try:
                 progress_cb(i, total)
@@ -358,12 +354,10 @@ def search(
 
         meta = _load_session_meta(session_dir)
 
-        # --- Фильтр по проекту ---
         if filters.project:
             if (meta.get("project") or "") != filters.project:
                 continue
 
-        # --- Фильтр по дате ---
         sdate = _parse_session_date(session_dir, meta)
         if filters.date_from and sdate and sdate.date() < filters.date_from.date():
             continue
@@ -374,7 +368,6 @@ def search(
         project = meta.get("project") or ""
         date_str = sdate.strftime("%Y-%m-%d") if sdate else ""
 
-        # --- Стенограмма ---
         if filters.search_transcripts:
             for fname in _TRANSCRIPT_NAMES:
                 fp = os.path.join(session_dir, fname)
@@ -401,7 +394,6 @@ def search(
                     if len(hits) >= filters.max_results:
                         break
 
-        # --- Протоколы (ручной, deepseek_prompt, protocol.*) ---
         if filters.search_protocols:
             for fname in _PROTOCOL_PATTERNS:
                 fp = os.path.join(session_dir, fname)
@@ -428,10 +420,6 @@ def search(
                     if len(hits) >= filters.max_results:
                         break
 
-        # --- Summary из session.json ---
-        # В поле summary_bb может лежать Markdown (новые записи)
-        # или BB-код (старые). markdown_to_plain_with_bb корректно
-        # снимет оба варианта разметки.
         if filters.search_summaries:
             summary_bb = str(meta.get("summary_bb") or "").strip()
             if summary_bb:
@@ -455,7 +443,6 @@ def search(
                     if len(hits) >= filters.max_results:
                         break
 
-        # --- Вложения ---
         if filters.search_attachments:
             att_dir = os.path.join(session_dir, "attachments")
             if os.path.isdir(att_dir):
@@ -490,6 +477,374 @@ def search(
         except Exception:
             pass
 
-    # Сортируем: сначала по дате (новые сверху), потом по score
     hits.sort(key=lambda h: (h.date, h.score), reverse=True)
     return hits
+
+
+# ---------------------------------------------------------------------------
+# Формирование промпта из найденных совпадений
+# ---------------------------------------------------------------------------
+@dataclass
+class PromptContext:
+    """Расширенный контекст одного совпадения для промпта."""
+    hit: SearchHit
+    before_text: str
+    after_text: str
+    full_context: str           # before + найденное + after, с маркерами
+    match_start_in_full: int    # позиция совпадения внутри full_context
+    match_end_in_full: int
+    truncated_before: bool      # был ли обрезан левый край
+    truncated_after: bool       # был ли обрезан правый край
+    dedup_key: str = ""         # ключ для схлопывания дубликатов
+
+
+def _find_match_position(text: str, query: str,
+                         case_sensitive: bool = False) -> Tuple[int, int]:
+    """
+    Возвращает (start, end) первого точного вхождения query в text.
+    Если точного вхождения нет — возвращает (-1, -1).
+    """
+    if not query:
+        return -1, -1
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        m = re.search(re.escape(query), text, flags)
+    except re.error:
+        return -1, -1
+    if not m:
+        return -1, -1
+    return m.start(), m.end()
+
+
+def extract_hit_context(
+    hit: SearchHit,
+    query: str,
+    before_chars: int = 400,
+    after_chars: int = 400,
+) -> Optional[PromptContext]:
+    """
+    Извлекает расширенный контекст вокруг совпадения.
+
+    Args:
+        hit:          найденное совпадение (SearchHit).
+        query:        поисковый запрос — используется, чтобы найти
+                      точную позицию совпадения в исходном тексте.
+        before_chars: сколько символов включить до совпадения.
+        after_chars:  сколько символов включить после совпадения.
+
+    Returns:
+        PromptContext или None, если исходный текст/совпадение
+        не удалось прочитать.
+    """
+    if not hit.file_path or not os.path.exists(hit.file_path):
+        log.warning("Файл совпадения не найден: %s", hit.file_path)
+        return None
+
+    # session.json в качестве источника — читаем summary_bb из meta
+    if hit.source == "summary" and hit.file_path.endswith("session.json"):
+        meta = _load_session_meta(hit.session_dir)
+        raw = str(meta.get("summary_bb") or "")
+        if not raw:
+            return None
+        from .markdown_to_bitrix import markdown_to_plain_with_bb
+        text = markdown_to_plain_with_bb(raw)
+    else:
+        text = _read_text_safe(hit.file_path)
+
+    if not text:
+        return None
+
+    # Ищем позицию вхождения.
+    # Для точных совпадений — сразу query.
+    # Для fuzzy — ищем по первому слову запроса (эвристика).
+    start, end = _find_match_position(text, query)
+    if start < 0:
+        # Fallback: ищем первое длинное слово запроса
+        tokens = [t for t in _tokenize(query) if len(t) >= 3]
+        for tok in tokens:
+            start, end = _find_match_position(text, tok)
+            if start >= 0:
+                break
+    if start < 0:
+        # Совсем не нашли — берём начало файла
+        start, end = 0, min(len(text), 200)
+
+    # Границы контекста
+    left = max(0, start - before_chars)
+    right = min(len(text), end + after_chars)
+
+    before_text = text[left:start]
+    after_text = text[end:right]
+
+    full = text[left:right]
+
+    # Смещение совпадения внутри full (для подсветки при желании)
+    match_start_in_full = start - left
+    match_end_in_full = end - left
+
+    # Ключ для дедупликации — комбинация «файл + совпадение вокруг»
+    # Используем первые 100 символов до и после, нормализованные.
+    norm_before = re.sub(r"\s+", " ", before_text[-80:]).strip().lower()
+    norm_after = re.sub(r"\s+", " ", after_text[:80]).strip().lower()
+    dedup_key = f"{hit.file_path}|{norm_before}|{norm_after}"
+
+    return PromptContext(
+        hit=hit,
+        before_text=before_text,
+        after_text=after_text,
+        full_context=full,
+        match_start_in_full=match_start_in_full,
+        match_end_in_full=match_end_in_full,
+        truncated_before=(left > 0),
+        truncated_after=(right < len(text)),
+        dedup_key=dedup_key,
+    )
+
+
+def _deduplicate_contexts(
+    contexts: List[PromptContext],
+    overlap_ratio: float = 0.7,
+) -> List[PromptContext]:
+    """
+    Схлопывает контексты, которые сильно пересекаются.
+
+    Если два контекста из одного файла имеют общий фрагмент больше
+    overlap_ratio от длины меньшего — оставляем тот, у которого
+    score выше (или первый, если равны).
+    """
+    by_file: Dict[str, List[PromptContext]] = {}
+    for c in contexts:
+        by_file.setdefault(c.hit.file_path, []).append(c)
+
+    result: List[PromptContext] = []
+    for fpath, ctxs in by_file.items():
+        # Сортируем по score (убыв.), чтобы первыми шли самые релевантные
+        ctxs_sorted = sorted(ctxs, key=lambda x: x.hit.score, reverse=True)
+        kept: List[PromptContext] = []
+        for c in ctxs_sorted:
+            is_dup = False
+            for k in kept:
+                # Сравниваем тексты контекстов
+                a, b = c.full_context, k.full_context
+                if not a or not b:
+                    continue
+                # Быстрая проверка: общая подстрока (используем
+                # SequenceMatcher по первым 500 символам — это быстро)
+                sample_a = a[:500]
+                sample_b = b[:500]
+                r = SequenceMatcher(None, sample_a, sample_b).ratio()
+                if r >= overlap_ratio:
+                    is_dup = True
+                    break
+            if not is_dup:
+                kept.append(c)
+        result.extend(kept)
+
+    # Сохраняем исходный порядок (по дате/score из hits)
+    order = {id(c): i for i, c in enumerate(contexts)}
+    result.sort(key=lambda c: order.get(id(c), 0))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Сборка промпта
+# ---------------------------------------------------------------------------
+_SOURCE_RU = {
+    "transcript": "стенограмма",
+    "protocol": "протокол",
+    "summary": "краткое описание",
+    "attachment": "вложение",
+}
+
+
+def build_prompt_from_hits(
+    hits: List[SearchHit],
+    query: str,
+    user_instruction: str = "",
+    before_chars: int = 400,
+    after_chars: int = 400,
+    max_hits: int = 100,
+    deduplicate: bool = True,
+    include_meta: bool = True,
+) -> str:
+    """
+    Собирает структурированный текст промпта из найденных совпадений.
+
+    Args:
+        hits:             список SearchHit из search().
+        query:            исходный поисковый запрос.
+        user_instruction: инструкция для ИИ (что делать с фрагментами).
+        before_chars:     сколько символов до совпадения включать.
+        after_chars:      сколько символов после совпадения включать.
+        max_hits:         лимит количества совпадений в промпте.
+        deduplicate:      схлопывать ли пересекающиеся контексты.
+        include_meta:     включать ли шапку с параметрами поиска.
+
+    Returns:
+        Готовый текст промпта (Markdown).
+    """
+    if not hits:
+        return ""
+
+    log.info(
+        "Сборка промпта: hits=%d, query=%r, before=%d, after=%d, "
+        "max=%d, dedup=%s, meta=%s",
+        len(hits), query, before_chars, after_chars,
+        max_hits, deduplicate, include_meta,
+    )
+
+    # --- Извлекаем контексты ---
+    contexts: List[PromptContext] = []
+    for h in hits[:max_hits]:
+        ctx = extract_hit_context(
+            h, query=query,
+            before_chars=before_chars,
+            after_chars=after_chars,
+        )
+        if ctx is not None:
+            contexts.append(ctx)
+
+    if not contexts:
+        log.warning("Не удалось извлечь ни одного контекста из hits")
+        return ""
+
+    # --- Дедупликация ---
+    if deduplicate:
+        before = len(contexts)
+        contexts = _deduplicate_contexts(contexts)
+        log.info("Дедупликация: %d → %d контекстов", before, len(contexts))
+
+    # --- Группировка по записям/файлам ---
+    grouped: Dict[Tuple[str, str], List[PromptContext]] = {}
+    for c in contexts:
+        key = (c.hit.session_name, c.hit.file_path)
+        grouped.setdefault(key, []).append(c)
+
+    # --- Собираем текст ---
+    parts: List[str] = []
+
+    # 1. Шапка
+    if include_meta:
+        parts.append("# Промпт по результатам поиска")
+        parts.append("")
+        parts.append(f"**Поисковый запрос:** `{query}`")
+        parts.append("")
+        parts.append(f"**Найдено совпадений:** {len(contexts)}")
+        parts.append(f"**Уникальных источников:** {len(grouped)}")
+        parts.append(
+            f"**Контекст:** {before_chars} символов до, "
+            f"{after_chars} символов после"
+        )
+        parts.append("")
+
+        # Список источников
+        parts.append("## Источники")
+        parts.append("")
+        for i, ((sname, fpath), ctxs) in enumerate(grouped.items(), start=1):
+            src_label = _SOURCE_RU.get(ctxs[0].hit.source, ctxs[0].hit.source)
+            date = ctxs[0].hit.date or "—"
+            project = ctxs[0].hit.project or "—"
+            file_label = ctxs[0].hit.file_label
+            parts.append(
+                f"{i}. **{sname}** — {date}, проект: {project} "
+                f"({src_label}, файл: `{file_label}`, "
+                f"совпадений: {len(ctxs)})"
+            )
+        parts.append("")
+
+    # 2. Инструкция пользователя
+    if user_instruction and user_instruction.strip():
+        parts.append("## Инструкция для ИИ")
+        parts.append("")
+        parts.append(user_instruction.strip())
+        parts.append("")
+
+    # 3. Тело — совпадения по группам
+    parts.append("## Найденные фрагменты")
+    parts.append("")
+
+    for i, ((sname, fpath), ctxs) in enumerate(grouped.items(), start=1):
+        src_label = _SOURCE_RU.get(ctxs[0].hit.source, ctxs[0].hit.source)
+        date = ctxs[0].hit.date or "—"
+        project = ctxs[0].hit.project or "—"
+        file_label = ctxs[0].hit.file_label
+
+        parts.append(f"### Источник {i}: {sname}")
+        parts.append("")
+        parts.append(
+            f"*Дата:* {date} · *Проект:* {project} · "
+            f"*Тип:* {src_label} · *Файл:* `{file_label}`"
+        )
+        parts.append("")
+
+        for j, c in enumerate(ctxs, start=1):
+            kind_label = (
+                "точное совпадение" if c.hit.match_kind == "exact"
+                else f"нечёткое совпадение (fuzzy, {int(c.hit.score * 100)}%)"
+            )
+            parts.append(f"**Фрагмент {j}** — {kind_label}")
+            parts.append("")
+
+            # Маркеры обрезки
+            prefix_marker = "…\n" if c.truncated_before else ""
+            suffix_marker = "\n…" if c.truncated_after else ""
+
+            # Сам текст фрагмента. Оборачиваем в блок кода, чтобы
+            # сохранить переводы строк и избежать случайного
+            # форматирования Markdown внутри текста.
+            fragment = c.full_context.strip()
+            # Схлопываем более 2 пустых строк подряд
+            fragment = re.sub(r"\n{3,}", "\n\n", fragment)
+
+            parts.append("```")
+            if prefix_marker:
+                parts.append(prefix_marker.rstrip("\n"))
+            parts.append(fragment)
+            if suffix_marker:
+                parts.append(suffix_marker.lstrip("\n"))
+            parts.append("```")
+            parts.append("")
+
+    parts.append("---")
+    parts.append("")
+    parts.append(
+        "*Промпт сформирован автоматически из результатов поиска. "
+        f"Всего фрагментов: {len(contexts)}.*"
+    )
+
+    result = "\n".join(parts)
+    log.info("Промпт собран: %d символов, %d строк",
+             len(result), result.count("\n") + 1)
+    return result
+
+
+def save_prompt_docx(prompt_text: str, output_path: str,
+                     title: str = "Промпт по результатам поиска") -> str:
+    """
+    Сохраняет промпт в .docx.
+
+    Использует markdown_to_docx для сохранения структуры
+    (заголовки, жирный текст, блоки кода).
+    """
+    from .markdown_docx import markdown_to_docx
+
+    try:
+        markdown_to_docx(prompt_text, output_path, title=title)
+    except Exception as exc:
+        log.exception("Не удалось сохранить промпт в .docx: %s", exc)
+        raise
+
+    log.info("Промпт сохранён в DOCX: %s", output_path)
+    return output_path
+
+
+def save_prompt_markdown(prompt_text: str, output_path: str) -> str:
+    """Сохраняет промпт в .md."""
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(prompt_text)
+    except Exception as exc:
+        log.exception("Не удалось сохранить промпт в .md: %s", exc)
+        raise
+    log.info("Промпт сохранён в Markdown: %s", output_path)
+    return output_path

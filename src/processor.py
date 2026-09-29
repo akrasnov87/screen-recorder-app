@@ -37,7 +37,10 @@ class VideoProcessor(QObject):
         self.config = config or {}
         self.task_queue = task_queue
         self._is_recording_cb = is_recording_cb
-        self._cancelled: set[str] = set()
+        # Отмена теперь через asyncio.Event — её можно взять
+        # и передать в TranscribeClient._poll, и проверить
+        # между шагами конвейера.
+        self._cancel_events: Dict[str, asyncio.Event] = {}
         self._running = False
         self._last_retry_check = 0.0
         log.info("VideoProcessor инициализирован "
@@ -54,6 +57,12 @@ class VideoProcessor(QObject):
                 "video_path": video_path, "metadata": metadata,
             })
             metadata["task_id"] = task_id
+
+        # Регистрируем событие отмены ДО старта шагов,
+        # чтобы cancel_processing, вызванный сразу после старта,
+        # не потерялся.
+        cancel_event = asyncio.Event()
+        self._cancel_events[task_id] = cancel_event
 
         log.info("=" * 60)
         log.info("Начало обработки задачи %s", task_id)
@@ -88,13 +97,13 @@ class VideoProcessor(QObject):
 
             t1 = time.monotonic()
             audio_path = await self.convert_to_audio(
-                video_path, audio_fmt, audio_bitrate
+                video_path, audio_fmt, audio_bitrate,
+                cancel_event=cancel_event,
             )
             log.info("[%s] Конвертация завершена за %.1f с: %s",
                      task_id, time.monotonic() - t1, audio_path)
 
-            if self._is_cancelled(task_id):
-                raise RuntimeError("cancelled")
+            self._raise_if_cancelled(task_id, cancel_event)
 
             # --- Шаг 2: транскрибация + суммаризация ---
             transcribe_cfg = self.config.get("transcribe", {})
@@ -149,9 +158,6 @@ class VideoProcessor(QObject):
                              "(%d символов)", task_id, len(ctx_header))
 
                 # Summary — конвертируем в plain text и дописываем.
-                # Поле summary_bb может содержать как Markdown (новые
-                # записи), так и BB-код (старые). markdown_to_plain_with_bb
-                # корректно обрабатывает оба случая.
                 summary_bb = str(metadata.get("summary_bb") or "").strip()
                 if summary_bb:
                     summary_plain = markdown_to_plain_with_bb(summary_bb)
@@ -214,9 +220,18 @@ class VideoProcessor(QObject):
                 transcript = await self.transcribe(
                     target_for_transcribe, transcribe_cfg,
                     prompt=server_prompt,
+                    cancel_event=cancel_event,
                 )
                 log.info("[%s] Транскрибация завершена за %.1f с",
                          task_id, time.monotonic() - t2)
+
+                # Отмена в процессе транскрибации
+                if isinstance(transcript, dict) and \
+                        transcript.get("status") == "cancelled":
+                    log.info("[%s] Транскрибация отменена", task_id)
+                    self.task_queue.mark_failed(task_id, "cancelled by user")
+                    self.task_failed.emit(task_id, "cancelled by user")
+                    return {"error": "cancelled", "task_id": task_id}
 
                 if isinstance(transcript, dict) and transcript.get("error"):
                     err = str(transcript["error"])
@@ -225,15 +240,17 @@ class VideoProcessor(QObject):
                     self.task_failed.emit(task_id, f"transcribe: {err}")
                     return {"error": err, "task_id": task_id}
 
-                if isinstance(transcript, dict) and transcript.get("status") == "error":
-                    err = str(transcript.get("error") or "неизвестная ошибка на сервере")
-                    log.error("[%s] Сервер вернул status=error: %s", task_id, err)
+                if isinstance(transcript, dict) and \
+                        transcript.get("status") == "error":
+                    err = str(transcript.get("error")
+                              or "неизвестная ошибка на сервере")
+                    log.error("[%s] Сервер вернул status=error: %s",
+                              task_id, err)
                     self.task_queue.mark_failed(task_id, f"transcribe: {err}")
                     self.task_failed.emit(task_id, f"transcribe: {err}")
                     return {"error": err, "task_id": task_id}
 
-                if self._is_cancelled(task_id):
-                    raise RuntimeError("cancelled")
+                self._raise_if_cancelled(task_id, cancel_event)
 
                 transcript_path = str(Path(video_path).with_suffix(".txt"))
                 summary_path = str(Path(video_path).with_name("video_summary.md"))
@@ -279,6 +296,8 @@ class VideoProcessor(QObject):
                 log.info("[%s] Транскрибация пропущена: URL сервера не задан",
                          task_id)
 
+            self._raise_if_cancelled(task_id, cancel_event)
+
             # --- Шаг 3: DeepSeek-промпт ---
             if metadata.get("generate_deepseek_prompt") and transcript_path:
                 use_scrum = bool(metadata.get("is_scrum", False))
@@ -293,8 +312,7 @@ class VideoProcessor(QObject):
                              task_id, manual_protocol_path,
                              len(manual_protocol_text))
                 # Summary — конвертируем в plain и добавим в формате
-                # «Краткое описание». markdown_to_plain_with_bb снимет
-                # и Markdown, и старые BB-теги.
+                # «Краткое описание».
                 summary_bb = str(metadata.get("summary_bb") or "").strip()
                 summary_for_deepseek = (
                     markdown_to_plain_with_bb(summary_bb) if summary_bb else ""
@@ -358,6 +376,14 @@ class VideoProcessor(QObject):
             self.task_completed.emit(task_id, result)
             return result
 
+        except _CancelledError:
+            total = time.monotonic() - t0
+            log.info("[%s] Задача отменена пользователем (%.1f с)",
+                     task_id, total)
+            self.task_queue.mark_failed(task_id, "cancelled by user")
+            self.task_failed.emit(task_id, "cancelled by user")
+            return {"error": "cancelled", "task_id": task_id}
+
         except Exception as exc:
             total = time.monotonic() - t0
             log.exception("[%s] Ошибка обработки (%.1f с): %s",
@@ -366,10 +392,26 @@ class VideoProcessor(QObject):
             self.task_failed.emit(task_id, str(exc))
             return {"error": str(exc), "task_id": task_id}
 
+        finally:
+            # Чистим событие отмены — задача завершена
+            self._cancel_events.pop(task_id, None)
+
     # ------------------------------------------------------------------
     # Шаги
     # ------------------------------------------------------------------
-    async def convert_to_audio(self, video_path: str, fmt: str, bitrate: int) -> str:
+    async def convert_to_audio(
+        self,
+        video_path: str,
+        fmt: str,
+        bitrate: int,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> str:
+        """
+        Конвертирует видео в аудио через ffmpeg.
+
+        Отмена: если cancel_event выставлен — завершаем дочерний
+        процесс ffmpeg через terminate(), затем kill().
+        """
         out = str(Path(video_path).with_suffix(f".{fmt}"))
         codec = "libmp3lame" if fmt == "mp3" else "aac"
         cmd = [
@@ -377,27 +419,80 @@ class VideoProcessor(QObject):
             "-acodec", codec, "-b:a", f"{bitrate}k", out,
         ]
         log.debug("ffmpeg конвертация: %s", " ".join(cmd))
+
+        if cancel_event is not None and cancel_event.is_set():
+            log.info("Конвертация отменена до старта ffmpeg")
+            return ""
+
+        proc: Optional[asyncio.subprocess.Process] = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            rc = await proc.wait()
+
+            # Ждём завершения, но проверяем отмену раз в 0.5 с
+            if cancel_event is not None:
+                wait_task = asyncio.ensure_future(proc.wait())
+                cancel_task = asyncio.ensure_future(cancel_event.wait())
+                try:
+                    done, pending = await asyncio.wait(
+                        {wait_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if cancel_task in done:
+                        # отмена — убиваем ffmpeg
+                        log.info("Конвертация отменена — завершаем ffmpeg "
+                                 "(PID=%s)", proc.pid)
+                        try:
+                            proc.terminate()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            try:
+                                proc.kill()
+                            except ProcessLookupError:
+                                pass
+                            await proc.wait()
+                        wait_task.cancel()
+                        return ""
+                    rc = wait_task.result()
+                finally:
+                    cancel_task.cancel()
+                    if not wait_task.done():
+                        wait_task.cancel()
+            else:
+                rc = await proc.wait()
+
             if rc != 0:
                 log.error("ffmpeg вернул код %d", rc)
+
             if os.path.exists(out):
                 log.debug("Создан аудиофайл: %s (%.2f МБ)",
                           out, os.path.getsize(out) / 1024 / 1024)
                 return out
+
             log.warning("Аудиофайл не создан: %s", out)
             return ""
         except Exception as exc:
             log.exception("Ошибка конвертации: %s", exc)
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             return ""
 
-    async def transcribe(self, video_path: str, config: Dict[str, Any],
-                         prompt: str = "") -> Dict[str, Any]:
+    async def transcribe(
+        self,
+        video_path: str,
+        config: Dict[str, Any],
+        prompt: str = "",
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> Dict[str, Any]:
         base_url = config.get("url", "")
         access_key = config.get("access_key", "")
         connect_timeout = float(config.get("connect_timeout", 15))
@@ -427,8 +522,11 @@ class VideoProcessor(QObject):
                     poll_interval=2.0,
                     summary_prompt=prompt,
                     max_wait=max_wait,
+                    cancel_event=cancel_event,
                 )
-                log.info("Транскрибация: получен результат")
+                log.info("Транскрибация: получен результат (status=%s)",
+                         result.get("status") if isinstance(result, dict)
+                         else "—")
                 return result
         except Exception as exc:
             log.exception("Ошибка транскрибации: %s", exc)
@@ -813,16 +911,32 @@ class VideoProcessor(QObject):
         return self.task_queue.reset_for_retry(task_id)
 
     def cancel_processing(self, task_id: str) -> bool:
+        """
+        Отменяет задачу.
+
+        Работает даже если задача «висит» внутри транскрибации:
+        событие отмены прокидывается в TranscribeClient._poll
+        и в convert_to_audio, которые реагируют немедленно.
+        """
         log.warning("Отмена задачи %s", task_id)
-        self._cancelled.add(task_id)
-        self.task_queue.mark_failed(task_id, "cancelled by user")
+        event = self._cancel_events.get(task_id)
+        if event is None:
+            log.warning("Задача %s не найдена среди активных "
+                        "(возможно, уже завершена)", task_id)
+            # Всё равно помечаем в очереди — на случай гонок
+            self.task_queue.mark_failed(task_id, "cancelled by user")
+            return False
+        event.set()
         return True
 
     # ------------------------------------------------------------------
     # Вспомогательное
     # ------------------------------------------------------------------
-    def _is_cancelled(self, task_id: str) -> bool:
-        return task_id in self._cancelled
+    def _raise_if_cancelled(
+        self, task_id: str, event: asyncio.Event
+    ) -> None:
+        if event.is_set():
+            raise _CancelledError(task_id)
 
     @staticmethod
     def _save_transcript(data: Dict[str, Any], path: str) -> None:
@@ -925,3 +1039,10 @@ class VideoProcessor(QObject):
     def stop(self) -> None:
         log.info("Остановка воркера обработки")
         self._running = False
+
+
+class _CancelledError(Exception):
+    """Внутреннее исключение для прерывания конвейера по отмене."""
+    def __init__(self, task_id: str = "") -> None:
+        super().__init__(f"cancelled: {task_id}")
+        self.task_id = task_id

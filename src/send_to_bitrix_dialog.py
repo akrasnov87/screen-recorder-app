@@ -32,6 +32,8 @@ Summary хранится в session.json в поле summary_bb (Markdown).
   • Превью материалов не показывается текстом — вместо этого
     отображаются ссылки на файлы, которые можно открыть двойным
     кликом или кнопкой «Открыть файл».
+  • Массовая рассылка выполняется в отдельном QThread — GUI
+    остаётся отзывчивым, прогресс виден в QProgressDialog.
 """
 from __future__ import annotations
 
@@ -43,13 +45,13 @@ import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QSizePolicy, QSpinBox, QVBoxLayout,
-    QWidget,
+    QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from .bitrix_client import Bitrix24Client, Bitrix24Error
@@ -145,6 +147,189 @@ def _find_summary_file(session_dir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# QThread для массовой рассылки
+# ---------------------------------------------------------------------------
+class _SendWorker(QThread):
+    """
+    Выполняет массовую рассылку в отдельном потоке.
+
+    Внутри запускается свой asyncio-loop (asyncio.run), что
+    изолирует сетевые операции от Qt. Прогресс и результат
+    сообщаются через сигналы.
+    """
+    progress = Signal(int, int, str)    # current, total, chat_id
+    finished_ok = Signal(dict)          # отчёт целиком
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        webhook: str,
+        chat_ids: List[str],
+        plan: List[Dict[str, Any]],
+        build_file_cb,
+        build_text_cb,
+        *,
+        connect_timeout: float,
+        read_timeout: float,
+        system: bool,
+        url_preview: bool,
+        forced_folder_id: int,
+        prefer_chat_folder: bool,
+    ) -> None:
+        super().__init__()
+        self._webhook = webhook
+        self._chat_ids = list(chat_ids)
+        self._plan = list(plan)
+        self._build_file_cb = build_file_cb
+        self._build_text_cb = build_text_cb
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+        self._system = system
+        self._url_preview = url_preview
+        self._forced_folder_id = forced_folder_id
+        self._prefer_chat_folder = prefer_chat_folder
+
+    def run(self) -> None:
+        try:
+            report = asyncio.run(self._run_all())
+        except Exception as exc:
+            log.exception("Массовая рассылка: неожиданная ошибка: %s", exc)
+            self.failed.emit(str(exc))
+            return
+        self.finished_ok.emit(report)
+
+    async def _send_to_chat(
+        self,
+        client: Bitrix24Client,
+        chat_id: str,
+    ) -> tuple:
+        """Отправляет все материалы одному получателю."""
+        sent = 0
+        errors: List[str] = []
+
+        file_items = [it for it in self._plan if it["is_file"]]
+        text_items = [it for it in self._plan if not it["is_file"]]
+
+        if file_items:
+            prepared: List[str] = []
+            cleanup_paths: List[str] = []
+            try:
+                for it in file_items:
+                    p = self._build_file_cb(it)
+                    if p:
+                        prepared.append(p)
+                        if it.get("_tmp"):
+                            cleanup_paths.append(p)
+            except Exception as exc:
+                log.exception(
+                    "Bitrix24: [%s] ошибка подготовки файлов: %s",
+                    chat_id, exc,
+                )
+                errors.append(f"файлы: {exc}")
+                prepared = []
+
+            if prepared:
+                headers = [it.get("header", "") for it in file_items]
+                headers = [h for h in headers if h]
+                comment = " / ".join(headers) if headers else ""
+
+                try:
+                    log.info(
+                        "Bitrix24: [%s] отправка %d файлов одним сообщением",
+                        chat_id, len(prepared),
+                    )
+                    await client.send_file_message(
+                        dialog_id=chat_id,
+                        file_paths=prepared,
+                        comment=comment,
+                        folder_id=self._forced_folder_id,
+                        system=self._system,
+                        url_preview=self._url_preview,
+                        prefer_chat_folder=self._prefer_chat_folder,
+                    )
+                    sent += 1
+                except Bitrix24Error as exc:
+                    log.error(
+                        "Bitrix24: [%s] ошибка отправки файлов: %s",
+                        chat_id, exc,
+                    )
+                    errors.append(f"файлы: {exc}")
+                except Exception as exc:
+                    log.exception(
+                        "Bitrix24: [%s] неожиданная ошибка файлов: %s",
+                        chat_id, exc,
+                    )
+                    errors.append(f"файлы: {exc}")
+                finally:
+                    for p in cleanup_paths:
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+            elif not errors:
+                errors.append("файлы: нечего отправлять")
+
+        for idx, it in enumerate(text_items, start=1):
+            try:
+                text = self._build_text_cb(it)
+                log.info(
+                    "Bitrix24: [%s] текст #%d (%s, %d символов)",
+                    chat_id, idx, it["which"], len(text),
+                )
+                await client.send_message(
+                    dialog_id=chat_id,
+                    text=text,
+                    system=self._system,
+                    url_preview=self._url_preview,
+                )
+                sent += 1
+            except Bitrix24Error as exc:
+                log.error(
+                    "Bitrix24: [%s] ошибка отправки текста #%d: %s",
+                    chat_id, idx, exc,
+                )
+                errors.append(f"текст #{idx}: {exc}")
+            except Exception as exc:
+                log.exception(
+                    "Bitrix24: [%s] неожиданная ошибка текста #%d: %s",
+                    chat_id, idx, exc,
+                )
+                errors.append(f"текст #{idx}: {exc}")
+
+        return sent, errors
+
+    async def _run_all(self) -> Dict[str, Any]:
+        total_sent = 0
+        errors_by_chat: Dict[str, List[str]] = {}
+        ok_chats: List[str] = []
+        fail_chats: List[str] = []
+        total = len(self._chat_ids)
+
+        async with Bitrix24Client(
+            webhook_url=self._webhook,
+            connect_timeout=self._connect_timeout,
+            read_timeout=self._read_timeout,
+        ) as client:
+            for i, cid in enumerate(self._chat_ids, start=1):
+                self.progress.emit(i, total, cid)
+                sent, errs = await self._send_to_chat(client, cid)
+                total_sent += sent
+                if errs:
+                    errors_by_chat[cid] = errs
+                    fail_chats.append(cid)
+                else:
+                    ok_chats.append(cid)
+
+        return {
+            "sent_count": total_sent,
+            "errors_by_chat": errors_by_chat,
+            "ok_chats": ok_chats,
+            "fail_chats": fail_chats,
+            "total_chats": total,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Диалог
 # ---------------------------------------------------------------------------
 class SendToBitrixDialog(QDialog):
@@ -153,22 +338,6 @@ class SendToBitrixDialog(QDialog):
 
     Поддерживает массовую рассылку: один и тот же материал уходит
     сразу в несколько выбранных чатов (проекты / сотрудники / ручные ID).
-
-    Параметры:
-        session_info: dict с полями:
-            - name: имя записи
-            - project: проект
-            - date: дата
-            - protocol_path: путь к протоколу (может быть "")
-            - protocol_label: имя файла протокола
-            - summary_bb: текст summary (Markdown, может быть "")
-            - comment: комментарий к записи
-            - session_dir: путь к папке сессии (для «Показать в папке»)
-        chat_id: ID чата Bitrix24 (определяется по проекту) — начальный
-                 выбранный получатель, может быть пустым.
-        bitrix_cfg: настройки интеграции (из ConfigManager).
-        projects: список проектов [{"name", "chat_id"}, ...].
-        employees: список сотрудников [{"name", "chat_id"}, ...].
     """
 
     def __init__(
@@ -215,6 +384,8 @@ class SendToBitrixDialog(QDialog):
         self._summary_file_path = _find_summary_file(self._session_dir)
 
         self._selected_chat_ids: Set[str] = set()
+        self._worker: Optional[_SendWorker] = None
+        self._progress_dlg: Optional[QProgressDialog] = None
 
         self.selected_count_label: Optional[QLabel] = None
         self.empty_hint: Optional[QLabel] = None
@@ -871,9 +1042,6 @@ class SendToBitrixDialog(QDialog):
         return "\n".join(lines)
 
     # Регулярка ищет в конце строки дату (опционально с временем).
-    # Формат даты: YYYY-MM-DD. Время — через дефис или двоеточие:
-    # "2026-09-28", "2026-09-28 15-17", "2026-09-28 15:17",
-    # "2026-09-28 15-17-30", "2026-09-28 15:17:37".
     _DATE_TAIL_RE = re.compile(
         r"\d{4}-\d{2}-\d{2}"
         r"(?:\s+\d{2}[-:]\d{2}(?:[-:]\d{2})?)?"
@@ -882,20 +1050,12 @@ class SendToBitrixDialog(QDialog):
 
     @classmethod
     def _name_already_has_date(cls, name: str) -> bool:
-        """True, если имя записи уже заканчивается на дату/время."""
         if not name:
             return False
         return bool(cls._DATE_TAIL_RE.search(name.strip()))
 
     @staticmethod
     def _normalize_date(date: str) -> str:
-        """
-        Приводит строку даты к формату 'YYYY-MM-DD HH:MM'.
-
-        • Убирает секунды.
-        • Меняет дефис между часом и минутой на двоеточие.
-        • Если время 00:00 — оставляет только дату.
-        """
         if not date:
             return ""
         date = date.strip()
@@ -905,20 +1065,12 @@ class SendToBitrixDialog(QDialog):
 
         day = parts[0]
         time_part = parts[1].replace("-", ":")
-        # Обрезаем до HH:MM
         time_part = time_part[:5]
         if time_part in ("00:00", ""):
             return day
         return f"{day} {time_part}"
 
     def _build_default_header(self, which: str) -> str:
-        """
-        Формирует заголовок по умолчанию для протокола или summary.
-
-        Если имя записи УЖЕ содержит дату (например, «Созвон — 2026-09-28
-        15-17»), дата не добавляется повторно. Иначе — добавляется в
-        нормализованном виде 'YYYY-MM-DD HH:MM'.
-        """
         name = (self.session_info.get("name") or "").strip()
         date = (self.session_info.get("date") or "").strip()
 
@@ -933,7 +1085,6 @@ class SendToBitrixDialog(QDialog):
         if name:
             parts.append(name)
 
-        # Добавляем дату только если её ещё нет в имени.
         if date and not self._name_already_has_date(name):
             normalized = self._normalize_date(date)
             if normalized:
@@ -985,7 +1136,6 @@ class SendToBitrixDialog(QDialog):
         return ""
 
     def _load_previews(self) -> None:
-        # --- Протокол ---
         if self._protocol_path and os.path.exists(self._protocol_path):
             try:
                 self._protocol_text = _read_text_safe(self._protocol_path)
@@ -1014,7 +1164,6 @@ class SendToBitrixDialog(QDialog):
             self.open_protocol_btn.setEnabled(False)
             self.show_protocol_folder_btn.setEnabled(False)
 
-        # --- Summary ---
         if self._summary_bitrix:
             target = self._summary_target_path()
             if target:
@@ -1140,17 +1289,6 @@ class SendToBitrixDialog(QDialog):
         return body.strip()
 
     def _prepare_protocol_docx(self, src_path: str) -> str:
-        """
-        Готовит .docx для отправки протокола.
-
-        • Если src_path уже .docx — возвращает его как есть.
-        • Если .md / .txt / .pdf / что-то ещё — читает содержимое,
-          конвертирует через markdown_to_docx и возвращает путь
-          к временному .docx.
-
-        При любой ошибке конвертации логирует и возвращает исходный
-        путь (лучше отправить .md, чем ничего).
-        """
         ext = os.path.splitext(src_path)[1].lower()
 
         if ext == ".docx":
@@ -1158,14 +1296,12 @@ class SendToBitrixDialog(QDialog):
                      src_path)
             return src_path
 
-        # Читаем исходник как текст.
         try:
             if ext in (".md", ".txt"):
                 with open(src_path, "r", encoding="utf-8",
                           errors="replace") as f:
                     text = f.read()
             else:
-                # .pdf и прочие — через _read_text_safe.
                 text = _read_text_safe(src_path)
         except Exception as exc:
             log.exception("Не удалось прочитать протокол %s: %s",
@@ -1177,7 +1313,6 @@ class SendToBitrixDialog(QDialog):
                         src_path)
             return src_path
 
-        # Куда сохранить временный .docx.
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         safe_name = _safe_filename(
             self.session_info.get("name") or "protocol"
@@ -1203,22 +1338,18 @@ class SendToBitrixDialog(QDialog):
         return tmp_path
 
     def _prepare_file_for_item(self, item: Dict[str, Any]) -> str:
+        """Готовит один файл к отправке. Используется в фоновом потоке."""
         which = item["which"]
         src = item.get("src_file") or ""
 
-        # --- Протокол: всегда отправляем .docx ---
         if which == "protocol":
             if src and os.path.exists(src):
                 docx_path = self._prepare_protocol_docx(src)
-                # Если получили временный .docx (а не тот же src) —
-                # помечаем его для удаления после отправки.
                 if docx_path and docx_path != src:
                     item["_tmp"] = True
                     return docx_path
                 return docx_path
 
-            # src не задан или файла нет — формируем .docx из текста
-            # протокола в памяти.
             body = item.get("body", "")
             header = item.get("header", "") or ""
 
@@ -1235,7 +1366,6 @@ class SendToBitrixDialog(QDialog):
                 f"protocol_{safe_name}_{stamp}.docx",
             )
 
-            # Если header есть — добавляем его как H1 в начало.
             full_md = f"# {header}\n\n{body}" if header else body
 
             try:
@@ -1255,7 +1385,6 @@ class SendToBitrixDialog(QDialog):
                 )
                 return ""
 
-        # --- Summary: Markdown-файл ---
         if which == "summary":
             md_text = item.get("body_md") or item.get("body_plain") or ""
             header = item.get("header", "") or ""
@@ -1283,9 +1412,16 @@ class SendToBitrixDialog(QDialog):
         return ""
 
     # ------------------------------------------------------------------
-    # Отправка (массовая рассылка)
+    # Отправка (массовая рассылка через QThread)
     # ------------------------------------------------------------------
     def _on_send(self, which: str) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(
+                self, "Bitrix24",
+                "Отправка уже выполняется. Дождитесь завершения.",
+            )
+            return
+
         webhook = self.webhook_input.text().strip()
         chat_ids = self._resolve_chat_ids()
 
@@ -1410,137 +1546,83 @@ class SendToBitrixDialog(QDialog):
         )
         prefer_chat_folder = forced_folder_id <= 0
 
-        file_items = [it for it in plan if it["is_file"]]
-        text_items = [it for it in plan if not it["is_file"]]
+        # --- Прогресс-диалог ---
+        self._progress_dlg = QProgressDialog(
+            "Отправка в Bitrix24…",
+            "Отмена",
+            0,
+            len(chat_ids),
+            self,
+        )
+        self._progress_dlg.setWindowTitle("Отправка в Bitrix24")
+        self._progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dlg.setMinimumDuration(0)
+        self._progress_dlg.setValue(0)
+        self._progress_dlg.canceled.connect(self._on_cancel_send)
 
-        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # --- Запуск воркера ---
+        self._worker = _SendWorker(
+            webhook=webhook,
+            chat_ids=chat_ids,
+            plan=plan,
+            build_file_cb=self._prepare_file_for_item,
+            build_text_cb=self._build_text_message,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            system=system,
+            url_preview=url_preview,
+            forced_folder_id=forced_folder_id,
+            prefer_chat_folder=prefer_chat_folder,
+        )
+        self._worker.progress.connect(self._on_send_progress)
+        self._worker.finished_ok.connect(self._on_send_finished)
+        self._worker.failed.connect(self._on_send_failed)
+        self._worker.start()
 
-        async def _run_send_for_one(
-            client: Bitrix24Client, chat_id: str
-        ) -> tuple:
-            sent = 0
-            errors: List[str] = []
+    def _on_cancel_send(self) -> None:
+        """
+        Отмена массовой рассылки.
 
-            if file_items:
-                prepared: List[str] = []
-                cleanup_paths: List[str] = []
-                for it in file_items:
-                    p = self._prepare_file_for_item(it)
-                    if p:
-                        prepared.append(p)
-                        if it.get("_tmp"):
-                            cleanup_paths.append(p)
+        Полностью прервать сетевые операции aiohttp извне сложно,
+        поэтому используем requestInterruption: воркер проверяет
+        флаг на каждой итерации по чатам и прекращает работу.
+        Текущий (уже начатый) чат будет дообработан.
+        """
+        if self._worker is not None and self._worker.isRunning():
+            log.info("Запрошена отмена массовой рассылки")
+            self._worker.requestInterruption()
 
-                if not prepared:
-                    errors.append("файлы: нечего отправлять")
-                else:
-                    headers = [
-                        it.get("header", "") for it in file_items
-                    ]
-                    headers = [h for h in headers if h]
-                    comment = " / ".join(headers) if headers else ""
+    def _on_send_progress(self, current: int, total: int, chat_id: str) -> None:
+        if self._progress_dlg is not None:
+            self._progress_dlg.setValue(current - 1)
+            self._progress_dlg.setLabelText(
+                f"Отправка в {chat_id}…\n"
+                f"({current} из {total})"
+            )
 
-                    try:
-                        log.info(
-                            "Bitrix24: [%s] отправка %d файлов одним "
-                            "сообщением",
-                            chat_id, len(prepared),
-                        )
-                        await client.send_file_message(
-                            dialog_id=chat_id,
-                            file_paths=prepared,
-                            comment=comment,
-                            folder_id=forced_folder_id,
-                            system=system,
-                            url_preview=url_preview,
-                            prefer_chat_folder=prefer_chat_folder,
-                        )
-                        sent += 1
-                    except Bitrix24Error as exc:
-                        log.error(
-                            "Bitrix24: [%s] ошибка отправки файлов: %s",
-                            chat_id, exc,
-                        )
-                        errors.append(f"файлы: {exc}")
-                    finally:
-                        for p in cleanup_paths:
-                            try:
-                                os.remove(p)
-                            except Exception:
-                                pass
-
-            for idx, it in enumerate(text_items, start=1):
-                try:
-                    text = self._build_text_message(it)
-                    log.info(
-                        "Bitrix24: [%s] текст #%d (%s, %d символов)",
-                        chat_id, idx, it["which"], len(text),
-                    )
-                    await client.send_message(
-                        dialog_id=chat_id,
-                        text=text,
-                        system=system,
-                        url_preview=url_preview,
-                    )
-                    sent += 1
-                except Bitrix24Error as exc:
-                    log.error(
-                        "Bitrix24: [%s] ошибка отправки текста #%d: %s",
-                        chat_id, idx, exc,
-                    )
-                    errors.append(f"текст #{idx}: {exc}")
-                except Exception as exc:
-                    log.exception(
-                        "Bitrix24: [%s] неожиданная ошибка текста #%d: %s",
-                        chat_id, idx, exc,
-                    )
-                    errors.append(f"текст #{idx}: {exc}")
-
-            return sent, errors
-
-        async def _run_send_all() -> tuple:
-            total_sent = 0
-            errors_by_chat: Dict[str, List[str]] = {}
-            ok_chats: List[str] = []
-            fail_chats: List[str] = []
-
-            async with Bitrix24Client(
-                webhook_url=webhook,
-                connect_timeout=connect_timeout,
-                read_timeout=read_timeout,
-            ) as client:
-                for cid in chat_ids:
-                    sent, errs = await _run_send_for_one(client, cid)
-                    total_sent += sent
-                    if errs:
-                        errors_by_chat[cid] = errs
-                        fail_chats.append(cid)
-                    else:
-                        ok_chats.append(cid)
-
-            return total_sent, errors_by_chat, ok_chats, fail_chats
-
-        try:
-            (
-                sent_count,
-                errors_by_chat,
-                ok_chats,
-                fail_chats,
-            ) = asyncio.run(_run_send_all())
-        except Exception as exc:
-            log.exception("Bitrix24: ошибка массовой отправки: %s", exc)
-            QMessageBox.critical(self, "Bitrix24", f"Ошибка:\n{exc}")
-            return
-        finally:
-            if QGuiApplication.overrideCursor() is not None:
-                QGuiApplication.restoreOverrideCursor()
-
+    def _on_send_finished(self, report: Dict[str, Any]) -> None:
+        if self._progress_dlg is not None:
+            self._progress_dlg.setValue(self._progress_dlg.maximum())
+            self._progress_dlg.close()
+            self._progress_dlg = None
+        self._worker = None
         self._show_send_report(
-            sent_count=sent_count,
-            errors_by_chat=errors_by_chat,
-            ok_chats=ok_chats,
-            fail_chats=fail_chats,
-            total_chats=len(chat_ids),
+            sent_count=report.get("sent_count", 0),
+            errors_by_chat=report.get("errors_by_chat", {}),
+            ok_chats=report.get("ok_chats", []),
+            fail_chats=report.get("fail_chats", []),
+            total_chats=report.get("total_chats", 0),
+        )
+
+    def _on_send_failed(self, error: str) -> None:
+        if self._progress_dlg is not None:
+            self._progress_dlg.close()
+            self._progress_dlg = None
+        self._worker = None
+        log.error("Bitrix24: массовая рассылка провалена: %s", error)
+        QMessageBox.critical(
+            self, "Bitrix24",
+            f"Ошибка массовой рассылки:\n\n{error}",
         )
 
     def _show_send_report(
@@ -1588,7 +1670,9 @@ class SendToBitrixDialog(QDialog):
         lines.append("<b>Ошибки:</b><br>")
         for cid, errs in list(errors_by_chat.items())[:15]:
             joined = "; ".join(html.escape(e) for e in errs)
-            lines.append(f"&nbsp;&nbsp;• <b>{html.escape(cid)}</b>: {joined}<br>")
+            lines.append(
+                f"&nbsp;&nbsp;• <b>{html.escape(cid)}</b>: {joined}<br>"
+            )
         if len(errors_by_chat) > 15:
             lines.append(
                 f"&nbsp;&nbsp;… и ещё {len(errors_by_chat) - 15} "

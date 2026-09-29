@@ -9,6 +9,13 @@ TranscribeClient — клиент к серверу AI Видео Транскр
 
 Поле формы summary_prompt поддерживается сервером — передаётся
 в Summarizer.summarize() как custom_prompt.
+
+Особенности:
+  • Файл передаётся в aiohttp потоково (file-like object),
+    без чтения в память целиком — важно для больших аудио/видео.
+  • Поддерживается отмена через asyncio.Event: если во время
+    polling-а ожидания результата кто-то выставит event — метод
+    прерывает цикл и возвращает {"status": "cancelled"}.
 """
 from __future__ import annotations
 
@@ -17,7 +24,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import aiofiles
 import aiohttp
 
 from .logger import get_logger
@@ -31,6 +37,42 @@ class TranscribeError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+class _FileStreamWrapper:
+    """
+    Обёртка над обычным файловым объектом для aiohttp.FormData.
+
+    aiohttp умеет работать с file-like объектами, у которых есть
+    методы read() и seek() (или итерация). Мы передаём сюда
+    синхронный open(..., "rb") и сообщаем aiohttp нужный filename
+    и content_type через FormData.add_field.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fp = None
+        self._size = 0
+
+    def __enter__(self):
+        self._fp = open(self._path, "rb")
+        try:
+            self._size = self._path.stat().st_size
+        except OSError:
+            self._size = 0
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fp is not None:
+            try:
+                self._fp.close()
+            except Exception:
+                pass
+            self._fp = None
+
+    @property
+    def file(self):
+        return self._fp
 
 
 class TranscribeClient:
@@ -160,11 +202,19 @@ class TranscribeClient:
         summary_prompt: str = "",
         max_wait: float = 7200.0,
         simple_format: bool = False,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> Dict[str, Any]:
         """
         Загрузка файла: POST /api/process-upload.
-        Поле summary_prompt передаётся как есть (сервер применяет его
-        в Summarizer.summarize(custom_prompt=...)).
+
+        Файл передаётся потоково через file-like object — не читается
+        в память целиком. Это критично для длинных записей: mp3 на
+        2 часа ≈ 180 МБ, и держать такой объём в RAM накладно.
+
+        Параметр cancel_event позволяет прервать ожидание результата:
+        если он выставлен во время polling-а, метод вернёт
+        {"status": "cancelled"} и не будет ждать завершения задачи
+        на сервере.
         """
         if self._session is None:
             raise TranscribeError("aiohttp-сессия не открыта")
@@ -180,62 +230,104 @@ class TranscribeClient:
                   summary_language, transcription_language, simple_format,
                   wait, max_wait, len(summary_prompt or ""))
 
-        async with aiofiles.open(file_path, "rb") as f:
-            content = await f.read()
+        # Проверяем отмену до старта
+        if cancel_event is not None and cancel_event.is_set():
+            log.info("Транскрибация отменена до загрузки файла")
+            return {"status": "cancelled", "task_id": ""}
 
-        form = aiohttp.FormData()
-        form.add_field("file", content, filename=file_path.name)
-        form.add_field("summary_language", summary_language)
-        form.add_field("transcription_language", transcription_language)
-        form.add_field("simple_format", "true" if simple_format else "false")
-        if summary_prompt:
-            form.add_field("summary_prompt", summary_prompt)
-            log.info("Промпт отправлен на сервер (%d символов)",
-                     len(summary_prompt))
-
+        # Открываем файл и передаём в aiohttp как file-like.
+        # Формат: (filename, fileobj, content_type)
+        #
+        # ВАЖНО: aiohttp.FormData.add_field с file-like объектом
+        # стримит данные, а не грузит их в память.
         try:
-            async with self._session.post(url, data=form, headers=headers) as resp:
-                log.debug("Ответ сервера: HTTP %d", resp.status)
-                await self._raise_for_status(resp, url, "Загрузка файла")
+            with _FileStreamWrapper(file_path) as wrapper:
+                form = aiohttp.FormData()
+                form.add_field(
+                    "file",
+                    wrapper.file,
+                    filename=file_path.name,
+                    content_type="application/octet-stream",
+                )
+                form.add_field("summary_language", summary_language)
+                form.add_field("transcription_language", transcription_language)
+                form.add_field(
+                    "simple_format", "true" if simple_format else "false"
+                )
+                if summary_prompt:
+                    form.add_field("summary_prompt", summary_prompt)
+                    log.info("Промпт отправлен на сервер (%d символов)",
+                             len(summary_prompt))
 
                 try:
-                    data = await resp.json()
+                    async with self._session.post(
+                        url, data=form, headers=headers
+                    ) as resp:
+                        log.debug("Ответ сервера: HTTP %d", resp.status)
+                        await self._raise_for_status(resp, url, "Загрузка файла")
+
+                        try:
+                            data = await resp.json()
+                        except Exception as exc:
+                            body = await self._read_body(resp)
+                            msg = (f"Загрузка файла: не удалось разобрать JSON "
+                                   f"(HTTP {resp.status}): {exc}. Тело: {body}")
+                            log.error(msg)
+                            raise TranscribeError(
+                                msg, status=resp.status, body=body
+                            )
+
+                        task_id = data.get("task_id")
+                        log.info("Задача транскрибации создана: task_id=%s",
+                                 task_id)
+
+                        if wait and not task_id:
+                            body = str(data)[:500]
+                            msg = f"Сервер не вернул task_id. Ответ: {body}"
+                            log.error(msg)
+                            raise TranscribeError(
+                                msg, status=resp.status, body=body
+                            )
+
+                        if not wait or not task_id:
+                            log.debug(
+                                "Ожидание результата не требуется, "
+                                "возвращаем ответ"
+                            )
+                            return data
+
+                        return await self._poll(
+                            task_id, poll_interval, max_wait, cancel_event
+                        )
+                except TranscribeError:
+                    raise
                 except Exception as exc:
-                    body = await self._read_body(resp)
-                    msg = (f"Загрузка файла: не удалось разобрать JSON "
-                           f"(HTTP {resp.status}): {exc}. Тело: {body}")
-                    log.error(msg)
-                    raise TranscribeError(msg, status=resp.status, body=body)
-
-                task_id = data.get("task_id")
-                log.info("Задача транскрибации создана: task_id=%s", task_id)
-
-                if wait and not task_id:
-                    body = str(data)[:500]
-                    msg = f"Сервер не вернул task_id. Ответ: {body}"
-                    log.error(msg)
-                    raise TranscribeError(msg, status=resp.status, body=body)
-
-                if not wait or not task_id:
-                    log.debug("Ожидание результата не требуется, возвращаем ответ")
-                    return data
-
-                return await self._poll(task_id, poll_interval, max_wait)
-        except TranscribeError:
-            raise
-        except Exception as exc:
-            log.exception("Ошибка загрузки файла на транскрибацию: %s", exc)
-            raise
+                    log.exception("Ошибка загрузки файла на транскрибацию: %s",
+                                  exc)
+                    raise
+        except FileNotFoundError:
+            msg = f"Файл не найден: {file_path}"
+            log.error(msg)
+            raise TranscribeError(msg)
+        except PermissionError as exc:
+            msg = f"Нет доступа к файлу {file_path}: {exc}"
+            log.error(msg)
+            raise TranscribeError(msg)
 
     async def _poll(
         self,
         task_id: str,
         interval: float,
         max_wait: float = 7200.0,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> Dict[str, Any]:
         """
         Опрос статуса: GET /api/task-status/{task_id} с X-Session-Token.
-        Возвращает финальный JSON со status в ("completed", "error").
+
+        Возвращает финальный JSON со status в ("completed", "error",
+        "cancelled"). Если cancel_event выставлен — возвращает
+        {"status": "cancelled"} немедленно, не дожидаясь завершения
+        задачи на сервере.
         """
         url = f"{self.base_url}/api/task-status/{task_id}"
         headers = self._auth_headers()
@@ -247,11 +339,25 @@ class TranscribeClient:
         last_status = None
 
         while True:
+            # --- Проверка отмены ---
+            if cancel_event is not None and cancel_event.is_set():
+                log.info(
+                    "Транскрибация %s отменена пользователем "
+                    "(poll #%d, прошло %.1f с)",
+                    task_id, attempt, time.monotonic() - t_start,
+                )
+                return {
+                    "status": "cancelled",
+                    "error": "cancelled by user",
+                    "task_id": task_id,
+                }
+
             attempt += 1
             elapsed = time.monotonic() - t_start
 
             if elapsed > max_wait:
-                msg = f"Транскрибация {task_id}: превышен лимит ожидания ({max_wait:.0f} с)"
+                msg = (f"Транскрибация {task_id}: превышен лимит ожидания "
+                       f"({max_wait:.0f} с)")
                 log.error(msg)
                 return {"status": "error", "error": msg, "task_id": task_id}
 
@@ -270,12 +376,17 @@ class TranscribeClient:
                         progress = data.get("progress", 0)
                         message = data.get("message", "")
                         if status != last_status:
-                            log.info("Транскрибация %s: status=%s, progress=%s, message=%r",
-                                     task_id, status, progress, message)
+                            log.info(
+                                "Транскрибация %s: status=%s, progress=%s, "
+                                "message=%r",
+                                task_id, status, progress, message,
+                            )
                             last_status = status
                         else:
-                            log.debug("Poll #%d: status=%s, progress=%s (%.1f с)",
-                                      attempt, status, progress, elapsed)
+                            log.debug(
+                                "Poll #%d: status=%s, progress=%s (%.1f с)",
+                                attempt, status, progress, elapsed,
+                            )
 
                         if status in ("completed", "error"):
                             log.info("Транскрибация завершена: status=%s "
@@ -286,7 +397,22 @@ class TranscribeClient:
                 log.warning("Ошибка при опросе статуса (попытка %d): %s",
                             attempt, exc)
 
-            await asyncio.sleep(interval)
+            # --- Ожидание с возможностью отмены ---
+            # asyncio.sleep не прерывается внешним событием,
+            # поэтому ждём через wait_for на cancel_event.wait(),
+            # ограничивая время интервалом.
+            if cancel_event is not None:
+                try:
+                    await asyncio.wait_for(
+                        cancel_event.wait(), timeout=interval
+                    )
+                    # event выставлен — выходим на следующей итерации
+                    continue
+                except asyncio.TimeoutError:
+                    # интервал истёк, event не выставлен — идём на новый poll
+                    continue
+            else:
+                await asyncio.sleep(interval)
 
     async def verify(self) -> bool:
         """POST /api/auth/verify — проверка валидности токена."""
