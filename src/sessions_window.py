@@ -1,21 +1,9 @@
 """Окно со списком всех записей (сессий).
 
-Действия вынесены в верхнее меню, чтобы не переполнять панель.
-Дополнительно есть служебное меню «Утилиты» для обслуживания хранилища.
-
-Раздел «Протокол»:
-  • «Создать/редактировать протокол (Markdown)…» — двухпанельный
-    редактор Markdown с предпросмотром и экспортом в DOCX;
-  • «Экспорт протокола в DOCX…» — конвертирует прикреплённый
-    протокол (.md/.txt/.pdf) в manual_protocol.docx и прикрепляет
-    его к записи.
-
-Раздел «Очередь»:
-  • «Редактировать метаданные и перезапустить…» (Ctrl+E) —
-    открывает карточку записи с текущими параметрами из
-    session.json и после подтверждения ставит запись в очередь
-    заново. Удобно, если забыли включить «Сформировать промпт
-    для DeepSeek» при первичной обработке.
+Изменения:
+  • Сканирование папки sessions/ вынесено в отдельный QThread
+    (SessionsScanThread) — UI остаётся отзывчивым на большом архиве.
+  • Чтение текста через file_readers.
 """
 from __future__ import annotations
 
@@ -26,7 +14,7 @@ import shutil
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
@@ -34,6 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from .file_readers import read_any_text, read_json_file
 from .logger import get_logger
 from .markdown_docx import markdown_to_docx
 from .markdown_editor import MarkdownEditorDialog, MarkdownViewerDialog
@@ -61,29 +50,190 @@ STATUS_COLORS = {
 }
 
 
-def _read_json(path: str) -> Optional[Dict[str, Any]]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+# Расширения видео/аудио, которые ищем в папке сессии.
+_VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv",
+               ".mp3", ".wav", ".m4a", ".aac", ".opus", ".ogg")
+
+# Расширения аудио, наличие которого считаем признаком обработки.
+_AUDIO_EXTS = (".mp3", ".aac", ".wav", ".opus", ".ogg", ".m4a")
 
 
-def _write_json(path: str, data: Dict[str, Any]) -> bool:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        return True
-    except Exception as exc:
-        log.exception("Не удалось записать %s: %s", path, exc)
-        return False
+# ---------------------------------------------------------------------------
+# Поток сканирования сессий
+# ---------------------------------------------------------------------------
+class SessionsScanThread(QThread):
+    """Фоновое сканирование папки sessions/ и сбор метаданных записей."""
+
+    finished_ok = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, sessions_root: str,
+                 tasks_index: Dict[str, Dict[str, Any]],
+                 parent=None) -> None:
+        super().__init__(parent)
+        self._sessions_root = sessions_root
+        self._tasks_index = tasks_index
+
+    def run(self) -> None:
+        try:
+            rows = self._collect(self._sessions_root, self._tasks_index)
+            self.finished_ok.emit(rows)
+        except Exception as exc:
+            log.exception("Ошибка сканирования сессий: %s", exc)
+            self.failed.emit(str(exc))
+
+    # ------------------------------------------------------------------
+    # Сбор данных
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_first_video(session_dir: str) -> str:
+        for ext in _VIDEO_EXTS:
+            p = os.path.join(session_dir, f"video{ext}")
+            if os.path.exists(p):
+                return p
+        return ""
+
+    @staticmethod
+    def _find_first_audio(session_dir: str) -> str:
+        for ext in _AUDIO_EXTS:
+            p = os.path.join(session_dir, f"video{ext}")
+            if os.path.exists(p):
+                return p
+        return ""
+
+    @staticmethod
+    def _find_prompt(session_dir: str) -> str:
+        for fname in ("deepseek_prompt.docx", "deepseek_prompt.md",
+                      "deepseek_prompt.txt"):
+            p = os.path.join(session_dir, fname)
+            if os.path.exists(p):
+                return p
+        return ""
+
+    def _collect(
+        self,
+        sessions_root: str,
+        tasks_index: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if not os.path.isdir(sessions_root):
+            log.warning("Папка сессий не найдена: %s", sessions_root)
+            return rows
+
+        try:
+            entries = sorted(os.listdir(sessions_root))
+        except OSError as exc:
+            log.error("Не удалось прочитать %s: %s", sessions_root, exc)
+            return rows
+
+        for name in entries:
+            session_dir = os.path.join(sessions_root, name)
+            if not os.path.isdir(session_dir):
+                continue
+
+            meta_path = os.path.join(session_dir, "session.json")
+            meta = read_json_file(meta_path) or {}
+
+            video_path = self._find_first_video(session_dir)
+            has_video = bool(video_path)
+            has_transcript = os.path.exists(
+                os.path.join(session_dir, "video.txt")
+            )
+            audio_path = self._find_first_audio(session_dir)
+            has_audio = bool(audio_path)
+
+            task = (tasks_index.get(os.path.abspath(video_path))
+                    if video_path else None)
+            task_id = (task or {}).get("task_id", "")
+
+            if task is not None:
+                st = task.get("status", "")
+                if st == "completed":
+                    status = STATUS_PROCESSED
+                elif st == "error":
+                    status = STATUS_ERROR
+                elif st in ("pending", "converting", "transcribing",
+                            "summarizing"):
+                    status = STATUS_TRANSCRIBING
+                else:
+                    status = STATUS_UNKNOWN
+            else:
+                if has_transcript or has_audio:
+                    status = STATUS_PROCESSED
+                elif has_video:
+                    status = STATUS_UPLOADED
+                else:
+                    status = STATUS_UNKNOWN
+
+            date_str = meta.get("date") or ""
+            time_str = meta.get("time") or ""
+            try:
+                parts = name.split("_")
+                if len(parts) >= 2:
+                    date_str = date_str or parts[0]
+                    time_str = time_str or parts[1].replace("-", ":")
+            except Exception:
+                pass
+            if not date_str:
+                try:
+                    ts = os.path.getmtime(session_dir)
+                    date_str = datetime.fromtimestamp(ts).strftime(
+                        "%Y-%m-%d"
+                    )
+                    time_str = datetime.fromtimestamp(ts).strftime(
+                        "%H:%M:%S"
+                    )
+                except Exception:
+                    pass
+
+            prompt_path = self._find_prompt(session_dir)
+
+            attachments = list(meta.get("attachments", []) or [])
+            attachments_dir = os.path.join(session_dir, "attachments")
+            if not attachments and os.path.isdir(attachments_dir):
+                try:
+                    attachments = [
+                        os.path.join(attachments_dir, f)
+                        for f in sorted(os.listdir(attachments_dir))
+                        if os.path.isfile(
+                            os.path.join(attachments_dir, f)
+                        )
+                    ]
+                except OSError:
+                    attachments = []
+
+            manual_protocol_path = meta.get("manual_protocol_path") or ""
+            if manual_protocol_path and not os.path.exists(
+                manual_protocol_path
+            ):
+                manual_protocol_path = ""
+
+            summary_bb = str(meta.get("summary_bb") or "")
+
+            rows.append({
+                "dir": session_dir,
+                "name": meta.get("name") or name,
+                "project": meta.get("project") or "",
+                "status": status,
+                "source": meta.get("source") or "record",
+                "is_scrum": bool(meta.get("is_scrum", False)),
+                "datetime": f"{date_str} {time_str}".strip(),
+                "video_path": video_path,
+                "has_video": has_video,
+                "task_id": task_id,
+                "prompt_path": prompt_path,
+                "attachments": attachments,
+                "manual_protocol_path": manual_protocol_path,
+                "summary_bb": summary_bb,
+            })
+
+        rows.sort(key=lambda r: r["datetime"], reverse=True)
+        return rows
 
 
 class SessionsWindow(QDialog):
     """Список всех записей в папке sessions/."""
 
-    # Сигнал: пользователь запросил импорт материалов.
-    # Обрабатывается в main.ScreenRecorderApp.
     import_requested = Signal()
 
     def __init__(
@@ -103,6 +253,7 @@ class SessionsWindow(QDialog):
         self.setMinimumSize(1400, 780)
         self.setModal(False)
         self._rows: List[Dict[str, Any]] = []
+        self._thread: Optional[SessionsScanThread] = None
 
         self._build_ui()
         self._build_menu_bar()
@@ -124,6 +275,12 @@ class SessionsWindow(QDialog):
         self.selection_label.setStyleSheet("QLabel { color: #666; }")
         header.addWidget(self.selection_label)
         header.addStretch()
+
+        self.refresh_indicator = QLabel("")
+        self.refresh_indicator.setStyleSheet(
+            "QLabel { color: #4a90d9; font-style: italic; }"
+        )
+        header.addWidget(self.refresh_indicator)
         root.addLayout(header)
 
         self.table = QTableWidget(0, 10)
@@ -152,11 +309,15 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         hv.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
-        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.itemSelectionChanged.connect(
+            self._on_selection_changed
+        )
         self.table.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
-        self.table.customContextMenuRequested.connect(self._show_context_menu)
+        self.table.customContextMenuRequested.connect(
+            self._show_context_menu
+        )
         root.addWidget(self.table, 1)
 
         root.addWidget(self._build_legend())
@@ -176,10 +337,6 @@ class SessionsWindow(QDialog):
 
     def _build_menu_bar(self) -> None:
         bar = QMenuBar(self)
-        # ВАЖНО: цвета выделения задаём явно, чтобы не зависеть от
-        # системной палитры. При использовании palette(highlight) /
-        # palette(highlighted-text) в некоторых темах выделение
-        # получается белым на белом, и текст в меню исчезает.
         _MENU_QSS = (
             "QMenuBar {"
             "  background-color: palette(window);"
@@ -222,8 +379,6 @@ class SessionsWindow(QDialog):
             "}"
         )
         bar.setStyleSheet(_MENU_QSS)
-        # Дублируем стиль на само окно — чтобы контекстное меню по
-        # правому клику в таблице получило тот же вид и те же цвета.
         self.setStyleSheet(self.styleSheet() + _MENU_QSS)
 
         layout: QVBoxLayout = self.layout()
@@ -299,7 +454,9 @@ class SessionsWindow(QDialog):
             "записи — после этого «Отправить в чат…» (Bitrix24) "
             "сможет отправить именно DOCX."
         )
-        act_export_protocol_docx.triggered.connect(self._export_protocol_docx)
+        act_export_protocol_docx.triggered.connect(
+            self._export_protocol_docx
+        )
         m_protocol.addAction(act_export_protocol_docx)
 
         m_protocol.addSeparator()
@@ -509,9 +666,12 @@ class SessionsWindow(QDialog):
         layout.addWidget(QLabel("<b>Статусы:</b>"))
         items = [
             (STATUS_UPLOADED, "видео сохранено, обработка не выполнялась"),
-            (STATUS_TRANSCRIBING, "задача в очереди: конвертация/транскрибация"),
-            (STATUS_PROCESSED, "все шаги завершены — есть audio и/или transcript"),
-            (STATUS_ERROR, "задача завершилась с ошибкой; доступен ручной перезапуск"),
+            (STATUS_TRANSCRIBING,
+             "задача в очереди: конвертация/транскрибация"),
+            (STATUS_PROCESSED,
+             "все шаги завершены — есть audio и/или transcript"),
+            (STATUS_ERROR,
+             "задача завершилась с ошибкой; доступен ручной перезапуск"),
             (STATUS_UNKNOWN, "не удалось определить состояние"),
         ]
         for status, hint in items:
@@ -537,7 +697,9 @@ class SessionsWindow(QDialog):
         row.addWidget(text)
         hint_lbl = QLabel("?")
         hint_lbl.setToolTip(hint)
-        hint_lbl.setStyleSheet("color: gray; font-weight: bold; padding-left: 2px;")
+        hint_lbl.setStyleSheet(
+            "color: gray; font-weight: bold; padding-left: 2px;"
+        )
         row.addWidget(hint_lbl)
         return w
 
@@ -560,14 +722,9 @@ class SessionsWindow(QDialog):
         self.selection_label.setText(" | ".join(parts))
 
     # ------------------------------------------------------------------
-    # Сбор данных
+    # Обновление
     # ------------------------------------------------------------------
-    def _collect_sessions(self) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        if not os.path.isdir(self.sessions_root):
-            log.warning("Папка сессий не найдена: %s", self.sessions_root)
-            return rows
-
+    def _build_tasks_index(self) -> Dict[str, Dict[str, Any]]:
         tasks_index: Dict[str, Dict[str, Any]] = {}
         try:
             for t in self.task_queue.get_queue():
@@ -576,138 +733,60 @@ class SessionsWindow(QDialog):
                     tasks_index[os.path.abspath(vp)] = t
         except Exception as exc:
             log.warning("Не удалось получить очередь: %s", exc)
+        return tasks_index
 
-        try:
-            entries = sorted(os.listdir(self.sessions_root))
-        except OSError as exc:
-            log.error("Не удалось прочитать %s: %s", self.sessions_root, exc)
-            return rows
-
-        for name in entries:
-            session_dir = os.path.join(self.sessions_root, name)
-            if not os.path.isdir(session_dir):
-                continue
-
-            meta_path = os.path.join(session_dir, "session.json")
-            meta = _read_json(meta_path) or {}
-
-            # Ищем видео с любым расширением
-            video_path = ""
-            for ext in (".mp4", ".mkv", ".mov", ".avi", ".webm",
-                        ".flv", ".wmv", ".mp3", ".wav", ".m4a",
-                        ".aac", ".opus", ".ogg"):
-                p = os.path.join(session_dir, f"video{ext}")
-                if os.path.exists(p):
-                    video_path = p
-                    break
-
-            has_video = bool(video_path)
-            has_transcript = os.path.exists(os.path.join(session_dir, "video.txt"))
-            has_audio = os.path.exists(os.path.join(session_dir, "video.mp3"))
-
-            task = tasks_index.get(os.path.abspath(video_path)) if video_path else None
-            task_id = (task or {}).get("task_id", "")
-
-            if task is not None:
-                st = task.get("status", "")
-                if st == "completed":
-                    status = STATUS_PROCESSED
-                elif st == "error":
-                    status = STATUS_ERROR
-                elif st in ("pending", "converting", "transcribing", "summarizing"):
-                    status = STATUS_TRANSCRIBING
-                else:
-                    status = STATUS_UNKNOWN
-            else:
-                if has_transcript or has_audio:
-                    status = STATUS_PROCESSED
-                elif has_video:
-                    status = STATUS_UPLOADED
-                else:
-                    status = STATUS_UNKNOWN
-
-            date_str = meta.get("date") or ""
-            time_str = meta.get("time") or ""
-            try:
-                parts = name.split("_")
-                if len(parts) >= 2:
-                    date_str = date_str or parts[0]
-                    time_str = time_str or parts[1].replace("-", ":")
-            except Exception:
-                pass
-            if not date_str:
-                try:
-                    import datetime as _dt
-                    ts = os.path.getmtime(session_dir)
-                    date_str = _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
-                    time_str = _dt.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-                except Exception:
-                    pass
-
-            prompt_path = ""
-            for fname in (
-                "deepseek_prompt.docx", "deepseek_prompt.md",
-                "deepseek_prompt.txt",
-            ):
-                p = os.path.join(session_dir, fname)
-                if os.path.exists(p):
-                    prompt_path = p
-                    break
-
-            attachments = list(meta.get("attachments", []) or [])
-            attachments_dir = os.path.join(session_dir, "attachments")
-            if not attachments and os.path.isdir(attachments_dir):
-                attachments = [
-                    os.path.join(attachments_dir, f)
-                    for f in sorted(os.listdir(attachments_dir))
-                    if os.path.isfile(os.path.join(attachments_dir, f))
-                ]
-
-            manual_protocol_path = meta.get("manual_protocol_path") or ""
-            if manual_protocol_path and not os.path.exists(manual_protocol_path):
-                manual_protocol_path = ""
-
-            summary_bb = str(meta.get("summary_bb") or "")
-
-            rows.append({
-                "dir": session_dir,
-                "name": meta.get("name") or name,
-                "project": meta.get("project") or "",
-                "status": status,
-                "source": meta.get("source") or "record",
-                "is_scrum": bool(meta.get("is_scrum", False)),
-                "datetime": f"{date_str} {time_str}".strip(),
-                "video_path": video_path,
-                "has_video": has_video,
-                "task_id": task_id,
-                "prompt_path": prompt_path,
-                "attachments": attachments,
-                "manual_protocol_path": manual_protocol_path,
-                "summary_bb": summary_bb,
-            })
-
-        rows.sort(key=lambda r: r["datetime"], reverse=True)
-        return rows
-
-    # ------------------------------------------------------------------
-    # Обновление
-    # ------------------------------------------------------------------
     def refresh(self) -> None:
-        self._rows = self._collect_sessions()
+        if self._thread is not None and self._thread.isRunning():
+            log.debug("Сканирование уже идёт, пропускаем refresh")
+            return
 
-        total = len(self._rows)
-        processed = sum(1 for r in self._rows if r["status"] == STATUS_PROCESSED)
-        uploaded = sum(1 for r in self._rows if r["status"] == STATUS_UPLOADED)
-        in_progress = sum(1 for r in self._rows
+        self.refresh_indicator.setText("Сканирование…")
+        self.refresh_btn.setEnabled(False)
+
+        tasks_index = self._build_tasks_index()
+        self._thread = SessionsScanThread(
+            self.sessions_root, tasks_index, parent=self
+        )
+        self._thread.finished_ok.connect(self._on_scan_finished)
+        self._thread.failed.connect(self._on_scan_failed)
+        self._thread.finished.connect(self._on_scan_thread_done)
+        self._thread.start()
+
+    def _on_scan_finished(self, rows: list) -> None:
+        self._rows = list(rows or [])
+        self._render_rows()
+        self._update_summary()
+
+    def _on_scan_failed(self, error: str) -> None:
+        log.error("Сканирование сессий провалено: %s", error)
+        QMessageBox.warning(self, "Записи",
+                            f"Ошибка сканирования:\n{error}")
+
+    def _on_scan_thread_done(self) -> None:
+        self.refresh_indicator.setText("")
+        self.refresh_btn.setEnabled(True)
+        self._thread = None
+
+    def _update_summary(self) -> None:
+        rows = self._rows
+        total = len(rows)
+        processed = sum(1 for r in rows
+                        if r["status"] == STATUS_PROCESSED)
+        uploaded = sum(1 for r in rows
+                       if r["status"] == STATUS_UPLOADED)
+        in_progress = sum(1 for r in rows
                           if r["status"] == STATUS_TRANSCRIBING)
-        errors = sum(1 for r in self._rows if r["status"] == STATUS_ERROR)
+        errors = sum(1 for r in rows if r["status"] == STATUS_ERROR)
 
         self.summary_label.setText(
             f"Всего: {total} | Обработан: {processed} | "
             f"Сохранено: {uploaded} | В обработке: {in_progress} | "
             f"Ошибок: {errors}"
         )
+        log.debug("Список записей обновлён: %d сессий", total)
+        self._on_selection_changed()
 
+    def _render_rows(self) -> None:
         self.table.setRowCount(0)
         for r in self._rows:
             row = self.table.rowCount()
@@ -733,11 +812,14 @@ class SessionsWindow(QDialog):
             }
             src = src_map.get(r["source"], r["source"] or "—")
             self.table.setItem(row, 4, QTableWidgetItem(src))
-            self.table.setItem(row, 5, QTableWidgetItem("да" if r["is_scrum"] else "—"))
+            self.table.setItem(row, 5,
+                               QTableWidgetItem("да" if r["is_scrum"]
+                                                else "—"))
 
             att_count = len(r.get("attachments", []) or [])
             self.table.setItem(
-                row, 6, QTableWidgetItem(str(att_count) if att_count else "—")
+                row, 6,
+                QTableWidgetItem(str(att_count) if att_count else "—")
             )
 
             summary_bb = (r.get("summary_bb") or "").strip()
@@ -751,17 +833,14 @@ class SessionsWindow(QDialog):
                 summary_item = QTableWidgetItem("—")
             self.table.setItem(row, 7, summary_item)
 
-            self.table.setItem(row, 8, QTableWidgetItem(r["task_id"] or "—"))
+            self.table.setItem(row, 8,
+                               QTableWidgetItem(r["task_id"] or "—"))
             self.table.setItem(row, 9, QTableWidgetItem(r["dir"]))
-
-        log.debug("Список записей обновлён: %d сессий", total)
-        self._on_selection_changed()
 
     # ------------------------------------------------------------------
     # Bitrix24
     # ------------------------------------------------------------------
     def _send_to_bitrix(self, default: str = "") -> None:
-        """Открывает диалог отправки протокола/summary в чат Bitrix24."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -807,7 +886,9 @@ class SessionsWindow(QDialog):
         }
 
         try:
-            meta = _read_json(os.path.join(r["dir"], "session.json")) or {}
+            meta = read_json_file(
+                os.path.join(r["dir"], "session.json")
+            ) or {}
             session_info["comment"] = meta.get("comment") or ""
         except Exception:
             pass
@@ -828,9 +909,9 @@ class SessionsWindow(QDialog):
         dlg.exec()
 
     # ------------------------------------------------------------------
-    # Протокол: Markdown-редактор и конвертация в DOCX    # ------------------------------------------------------------------
+    # Протокол
+    # ------------------------------------------------------------------
     def _edit_manual_protocol_md(self) -> None:
-        """Открывает Markdown-редактор и сохраняет manual_protocol.md."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -840,18 +921,11 @@ class SessionsWindow(QDialog):
         initial_text = ""
 
         if os.path.exists(md_path):
-            try:
-                with open(md_path, "r", encoding="utf-8") as f:
-                    initial_text = f.read()
-            except Exception as exc:
-                log.warning("Не удалось прочитать %s: %s", md_path, exc)
+            initial_text = read_any_text(md_path)
         else:
             existing = r.get("manual_protocol_path") or ""
             if existing and os.path.exists(existing):
-                try:
-                    initial_text = self._read_protocol_as_text(existing)
-                except Exception as exc:
-                    log.warning("Не удалось прочитать %s: %s", existing, exc)
+                initial_text = self._read_protocol_as_text(existing)
 
         default_docx = os.path.join(r["dir"], "manual_protocol.docx")
 
@@ -881,12 +955,13 @@ class SessionsWindow(QDialog):
             return
 
         session_json = os.path.join(r["dir"], "session.json")
-        meta = _read_json(session_json) or {}
+        meta = read_json_file(session_json) or {}
         meta["manual_protocol_path"] = md_path
-        if not _write_json(session_json, meta):
+        if not self._write_json(session_json, meta):
             QMessageBox.critical(
                 self, "Протокол",
-                "Файл протокола записан, но не удалось обновить session.json.",
+                "Файл протокола записан, но не удалось обновить "
+                "session.json.",
             )
             return
 
@@ -899,7 +974,6 @@ class SessionsWindow(QDialog):
         )
 
     def _export_protocol_docx(self) -> None:
-        """Конвертирует протокол в .docx и прикрепляет к записи."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -930,26 +1004,14 @@ class SessionsWindow(QDialog):
             )
             return
 
-        if ext in (".md", ".txt"):
-            try:
-                with open(src_path, "r", encoding="utf-8", errors="replace") as f:
-                    md_text = f.read()
-            except Exception as exc:
-                log.exception("Не удалось прочитать %s: %s", src_path, exc)
-                QMessageBox.critical(
-                    self, "Экспорт в DOCX",
-                    f"Не удалось прочитать исходный протокол:\n{exc}",
-                )
-                return
-        else:
-            md_text = self._read_protocol_as_text(src_path)
-            if not md_text.strip():
-                QMessageBox.warning(
-                    self, "Экспорт в DOCX",
-                    "Не удалось извлечь текст из исходного файла.\n"
-                    "Поддерживаются .md, .txt, .docx, .pdf.",
-                )
-                return
+        md_text = self._read_protocol_as_text(src_path)
+        if not md_text.strip():
+            QMessageBox.warning(
+                self, "Экспорт в DOCX",
+                "Не удалось извлечь текст из исходного файла.\n"
+                "Поддерживаются .md, .txt, .docx, .pdf.",
+            )
+            return
 
         default_path = os.path.join(r["dir"], "manual_protocol.docx")
         target, _ = QFileDialog.getSaveFileName(
@@ -979,13 +1041,14 @@ class SessionsWindow(QDialog):
         attach = False
         if os.path.abspath(target) == os.path.abspath(default_path):
             session_json = os.path.join(r["dir"], "session.json")
-            meta = _read_json(session_json) or {}
+            meta = read_json_file(session_json) or {}
             meta["manual_protocol_path"] = target
-            if _write_json(session_json, meta):
+            if self._write_json(session_json, meta):
                 attach = True
 
         if attach:
-            log.info("Протокол DOCX сохранён и прикреплён к записи: %s", target)
+            log.info("Протокол DOCX сохранён и прикреплён к записи: %s",
+                     target)
             QMessageBox.information(
                 self, "Экспорт в DOCX",
                 f"Документ сохранён и прикреплён к записи:\n{target}\n\n"
@@ -1001,35 +1064,20 @@ class SessionsWindow(QDialog):
             )
 
     @staticmethod
-    def _read_protocol_as_text(path: str) -> str:
-        """Читает протокол (.md/.txt/.docx/.pdf) как обычный текст."""
-        ext = os.path.splitext(path)[1].lower()
-        if ext in (".md", ".txt"):
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
-        if ext == ".docx":
-            try:
-                from docx import Document  # type: ignore
-                doc = Document(path)
-                return "\n\n".join(p.text for p in doc.paragraphs)
-            except Exception as exc:
-                log.warning("Не удалось прочитать .docx %s: %s", path, exc)
-                return ""
-        if ext == ".pdf":
-            try:
-                from pypdf import PdfReader  # type: ignore
-                reader = PdfReader(path)
-                return "\n\n".join(
-                    (pg.extract_text() or "") for pg in reader.pages
-                )
-            except Exception as exc:
-                log.warning("Не удалось прочитать .pdf %s: %s", path, exc)
-                return ""
+    def _write_json(path: str, data: Dict[str, Any]) -> bool:
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
-        except Exception:
-            return ""
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, path)
+            return True
+        except Exception as exc:
+            log.exception("Не удалось записать %s: %s", path, exc)
+            return False
+
+    @staticmethod
+    def _read_protocol_as_text(path: str) -> str:
+        return read_any_text(path)
 
     def _attach_manual_protocol(self) -> None:
         r = self._selected_row()
@@ -1065,9 +1113,9 @@ class SessionsWindow(QDialog):
             return
 
         session_json = os.path.join(r["dir"], "session.json")
-        meta = _read_json(session_json) or {}
+        meta = read_json_file(session_json) or {}
         meta["manual_protocol_path"] = target
-        if not _write_json(session_json, meta):
+        if not self._write_json(session_json, meta):
             QMessageBox.critical(self, "Протокол",
                                  "Не удалось обновить session.json")
             return
@@ -1099,7 +1147,6 @@ class SessionsWindow(QDialog):
     # Summary (Markdown)
     # ------------------------------------------------------------------
     def _edit_summary_bb(self) -> None:
-        """Открывает Markdown-редактор summary."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -1116,17 +1163,15 @@ class SessionsWindow(QDialog):
 
         new_text = dlg.result_text()
         session_json = os.path.join(r["dir"], "session.json")
-        meta = _read_json(session_json) or {}
+        meta = read_json_file(session_json) or {}
         meta["summary_bb"] = new_text
-        if not _write_json(session_json, meta):
+        if not self._write_json(session_json, meta):
             QMessageBox.critical(
                 self, "Summary",
                 "Не удалось сохранить summary в session.json",
             )
             return
 
-        # Кладём рядом summary.md, чтобы ссылка «Открыть файл» в диалоге
-        # отправки в Bitrix24 вела на реальный файл.
         try:
             summary_md_path = os.path.join(r["dir"], "summary.md")
             with open(summary_md_path, "w", encoding="utf-8") as f:
@@ -1176,12 +1221,8 @@ class SessionsWindow(QDialog):
 
         formats = ["docx", "html", "md", "txt"]
         fmt, ok = QInputDialog.getItem(
-            self,
-            "Экспорт summary",
-            "Формат файла:",
-            formats,
-            0,
-            False,
+            self, "Экспорт summary", "Формат файла:",
+            formats, 0, False,
         )
         if not ok or not fmt:
             return
@@ -1193,7 +1234,8 @@ class SessionsWindow(QDialog):
             self,
             "Сохранить summary как",
             default_path,
-            "Word (*.docx);;HTML (*.html);;Markdown (*.md);;Text (*.txt);;All files (*)",
+            "Word (*.docx);;HTML (*.html);;Markdown (*.md);;"
+            "Text (*.txt);;All files (*)",
         )
         if not target_path:
             return
@@ -1225,7 +1267,6 @@ class SessionsWindow(QDialog):
 
     @staticmethod
     def _export_summary_html_md(text_md: str, path: str) -> None:
-        """Экспорт Markdown-summary в HTML через QTextDocument."""
         from PySide6.QtGui import QTextDocument
         doc = QTextDocument()
         doc.setMarkdown(text_md)
@@ -1236,7 +1277,8 @@ class SessionsWindow(QDialog):
     @staticmethod
     def _safe_name(name: str) -> str:
         bad = '<>:"/\\|?*\n\r\t'
-        cleaned = "".join(("_" if c in bad else c) for c in (name or "summary"))
+        cleaned = "".join(("_" if c in bad else c)
+                          for c in (name or "summary"))
         cleaned = cleaned.strip() or "summary"
         return cleaned[:60]
 
@@ -1270,11 +1312,9 @@ class SessionsWindow(QDialog):
             return
 
         candidates = []
-        for fname in (
-            "deepseek_prompt.docx",
-            "deepseek_prompt.md",
-            "deepseek_prompt.txt",
-        ):
+        for fname in ("deepseek_prompt.docx",
+                      "deepseek_prompt.md",
+                      "deepseek_prompt.txt"):
             p = os.path.join(r["dir"], fname)
             if os.path.exists(p):
                 candidates.append(p)
@@ -1380,9 +1420,7 @@ class SessionsWindow(QDialog):
 
     @staticmethod
     def _find_video_file(session_dir: str) -> str:
-        for ext in (".mp4", ".mkv", ".mov", ".avi", ".webm",
-                    ".flv", ".wmv", ".mp3", ".wav", ".m4a",
-                    ".aac", ".opus", ".ogg"):
+        for ext in _VIDEO_EXTS:
             p = os.path.join(session_dir, f"video{ext}")
             if os.path.exists(p):
                 return p
@@ -1390,11 +1428,8 @@ class SessionsWindow(QDialog):
 
     @staticmethod
     def _find_audio_file(session_dir: str) -> str:
-        for fname in (
-            "video.mp3", "video.aac", "video.wav", "video.opus",
-            "video.ogg", "video.m4a",
-        ):
-            p = os.path.join(session_dir, fname)
+        for ext in _AUDIO_EXTS:
+            p = os.path.join(session_dir, f"video{ext}")
             if os.path.exists(p):
                 return p
         return ""
@@ -1416,9 +1451,8 @@ class SessionsWindow(QDialog):
             if not video_path:
                 continue
 
-            if os.path.splitext(video_path)[1].lower() in (
-                ".mp3", ".wav", ".m4a", ".aac", ".opus", ".ogg"
-            ):
+            ext = os.path.splitext(video_path)[1].lower()
+            if ext in _AUDIO_EXTS:
                 continue
 
             result["sessions_with_video"] += 1
@@ -1527,8 +1561,7 @@ class SessionsWindow(QDialog):
         progress = QProgressDialog(
             "Удаление видеофайлов…",
             "Отмена",
-            0,
-            len(deletable),
+            0, len(deletable),
             self,
         )
         progress.setWindowTitle("Удаление видеофайлов")
@@ -1563,10 +1596,8 @@ class SessionsWindow(QDialog):
                 os.remove(video_path)
                 removed += 1
                 freed_bytes += size
-                log.info(
-                    "Удалён видеофайл: %s (%s)",
-                    video_path, self._format_size(size),
-                )
+                log.info("Удалён видеофайл: %s (%s)",
+                         video_path, self._format_size(size))
             except Exception as exc:
                 errors.append(f"{item['name']}: {exc}")
                 log.exception("Не удалось удалить %s: %s", video_path, exc)
@@ -1616,7 +1647,6 @@ class SessionsWindow(QDialog):
             return False
 
     def _delete_processed_files(self, session_dir: str) -> None:
-        """Удаляет только результаты транскрибации/суммаризации (без DeepSeek)."""
         for fname in ("video.mp3", "video.txt", "video.aac",
                       "video.wav", "video.opus"):
             p = os.path.join(session_dir, fname)
@@ -1628,15 +1658,6 @@ class SessionsWindow(QDialog):
                     log.warning("Не удалось удалить %s: %s", p, exc)
 
     def _remove_processed_artifacts(self, session_dir: str) -> None:
-        """
-        Удаляет ВСЕ артефакты предыдущей обработки для полного
-        перезапуска. Сохраняет:
-          • исходное видео;
-          • session.json;
-          • manual_protocol.*;
-          • summary.md / summary_*.* (пользовательские);
-          • attachments/.
-        """
         patterns = [
             "video.mp3", "video.aac", "video.wav", "video.opus",
             "video.ogg", "video.m4a",
@@ -1659,7 +1680,7 @@ class SessionsWindow(QDialog):
         if not os.path.exists(r["video_path"]):
             log.error("Видео не найдено: %s", r["video_path"])
             return None
-        meta = _read_json(os.path.join(r["dir"], "session.json")) or {}
+        meta = read_json_file(os.path.join(r["dir"], "session.json")) or {}
         meta["video_path"] = r["video_path"]
         meta["session_dir"] = r["dir"]
         meta.pop("task_id", None)
@@ -1678,7 +1699,6 @@ class SessionsWindow(QDialog):
     # Перезапуск / редактирование метаданных
     # ------------------------------------------------------------------
     def _restart_processing(self) -> None:
-        """Перезапускает обработку с текущими метаданными."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -1709,13 +1729,6 @@ class SessionsWindow(QDialog):
                                  "Не удалось добавить запись в очередь")
 
     def _edit_metadata_and_restart(self) -> None:
-        """
-        Открывает карточку метаданных с текущими значениями из
-        session.json. После подтверждения:
-          • сохраняет обновлённые метаданные;
-          • удаляет старые артефакты обработки;
-          • ставит запись в очередь заново.
-        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -1724,7 +1737,8 @@ class SessionsWindow(QDialog):
         if not r["video_path"] or not os.path.exists(r["video_path"]):
             QMessageBox.warning(
                 self, "Записи",
-                f"Видео не найдено:\n{r['video_path'] or '(путь не задан)'}",
+                f"Видео не найдено:\n"
+                f"{r['video_path'] or '(путь не задан)'}",
             )
             return
 
@@ -1736,7 +1750,7 @@ class SessionsWindow(QDialog):
             return
 
         session_json = os.path.join(r["dir"], "session.json")
-        meta = _read_json(session_json) or {}
+        meta = read_json_file(session_json) or {}
 
         projects = self.config_manager.get_project_names()
         prompts = self.config_manager.get_prompts()
@@ -1767,7 +1781,6 @@ class SessionsWindow(QDialog):
 
         new_meta = dlg.result_data
 
-        # Сохраняем поля, которых нет в диалоге.
         for keep_key in (
             "date", "time", "monitor",
             "summary_bb",
@@ -1790,7 +1803,8 @@ class SessionsWindow(QDialog):
             f"• скрам-митинг: "
             f"<b>{'да' if new_meta.get('is_scrum') else 'нет'}</b><br>"
             f"• формировать summary: "
-            f"<b>{'да' if new_meta.get('generate_summary') else 'нет'}</b><br>"
+            f"<b>{'да' if new_meta.get('generate_summary') else 'нет'}</b>"
+            f"<br>"
             f"• сформировать промпт DeepSeek: "
             f"<b>{'да' if new_meta.get('generate_deepseek_prompt') else 'нет'}</b>"
             f"<br><br>"
@@ -1804,7 +1818,7 @@ class SessionsWindow(QDialog):
             log.info("Перезапуск с новыми метаданными отменён")
             return
 
-        if not _write_json(session_json, new_meta):
+        if not self._write_json(session_json, new_meta):
             QMessageBox.critical(
                 self, "Записи",
                 "Не удалось сохранить session.json",
@@ -1846,7 +1860,6 @@ class SessionsWindow(QDialog):
     # Помощники для MetadataDialog
     # ------------------------------------------------------------------
     def _on_save_prompt_to_config(self, name: str, text: str) -> None:
-        """Сохраняет промпт в библиотеку через ConfigManager."""
         try:
             name = (name or "").strip()
             text = (text or "").strip()
@@ -1873,7 +1886,6 @@ class SessionsWindow(QDialog):
             raise
 
     def _on_save_name_template(self, label: str, template: str) -> None:
-        """Сохраняет шаблон имени в конфиг через ConfigManager."""
         try:
             label = (label or "").strip()
             template = (template or "").strip()
@@ -1916,14 +1928,19 @@ class SessionsWindow(QDialog):
         if new_status == STATUS_UPLOADED:
             self._delete_processed_files(r["dir"])
         if new_status == STATUS_PROCESSED:
-            has_audio = os.path.exists(os.path.join(r["dir"], "video.mp3"))
-            has_txt = os.path.exists(os.path.join(r["dir"], "video.txt"))
+            has_audio = os.path.exists(
+                os.path.join(r["dir"], "video.mp3")
+            )
+            has_txt = os.path.exists(
+                os.path.join(r["dir"], "video.txt")
+            )
             if not (has_audio or has_txt):
                 QMessageBox.warning(
                     self, "Записи",
-                    "Не найдены video.mp3 или video.txt — файлы обработки "
-                    "отсутствуют.\n\nСтатус изменён не будет. "
-                    "Используйте «Перезапустить», если нужно обработать запись.",
+                    "Не найдены video.mp3 или video.txt — файлы "
+                    "обработки отсутствуют.\n\nСтатус изменён не будет. "
+                    "Используйте «Перезапустить», если нужно обработать "
+                    "запись.",
                 )
                 self.refresh()
                 return
@@ -2034,35 +2051,18 @@ class SessionsWindow(QDialog):
             pref_idx = 0
 
         fmt, ok = QInputDialog.getItem(
-            self,
-            "Экспорт промпта",
-            "Формат файла:",
-            formats,
-            pref_idx,
-            False,
+            self, "Экспорт промпта", "Формат файла:",
+            formats, pref_idx, False,
         )
         if not ok or not fmt:
             return
 
-        text = ""
-        try:
-            if path.endswith(".docx"):
-                try:
-                    from docx import Document
-                    doc = Document(path)
-                    text = "\n".join(p.text for p in doc.paragraphs)
-                except ImportError:
-                    QMessageBox.warning(
-                        self, "Экспорт",
-                        "python-docx не установлен — невозможно прочитать .docx.",
-                    )
-                    return
-            else:
-                with open(path, "r", encoding="utf-8") as f:
-                    text = f.read()
-        except Exception as exc:
-            log.exception("Не удалось прочитать промпт: %s", exc)
-            QMessageBox.critical(self, "Экспорт", f"Ошибка чтения: {exc}")
+        text = read_any_text(path)
+        if not text.strip():
+            QMessageBox.warning(
+                self, "Экспорт",
+                "Не удалось прочитать промпт.",
+            )
             return
 
         base_name = os.path.splitext(os.path.basename(path))[0]
@@ -2091,7 +2091,8 @@ class SessionsWindow(QDialog):
                                     f"Файл сохранён:\n{target_path}")
         except Exception as exc:
             log.exception("Ошибка сохранения промпта: %s", exc)
-            QMessageBox.critical(self, "Экспорт", f"Не удалось сохранить: {exc}")
+            QMessageBox.critical(self, "Экспорт",
+                                 f"Не удалось сохранить: {exc}")
 
     # ------------------------------------------------------------------
     # Вложения
@@ -2121,7 +2122,8 @@ class SessionsWindow(QDialog):
             self,
             "Выберите файлы-вложения",
             os.path.expanduser("~"),
-            "Документы (*.txt *.md *.docx *.pdf *.csv *.json);;Все файлы (*)",
+            "Документы (*.txt *.md *.docx *.pdf *.csv *.json);;"
+            "Все файлы (*)",
         )
         if not files:
             return
@@ -2130,7 +2132,7 @@ class SessionsWindow(QDialog):
         os.makedirs(att_dir, exist_ok=True)
 
         session_json = os.path.join(r["dir"], "session.json")
-        meta = _read_json(session_json) or {}
+        meta = read_json_file(session_json) or {}
         current = list(meta.get("attachments", []) or [])
 
         added = 0
@@ -2151,20 +2153,22 @@ class SessionsWindow(QDialog):
                 added += 1
                 log.info("Добавлено вложение: %s → %s", src, dst)
             except Exception as exc:
-                log.exception("Ошибка копирования вложения %s: %s", src, exc)
+                log.exception("Ошибка копирования вложения %s: %s",
+                              src, exc)
 
         if added:
             meta["attachments"] = current
-            if not _write_json(session_json, meta):
+            if not self._write_json(session_json, meta):
                 QMessageBox.critical(self, "Ошибка",
                                      "Не удалось обновить session.json")
                 return
             QMessageBox.information(
                 self, "Вложения",
                 f"Добавлено файлов: {added}\n\n"
-                "Чтобы вложения попали в транскрибацию или промпт DeepSeek, "
-                "установите соответствующие флаги в метаданных через "
-                "«Очередь → Редактировать метаданные и перезапустить…».",
+                "Чтобы вложения попали в транскрибацию или промпт "
+                "DeepSeek, установите соответствующие флаги в "
+                "метаданных через «Очередь → Редактировать метаданные "
+                "и перезапустить…».",
             )
             self.refresh()
 
@@ -2184,7 +2188,8 @@ class SessionsWindow(QDialog):
             return
         folder = r["dir"]
         if not os.path.isdir(folder):
-            QMessageBox.warning(self, "Записи", f"Папка не найдена:\n{folder}")
+            QMessageBox.warning(self, "Записи",
+                                f"Папка не найдена:\n{folder}")
             return
         log.info("Открытие папки сессии: %s", folder)
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
@@ -2196,7 +2201,8 @@ class SessionsWindow(QDialog):
             return
         video = r["video_path"]
         if not video or not os.path.exists(video):
-            QMessageBox.warning(self, "Записи", f"Видео не найдено:\n{video}")
+            QMessageBox.warning(self, "Записи",
+                                f"Видео не найдено:\n{video}")
             return
         log.info("Открытие видео: %s", video)
         QDesktopServices.openUrl(QUrl.fromLocalFile(video))
@@ -2220,7 +2226,8 @@ class SessionsWindow(QDialog):
             self.refresh()
         except Exception as exc:
             log.exception("Не удалось удалить %s: %s", r["dir"], exc)
-            QMessageBox.critical(self, "Ошибка", f"Не удалось удалить: {exc}")
+            QMessageBox.critical(self, "Ошибка",
+                                 f"Не удалось удалить: {exc}")
 
     # ------------------------------------------------------------------
     # Справка

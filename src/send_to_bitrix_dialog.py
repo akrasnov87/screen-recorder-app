@@ -34,6 +34,10 @@ Summary хранится в session.json в поле summary_bb (Markdown).
     кликом или кнопкой «Открыть файл».
   • Массовая рассылка выполняется в отдельном QThread — GUI
     остаётся отзывчивым, прогресс виден в QProgressDialog.
+
+Изменения:
+  • Чтение файлов теперь идёт через единый модуль file_readers —
+    устранено дублирование логики чтения .txt/.md/.docx/.pdf.
 """
 from __future__ import annotations
 
@@ -55,6 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 from .bitrix_client import Bitrix24Client, Bitrix24Error
+from .file_readers import read_any_text
 from .logger import get_logger
 from .markdown_docx import markdown_to_docx
 from .markdown_to_bitrix import (
@@ -70,37 +75,12 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Утилиты
 # ---------------------------------------------------------------------------
-def _read_text_safe(path: str, max_chars: int = 200000) -> str:
-    """Читает файл как текст, с ограничением длины."""
-    if not path or not os.path.exists(path):
-        return ""
-    ext = os.path.splitext(path)[1].lower()
-    try:
-        if ext == ".docx":
-            from docx import Document  # type: ignore
-            doc = Document(path)
-            return "\n".join(p.text for p in doc.paragraphs)[:max_chars]
-        if ext == ".pdf":
-            try:
-                from pypdf import PdfReader  # type: ignore
-                reader = PdfReader(path)
-                text = "\n".join(
-                    (pg.extract_text() or "") for pg in reader.pages
-                )
-                return text[:max_chars]
-            except ImportError:
-                return ""
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read(max_chars)
-    except Exception as exc:
-        log.warning("Не удалось прочитать %s: %s", path, exc)
-        return ""
-
-
 def _safe_filename(name: str) -> str:
     """Безопасное имя файла для временных документов."""
     bad = '<>:"/\\|?*\n\r\t'
-    cleaned = "".join(("_" if c in bad else c) for c in (name or "document"))
+    cleaned = "".join(
+        ("_" if c in bad else c) for c in (name or "document")
+    )
     cleaned = cleaned.strip() or "document"
     return cleaned[:60]
 
@@ -235,7 +215,8 @@ class _SendWorker(QThread):
 
                 try:
                     log.info(
-                        "Bitrix24: [%s] отправка %d файлов одним сообщением",
+                        "Bitrix24: [%s] отправка %d файлов одним "
+                        "сообщением",
                         chat_id, len(prepared),
                     )
                     await client.send_file_message(
@@ -746,7 +727,9 @@ class SendToBitrixDialog(QDialog):
         self.protocol_link.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
         )
-        self.protocol_link.linkActivated.connect(self._on_open_protocol_link)
+        self.protocol_link.linkActivated.connect(
+            self._on_open_protocol_link
+        )
         protocol_row.addWidget(self.protocol_link, 1)
 
         self.open_protocol_btn = QPushButton("Открыть файл")
@@ -1127,7 +1110,9 @@ class SendToBitrixDialog(QDialog):
     # Ссылки на материалы
     # ------------------------------------------------------------------
     def _summary_target_path(self) -> str:
-        if self._summary_file_path and os.path.exists(self._summary_file_path):
+        if self._summary_file_path and os.path.exists(
+            self._summary_file_path
+        ):
             return self._summary_file_path
         if self._session_dir:
             sj = os.path.join(self._session_dir, "session.json")
@@ -1138,7 +1123,7 @@ class SendToBitrixDialog(QDialog):
     def _load_previews(self) -> None:
         if self._protocol_path and os.path.exists(self._protocol_path):
             try:
-                self._protocol_text = _read_text_safe(self._protocol_path)
+                self._protocol_text = read_any_text(self._protocol_path)
             except Exception as exc:
                 log.warning("Не удалось прочитать %s: %s",
                             self._protocol_path, exc)
@@ -1243,7 +1228,9 @@ class SendToBitrixDialog(QDialog):
             )
             return
 
-        connect_timeout = float(self.bitrix_cfg.get("connect_timeout", 15))
+        connect_timeout = float(
+            self.bitrix_cfg.get("connect_timeout", 15)
+        )
         read_timeout = float(self.bitrix_cfg.get("read_timeout", 60))
 
         QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -1266,7 +1253,9 @@ class SendToBitrixDialog(QDialog):
             )
             return
         except Exception as exc:
-            log.exception("Неожиданная ошибка при ping Bitrix24: %s", exc)
+            log.exception(
+                "Неожиданная ошибка при ping Bitrix24: %s", exc
+            )
             QMessageBox.critical(self, "Bitrix24", f"Ошибка:\n{exc}")
             return
         finally:
@@ -1302,15 +1291,17 @@ class SendToBitrixDialog(QDialog):
                           errors="replace") as f:
                     text = f.read()
             else:
-                text = _read_text_safe(src_path)
+                text = read_any_text(src_path)
         except Exception as exc:
             log.exception("Не удалось прочитать протокол %s: %s",
                           src_path, exc)
             return src_path
 
         if not text.strip():
-            log.warning("Протокол пустой, конвертация в .docx не нужна: %s",
-                        src_path)
+            log.warning(
+                "Протокол пустой, конвертация в .docx не нужна: %s",
+                src_path,
+            )
             return src_path
 
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1327,8 +1318,9 @@ class SendToBitrixDialog(QDialog):
         try:
             markdown_to_docx(text, tmp_path, title=title)
         except Exception as exc:
-            log.exception("Не удалось конвертировать протокол в .docx: %s",
-                          exc)
+            log.exception(
+                "Не удалось конвертировать протокол в .docx: %s", exc
+            )
             return src_path
 
         log.info(
@@ -1398,7 +1390,9 @@ class SendToBitrixDialog(QDialog):
                 self.session_info.get("name") or "document"
             )
             filename = f"summary_{safe_name}_{stamp}.md"
-            full_text = (f"# {header}\n\n{md_text}" if header else md_text)
+            full_text = (
+                f"# {header}\n\n{md_text}" if header else md_text
+            )
             path = os.path.join(tmpdir, filename)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(full_text)
@@ -1442,7 +1436,8 @@ class SendToBitrixDialog(QDialog):
         targets: List[str] = []
         if which == "protocol":
             if not self._protocol_text.strip() and not (
-                self._protocol_path and os.path.exists(self._protocol_path)
+                self._protocol_path
+                and os.path.exists(self._protocol_path)
             ):
                 QMessageBox.warning(self, "Bitrix24",
                                     "Протокол не прикреплён.")
@@ -1455,7 +1450,8 @@ class SendToBitrixDialog(QDialog):
             targets = ["summary"]
         elif which == "both":
             if not self._protocol_text.strip() and not (
-                self._protocol_path and os.path.exists(self._protocol_path)
+                self._protocol_path
+                and os.path.exists(self._protocol_path)
             ):
                 QMessageBox.warning(self, "Bitrix24",
                                     "Протокол не прикреплён.")
@@ -1475,9 +1471,8 @@ class SendToBitrixDialog(QDialog):
                 body = self._protocol_text
                 src_file = (
                     self._protocol_path
-                    if self._protocol_path and os.path.exists(
-                        self._protocol_path
-                    ) else ""
+                    if self._protocol_path
+                    and os.path.exists(self._protocol_path) else ""
                 )
                 plan.append({
                     "which": "protocol",
@@ -1501,7 +1496,8 @@ class SendToBitrixDialog(QDialog):
                     "body_plain": body_plain,
                     "body_md": body_md,
                     "src_file": "",
-                    "is_file": self._is_file_mode("summary", len(body_plain)),
+                    "is_file": self._is_file_mode("summary",
+                                                  len(body_plain)),
                 })
 
         file_items_preview = [p for p in plan if p["is_file"]]
@@ -1536,7 +1532,9 @@ class SendToBitrixDialog(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        connect_timeout = float(self.bitrix_cfg.get("connect_timeout", 15))
+        connect_timeout = float(
+            self.bitrix_cfg.get("connect_timeout", 15)
+        )
         read_timeout = float(self.bitrix_cfg.get("read_timeout", 60))
         system = self.system_check.isChecked()
         url_preview = not self.no_preview_check.isChecked()
@@ -1592,7 +1590,9 @@ class SendToBitrixDialog(QDialog):
             log.info("Запрошена отмена массовой рассылки")
             self._worker.requestInterruption()
 
-    def _on_send_progress(self, current: int, total: int, chat_id: str) -> None:
+    def _on_send_progress(
+        self, current: int, total: int, chat_id: str
+    ) -> None:
         if self._progress_dlg is not None:
             self._progress_dlg.setValue(current - 1)
             self._progress_dlg.setLabelText(

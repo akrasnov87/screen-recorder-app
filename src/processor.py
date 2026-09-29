@@ -1,4 +1,10 @@
-"""Конвейер обработки: конвертация → транскрибация → суммаризация → DeepSeek-промпт."""
+"""Конвейер обработки: конвертация → транскрибация → суммаризация → DeepSeek-промпт.
+
+Изменения:
+  • Все синхронные файловые операции вынесены в asyncio.to_thread().
+  • Чтение текста через file_readers.read_any_text.
+  • Таймауты и интервалы читаются из config["app"].
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Signal
 
+from .file_readers import read_any_text
 from .litellm_client import LiteLLMClient, LiteLLMError
 from .logger import get_logger
 from .markdown_to_bitrix import markdown_to_plain_with_bb
@@ -37,14 +44,29 @@ class VideoProcessor(QObject):
         self.config = config or {}
         self.task_queue = task_queue
         self._is_recording_cb = is_recording_cb
-        # Отмена теперь через asyncio.Event — её можно взять
-        # и передать в TranscribeClient._poll, и проверить
-        # между шагами конвейера.
         self._cancel_events: Dict[str, asyncio.Event] = {}
         self._running = False
         self._last_retry_check = 0.0
+
+        app_cfg = (self.config.get("app", {}) or {})
+        self._poll_interval = float(app_cfg.get("processor_poll_interval", 2.0))
+        self._retry_check_interval = float(
+            app_cfg.get("processor_retry_check_interval", 300)
+        )
+        self._max_file_read_chars = int(
+            app_cfg.get("max_file_read_chars", 5_000_000)
+        )
+        self._ffmpeg_start_check_delay = float(
+            app_cfg.get("ffmpeg_start_check_delay", 0.3)
+        )
+        self._ffmpeg_stop_timeout = float(
+            app_cfg.get("ffmpeg_stop_timeout", 10)
+        )
+
         log.info("VideoProcessor инициализирован "
-                 "(is_recording_cb=%s)", is_recording_cb is not None)
+                 "(is_recording_cb=%s, poll=%.1fs, retry=%.0fs)",
+                 is_recording_cb is not None,
+                 self._poll_interval, self._retry_check_interval)
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -58,29 +80,29 @@ class VideoProcessor(QObject):
             })
             metadata["task_id"] = task_id
 
-        # Регистрируем событие отмены ДО старта шагов,
-        # чтобы cancel_processing, вызванный сразу после старта,
-        # не потерялся.
         cancel_event = asyncio.Event()
         self._cancel_events[task_id] = cancel_event
 
         log.info("=" * 60)
         log.info("Начало обработки задачи %s", task_id)
         log.info("Видео: %s", video_path)
-        log.info("Метаданные: project=%s, name=%s, generate_summary=%s, "
-                 "is_scrum=%s, generate_deepseek=%s, "
-                 "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
-                 "attachments=%d, summary_bb=%d, manual_protocol=%s",
-                 metadata.get("project"), metadata.get("name"),
-                 metadata.get("generate_summary"),
-                 metadata.get("is_scrum"),
-                 metadata.get("generate_deepseek_prompt"),
-                 metadata.get("include_name_in_prompt"),
-                 metadata.get("include_project_in_prompt"),
-                 metadata.get("include_comment_in_prompt"),
-                 len(metadata.get("attachments", []) or []),
-                 len(metadata.get("summary_bb") or ""),
-                 os.path.basename(metadata.get("manual_protocol_path") or "") or "—")
+        log.info(
+            "Метаданные: project=%s, name=%s, generate_summary=%s, "
+            "is_scrum=%s, generate_deepseek=%s, "
+            "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
+            "attachments=%d, summary_bb=%d, manual_protocol=%s",
+            metadata.get("project"), metadata.get("name"),
+            metadata.get("generate_summary"),
+            metadata.get("is_scrum"),
+            metadata.get("generate_deepseek_prompt"),
+            metadata.get("include_name_in_prompt"),
+            metadata.get("include_project_in_prompt"),
+            metadata.get("include_comment_in_prompt"),
+            len(metadata.get("attachments", []) or []),
+            len(metadata.get("summary_bb") or ""),
+            os.path.basename(metadata.get("manual_protocol_path") or "")
+            or "—",
+        )
 
         t0 = time.monotonic()
         try:
@@ -114,8 +136,6 @@ class VideoProcessor(QObject):
             if provider not in ("server", "litellm"):
                 provider = "server"
 
-            # Флаг формирования summary — берётся из метаданных записи.
-            # По умолчанию (если поля нет) — False (не формировать).
             generate_summary = bool(metadata.get("generate_summary", False))
 
             gl = self.config.get("glossary", {}) or {}
@@ -137,27 +157,32 @@ class VideoProcessor(QObject):
                 self.task_queue.update_task_status(task_id, "transcribing", 50)
                 self.task_progress.emit(task_id, 50, "transcribing")
 
-                # Промпт пользователя
                 prompt = (
                     metadata.get("prompt")
-                    or self.config.get("metadata", {}).get("default_prompt", "")
+                    or self.config.get("metadata", {}).get(
+                        "default_prompt", ""
+                    )
                 )
                 log.debug("[%s] Промпт пользователя (%d символов)",
                           task_id, len(prompt))
 
-                # Контекст записи — шапка перед промптом
                 ctx_header = self._build_context_header(
                     metadata=metadata,
-                    include_name=bool(metadata.get("include_name_in_prompt")),
-                    include_project=bool(metadata.get("include_project_in_prompt")),
-                    include_comment=bool(metadata.get("include_comment_in_prompt")),
+                    include_name=bool(
+                        metadata.get("include_name_in_prompt")
+                    ),
+                    include_project=bool(
+                        metadata.get("include_project_in_prompt")
+                    ),
+                    include_comment=bool(
+                        metadata.get("include_comment_in_prompt")
+                    ),
                 )
                 if ctx_header:
                     prompt = ctx_header + "\n\n" + prompt
                     log.info("[%s] В промпт добавлен контекст записи "
                              "(%d символов)", task_id, len(ctx_header))
 
-                # Summary — конвертируем в plain text и дописываем.
                 summary_bb = str(metadata.get("summary_bb") or "").strip()
                 if summary_bb:
                     summary_plain = markdown_to_plain_with_bb(summary_bb)
@@ -173,21 +198,21 @@ class VideoProcessor(QObject):
                             task_id, len(summary_bb), len(summary_plain),
                         )
 
-                # Вложения
                 if metadata.get("send_attachments_to_transcribe"):
-                    att_text = self._read_attachments_text(
-                        metadata.get("attachments", []) or []
+                    att_text = await asyncio.to_thread(
+                        self._read_attachments_text,
+                        metadata.get("attachments", []) or [],
                     )
                     if att_text:
                         prompt = (
                             prompt
-                            + "\n\n===== ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ (вложения) =====\n\n"
+                            + "\n\n===== ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ "
+                              "(вложения) =====\n\n"
                             + att_text
                         )
                         log.info("[%s] К промпту добавлены вложения "
                                  "(%d символов)", task_id, len(att_text))
 
-                # Глоссарий
                 if gl_to_summarizer and gl_text:
                     prompt = (
                         prompt
@@ -203,8 +228,6 @@ class VideoProcessor(QObject):
                 log.info("[%s] Для транскрибации используется: %s",
                          task_id, target_for_transcribe)
 
-                # Если summary для записи не формируется — не передаём
-                # промпт на сервер транскрибации: он там не нужен.
                 if provider == "server" and generate_summary:
                     server_prompt = prompt
                 else:
@@ -225,18 +248,19 @@ class VideoProcessor(QObject):
                 log.info("[%s] Транскрибация завершена за %.1f с",
                          task_id, time.monotonic() - t2)
 
-                # Отмена в процессе транскрибации
                 if isinstance(transcript, dict) and \
                         transcript.get("status") == "cancelled":
                     log.info("[%s] Транскрибация отменена", task_id)
-                    self.task_queue.mark_failed(task_id, "cancelled by user")
+                    self.task_queue.mark_failed(task_id,
+                                                "cancelled by user")
                     self.task_failed.emit(task_id, "cancelled by user")
                     return {"error": "cancelled", "task_id": task_id}
 
                 if isinstance(transcript, dict) and transcript.get("error"):
                     err = str(transcript["error"])
                     log.error("[%s] Ошибка транскрибации: %s", task_id, err)
-                    self.task_queue.mark_failed(task_id, f"transcribe: {err}")
+                    self.task_queue.mark_failed(task_id,
+                                                f"transcribe: {err}")
                     self.task_failed.emit(task_id, f"transcribe: {err}")
                     return {"error": err, "task_id": task_id}
 
@@ -246,17 +270,21 @@ class VideoProcessor(QObject):
                               or "неизвестная ошибка на сервере")
                     log.error("[%s] Сервер вернул status=error: %s",
                               task_id, err)
-                    self.task_queue.mark_failed(task_id, f"transcribe: {err}")
+                    self.task_queue.mark_failed(task_id,
+                                                f"transcribe: {err}")
                     self.task_failed.emit(task_id, f"transcribe: {err}")
                     return {"error": err, "task_id": task_id}
 
                 self._raise_if_cancelled(task_id, cancel_event)
 
                 transcript_path = str(Path(video_path).with_suffix(".txt"))
-                summary_path = str(Path(video_path).with_name("video_summary.md"))
-                self._save_transcript(transcript, transcript_path)
+                summary_path = str(
+                    Path(video_path).with_name("video_summary.md")
+                )
+                await asyncio.to_thread(
+                    self._save_transcript, transcript, transcript_path
+                )
 
-                # --- Суммаризация ---
                 if not generate_summary:
                     log.info(
                         "[%s] Формирование summary отключено для этой "
@@ -265,7 +293,9 @@ class VideoProcessor(QObject):
                         task_id, provider,
                     )
                 elif provider == "litellm":
-                    self.task_queue.update_task_status(task_id, "summarizing", 70)
+                    self.task_queue.update_task_status(
+                        task_id, "summarizing", 70
+                    )
                     self.task_progress.emit(task_id, 70, "summarizing")
                     try:
                         summary_text = await self._summarize_with_litellm(
@@ -275,7 +305,9 @@ class VideoProcessor(QObject):
                             video_title=metadata.get("name", "") or "",
                         )
                         if summary_text:
-                            self._write_file(summary_path, summary_text)
+                            await asyncio.to_thread(
+                                self._write_file, summary_path, summary_text
+                            )
                             transcript["summary"] = summary_text
                         else:
                             log.warning(
@@ -289,52 +321,56 @@ class VideoProcessor(QObject):
                         self.task_failed.emit(task_id, err)
                         return {"error": err, "task_id": task_id}
                 else:
-                    # server-режим: сервер уже отдал summary в transcript,
-                    # сохраняем его на диск (если он есть).
-                    self._save_summary(transcript, summary_path)
+                    await asyncio.to_thread(
+                        self._save_summary, transcript, summary_path
+                    )
             else:
-                log.info("[%s] Транскрибация пропущена: URL сервера не задан",
-                         task_id)
+                log.info("[%s] Транскрибация пропущена: URL сервера "
+                         "не задан", task_id)
 
             self._raise_if_cancelled(task_id, cancel_event)
 
             # --- Шаг 3: DeepSeek-промпт ---
             if metadata.get("generate_deepseek_prompt") and transcript_path:
                 use_scrum = bool(metadata.get("is_scrum", False))
-                # Ручной протокол
                 manual_protocol_path = str(
                     metadata.get("manual_protocol_path") or ""
                 ).strip()
                 manual_protocol_text = ""
-                if manual_protocol_path and os.path.exists(manual_protocol_path):
-                    manual_protocol_text = self._read_any_text(manual_protocol_path)
-                    log.info("[%s] Ручной протокол прочитан: %s (%d символов)",
-                             task_id, manual_protocol_path,
-                             len(manual_protocol_text))
-                # Summary — конвертируем в plain и добавим в формате
-                # «Краткое описание».
+                if manual_protocol_path and os.path.exists(
+                    manual_protocol_path
+                ):
+                    manual_protocol_text = await asyncio.to_thread(
+                        read_any_text, manual_protocol_path,
+                        self._max_file_read_chars,
+                    )
+                    log.info(
+                        "[%s] Ручной протокол прочитан: %s (%d символов)",
+                        task_id, manual_protocol_path,
+                        len(manual_protocol_text),
+                    )
+
                 summary_bb = str(metadata.get("summary_bb") or "").strip()
                 summary_for_deepseek = (
-                    markdown_to_plain_with_bb(summary_bb) if summary_bb else ""
+                    markdown_to_plain_with_bb(summary_bb)
+                    if summary_bb else ""
                 )
 
                 try:
-                    prompt_path = self._build_deepseek_prompt(
-                        session_dir=os.path.dirname(video_path),
-                        transcript_path=transcript_path,
-                        previous_protocol_path=metadata.get(
-                            "previous_protocol_path", ""
-                        ),
-                        attachments=metadata.get("attachments", []) or [],
-                        include_attachments=bool(
-                            metadata.get("send_attachments_to_deepseek", False)
-                        ),
-                        use_scrum_template=use_scrum,
-                        user_prompt=str(metadata.get("prompt") or ""),
-                        glossary_text=gl_text if gl_to_deepseek else "",
-                        metadata=metadata,
-                        summary_text=summary_for_deepseek,
-                        manual_protocol_text=manual_protocol_text,
+                    prompt_path = await asyncio.to_thread(
+                        self._build_deepseek_prompt,
+                        os.path.dirname(video_path),
+                        transcript_path,
+                        metadata.get("previous_protocol_path", ""),
+                        metadata.get("attachments", []) or [],
+                        bool(metadata.get("send_attachments_to_deepseek",
+                                          False)),
+                        use_scrum,
+                        str(metadata.get("prompt") or ""),
+                        gl_text if gl_to_deepseek else "",
+                        metadata,
+                        summary_for_deepseek,
+                        manual_protocol_text,
                     )
                     if prompt_path:
                         log.info(
@@ -347,8 +383,10 @@ class VideoProcessor(QObject):
                             bool(manual_protocol_text),
                         )
                 except Exception as exc:
-                    log.exception("[%s] Не удалось собрать DeepSeek-промпт: %s",
-                                  task_id, exc)
+                    log.exception(
+                        "[%s] Не удалось собрать DeepSeek-промпт: %s",
+                        task_id, exc,
+                    )
             else:
                 log.info(
                     "[%s] DeepSeek-промпт не формируется: "
@@ -393,7 +431,6 @@ class VideoProcessor(QObject):
             return {"error": str(exc), "task_id": task_id}
 
         finally:
-            # Чистим событие отмены — задача завершена
             self._cancel_events.pop(task_id, None)
 
     # ------------------------------------------------------------------
@@ -406,12 +443,6 @@ class VideoProcessor(QObject):
         bitrate: int,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> str:
-        """
-        Конвертирует видео в аудио через ffmpeg.
-
-        Отмена: если cancel_event выставлен — завершаем дочерний
-        процесс ffmpeg через terminate(), затем kill().
-        """
         out = str(Path(video_path).with_suffix(f".{fmt}"))
         codec = "libmp3lame" if fmt == "mp3" else "aac"
         cmd = [
@@ -432,7 +463,6 @@ class VideoProcessor(QObject):
                 stderr=asyncio.subprocess.DEVNULL,
             )
 
-            # Ждём завершения, но проверяем отмену раз в 0.5 с
             if cancel_event is not None:
                 wait_task = asyncio.ensure_future(proc.wait())
                 cancel_task = asyncio.ensure_future(cancel_event.wait())
@@ -442,7 +472,6 @@ class VideoProcessor(QObject):
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if cancel_task in done:
-                        # отмена — убиваем ffmpeg
                         log.info("Конвертация отменена — завершаем ffmpeg "
                                  "(PID=%s)", proc.pid)
                         try:
@@ -450,7 +479,10 @@ class VideoProcessor(QObject):
                         except ProcessLookupError:
                             pass
                         try:
-                            await asyncio.wait_for(proc.wait(), timeout=5.0)
+                            await asyncio.wait_for(
+                                proc.wait(),
+                                timeout=self._ffmpeg_stop_timeout,
+                            )
                         except asyncio.TimeoutError:
                             try:
                                 proc.kill()
@@ -525,8 +557,8 @@ class VideoProcessor(QObject):
                     cancel_event=cancel_event,
                 )
                 log.info("Транскрибация: получен результат (status=%s)",
-                         result.get("status") if isinstance(result, dict)
-                         else "—")
+                         result.get("status")
+                         if isinstance(result, dict) else "—")
                 return result
         except Exception as exc:
             log.exception("Ошибка транскрибации: %s", exc)
@@ -646,7 +678,7 @@ class VideoProcessor(QObject):
             if not p or not os.path.exists(p):
                 log.warning("Вложение не найдено: %s", p)
                 continue
-            text = self._read_any_text(p)
+            text = read_any_text(p, self._max_file_read_chars)
             if not text:
                 continue
             blocks.append(f"### Файл: {os.path.basename(p)}\n{text}")
@@ -695,13 +727,6 @@ class VideoProcessor(QObject):
         summary_text: str = "",
         manual_protocol_text: str = "",
     ) -> str:
-        """
-        Формирует файл с готовым промптом для DeepSeek.
-
-        Дополнительно:
-          • summary_text          — краткое описание записи (plain, без разметки);
-          • manual_protocol_text  — вручную подготовленный протокол.
-        """
         log.info(
             "Сборка DeepSeek-промпта: transcript=%s, prev=%s, attach=%s, "
             "use_scrum_template=%s, user_prompt=%d симв, glossary=%d симв, "
@@ -717,8 +742,12 @@ class VideoProcessor(QObject):
             ctx_header = self._build_context_header(
                 metadata=metadata,
                 include_name=bool(metadata.get("include_name_in_prompt")),
-                include_project=bool(metadata.get("include_project_in_prompt")),
-                include_comment=bool(metadata.get("include_comment_in_prompt")),
+                include_project=bool(
+                    metadata.get("include_project_in_prompt")
+                ),
+                include_comment=bool(
+                    metadata.get("include_comment_in_prompt")
+                ),
             )
             if ctx_header:
                 log.info("В DeepSeek-промпт добавлен контекст записи "
@@ -747,17 +776,15 @@ class VideoProcessor(QObject):
         if export_format not in ("docx", "md", "txt"):
             export_format = "docx"
 
-        transcript_text = ""
-        try:
-            with open(transcript_path, "r", encoding="utf-8") as f:
-                transcript_text = f.read()
-        except Exception as exc:
-            log.warning("Не удалось прочитать стенограмму %s: %s",
-                        transcript_path, exc)
+        transcript_text = read_any_text(
+            transcript_path, self._max_file_read_chars
+        )
 
         previous_text = ""
         if previous_protocol_path and os.path.exists(previous_protocol_path):
-            previous_text = self._read_any_text(previous_protocol_path)
+            previous_text = read_any_text(
+                previous_protocol_path, self._max_file_read_chars
+            )
 
         attachments_text = ""
         if include_attachments and attachments:
@@ -766,7 +793,6 @@ class VideoProcessor(QObject):
                 log.info("В промпт DeepSeek добавлены вложения "
                          "(%d символов)", len(attachments_text))
 
-        # --- Сборка ---
         parts: List[str] = []
 
         if ctx_header:
@@ -776,7 +802,6 @@ class VideoProcessor(QObject):
         parts.append(template)
         parts.append("")
 
-        # Ручной протокол — самый приоритетный контекст
         if manual_protocol_text:
             parts.append("=" * 60)
             parts.append("РУЧНОЙ ПРОТОКОЛ (загружен пользователем)")
@@ -785,7 +810,6 @@ class VideoProcessor(QObject):
             parts.append(manual_protocol_text)
             parts.append("")
 
-        # Краткое описание записи
         if summary_text:
             parts.append("=" * 60)
             parts.append("КРАТКОЕ ОПИСАНИЕ ЗАПИСИ (введено пользователем)")
@@ -873,30 +897,6 @@ class VideoProcessor(QObject):
             log.exception("Ошибка сохранения промпта: %s", exc)
             return ""
 
-    @staticmethod
-    def _read_any_text(path: str) -> str:
-        ext = os.path.splitext(path)[1].lower()
-        if ext in (".txt", ".md", ".csv", ".json", ".log"):
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read()
-            except Exception as exc:
-                log.warning("Не удалось прочитать %s: %s", path, exc)
-                return ""
-        if ext == ".docx":
-            try:
-                from docx import Document  # type: ignore
-                doc = Document(path)
-                return "\n".join(p.text for p in doc.paragraphs)
-            except ImportError:
-                log.warning("python-docx не установлен, docx не прочитан: %s", path)
-                return ""
-            except Exception as exc:
-                log.warning("Ошибка чтения .docx %s: %s", path, exc)
-                return ""
-        log.warning("Неподдерживаемое расширение вложения: %s (%s)", ext, path)
-        return ""
-
     # ------------------------------------------------------------------
     # Управление
     # ------------------------------------------------------------------
@@ -911,19 +911,11 @@ class VideoProcessor(QObject):
         return self.task_queue.reset_for_retry(task_id)
 
     def cancel_processing(self, task_id: str) -> bool:
-        """
-        Отменяет задачу.
-
-        Работает даже если задача «висит» внутри транскрибации:
-        событие отмены прокидывается в TranscribeClient._poll
-        и в convert_to_audio, которые реагируют немедленно.
-        """
         log.warning("Отмена задачи %s", task_id)
         event = self._cancel_events.get(task_id)
         if event is None:
             log.warning("Задача %s не найдена среди активных "
                         "(возможно, уже завершена)", task_id)
-            # Всё равно помечаем в очереди — на случай гонок
             self.task_queue.mark_failed(task_id, "cancelled by user")
             return False
         event.set()
@@ -987,7 +979,7 @@ class VideoProcessor(QObject):
             if self._is_recording_cb is not None:
                 try:
                     if self._is_recording_cb():
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(self._poll_interval)
                         continue
                 except Exception as exc:
                     log.warning("Ошибка в is_recording_cb: %s", exc)
@@ -1004,7 +996,7 @@ class VideoProcessor(QObject):
                 continue
 
             await self._maybe_retry_failed()
-            await asyncio.sleep(2)
+            await asyncio.sleep(self._poll_interval)
         log.info("Фоновый воркер остановлен")
 
     async def _maybe_retry_failed(self) -> None:
@@ -1012,7 +1004,7 @@ class VideoProcessor(QObject):
         if not cfg.get("auto_retry_enabled", True):
             return
 
-        interval_sec = int(cfg.get("retry_interval_minutes", 5)) * 60
+        interval_sec = self._retry_check_interval
         max_retries = int(cfg.get("max_retries", 10))
 
         now = time.monotonic()

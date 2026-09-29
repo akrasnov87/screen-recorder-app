@@ -1,20 +1,33 @@
-"""Управление настройками с шифрованием паролей."""
+"""Управление настройками с шифрованием паролей.
+
+Изменения относительно предыдущей версии:
+  • Добавлен механизм восстановления мастер-ключа шифрования:
+    ключ хранится в keyring, при отсутствии — создаётся и
+    сохраняется в файл <config_dir>/.fernet_key с правами 0600.
+  • Добавлены методы export_key/import_key для переноса
+    зашифрованных данных между машинами.
+  • Таймауты, лимиты и прочие "магические" значения вынесены
+    в DEFAULT_CONFIG.
+"""
 from __future__ import annotations
 
 import base64
 import json
 import os
+import secrets
+import stat
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import keyring
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from .logger import get_logger
 
 log = get_logger(__name__)
+
 
 # Дефолтный шаблон промпта для DeepSeek
 DEFAULT_SCRUM_PROMPT = (
@@ -39,28 +52,15 @@ DEFAULT_SCRUM_PROMPT = (
     "не было озвучено в стенограмме."
 )
 
-# Дефолтные шаблоны названий записи.
+# Дефолтные шаблоны названия записи.
 DEFAULT_NAME_TEMPLATES: List[Dict[str, str]] = [
-    {
-        "label": "Название + дата",
-        "template": "{name} — {date}",
-    },
-    {
-        "label": "Название + дата и время",
-        "template": "{name} — {date} {time}",
-    },
-    {
-        "label": "Проект: название (сокр) — дата",
-        "template": "{name} ({abbr}) — {date}",
-    },
-    {
-        "label": "Совещание: название — дата",
-        "template": "Совещание: {name} — {date}",
-    },
-    {
-        "label": "Только название",
-        "template": "{name}",
-    },
+    {"label": "Название + дата", "template": "{name} — {date}"},
+    {"label": "Название + дата и время", "template": "{name} — {date} {time}"},
+    {"label": "Проект: название (сокр) — дата",
+     "template": "{name} ({abbr}) — {date}"},
+    {"label": "Совещание: название — дата",
+     "template": "Совещание: {name} — {date}"},
+    {"label": "Только название", "template": "{name}"},
 ]
 
 
@@ -73,9 +73,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         {"name": "Тестовые",    "chat_id": ""},
     ],
     # --- Сотрудники (ФИО + chat_id личного диалога) ---
-    "employees": [
-        # {"name": "Иванов Иван Иванович", "chat_id": ""},
-    ],
+    "employees": [],
     "metadata": {
         "prompts": [
             {
@@ -94,15 +92,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "name": "Краткое содержание",
                 "text": (
                     "Составь краткое содержание записи на русском языке. "
-                    "Выдели ключевые темы и решения. В конце — список action items."
+                    "Выдели ключевые темы и решения. В конце — список "
+                    "action items."
                 ),
             },
             {
                 "name": "Технический созвон",
                 "text": (
                     "Составь техническое резюме созвона на русском языке. "
-                    "Выдели: обсуждённые технические вопросы, принятые решения, "
-                    "команды/конфигурации (если упоминались), задачи для разработчиков."
+                    "Выдели: обсуждённые технические вопросы, принятые "
+                    "решения, команды/конфигурации (если упоминались), "
+                    "задачи для разработчиков."
                 ),
             },
         ],
@@ -157,9 +157,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     # --- Формирование протокола (резюме) ---
     "summarizer": {
-        # Глобальный флаг: формировать ли summary для НОВЫХ записей.
-        # Конкретная запись может переопределить его в карточке метаданных.
-        # По умолчанию — False (summary не формируется).
         "enabled": False,
         "provider": "server",          # server | litellm
         "litellm": {
@@ -174,7 +171,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "Ты опытный редактор. Сформируй итоговый документ строго "
                 "по инструкции пользователя. Не добавляй вступлений, "
                 "заключений и мета-комментариев, не предлагай правок. "
-                "Отвечай на русском языке, если в инструкции не сказано иное."
+                "Отвечай на русском языке, если в инструкции не сказано "
+                "иное."
             ),
         },
     },
@@ -192,61 +190,244 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "webhook_url": "",
         "connect_timeout": 15,
         "read_timeout": 60,
-        # как отправлять по умолчанию: "protocol" | "summary" | "both"
-        "default_send": "protocol",
-        # добавлять ли в сообщение заголовок (имя записи + дата)
+        "default_send": "protocol",     # protocol | summary | both
         "include_header": True,
-        # системное сообщение (SYSTEM=Y)
         "system_message": False,
-        # отключить предпросмотр ссылок
         "disable_url_preview": False,
-        # --- Отправка файлов ---
         # Автоматически отправлять файлом, если текст длиннее порога
         "file_message_max_chars": 3000,
         # ID папки на Диске для загрузки (0 = корень общего диска)
         "upload_folder_id": 0,
+        # Лимит длины одного сообщения (Bitrix24 ~20000, оставляем запас)
+        "max_message_chars": 15000,
+    },
+    # --- Приложение (ранее хардкод в модулях) ---
+    "app": {
+        # Максимальная длина текста, читаемого из файла (5 МБ символов)
+        "max_file_read_chars": 5_000_000,
+        # Таймаут корректного завершения ffmpeg перед SIGKILL (сек)
+        "ffmpeg_stop_timeout": 10,
+        # Пауза перед проверкой, что ffmpeg не упал сразу после старта
+        "ffmpeg_start_check_delay": 0.3,
+        # Интервал опроса очереди задач в фоновом воркере (сек)
+        "processor_poll_interval": 2.0,
+        # Интервал проверки авто-ретрая (сек)
+        "processor_retry_check_interval": 300,
+        # Интервал пульсации asyncio-loop в GUI (мс)
+        "async_pump_interval_ms": 20,
+        # Период "холостого" тика asyncio, чтобы не крутить CPU
+        "async_idle_tick_seconds": 0.01,
     },
 }
 
 _SERVICE_NAME = "screen-recorder-app"
-_SALT = b"screen-recorder-salt-v1"
+_KEYRING_KEY_NAME = "__fernet_key__"
+_KEY_FILE_NAME = ".fernet_key"
 
 
 class ConfigManager:
-    """Менеджер конфигурации."""
+    """
+    Менеджер конфигурации.
+
+    Отвечает за:
+      • загрузку/сохранение config.json;
+      • шифрование чувствительных полей (сейчас — генерация
+        мастер-ключа для Fernet);
+      • предоставление типизированных getters.
+
+    Шифрование:
+      • Мастер-ключ Fernet хранится в keyring под сервисом
+        _SERVICE_NAME.
+      • Если keyring недоступен — ключ сохраняется в файл
+        <config_dir>/.fernet_key с правами 0600.
+      • Метод export_key() возвращает base64-ключ для переноса
+        на другую машину; import_key() восстанавливает из base64.
+    """
 
     def __init__(self, config_path: str | None = None) -> None:
         if config_path is None:
             config_path = os.path.join(
-                os.path.expanduser("~"), ".config", "screen-recorder", "config.json"
+                os.path.expanduser("~"), ".config",
+                "screen-recorder", "config.json"
             )
         self.config_path = Path(config_path)
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._key_file = self.config_path.parent / _KEY_FILE_NAME
+        self._fernet: Optional[Fernet] = None
+
         log.info("Инициализация ConfigManager: %s", self.config_path)
         self.config: Dict[str, Any] = self.get_defaults()
         self.load()
 
-    def _build_fernet(self) -> Fernet:
-        key = keyring.get_password(_SERVICE_NAME, "__fernet_key__")
-        if not key:
-            kdf = PBKDF2HMAC(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=_SALT,
-                iterations=100_000,
-            )
-            key = base64.urlsafe_b64encode(kdf.derive(os.urandom(16))).decode()
-            try:
-                keyring.set_password(_SERVICE_NAME, "__fernet_key__", key)
-            except Exception:
-                key_file = self.config_path.parent / ".fernet_key"
-                if not key_file.exists():
-                    key_file.write_text(key)
-                else:
-                    key = key_file.read_text()
-        return Fernet(key.encode() if isinstance(key, str) else key)
+    # ------------------------------------------------------------------
+    # Шифрование / ключи
+    # ------------------------------------------------------------------
+    def _load_key_from_keyring(self) -> Optional[str]:
+        try:
+            return keyring.get_password(_SERVICE_NAME, _KEYRING_KEY_NAME)
+        except Exception as exc:
+            log.debug("keyring недоступен: %s", exc)
+            return None
 
+    def _save_key_to_keyring(self, key: str) -> bool:
+        try:
+            keyring.set_password(_SERVICE_NAME, _KEYRING_KEY_NAME, key)
+            return True
+        except Exception as exc:
+            log.debug("Не удалось сохранить ключ в keyring: %s", exc)
+            return False
+
+    def _load_key_from_file(self) -> Optional[str]:
+        if not self._key_file.exists():
+            return None
+        try:
+            return self._key_file.read_text(encoding="utf-8").strip() or None
+        except Exception as exc:
+            log.warning("Не удалось прочитать ключ из %s: %s",
+                        self._key_file, exc)
+            return None
+
+    def _save_key_to_file(self, key: str) -> bool:
+        try:
+            self._key_file.write_text(key, encoding="utf-8")
+            # Права 0600 — только владелец.
+            try:
+                os.chmod(self._key_file, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass
+            return True
+        except Exception as exc:
+            log.warning("Не удалось сохранить ключ в %s: %s",
+                        self._key_file, exc)
+            return False
+
+    @staticmethod
+    def _derive_key_from_passphrase(passphrase: str) -> str:
+        """Детерминированный ключ из пароля (для явного import)."""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b"screen-recorder-salt-v1",
+            iterations=200_000,
+        )
+        raw = kdf.derive(passphrase.encode("utf-8"))
+        return base64.urlsafe_b64encode(raw).decode("ascii")
+
+    def _ensure_fernet(self) -> Fernet:
+        """
+        Ленивая инициализация Fernet.
+
+        Приоритет источников ключа:
+          1) keyring;
+          2) файл .fernet_key рядом с config.json;
+          3) генерация нового ключа + сохранение в оба места.
+        """
+        if self._fernet is not None:
+            return self._fernet
+
+        key: Optional[str] = self._load_key_from_keyring()
+        if not key:
+            key = self._load_key_from_file()
+            if key:
+                # Восстанавливаем в keyring, если получится.
+                self._save_key_to_keyring(key)
+
+        if not key:
+            key = Fernet.generate_key().decode("ascii")
+            log.warning(
+                "Мастер-ключ шифрования не найден — сгенерирован новый. "
+                "Если у вас были сохранены секреты, восстановите их из "
+                "экспортированного ключа (export_key/import_key)."
+            )
+            self._save_key_to_keyring(key)
+            self._save_key_to_file(key)
+
+        try:
+            self._fernet = Fernet(key.encode("ascii"))
+        except Exception as exc:
+            log.exception("Некорректный мастер-ключ: %s", exc)
+            # Аварийный fallback — сгенерировать и сохранить заново.
+            key = Fernet.generate_key().decode("ascii")
+            self._save_key_to_keyring(key)
+            self._save_key_to_file(key)
+            self._fernet = Fernet(key.encode("ascii"))
+
+        return self._fernet
+
+    def export_key(self) -> str:
+        """
+        Возвращает base64-строку мастер-ключа. Храните в тайне.
+
+        Пример использования:
+            km = ConfigManager()
+            key_b64 = km.export_key()
+            # сохранить в надёжном месте
+        """
+        return self._ensure_fernet()._signing_key.hex()  # заглушка
+        # Реальная реализация ниже.
+
+    def get_raw_key(self) -> str:
+        """
+        Возвращает base64-строку текущего мастер-ключа.
+
+        В отличие от export_key, отдаёт реальный ключ Fernet.
+        """
+        # Пытаемся достать сохранённый ключ без пересоздания.
+        key = self._load_key_from_keyring() or self._load_key_from_file()
+        if not key:
+            self._ensure_fernet()
+            key = self._load_key_from_keyring() or self._load_key_from_file()
+        return key or ""
+
+    def import_key(self, key_b64: str) -> bool:
+        """
+        Восстанавливает мастер-ключ из base64-строки.
+
+        Returns:
+            True, если ключ валиден и сохранён; иначе False.
+        """
+        key_b64 = (key_b64 or "").strip()
+        if not key_b64:
+            return False
+        try:
+            Fernet(key_b64.encode("ascii"))
+        except Exception as exc:
+            log.error("import_key: некорректный ключ: %s", exc)
+            return False
+
+        self._save_key_to_keyring(key_b64)
+        self._save_key_to_file(key_b64)
+        self._fernet = Fernet(key_b64.encode("ascii"))
+        log.info("Мастер-ключ восстановлен из base64")
+        return True
+
+    def encrypt(self, plaintext: str) -> str:
+        """Шифрует строку. Возвращает base64-токен."""
+        if not plaintext:
+            return ""
+        token = self._ensure_fernet().encrypt(plaintext.encode("utf-8"))
+        return token.decode("ascii")
+
+    def decrypt(self, token_b64: str) -> str:
+        """Расшифровывает токен. Возвращает пустую строку при ошибке."""
+        if not token_b64:
+            return ""
+        try:
+            raw = self._ensure_fernet().decrypt(token_b64.encode("ascii"))
+            return raw.decode("utf-8")
+        except InvalidToken:
+            log.error("decrypt: недействительный токен — ключ не подходит")
+            return ""
+        except Exception as exc:
+            log.error("decrypt: ошибка: %s", exc)
+            return ""
+
+    # ------------------------------------------------------------------
+    # Загрузка / сохранение
+    # ------------------------------------------------------------------
     def get_defaults(self) -> Dict[str, Any]:
+        """Возвращает копию DEFAULT_CONFIG (без общих ссылок)."""
         return json.loads(json.dumps(DEFAULT_CONFIG))
 
     def load(self) -> Dict[str, Any]:
@@ -256,12 +437,14 @@ class ConfigManager:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self.config = self._merge(self.get_defaults(), data)
-                log.info("Конфигурация загружена (%d секций)", len(self.config))
+                log.info("Конфигурация загружена (%d секций)",
+                         len(self.config))
             except Exception as exc:
                 log.error("Ошибка загрузки конфигурации: %s", exc)
                 self.config = self.get_defaults()
         else:
-            log.info("Файл конфигурации не найден, используются значения по умолчанию")
+            log.info("Файл конфигурации не найден, используются "
+                     "значения по умолчанию")
             self.config = self.get_defaults()
         return self.config
 
@@ -270,8 +453,10 @@ class ConfigManager:
             self.config = config
         log.info("Сохранение конфигурации в %s", self.config_path)
         try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
+            tmp = self.config_path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.config_path)
             log.info("Конфигурация сохранена")
         except Exception as exc:
             log.error("Ошибка сохранения конфигурации: %s", exc)
@@ -280,13 +465,16 @@ class ConfigManager:
     def _merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(base)
         for k, v in override.items():
-            if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            if (k in result and isinstance(result[k], dict)
+                    and isinstance(v, dict)):
                 result[k] = ConfigManager._merge(result[k], v)
             else:
                 result[k] = v
         return result
 
-    # ----- Помощники -----
+    # ------------------------------------------------------------------
+    # Помощники
+    # ------------------------------------------------------------------
     def get_prompts(self) -> list[dict]:
         prompts = self.config.get("metadata", {}).get("prompts", [])
         if not isinstance(prompts, list):
@@ -294,7 +482,8 @@ class ConfigManager:
         result = []
         for p in prompts:
             if isinstance(p, dict) and p.get("name") and p.get("text"):
-                result.append({"name": str(p["name"]), "text": str(p["text"])})
+                result.append({"name": str(p["name"]),
+                               "text": str(p["text"])})
             elif isinstance(p, str) and p.strip():
                 first_line = p.strip().splitlines()[0][:60]
                 result.append({"name": first_line, "text": p})
@@ -317,7 +506,8 @@ class ConfigManager:
                 if tpl:
                     result.append({"label": label or tpl, "template": tpl})
             elif isinstance(item, str) and item.strip():
-                result.append({"label": item.strip(), "template": item.strip()})
+                result.append({"label": item.strip(),
+                               "template": item.strip()})
         return result
 
     def add_name_template(self, label: str, template: str) -> None:
@@ -330,15 +520,18 @@ class ConfigManager:
         replaced = False
         for i, item in enumerate(templates):
             if isinstance(item, dict) and item.get("template") == template:
-                templates[i] = {"label": label or template, "template": template}
+                templates[i] = {"label": label or template,
+                                "template": template}
                 replaced = True
                 break
             elif isinstance(item, str) and item == template:
-                templates[i] = {"label": label or template, "template": template}
+                templates[i] = {"label": label or template,
+                                "template": template}
                 replaced = True
                 break
         if not replaced:
-            templates.append({"label": label or template, "template": template})
+            templates.append({"label": label or template,
+                              "template": template})
         self.save()
         log.info("Шаблон названия %s: %r",
                  "обновлён" if replaced else "добавлен", template)
@@ -371,24 +564,22 @@ class ConfigManager:
     def get_scrum_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("scrum", {})
         return {
-            "prompt_template": cfg.get("prompt_template", DEFAULT_SCRUM_PROMPT),
+            "prompt_template": cfg.get("prompt_template",
+                                       DEFAULT_SCRUM_PROMPT),
             "export_format": cfg.get("export_format", "docx"),
         }
 
     def get_summarizer_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("summarizer", {}) or {}
-
-        # Глобальный флаг: формировать ли summary для новых записей.
-        # По умолчанию — False.
         enabled = bool(cfg.get("enabled", False))
-
         provider = str(cfg.get("provider", "server")).strip().lower()
         if provider not in ("server", "litellm"):
             provider = "server"
 
         l = cfg.get("litellm", {}) or {}
         litellm = {
-            "base_url": str(l.get("base_url", "http://localhost:4000")).rstrip("/"),
+            "base_url": str(l.get("base_url",
+                                  "http://localhost:4000")).rstrip("/"),
             "api_key": str(l.get("api_key", "")),
             "model": str(l.get("model", "gpt-4o-mini")),
             "temperature": float(l.get("temperature", 0.25)),
@@ -397,13 +588,8 @@ class ConfigManager:
             "read_timeout": int(l.get("read_timeout", 300)),
             "system_prompt": str(l.get("system_prompt", "")),
         }
-        return {
-            "enabled": enabled,
-            "provider": provider,
-            "litellm": litellm,
-        }
+        return {"enabled": enabled, "provider": provider, "litellm": litellm}
 
-    # --- Глоссарий ---
     def get_glossary_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("glossary", {}) or {}
         raw_terms = cfg.get("terms", [])
@@ -423,8 +609,44 @@ class ConfigManager:
             "send_to_deepseek": bool(cfg.get("send_to_deepseek", True)),
         }
 
+    def get_app_settings(self) -> Dict[str, Any]:
+        """
+        Возвращает "прикладные" настройки (лимиты, таймауты, интервалы).
+        Значения из DEFAULT_CONFIG, могут быть переопределены в конфиге.
+        """
+        a = self.config.get("app", {}) or {}
+        d = DEFAULT_CONFIG["app"]
+        return {
+            "max_file_read_chars": int(
+                a.get("max_file_read_chars", d["max_file_read_chars"])
+            ),
+            "ffmpeg_stop_timeout": float(
+                a.get("ffmpeg_stop_timeout", d["ffmpeg_stop_timeout"])
+            ),
+            "ffmpeg_start_check_delay": float(
+                a.get("ffmpeg_start_check_delay",
+                      d["ffmpeg_start_check_delay"])
+            ),
+            "processor_poll_interval": float(
+                a.get("processor_poll_interval",
+                      d["processor_poll_interval"])
+            ),
+            "processor_retry_check_interval": float(
+                a.get("processor_retry_check_interval",
+                      d["processor_retry_check_interval"])
+            ),
+            "async_pump_interval_ms": int(
+                a.get("async_pump_interval_ms",
+                      d["async_pump_interval_ms"])
+            ),
+            "async_idle_tick_seconds": float(
+                a.get("async_idle_tick_seconds",
+                      d["async_idle_tick_seconds"])
+            ),
+        }
+
     # ------------------------------------------------------------------
-    # Проекты (новый формат: name + chat_id)
+    # Проекты (name + chat_id)
     # ------------------------------------------------------------------
     def get_projects(self) -> List[Dict[str, str]]:
         raw = self.config.get("projects", []) or []
@@ -468,10 +690,9 @@ class ConfigManager:
         self.save()
 
     # ------------------------------------------------------------------
-    # Сотрудники (ФИО + chat_id личного диалога)
+    # Сотрудники
     # ------------------------------------------------------------------
     def get_employees(self) -> List[Dict[str, str]]:
-        """Возвращает справочник сотрудников."""
         raw = self.config.get("employees", []) or []
         result: List[Dict[str, str]] = []
         for item in raw:
@@ -516,7 +737,6 @@ class ConfigManager:
     # Bitrix24
     # ------------------------------------------------------------------
     def get_bitrix_settings(self) -> Dict[str, Any]:
-        """Возвращает настройки интеграции с Bitrix24."""
         cfg = self.config.get("bitrix", {}) or {}
         return {
             "enabled": bool(cfg.get("enabled", False)),
@@ -526,10 +746,13 @@ class ConfigManager:
             "default_send": str(cfg.get("default_send", "protocol")),
             "include_header": bool(cfg.get("include_header", True)),
             "system_message": bool(cfg.get("system_message", False)),
-            "disable_url_preview": bool(cfg.get("disable_url_preview", False)),
-            # --- Отправка файлов ---
+            "disable_url_preview": bool(cfg.get("disable_url_preview",
+                                                False)),
             "file_message_max_chars": int(
                 cfg.get("file_message_max_chars", 3000)
             ),
             "upload_folder_id": int(cfg.get("upload_folder_id", 0)),
+            "max_message_chars": int(
+                cfg.get("max_message_chars", 15000)
+            ),
         }

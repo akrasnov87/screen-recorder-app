@@ -11,6 +11,10 @@
   • Формирование промпта: extract_hit_context() + build_prompt_from_hits()
     позволяют собрать из найденных совпадений структурированный
     текст с расширенным контекстом — для передачи в ИИ.
+
+Изменения:
+  • Чтение файлов теперь идёт через единый модуль file_readers —
+    устранено дублирование логики чтения .txt/.md/.docx/.pdf/.json.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from .file_readers import read_any_text, read_json_file
 from .logger import get_logger
 
 log = get_logger(__name__)
@@ -76,32 +81,6 @@ _TRANSCRIPT_NAMES = ("video.txt",)
 _SUMMARY_KEYS = ("summary_bb",)  # Markdown или BB-код в session.json
 
 
-def _read_text_safe(path: str) -> str:
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".docx":
-        try:
-            from docx import Document  # type: ignore
-            doc = Document(path)
-            return "\n".join(p.text for p in doc.paragraphs)
-        except Exception as exc:
-            log.warning("Не удалось прочитать .docx %s: %s", path, exc)
-            return ""
-    if ext == ".pdf":
-        try:
-            from pypdf import PdfReader  # type: ignore
-            reader = PdfReader(path)
-            return "\n".join((pg.extract_text() or "") for pg in reader.pages)
-        except Exception as exc:
-            log.warning("Не удалось прочитать .pdf %s: %s", path, exc)
-            return ""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except Exception as exc:
-        log.warning("Не удалось прочитать %s: %s", path, exc)
-        return ""
-
-
 def _iter_session_dirs(sessions_root: str) -> Iterable[str]:
     if not os.path.isdir(sessions_root):
         return []
@@ -114,17 +93,19 @@ def _iter_session_dirs(sessions_root: str) -> Iterable[str]:
 
 
 def _load_session_meta(session_dir: str) -> Dict[str, Any]:
+    """
+    Читает session.json через file_readers.
+
+    Возвращает dict или пустой dict при ошибке.
+    """
     path = os.path.join(session_dir, "session.json")
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    data = read_json_file(path)
+    return data or {}
 
 
-def _parse_session_date(session_dir: str, meta: Dict[str, Any]) -> Optional[datetime]:
+def _parse_session_date(
+    session_dir: str, meta: Dict[str, Any]
+) -> Optional[datetime]:
     """Пытается извлечь дату сессии из meta или имени папки."""
     date_str = meta.get("date") or ""
     name = os.path.basename(session_dir)
@@ -208,8 +189,10 @@ def _exact_search(
         return []
     hits = []
     for m in pattern.finditer(text):
-        hits.append((m.start(), m.end(),
-                     _make_snippet(text, m.start(), m.end(), context_chars)))
+        hits.append((
+            m.start(), m.end(),
+            _make_snippet(text, m.start(), m.end(), context_chars),
+        ))
     return hits
 
 
@@ -234,7 +217,9 @@ def _fuzzy_search_words(
         if w:
             word_positions.append((w, m.start(), m.end()))
 
-    matched_per_word: List[List[Tuple[float, int, int]]] = [[] for _ in q_words]
+    matched_per_word: List[List[Tuple[float, int, int]]] = [
+        [] for _ in q_words
+    ]
 
     for wi, qw in enumerate(q_words):
         for w, s, e in word_positions:
@@ -297,7 +282,9 @@ def _search_in_text(
         results.append((1.0, snippet, "exact"))
 
     if not exact:
-        fuzzy = _fuzzy_search_words(text, query, fuzzy_threshold, context_chars)
+        fuzzy = _fuzzy_search_words(
+            text, query, fuzzy_threshold, context_chars
+        )
         seen = set()
         for score, _s, _e, snippet, _wc in fuzzy:
             key = snippet[:80]
@@ -335,8 +322,8 @@ def search(
             try:
                 if is_cancelled():
                     log.info(
-                        "Поиск прерван пользователем: обработано %d/%d сессий, "
-                        "найдено %d hits",
+                        "Поиск прерван пользователем: обработано %d/%d "
+                        "сессий, найдено %d hits",
                         i, total, len(hits),
                     )
                     break
@@ -359,9 +346,11 @@ def search(
                 continue
 
         sdate = _parse_session_date(session_dir, meta)
-        if filters.date_from and sdate and sdate.date() < filters.date_from.date():
+        if filters.date_from and sdate and \
+                sdate.date() < filters.date_from.date():
             continue
-        if filters.date_to and sdate and sdate.date() > filters.date_to.date():
+        if filters.date_to and sdate and \
+                sdate.date() > filters.date_to.date():
             continue
 
         session_name = meta.get("name") or os.path.basename(session_dir)
@@ -373,11 +362,12 @@ def search(
                 fp = os.path.join(session_dir, fname)
                 if not os.path.exists(fp):
                     continue
-                text = _read_text_safe(fp)
+                text = read_any_text(fp)
                 if not text:
                     continue
                 for score, snippet, kind in _search_in_text(
-                    text, query, filters.fuzzy_threshold, filters.context_chars
+                    text, query, filters.fuzzy_threshold,
+                    filters.context_chars,
                 ):
                     hits.append(SearchHit(
                         session_dir=session_dir,
@@ -399,11 +389,12 @@ def search(
                 fp = os.path.join(session_dir, fname)
                 if not os.path.exists(fp):
                     continue
-                text = _read_text_safe(fp)
+                text = read_any_text(fp)
                 if not text:
                     continue
                 for score, snippet, kind in _search_in_text(
-                    text, query, filters.fuzzy_threshold, filters.context_chars
+                    text, query, filters.fuzzy_threshold,
+                    filters.context_chars,
                 ):
                     hits.append(SearchHit(
                         session_dir=session_dir,
@@ -426,7 +417,8 @@ def search(
                 from .markdown_to_bitrix import markdown_to_plain_with_bb
                 plain = markdown_to_plain_with_bb(summary_bb)
                 for score, snippet, kind in _search_in_text(
-                    plain, query, filters.fuzzy_threshold, filters.context_chars
+                    plain, query, filters.fuzzy_threshold,
+                    filters.context_chars,
                 ):
                     hits.append(SearchHit(
                         session_dir=session_dir,
@@ -434,7 +426,9 @@ def search(
                         project=project,
                         date=date_str,
                         source="summary",
-                        file_path=os.path.join(session_dir, "session.json"),
+                        file_path=os.path.join(
+                            session_dir, "session.json"
+                        ),
                         file_label="summary (session.json)",
                         snippet=snippet,
                         score=score,
@@ -450,11 +444,12 @@ def search(
                     fp = os.path.join(att_dir, fname)
                     if not os.path.isfile(fp):
                         continue
-                    text = _read_text_safe(fp)
+                    text = read_any_text(fp)
                     if not text:
                         continue
                     for score, snippet, kind in _search_in_text(
-                        text, query, filters.fuzzy_threshold, filters.context_chars
+                        text, query, filters.fuzzy_threshold,
+                        filters.context_chars,
                     ):
                         hits.append(SearchHit(
                             session_dir=session_dir,
@@ -498,8 +493,9 @@ class PromptContext:
     dedup_key: str = ""         # ключ для схлопывания дубликатов
 
 
-def _find_match_position(text: str, query: str,
-                         case_sensitive: bool = False) -> Tuple[int, int]:
+def _find_match_position(
+    text: str, query: str, case_sensitive: bool = False
+) -> Tuple[int, int]:
     """
     Возвращает (start, end) первого точного вхождения query в text.
     Если точного вхождения нет — возвращает (-1, -1).
@@ -549,7 +545,7 @@ def extract_hit_context(
         from .markdown_to_bitrix import markdown_to_plain_with_bb
         text = markdown_to_plain_with_bb(raw)
     else:
-        text = _read_text_safe(hit.file_path)
+        text = read_any_text(hit.file_path)
 
     if not text:
         return None
@@ -712,7 +708,8 @@ def build_prompt_from_hits(
     if deduplicate:
         before = len(contexts)
         contexts = _deduplicate_contexts(contexts)
-        log.info("Дедупликация: %d → %d контекстов", before, len(contexts))
+        log.info("Дедупликация: %d → %d контекстов",
+                 before, len(contexts))
 
     # --- Группировка по записям/файлам ---
     grouped: Dict[Tuple[str, str], List[PromptContext]] = {}
@@ -740,8 +737,10 @@ def build_prompt_from_hits(
         # Список источников
         parts.append("## Источники")
         parts.append("")
-        for i, ((sname, fpath), ctxs) in enumerate(grouped.items(), start=1):
-            src_label = _SOURCE_RU.get(ctxs[0].hit.source, ctxs[0].hit.source)
+        for i, ((sname, fpath), ctxs) in enumerate(grouped.items(),
+                                                    start=1):
+            src_label = _SOURCE_RU.get(ctxs[0].hit.source,
+                                       ctxs[0].hit.source)
             date = ctxs[0].hit.date or "—"
             project = ctxs[0].hit.project or "—"
             file_label = ctxs[0].hit.file_label
@@ -780,7 +779,8 @@ def build_prompt_from_hits(
         for j, c in enumerate(ctxs, start=1):
             kind_label = (
                 "точное совпадение" if c.hit.match_kind == "exact"
-                else f"нечёткое совпадение (fuzzy, {int(c.hit.score * 100)}%)"
+                else f"нечёткое совпадение (fuzzy, "
+                     f"{int(c.hit.score * 100)}%)"
             )
             parts.append(f"**Фрагмент {j}** — {kind_label}")
             parts.append("")
@@ -818,8 +818,11 @@ def build_prompt_from_hits(
     return result
 
 
-def save_prompt_docx(prompt_text: str, output_path: str,
-                     title: str = "Промпт по результатам поиска") -> str:
+def save_prompt_docx(
+    prompt_text: str,
+    output_path: str,
+    title: str = "Промпт по результатам поиска",
+) -> str:
     """
     Сохраняет промпт в .docx.
 
