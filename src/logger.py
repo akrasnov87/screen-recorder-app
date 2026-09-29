@@ -1,4 +1,11 @@
-"""Система логирования."""
+"""Система логирования.
+
+Изменения:
+  • setup_logger() принимает max_bytes и backup_count — значения
+    ротации теперь берутся из config["logging"].
+  • Удалены неиспользуемые функции: log_to_gui(), rotate_logs(),
+    unregister_gui_handler().
+"""
 from __future__ import annotations
 
 import logging
@@ -41,15 +48,19 @@ def setup_logger(
     name: str = "src",
     log_path: Optional[str] = None,
     level: str = "DEBUG",
+    max_bytes: int = 10 * 1024 * 1024,
+    backup_count: int = 5,
 ) -> logging.Logger:
     """
     Настраивает корневой логгер пакета.
 
     Args:
-        name: имя корневого логгера (обычно "src").
-        log_path: путь к файлу логов. Если None — берётся из set_log_path()
-            или дефолтный /tmp/screen-recorder/app.log.
-        level: уровень логирования (DEBUG/INFO/WARNING/ERROR/CRITICAL).
+        name:         имя корневого логгера (обычно "src").
+        log_path:     путь к файлу логов. Если None — берётся из
+                      set_log_path() или дефолтный.
+        level:        уровень логирования (DEBUG/INFO/WARNING/ERROR/CRITICAL).
+        max_bytes:    размер файла лога перед ротацией.
+        backup_count: сколько старых файлов хранить.
 
     Returns:
         Настроенный корневой логгер.
@@ -76,7 +87,10 @@ def setup_logger(
 
     # --- Файл с ротацией ---
     fh = RotatingFileHandler(
-        log_path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        log_path,
+        maxBytes=int(max_bytes),
+        backupCount=int(backup_count),
+        encoding="utf-8",
     )
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
@@ -94,7 +108,10 @@ def setup_logger(
     logger.addHandler(gui_handler)
 
     _root_logger = logger
-    logger.debug("Логгер инициализирован: %s (level=%s)", log_path, level)
+    logger.debug(
+        "Логгер инициализирован: %s (level=%s, max=%d MB, backups=%d)",
+        log_path, level, max_bytes // (1024 * 1024), backup_count,
+    )
     return logger
 
 
@@ -108,30 +125,10 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
-def log_to_gui(message: str, level: str = "INFO") -> None:
-    """Отправляет сообщение во все GUI-обработчики (для ручных вызовов)."""
-    for handler in list(_gui_handlers):
-        try:
-            handler(message, level)
-        except Exception:
-            pass
-
-
 def register_gui_handler(handler: Callable[[str, str], None]) -> None:
     """Регистрирует обработчик логов для GUI."""
     if handler not in _gui_handlers:
         _gui_handlers.append(handler)
-
-
-def unregister_gui_handler(handler: Callable[[str, str], None]) -> None:
-    """Удаляет обработчик логов для GUI."""
-    if handler in _gui_handlers:
-        _gui_handlers.remove(handler)
-
-
-def rotate_logs(log_path: str, max_size_mb: int = 10, backup_count: int = 5) -> None:
-    """Совместимость: принудительная ротация (реализована через RotatingFileHandler)."""
-    pass
 
 
 # ---------------------------------------------------------------------------

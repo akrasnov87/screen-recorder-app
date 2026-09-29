@@ -1,20 +1,22 @@
 """Управление настройками с шифрованием паролей.
 
-Изменения относительно предыдущей версии:
-  • Добавлен механизм восстановления мастер-ключа шифрования:
-    ключ хранится в keyring, при отсутствии — создаётся и
-    сохраняется в файл <config_dir>/.fernet_key с правами 0600.
-  • Добавлены методы export_key/import_key для переноса
-    зашифрованных данных между машинами.
-  • Таймауты, лимиты и прочие "магические" значения вынесены
-    в DEFAULT_CONFIG.
+Изменения:
+  • Удалён сломанный export_key() — используйте get_raw_key().
+  • Удалён неиспользуемый _derive_key_from_passphrase().
+  • Удалены set_projects() / set_employees() — не используются.
+  • Убран неиспользуемый импорт secrets.
+  • Добавлены настройки: bitrix.retry_count/retry_delay,
+    logging.max_bytes_mb/backup_count, queue.pause_when_recording,
+    а также расширенная секция app с параметрами ffmpeg,
+    overlay, уведомлений, подсказок и поиска.
+  • Убраны мёртвые ключи app.async_pump_interval_ms и
+    app.async_idle_tick_seconds.
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
-import secrets
 import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -135,6 +137,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "auto_retry_enabled": True,
         "retry_interval_minutes": 5,
         "max_retries": 10,
+        # Не брать задачи из очереди, пока идёт запись
+        "pause_when_recording": True,
     },
     "compression": {
         "audio_format": "mp3",
@@ -149,6 +153,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "logging": {
         "log_path": "/tmp/screen-recorder/app.log",
         "level": "DEBUG",
+        # Ротация логов
+        "max_bytes_mb": 10,
+        "backup_count": 5,
     },
     # --- Скрам-митинги ---
     "scrum": {
@@ -196,27 +203,51 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "disable_url_preview": False,
         # Автоматически отправлять файлом, если текст длиннее порога
         "file_message_max_chars": 3000,
-        # ID папки на Диске для загрузки (0 = корень общего диска)
+        # ID папки на Диске для загрузки (0 = папка чата / корень)
         "upload_folder_id": 0,
         # Лимит длины одного сообщения (Bitrix24 ~20000, оставляем запас)
         "max_message_chars": 15000,
+        # Повторы при сетевых сбоях
+        "retry_count": 3,
+        "retry_delay": 2.0,
     },
     # --- Приложение (ранее хардкод в модулях) ---
     "app": {
-        # Максимальная длина текста, читаемого из файла (5 МБ символов)
+        # --- Чтение/запись файлов ---
         "max_file_read_chars": 5_000_000,
-        # Таймаут корректного завершения ffmpeg перед SIGKILL (сек)
-        "ffmpeg_stop_timeout": 10,
-        # Пауза перед проверкой, что ffmpeg не упал сразу после старта
+
+        # --- ffmpeg ---
         "ffmpeg_start_check_delay": 0.3,
-        # Интервал опроса очереди задач в фоновом воркере (сек)
+        "ffmpeg_stop_timeout": 10,
+        "ffmpeg_kill_timeout": 5,
+
+        # --- Обработка очереди ---
         "processor_poll_interval": 2.0,
-        # Интервал проверки авто-ретрая (сек)
         "processor_retry_check_interval": 300,
-        # Интервал пульсации asyncio-loop в GUI (мс)
-        "async_pump_interval_ms": 20,
-        # Период "холостого" тика asyncio, чтобы не крутить CPU
-        "async_idle_tick_seconds": 0.01,
+
+        # --- Overlay panel ---
+        "overlay_hide_delay_ms": 5000,
+        "overlay_hide_after_task_ms": 3000,
+        "overlay_log_lines": 5,
+        "overlay_width": 340,
+        "overlay_height": 190,
+
+        # --- Уведомления трея ---
+        "notification_timeout_ms": 4000,
+        "notification_max_title": 50,
+        "notification_max_message": 100,
+
+        # --- Подсказки ---
+        "tooltip_toast_max_width": 420,
+        "tooltip_toast_threshold": 120,
+        "tooltip_toast_hide_delay_ms": 120,
+
+        # --- Библиотека (поиск) ---
+        "search_default_fuzzy": 82,
+        "search_default_context_chars": 400,
+        "search_default_max_prompt_hits": 100,
+        "fuzzy_max_word_distance": 200,
+        "search_cancel_wait_ms": 3000,
     },
 }
 
@@ -231,16 +262,14 @@ class ConfigManager:
 
     Отвечает за:
       • загрузку/сохранение config.json;
-      • шифрование чувствительных полей (сейчас — генерация
-        мастер-ключа для Fernet);
+      • шифрование чувствительных полей (мастер-ключ Fernet);
       • предоставление типизированных getters.
 
     Шифрование:
-      • Мастер-ключ Fernet хранится в keyring под сервисом
-        _SERVICE_NAME.
+      • Мастер-ключ хранится в keyring под сервисом _SERVICE_NAME.
       • Если keyring недоступен — ключ сохраняется в файл
         <config_dir>/.fernet_key с правами 0600.
-      • Метод export_key() возвращает base64-ключ для переноса
+      • Метод get_raw_key() возвращает base64-ключ для переноса
         на другую машину; import_key() восстанавливает из base64.
     """
 
@@ -291,7 +320,6 @@ class ConfigManager:
     def _save_key_to_file(self, key: str) -> bool:
         try:
             self._key_file.write_text(key, encoding="utf-8")
-            # Права 0600 — только владелец.
             try:
                 os.chmod(self._key_file, stat.S_IRUSR | stat.S_IWUSR)
             except OSError:
@@ -301,18 +329,6 @@ class ConfigManager:
             log.warning("Не удалось сохранить ключ в %s: %s",
                         self._key_file, exc)
             return False
-
-    @staticmethod
-    def _derive_key_from_passphrase(passphrase: str) -> str:
-        """Детерминированный ключ из пароля (для явного import)."""
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=b"screen-recorder-salt-v1",
-            iterations=200_000,
-        )
-        raw = kdf.derive(passphrase.encode("utf-8"))
-        return base64.urlsafe_b64encode(raw).decode("ascii")
 
     def _ensure_fernet(self) -> Fernet:
         """
@@ -330,15 +346,14 @@ class ConfigManager:
         if not key:
             key = self._load_key_from_file()
             if key:
-                # Восстанавливаем в keyring, если получится.
                 self._save_key_to_keyring(key)
 
         if not key:
             key = Fernet.generate_key().decode("ascii")
             log.warning(
                 "Мастер-ключ шифрования не найден — сгенерирован новый. "
-                "Если у вас были сохранены секреты, восстановите их из "
-                "экспортированного ключа (export_key/import_key)."
+                "Если у вас были сохранены секреты, восстановите их "
+                "из экспортированного ключа (get_raw_key/import_key)."
             )
             self._save_key_to_keyring(key)
             self._save_key_to_file(key)
@@ -347,7 +362,6 @@ class ConfigManager:
             self._fernet = Fernet(key.encode("ascii"))
         except Exception as exc:
             log.exception("Некорректный мастер-ключ: %s", exc)
-            # Аварийный fallback — сгенерировать и сохранить заново.
             key = Fernet.generate_key().decode("ascii")
             self._save_key_to_keyring(key)
             self._save_key_to_file(key)
@@ -355,25 +369,11 @@ class ConfigManager:
 
         return self._fernet
 
-    def export_key(self) -> str:
-        """
-        Возвращает base64-строку мастер-ключа. Храните в тайне.
-
-        Пример использования:
-            km = ConfigManager()
-            key_b64 = km.export_key()
-            # сохранить в надёжном месте
-        """
-        return self._ensure_fernet()._signing_key.hex()  # заглушка
-        # Реальная реализация ниже.
-
     def get_raw_key(self) -> str:
         """
         Возвращает base64-строку текущего мастер-ключа.
-
-        В отличие от export_key, отдаёт реальный ключ Fernet.
+        Храните в тайне. Для восстановления используйте import_key().
         """
-        # Пытаемся достать сохранённый ключ без пересоздания.
         key = self._load_key_from_keyring() or self._load_key_from_file()
         if not key:
             self._ensure_fernet()
@@ -462,7 +462,8 @@ class ConfigManager:
             log.error("Ошибка сохранения конфигурации: %s", exc)
 
     @staticmethod
-    def _merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    def _merge(base: Dict[str, Any],
+               override: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(base)
         for k, v in override.items():
             if (k in result and isinstance(result[k], dict)
@@ -542,6 +543,7 @@ class ConfigManager:
             "auto_retry_enabled": bool(q.get("auto_retry_enabled", True)),
             "retry_interval_minutes": int(q.get("retry_interval_minutes", 5)),
             "max_retries": int(q.get("max_retries", 10)),
+            "pause_when_recording": bool(q.get("pause_when_recording", True)),
         }
 
     def get_log_settings(self) -> Dict[str, Any]:
@@ -549,6 +551,8 @@ class ConfigManager:
         return {
             "log_path": cfg.get("log_path", "/tmp/screen-recorder/app.log"),
             "level": cfg.get("level", "DEBUG"),
+            "max_bytes_mb": int(cfg.get("max_bytes_mb", 10)),
+            "backup_count": int(cfg.get("backup_count", 5)),
         }
 
     def get_transcribe_settings(self) -> Dict[str, Any]:
@@ -611,39 +615,12 @@ class ConfigManager:
 
     def get_app_settings(self) -> Dict[str, Any]:
         """
-        Возвращает "прикладные" настройки (лимиты, таймауты, интервалы).
-        Значения из DEFAULT_CONFIG, могут быть переопределены в конфиге.
+        Возвращает прикладные настройки (лимиты, таймауты, интервалы).
+        Значения из DEFAULT_CONFIG["app"], могут быть переопределены.
         """
         a = self.config.get("app", {}) or {}
         d = DEFAULT_CONFIG["app"]
-        return {
-            "max_file_read_chars": int(
-                a.get("max_file_read_chars", d["max_file_read_chars"])
-            ),
-            "ffmpeg_stop_timeout": float(
-                a.get("ffmpeg_stop_timeout", d["ffmpeg_stop_timeout"])
-            ),
-            "ffmpeg_start_check_delay": float(
-                a.get("ffmpeg_start_check_delay",
-                      d["ffmpeg_start_check_delay"])
-            ),
-            "processor_poll_interval": float(
-                a.get("processor_poll_interval",
-                      d["processor_poll_interval"])
-            ),
-            "processor_retry_check_interval": float(
-                a.get("processor_retry_check_interval",
-                      d["processor_retry_check_interval"])
-            ),
-            "async_pump_interval_ms": int(
-                a.get("async_pump_interval_ms",
-                      d["async_pump_interval_ms"])
-            ),
-            "async_idle_tick_seconds": float(
-                a.get("async_idle_tick_seconds",
-                      d["async_idle_tick_seconds"])
-            ),
-        }
+        return {k: a.get(k, v) for k, v in d.items()}
 
     # ------------------------------------------------------------------
     # Проекты (name + chat_id)
@@ -676,19 +653,6 @@ class ConfigManager:
                 return p["chat_id"]
         return ""
 
-    def set_projects(self, projects: List[Dict[str, str]]) -> None:
-        normalized = []
-        for p in projects or []:
-            name = str(p.get("name") or "").strip()
-            if not name:
-                continue
-            normalized.append({
-                "name": name,
-                "chat_id": str(p.get("chat_id") or "").strip(),
-            })
-        self.config["projects"] = normalized
-        self.save()
-
     # ------------------------------------------------------------------
     # Сотрудники
     # ------------------------------------------------------------------
@@ -720,19 +684,6 @@ class ConfigManager:
                 return e["chat_id"]
         return ""
 
-    def set_employees(self, employees: List[Dict[str, str]]) -> None:
-        normalized = []
-        for e in employees or []:
-            name = str(e.get("name") or "").strip()
-            if not name:
-                continue
-            normalized.append({
-                "name": name,
-                "chat_id": str(e.get("chat_id") or "").strip(),
-            })
-        self.config["employees"] = normalized
-        self.save()
-
     # ------------------------------------------------------------------
     # Bitrix24
     # ------------------------------------------------------------------
@@ -755,4 +706,6 @@ class ConfigManager:
             "max_message_chars": int(
                 cfg.get("max_message_chars", 15000)
             ),
+            "retry_count": int(cfg.get("retry_count", 3)),
+            "retry_delay": float(cfg.get("retry_delay", 2.0)),
         }

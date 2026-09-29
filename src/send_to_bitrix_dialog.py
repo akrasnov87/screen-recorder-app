@@ -1,43 +1,13 @@
 """Диалог отправки протокола/summary в чат Bitrix24.
 
-Поддерживает массовую рассылку: одно и то же содержимое можно
-отправить сразу в несколько чатов — выбранных из справочника
-проектов, сотрудников или введённых вручную.
-
-Режимы отправки:
-  • текстом в чат (im.message.add с MESSAGE);
-  • файлом с комментарием (загрузка на Диск + im.message.add с FILE_ID).
-
-Папка для загрузки файла выбирается автоматически:
-  • если задан upload_folder_id > 0 в настройках — используется он;
-  • иначе — папка самого чата (у каждого чата в Bitrix24 она своя).
-
-Если выбрано «Отправить всё» и оба материала уходят файлами, они
-упаковываются в ОДНО сообщение с двумя вложениями.
-
-Протокол всегда отправляется в формате .docx:
-  • если manual_protocol_path уже .docx — берём как есть;
-  • если .md / .txt / .pdf — конвертируем во временный .docx
-    через markdown_to_docx() и отправляем его.
-
-Summary хранится в session.json в поле summary_bb (Markdown).
-При отправке «текстом» конвертируется в BB-код Bitrix24
-через markdown_to_bitrix.
-
-Особенности UI:
-  • Список получателей и кнопки управления им — в отдельном
-    контейнере recipients_block с вертикальным QVBoxLayout.
-  • Строки без chat_id нельзя отметить, они серые и с подсказкой
-    «Укажите ID в Настройках…».
-  • Превью материалов не показывается текстом — вместо этого
-    отображаются ссылки на файлы, которые можно открыть двойным
-    кликом или кнопкой «Открыть файл».
-  • Массовая рассылка выполняется в отдельном QThread — GUI
-    остаётся отзывчивым, прогресс виден в QProgressDialog.
-
 Изменения:
-  • Чтение файлов теперь идёт через единый модуль file_readers —
-    устранено дублирование логики чтения .txt/.md/.docx/.pdf.
+  • _SendWorker принимает max_message_chars и передаёт его
+    в Bitrix24Client.
+  • SendToBitrixDialog._on_send читает max_message_chars
+    из bitrix_cfg и передаёт в воркер.
+  • _on_test тоже передаёт max_message_chars.
+  • К списку получателей подключена подсказка
+    bitrix_recipients_list.
 """
 from __future__ import annotations
 
@@ -67,7 +37,7 @@ from .markdown_to_bitrix import (
     markdown_to_plain,
     markdown_to_plain_with_bb,
 )
-from .tooltips import with_info
+from .tooltips import attach_tooltip, with_info
 
 log = get_logger(__name__)
 
@@ -86,17 +56,7 @@ def _safe_filename(name: str) -> str:
 
 
 def _find_summary_file(session_dir: str) -> str:
-    """
-    Ищет файл summary в папке сессии.
-
-    Приоритет:
-      1) summary.md                       — сохраняется при редактировании;
-      2) summary_<…>.md                   — если пользователь экспортировал;
-      3) video_summary.md                 — создаётся автоматически при
-                                             обработке;
-      4) summary_<…>.docx                 — если пользователь экспортировал;
-      5) summary_<…>.txt                  — старые варианты.
-    """
+    """Ищет файл summary в папке сессии."""
     if not session_dir or not os.path.isdir(session_dir):
         return ""
 
@@ -105,7 +65,7 @@ def _find_summary_file(session_dir: str) -> str:
     except OSError:
         return ""
 
-    candidates: List[tuple] = []  # (priority, path)
+    candidates: List[tuple] = []
     for name in entries:
         low = name.lower()
         full = os.path.join(session_dir, name)
@@ -130,15 +90,10 @@ def _find_summary_file(session_dir: str) -> str:
 # QThread для массовой рассылки
 # ---------------------------------------------------------------------------
 class _SendWorker(QThread):
-    """
-    Выполняет массовую рассылку в отдельном потоке.
+    """Выполняет массовую рассылку в отдельном потоке."""
 
-    Внутри запускается свой asyncio-loop (asyncio.run), что
-    изолирует сетевые операции от Qt. Прогресс и результат
-    сообщаются через сигналы.
-    """
-    progress = Signal(int, int, str)    # current, total, chat_id
-    finished_ok = Signal(dict)          # отчёт целиком
+    progress = Signal(int, int, str)
+    finished_ok = Signal(dict)
     failed = Signal(str)
 
     def __init__(
@@ -151,6 +106,7 @@ class _SendWorker(QThread):
         *,
         connect_timeout: float,
         read_timeout: float,
+        max_message_chars: int,
         system: bool,
         url_preview: bool,
         forced_folder_id: int,
@@ -164,6 +120,7 @@ class _SendWorker(QThread):
         self._build_text_cb = build_text_cb
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
+        self._max_message_chars = max_message_chars
         self._system = system
         self._url_preview = url_preview
         self._forced_folder_id = forced_folder_id
@@ -173,7 +130,9 @@ class _SendWorker(QThread):
         try:
             report = asyncio.run(self._run_all())
         except Exception as exc:
-            log.exception("Массовая рассылка: неожиданная ошибка: %s", exc)
+            log.exception(
+                "Массовая рассылка: неожиданная ошибка: %s", exc
+            )
             self.failed.emit(str(exc))
             return
         self.finished_ok.emit(report)
@@ -209,7 +168,9 @@ class _SendWorker(QThread):
                 prepared = []
 
             if prepared:
-                headers = [it.get("header", "") for it in file_items]
+                headers = [
+                    it.get("header", "") for it in file_items
+                ]
                 headers = [h for h in headers if h]
                 comment = " / ".join(headers) if headers else ""
 
@@ -290,6 +251,7 @@ class _SendWorker(QThread):
             webhook_url=self._webhook,
             connect_timeout=self._connect_timeout,
             read_timeout=self._read_timeout,
+            max_message_chars=self._max_message_chars,
         ) as client:
             for i, cid in enumerate(self._chat_ids, start=1):
                 self.progress.emit(i, total, cid)
@@ -318,7 +280,8 @@ class SendToBitrixDialog(QDialog):
     Диалог отправки протокола / summary в чат Bitrix24.
 
     Поддерживает массовую рассылку: один и тот же материал уходит
-    сразу в несколько выбранных чатов (проекты / сотрудники / ручные ID).
+    сразу в несколько выбранных чатов (проекты / сотрудники /
+    ручные ID).
     """
 
     def __init__(
@@ -338,20 +301,23 @@ class SendToBitrixDialog(QDialog):
         self.employees = list(employees or [])
 
         self.setWindowTitle(
-            f"Отправка в Bitrix24 — {self.session_info.get('name', '')}"
+            f"Отправка в Bitrix24 — "
+            f"{self.session_info.get('name', '')}"
         )
         self.setModal(True)
         self.setMinimumSize(760, 640)
         self.resize(960, 900)
 
-        self._protocol_path = self.session_info.get("protocol_path") or ""
+        self._protocol_path = (
+            self.session_info.get("protocol_path") or ""
+        )
         self._protocol_text = ""
 
-        # В этом поле лежит Markdown. Имя «summary_bb» оставлено
-        # для совместимости со старыми записями.
         self._summary_md = self.session_info.get("summary_bb") or ""
 
-        self._session_dir = self.session_info.get("session_dir") or ""
+        self._session_dir = (
+            self.session_info.get("session_dir") or ""
+        )
 
         self._summary_plain = (
             markdown_to_plain_with_bb(self._summary_md).strip()
@@ -362,7 +328,9 @@ class SendToBitrixDialog(QDialog):
             if self._summary_md else ""
         )
 
-        self._summary_file_path = _find_summary_file(self._session_dir)
+        self._summary_file_path = _find_summary_file(
+            self._session_dir
+        )
 
         self._selected_chat_ids: Set[str] = set()
         self._worker: Optional[_SendWorker] = None
@@ -390,8 +358,8 @@ class SendToBitrixDialog(QDialog):
 
         info_text = (
             f"<b>{html.escape(name)}</b><br>"
-            f"Проект: <b>{html.escape(project or '—')}</b> &nbsp;|&nbsp; "
-            f"Дата: {html.escape(date or '—')}"
+            f"Проект: <b>{html.escape(project or '—')}</b> "
+            f"&nbsp;|&nbsp; Дата: {html.escape(date or '—')}"
         )
         if comment:
             info_text += (
@@ -403,7 +371,7 @@ class SendToBitrixDialog(QDialog):
         info_row.addWidget(info, 1)
         root.addLayout(info_row)
 
-        # --- Получатели (мультивыбор) ---
+        # --- Получатели ---
         rec_header = QHBoxLayout()
         rec_header.addWidget(QLabel("<b>Кому отправить</b>"))
         rec_header.addStretch()
@@ -411,14 +379,13 @@ class SendToBitrixDialog(QDialog):
 
         rec_hint = QLabel(
             "<span style='color:#666'>Отметьте галочками один или "
-            "несколько чатов. Можно комбинировать проекты, сотрудников "
-            "и вводить ID вручную — сообщение уйдёт каждому адресату "
-            "отдельно.</span>"
+            "несколько чатов. Можно комбинировать проекты, "
+            "сотрудников и вводить ID вручную — сообщение уйдёт "
+            "каждому адресату отдельно.</span>"
         )
         rec_hint.setWordWrap(True)
         root.addWidget(rec_hint)
 
-        # Контейнер «список + кнопки».
         recipients_block = QWidget()
         recipients_block_layout = QVBoxLayout(recipients_block)
         recipients_block_layout.setContentsMargins(0, 0, 0, 0)
@@ -430,10 +397,8 @@ class SendToBitrixDialog(QDialog):
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Expanding,
         )
-        self.recipients_list.setToolTip(
-            "Список проектов и сотрудников.\n\n"
-            "Клик по строке переключает галочку. "
-            "Можно выбрать сразу несколько получателей."
+        attach_tooltip(
+            self.recipients_list, "bitrix_recipients_list"
         )
         self.recipients_list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
@@ -497,7 +462,8 @@ class SendToBitrixDialog(QDialog):
         )
         self.selected_count_label.setMinimumWidth(140)
         self.selected_count_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
         )
         list_btns.addWidget(self.selected_count_label)
 
@@ -505,13 +471,15 @@ class SendToBitrixDialog(QDialog):
 
         root.addWidget(recipients_block, 1)
 
-        # --- Формы: ручной ID и вебхук ---
+        # --- Ручной ID и вебхук ---
         manual_form = QFormLayout()
         manual_form.setLabelAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
         )
         manual_form.setFormAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+            Qt.AlignmentFlag.AlignLeft
+            | Qt.AlignmentFlag.AlignTop
         )
 
         self.manual_chat_input = QLineEdit()
@@ -528,10 +496,12 @@ class SendToBitrixDialog(QDialog):
 
         chat_form = QFormLayout()
         chat_form.setLabelAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
         )
         chat_form.setFormAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+            Qt.AlignmentFlag.AlignLeft
+            | Qt.AlignmentFlag.AlignTop
         )
 
         self.webhook_input = QLineEdit(
@@ -561,7 +531,9 @@ class SendToBitrixDialog(QDialog):
             with_info(webhook_row, "bitrix_webhook"),
         )
 
-        self.system_check = QCheckBox("Системное сообщение (SYSTEM=Y)")
+        self.system_check = QCheckBox(
+            "Системное сообщение (SYSTEM=Y)"
+        )
         self.system_check.setChecked(
             bool(self.bitrix_cfg.get("system_message", False))
         )
@@ -570,9 +542,13 @@ class SendToBitrixDialog(QDialog):
             "без аватара отправителя."
         )
 
-        self.no_preview_check = QCheckBox("Отключить предпросмотр ссылок")
+        self.no_preview_check = QCheckBox(
+            "Отключить предпросмотр ссылок"
+        )
         self.no_preview_check.setChecked(
-            bool(self.bitrix_cfg.get("disable_url_preview", False))
+            bool(self.bitrix_cfg.get(
+                "disable_url_preview", False
+            ))
         )
 
         opts_row = QHBoxLayout()
@@ -586,7 +562,9 @@ class SendToBitrixDialog(QDialog):
 
         # --- Заголовки сообщений ---
         header_header = QHBoxLayout()
-        self.header_check = QCheckBox("Добавлять заголовок к сообщениям")
+        self.header_check = QCheckBox(
+            "Добавлять заголовок к сообщениям"
+        )
         self.header_check.setChecked(
             bool(self.bitrix_cfg.get("include_header", True))
         )
@@ -599,17 +577,19 @@ class SendToBitrixDialog(QDialog):
         root.addLayout(header_header)
 
         headers_hint = QLabel(
-            "<span style='color:#666'>Заголовок добавляется в начало "
-            "сообщения. Оформить его можно вручную, если нужно. "
-            "Пустое поле — заголовок не добавляется. При массовой "
-            "рассылке заголовок у всех получателей одинаковый.</span>"
+            "<span style='color:#666'>Заголовок добавляется "
+            "в начало сообщения. Оформить его можно вручную, "
+            "если нужно. Пустое поле — заголовок не добавляется. "
+            "При массовой рассылке заголовок у всех получателей "
+            "одинаковый.</span>"
         )
         headers_hint.setWordWrap(True)
         root.addWidget(headers_hint)
 
         headers_form = QFormLayout()
         headers_form.setLabelAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
         )
 
         self.protocol_header_input = QLineEdit()
@@ -617,22 +597,16 @@ class SendToBitrixDialog(QDialog):
             "Например: Протокол: Название встречи — 2026-09-28"
         )
         self.protocol_header_input.setToolTip(
-            "Заголовок для сообщения с протоколом.\n\n"
-            "Заполняется автоматически по шаблону "
-            "«Протокол: <название> — <дата>». Можно отредактировать "
-            "или очистить поле — тогда сообщение уйдёт без заголовка."
+            "Заголовок для сообщения с протоколом."
         )
 
         self.summary_header_input = QLineEdit()
         self.summary_header_input.setPlaceholderText(
-            "Например: Краткое описание: Название встречи — 2026-09-28"
+            "Например: Краткое описание: Название встречи — "
+            "2026-09-28"
         )
         self.summary_header_input.setToolTip(
-            "Заголовок для сообщения с кратким описанием (summary).\n\n"
-            "Заполняется автоматически по шаблону "
-            "«Краткое описание: <название> — <дата>». Можно "
-            "отредактировать или очистить поле — тогда сообщение "
-            "уйдёт без заголовка."
+            "Заголовок для сообщения с кратким описанием."
         )
 
         headers_form.addRow(
@@ -652,7 +626,8 @@ class SendToBitrixDialog(QDialog):
         # --- Режим отправки ---
         mode_box = QFormLayout()
         mode_box.setLabelAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
         )
 
         self.send_mode_combo = QComboBox()
@@ -660,16 +635,11 @@ class SendToBitrixDialog(QDialog):
             "Автоматически (текст или файл)", "auto"
         )
         self.send_mode_combo.addItem("Текстом в чат", "text")
-        self.send_mode_combo.addItem("Файлом с комментарием", "file")
+        self.send_mode_combo.addItem(
+            "Файлом с комментарием", "file"
+        )
         self.send_mode_combo.setToolTip(
-            "Как отправлять содержимое в чат:\n\n"
-            "• «Текстом» — весь текст уходит сообщением.\n"
-            "• «Файлом» — документы загружаются на Диск Bitrix24, "
-            "в чат отправляются вложения с превью и коротким "
-            "комментарием. Протокол всегда отправляется как .docx "
-            "(если исходник .md/.txt/.pdf — конвертируется).\n"
-            "• «Автоматически» — небольшие тексты уходят как текст, "
-            "крупные (протоколы, длинные summary) — как файл."
+            "Как отправлять содержимое в чат."
         )
         mode_box.addRow("Режим отправки:", self.send_mode_combo)
 
@@ -677,15 +647,17 @@ class SendToBitrixDialog(QDialog):
         self.auto_file_threshold.setRange(500, 100000)
         self.auto_file_threshold.setSingleStep(500)
         self.auto_file_threshold.setValue(
-            int(self.bitrix_cfg.get("file_message_max_chars", 3000))
+            int(self.bitrix_cfg.get(
+                "file_message_max_chars", 3000
+            ))
         )
         self.auto_file_threshold.setSuffix(" символов")
         self.auto_file_threshold.setToolTip(
-            "Порог для автоматического режима:\n"
-            "если текст длиннее — уходит файлом, если короче — "
-            "сообщением."
+            "Порог для автоматического режима."
         )
-        mode_box.addRow("Порог «текст → файл»:", self.auto_file_threshold)
+        mode_box.addRow(
+            "Порог «текст → файл»:", self.auto_file_threshold
+        )
 
         root.addLayout(mode_box)
 
@@ -702,24 +674,22 @@ class SendToBitrixDialog(QDialog):
         test_row.addStretch()
         root.addLayout(test_row)
 
-        # --- Материалы: ссылки на файлы вместо превью текста ---
+        # --- Материалы ---
         materials_header = QHBoxLayout()
-        materials_header.addWidget(QLabel("<b>Материалы к отправке</b>"))
+        materials_header.addWidget(
+            QLabel("<b>Материалы к отправке</b>")
+        )
         materials_header.addStretch()
         root.addLayout(materials_header)
 
         materials_hint = QLabel(
-            "<span style='color:#666'>Содержимое не отображается здесь — "
-            "чтобы проверить, откройте файл двойным кликом по ссылке "
-            "или кнопкой «Открыть файл». В чат уйдёт то, что выбрано "
-            "в режиме отправки ниже.<br>"
-            "Протокол отправляется в формате .docx "
-            "(при необходимости конвертируется автоматически).</span>"
+            "<span style='color:#666'>Содержимое не отображается "
+            "здесь — чтобы проверить, откройте файл двойным кликом "
+            "по ссылке или кнопкой «Открыть файл».</span>"
         )
         materials_hint.setWordWrap(True)
         root.addWidget(materials_hint)
 
-        # Протокол
         protocol_row = QHBoxLayout()
         protocol_row.addWidget(QLabel("Протокол:"))
         self.protocol_link = QLabel()
@@ -733,17 +703,20 @@ class SendToBitrixDialog(QDialog):
         protocol_row.addWidget(self.protocol_link, 1)
 
         self.open_protocol_btn = QPushButton("Открыть файл")
-        self.open_protocol_btn.clicked.connect(self._on_open_protocol)
+        self.open_protocol_btn.clicked.connect(
+            self._on_open_protocol
+        )
         protocol_row.addWidget(self.open_protocol_btn)
 
-        self.show_protocol_folder_btn = QPushButton("Показать в папке")
+        self.show_protocol_folder_btn = QPushButton(
+            "Показать в папке"
+        )
         self.show_protocol_folder_btn.clicked.connect(
             lambda: self._show_in_folder(self._protocol_path)
         )
         protocol_row.addWidget(self.show_protocol_folder_btn)
         root.addLayout(protocol_row)
 
-        # Summary
         summary_row = QHBoxLayout()
         summary_row.addWidget(QLabel("Summary:"))
         self.summary_link = QLabel()
@@ -751,16 +724,24 @@ class SendToBitrixDialog(QDialog):
         self.summary_link.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
         )
-        self.summary_link.linkActivated.connect(self._on_open_summary_link)
+        self.summary_link.linkActivated.connect(
+            self._on_open_summary_link
+        )
         summary_row.addWidget(self.summary_link, 1)
 
         self.open_summary_btn = QPushButton("Открыть файл")
-        self.open_summary_btn.clicked.connect(self._on_open_summary)
+        self.open_summary_btn.clicked.connect(
+            self._on_open_summary
+        )
         summary_row.addWidget(self.open_summary_btn)
 
-        self.show_summary_folder_btn = QPushButton("Показать в папке")
+        self.show_summary_folder_btn = QPushButton(
+            "Показать в папке"
+        )
         self.show_summary_folder_btn.clicked.connect(
-            lambda: self._show_in_folder(self._summary_target_path())
+            lambda: self._show_in_folder(
+                self._summary_target_path()
+            )
         )
         summary_row.addWidget(self.show_summary_folder_btn)
         root.addLayout(summary_row)
@@ -768,7 +749,9 @@ class SendToBitrixDialog(QDialog):
         # --- Кнопки отправки ---
         actions_row = QHBoxLayout()
 
-        self.send_protocol_btn = QPushButton("Отправить протокол")
+        self.send_protocol_btn = QPushButton(
+            "Отправить протокол"
+        )
         self.send_protocol_btn.clicked.connect(
             lambda: self._on_send(which="protocol")
         )
@@ -785,10 +768,7 @@ class SendToBitrixDialog(QDialog):
             "Отправить двумя сообщениями: сначала протокол, "
             "потом summary.\n\n"
             "В режиме «Файлом с комментарием» оба файла уйдут "
-            "одним сообщением с двумя вложениями "
-            "(протокол — .docx, summary — .md).\n\n"
-            "Массовая рассылка: содержимое уйдёт всем отмеченным "
-            "получателям."
+            "одним сообщением с двумя вложениями."
         )
         self.send_both_btn.clicked.connect(
             lambda: self._on_send(which="both")
@@ -855,10 +835,7 @@ class SendToBitrixDialog(QDialog):
                     item.setFlags(Qt.ItemFlag.NoItemFlags)
                     item.setForeground(Qt.GlobalColor.darkGray)
                     item.setToolTip(
-                        f"У проекта «{p['name']}» не задан ID чата.\n\n"
-                        "Укажите его в Настройках → "
-                        "Проекты и чаты Bitrix24 — после этого "
-                        "проект можно будет выбрать здесь."
+                        f"У проекта «{p['name']}» не задан ID чата."
                     )
                 self.recipients_list.addItem(item)
 
@@ -890,10 +867,8 @@ class SendToBitrixDialog(QDialog):
                     item.setFlags(Qt.ItemFlag.NoItemFlags)
                     item.setForeground(Qt.GlobalColor.darkGray)
                     item.setToolTip(
-                        f"У сотрудника «{e['name']}» не задан ID чата.\n\n"
-                        "Укажите его в Настройках → Сотрудники — "
-                        "после этого сотрудника можно будет "
-                        "выбрать здесь."
+                        f"У сотрудника «{e['name']}» не задан "
+                        f"ID чата."
                     )
                 self.recipients_list.addItem(item)
 
@@ -917,7 +892,9 @@ class SendToBitrixDialog(QDialog):
             item = self.recipients_list.item(i)
             if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
                 if item.checkState() == Qt.CheckState.Checked:
-                    cid = (item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                    cid = (
+                        item.data(Qt.ItemDataRole.UserRole) or ""
+                    ).strip()
                     if cid:
                         ids.add(cid)
         self._selected_chat_ids = ids
@@ -925,7 +902,9 @@ class SendToBitrixDialog(QDialog):
         if self.selected_count_label is not None:
             n = len(ids)
             if n == 0:
-                self.selected_count_label.setText("Ничего не выбрано")
+                self.selected_count_label.setText(
+                    "Ничего не выбрано"
+                )
             elif n == 1:
                 self.selected_count_label.setText("Выбрано: 1")
             else:
@@ -934,7 +913,9 @@ class SendToBitrixDialog(QDialog):
         if self.empty_hint is not None:
             self.empty_hint.setVisible(not ids)
 
-    def _on_recipient_item_changed(self, item: QListWidgetItem) -> None:
+    def _on_recipient_item_changed(
+        self, item: QListWidgetItem,
+    ) -> None:
         self._refresh_selected_chat_ids()
         self._update_send_buttons_state()
 
@@ -943,7 +924,9 @@ class SendToBitrixDialog(QDialog):
         for i in range(self.recipients_list.count()):
             item = self.recipients_list.item(i)
             if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
-                cid = (item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                cid = (
+                    item.data(Qt.ItemDataRole.UserRole) or ""
+                ).strip()
                 if cid:
                     item.setCheckState(Qt.CheckState.Checked)
         self.recipients_list.blockSignals(False)
@@ -966,7 +949,8 @@ class SendToBitrixDialog(QDialog):
             if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
                 if checked:
                     item.setHidden(
-                        item.checkState() != Qt.CheckState.Checked
+                        item.checkState()
+                        != Qt.CheckState.Checked
                     )
                 else:
                     item.setHidden(False)
@@ -980,7 +964,9 @@ class SendToBitrixDialog(QDialog):
         ):
             if not has_recipients:
                 btn.setEnabled(False)
-                btn.setToolTip("Отметьте хотя бы одного получателя")
+                btn.setToolTip(
+                    "Отметьте хотя бы одного получателя"
+                )
             else:
                 btn.setEnabled(True)
                 btn.setToolTip("")
@@ -1009,22 +995,27 @@ class SendToBitrixDialog(QDialog):
         for p in self.projects:
             cid = (p.get("chat_id") or "").strip()
             if cid:
-                name_by_id.setdefault(cid, f"проект «{p['name']}»")
+                name_by_id.setdefault(
+                    cid, f"проект «{p['name']}»"
+                )
         for e in self.employees:
             cid = (e.get("chat_id") or "").strip()
             if cid:
-                name_by_id.setdefault(cid, f"сотрудник «{e['name']}»")
+                name_by_id.setdefault(
+                    cid, f"сотрудник «{e['name']}»"
+                )
 
         lines: List[str] = []
         for cid in ids[:20]:
             name = name_by_id.get(cid, "ручной ввод")
             lines.append(f"• {cid} — {name}")
         if len(ids) > 20:
-            lines.append(f"… и ещё {len(ids) - 20} получателей")
+            lines.append(
+                f"… и ещё {len(ids) - 20} получателей"
+            )
 
         return "\n".join(lines)
 
-    # Регулярка ищет в конце строки дату (опционально с временем).
     _DATE_TAIL_RE = re.compile(
         r"\d{4}-\d{2}-\d{2}"
         r"(?:\s+\d{2}[-:]\d{2}(?:[-:]\d{2})?)?"
@@ -1110,9 +1101,8 @@ class SendToBitrixDialog(QDialog):
     # Ссылки на материалы
     # ------------------------------------------------------------------
     def _summary_target_path(self) -> str:
-        if self._summary_file_path and os.path.exists(
-            self._summary_file_path
-        ):
+        if (self._summary_file_path
+                and os.path.exists(self._summary_file_path)):
             return self._summary_file_path
         if self._session_dir:
             sj = os.path.join(self._session_dir, "session.json")
@@ -1121,18 +1111,25 @@ class SendToBitrixDialog(QDialog):
         return ""
 
     def _load_previews(self) -> None:
-        if self._protocol_path and os.path.exists(self._protocol_path):
+        if self._protocol_path and os.path.exists(
+            self._protocol_path
+        ):
             try:
-                self._protocol_text = read_any_text(self._protocol_path)
+                self._protocol_text = read_any_text(
+                    self._protocol_path
+                )
             except Exception as exc:
-                log.warning("Не удалось прочитать %s: %s",
-                            self._protocol_path, exc)
+                log.warning(
+                    "Не удалось прочитать %s: %s",
+                    self._protocol_path, exc,
+                )
                 self._protocol_text = ""
 
             size = os.path.getsize(self._protocol_path)
             fname = os.path.basename(self._protocol_path)
             self.protocol_link.setText(
-                f"<a href='open:protocol'>{html.escape(fname)}</a> "
+                f"<a href='open:protocol'>"
+                f"{html.escape(fname)}</a> "
                 f"<span style='color:#666'>"
                 f"({size / 1024:.1f} КБ, "
                 f"{len(self._protocol_text)} символов — в чат уйдёт "
@@ -1154,7 +1151,8 @@ class SendToBitrixDialog(QDialog):
             if target:
                 fname = os.path.basename(target)
                 self.summary_link.setText(
-                    f"<a href='open:summary'>{html.escape(fname)}</a> "
+                    f"<a href='open:summary'>"
+                    f"{html.escape(fname)}</a> "
                     f"<span style='color:#666'>"
                     f"({len(self._summary_plain)} символов, "
                     f"Markdown; в чат уйдёт с форматированием)"
@@ -1189,7 +1187,9 @@ class SendToBitrixDialog(QDialog):
         self._open_local_file(self._protocol_path, "Протокол")
 
     def _on_open_summary(self) -> None:
-        self._open_local_file(self._summary_target_path(), "Summary")
+        self._open_local_file(
+            self._summary_target_path(), "Summary"
+        )
 
     @staticmethod
     def _open_local_file(path: str, label: str) -> None:
@@ -1206,11 +1206,14 @@ class SendToBitrixDialog(QDialog):
     def _show_in_folder(path: str) -> None:
         if not path:
             return
-        folder = path if os.path.isdir(path) else os.path.dirname(path)
+        folder = (
+            path if os.path.isdir(path) else os.path.dirname(path)
+        )
         if not folder or not os.path.isdir(folder):
             QMessageBox.information(
                 None, "Папка",
-                f"Папка не найдена:\n{folder or '(путь не задан)'}",
+                f"Папка не найдена:\n"
+                f"{folder or '(путь не задан)'}",
             )
             return
         log.info("Открытие папки: %s", folder)
@@ -1231,15 +1234,23 @@ class SendToBitrixDialog(QDialog):
         connect_timeout = float(
             self.bitrix_cfg.get("connect_timeout", 15)
         )
-        read_timeout = float(self.bitrix_cfg.get("read_timeout", 60))
+        read_timeout = float(
+            self.bitrix_cfg.get("read_timeout", 60)
+        )
+        max_message_chars = int(
+            self.bitrix_cfg.get("max_message_chars", 15000)
+        )
 
-        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QGuiApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
 
         async def _run_ping() -> str:
             async with Bitrix24Client(
                 webhook_url=webhook,
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
+                max_message_chars=max_message_chars,
             ) as client:
                 return await client.ping()
 
@@ -1256,7 +1267,9 @@ class SendToBitrixDialog(QDialog):
             log.exception(
                 "Неожиданная ошибка при ping Bitrix24: %s", exc
             )
-            QMessageBox.critical(self, "Bitrix24", f"Ошибка:\n{exc}")
+            QMessageBox.critical(
+                self, "Bitrix24", f"Ошибка:\n{exc}"
+            )
             return
         finally:
             if QGuiApplication.overrideCursor() is not None:
@@ -1264,7 +1277,8 @@ class SendToBitrixDialog(QDialog):
 
         QMessageBox.information(
             self, "Bitrix24",
-            f"Подключение успешно.\n\nПользователь вебхука: {name}",
+            f"Подключение успешно.\n\n"
+            f"Пользователь вебхука: {name}",
         )
 
     # ------------------------------------------------------------------
@@ -1281,26 +1295,32 @@ class SendToBitrixDialog(QDialog):
         ext = os.path.splitext(src_path)[1].lower()
 
         if ext == ".docx":
-            log.info("Протокол уже в .docx — отправляем как есть: %s",
-                     src_path)
+            log.info(
+                "Протокол уже в .docx — отправляем как есть: %s",
+                src_path,
+            )
             return src_path
 
         try:
             if ext in (".md", ".txt"):
-                with open(src_path, "r", encoding="utf-8",
-                          errors="replace") as f:
+                with open(
+                    src_path, "r", encoding="utf-8",
+                    errors="replace",
+                ) as f:
                     text = f.read()
             else:
                 text = read_any_text(src_path)
         except Exception as exc:
-            log.exception("Не удалось прочитать протокол %s: %s",
-                          src_path, exc)
+            log.exception(
+                "Не удалось прочитать протокол %s: %s",
+                src_path, exc,
+            )
             return src_path
 
         if not text.strip():
             log.warning(
-                "Протокол пустой, конвертация в .docx не нужна: %s",
-                src_path,
+                "Протокол пустой, конвертация в .docx "
+                "не нужна: %s", src_path,
             )
             return src_path
 
@@ -1319,18 +1339,22 @@ class SendToBitrixDialog(QDialog):
             markdown_to_docx(text, tmp_path, title=title)
         except Exception as exc:
             log.exception(
-                "Не удалось конвертировать протокол в .docx: %s", exc
+                "Не удалось конвертировать протокол в .docx: %s",
+                exc,
             )
             return src_path
 
         log.info(
-            "Протокол сконвертирован в .docx: %s → %s (%d символов)",
+            "Протокол сконвертирован в .docx: %s → %s "
+            "(%d символов)",
             src_path, tmp_path, len(text),
         )
         return tmp_path
 
-    def _prepare_file_for_item(self, item: Dict[str, Any]) -> str:
-        """Готовит один файл к отправке. Используется в фоновом потоке."""
+    def _prepare_file_for_item(
+        self, item: Dict[str, Any],
+    ) -> str:
+        """Готовит один файл к отправке."""
         which = item["which"]
         src = item.get("src_file") or ""
 
@@ -1346,7 +1370,9 @@ class SendToBitrixDialog(QDialog):
             header = item.get("header", "") or ""
 
             if not body.strip():
-                log.warning("Протокол пустой — файл не сформирован")
+                log.warning(
+                    "Протокол пустой — файл не сформирован"
+                )
                 return ""
 
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1358,7 +1384,9 @@ class SendToBitrixDialog(QDialog):
                 f"protocol_{safe_name}_{stamp}.docx",
             )
 
-            full_md = f"# {header}\n\n{body}" if header else body
+            full_md = (
+                f"# {header}\n\n{body}" if header else body
+            )
 
             try:
                 markdown_to_docx(
@@ -1367,18 +1395,23 @@ class SendToBitrixDialog(QDialog):
                 )
                 item["_tmp"] = True
                 log.info(
-                    "Протокол сформирован из текста: %s (%d символов)",
+                    "Протокол сформирован из текста: %s "
+                    "(%d символов)",
                     tmp_path, len(full_md),
                 )
                 return tmp_path
             except Exception as exc:
                 log.exception(
-                    "Не удалось сформировать .docx протокола: %s", exc
+                    "Не удалось сформировать .docx протокола: %s",
+                    exc,
                 )
                 return ""
 
         if which == "summary":
-            md_text = item.get("body_md") or item.get("body_plain") or ""
+            md_text = (
+                item.get("body_md")
+                or item.get("body_plain") or ""
+            )
             header = item.get("header", "") or ""
 
             if not md_text.strip():
@@ -1398,7 +1431,8 @@ class SendToBitrixDialog(QDialog):
                 f.write(full_text)
             item["_tmp"] = True
             log.info(
-                "Подготовлен временный файл summary: %s (%d символов)",
+                "Подготовлен временный файл summary: %s "
+                "(%d символов)",
                 path, len(full_text),
             )
             return path
@@ -1406,7 +1440,7 @@ class SendToBitrixDialog(QDialog):
         return ""
 
     # ------------------------------------------------------------------
-    # Отправка (массовая рассылка через QThread)
+    # Отправка
     # ------------------------------------------------------------------
     def _on_send(self, which: str) -> None:
         if self._worker is not None and self._worker.isRunning():
@@ -1420,8 +1454,10 @@ class SendToBitrixDialog(QDialog):
         chat_ids = self._resolve_chat_ids()
 
         if not webhook:
-            QMessageBox.warning(self, "Bitrix24",
-                                "Укажите URL вебхука Bitrix24.")
+            QMessageBox.warning(
+                self, "Bitrix24",
+                "Укажите URL вебхука Bitrix24.",
+            )
             return
 
         if not chat_ids:
@@ -1439,13 +1475,16 @@ class SendToBitrixDialog(QDialog):
                 self._protocol_path
                 and os.path.exists(self._protocol_path)
             ):
-                QMessageBox.warning(self, "Bitrix24",
-                                    "Протокол не прикреплён.")
+                QMessageBox.warning(
+                    self, "Bitrix24", "Протокол не прикреплён."
+                )
                 return
             targets = ["protocol"]
         elif which == "summary":
             if not self._summary_bitrix.strip():
-                QMessageBox.warning(self, "Bitrix24", "Summary пустое.")
+                QMessageBox.warning(
+                    self, "Bitrix24", "Summary пустое."
+                )
                 return
             targets = ["summary"]
         elif which == "both":
@@ -1453,11 +1492,14 @@ class SendToBitrixDialog(QDialog):
                 self._protocol_path
                 and os.path.exists(self._protocol_path)
             ):
-                QMessageBox.warning(self, "Bitrix24",
-                                    "Протокол не прикреплён.")
+                QMessageBox.warning(
+                    self, "Bitrix24", "Протокол не прикреплён."
+                )
                 return
             if not self._summary_bitrix.strip():
-                QMessageBox.warning(self, "Bitrix24", "Summary пустое.")
+                QMessageBox.warning(
+                    self, "Bitrix24", "Summary пустое."
+                )
                 return
             targets = ["protocol", "summary"]
 
@@ -1479,7 +1521,9 @@ class SendToBitrixDialog(QDialog):
                     "header": header,
                     "body": body,
                     "src_file": src_file,
-                    "is_file": self._is_file_mode("protocol", len(body)),
+                    "is_file": self._is_file_mode(
+                        "protocol", len(body)
+                    ),
                 })
             elif t == "summary":
                 header = (
@@ -1496,22 +1540,33 @@ class SendToBitrixDialog(QDialog):
                     "body_plain": body_plain,
                     "body_md": body_md,
                     "src_file": "",
-                    "is_file": self._is_file_mode("summary",
-                                                  len(body_plain)),
+                    "is_file": self._is_file_mode(
+                        "summary", len(body_plain)
+                    ),
                 })
 
-        file_items_preview = [p for p in plan if p["is_file"]]
-        text_items_preview = [p for p in plan if not p["is_file"]]
+        file_items_preview = [
+            p for p in plan if p["is_file"]
+        ]
+        text_items_preview = [
+            p for p in plan if not p["is_file"]
+        ]
 
         preview_lines: List[str] = []
         if file_items_preview:
-            names = ", ".join(p["which"] for p in file_items_preview)
+            names = ", ".join(
+                p["which"] for p in file_items_preview
+            )
             preview_lines.append(f"• файлом: {names}")
         for p in text_items_preview:
             preview_lines.append(
-                f"• текстом: {p['which']}, {len(p['body'])} символов"
+                f"• текстом: {p['which']}, "
+                f"{len(p['body'])} символов"
             )
-        preview_text = "\n".join(preview_lines) or "(нечего отправлять)"
+        preview_text = (
+            "\n".join(preview_lines)
+            or "(нечего отправлять)"
+        )
 
         recipients_text = self._describe_recipients(chat_ids)
 
@@ -1526,7 +1581,8 @@ class SendToBitrixDialog(QDialog):
             f"<pre style='font-family:monospace'>"
             f"{html.escape(recipients_text)}</pre>"
             f"<br>Продолжить?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -1535,7 +1591,12 @@ class SendToBitrixDialog(QDialog):
         connect_timeout = float(
             self.bitrix_cfg.get("connect_timeout", 15)
         )
-        read_timeout = float(self.bitrix_cfg.get("read_timeout", 60))
+        read_timeout = float(
+            self.bitrix_cfg.get("read_timeout", 60)
+        )
+        max_message_chars = int(
+            self.bitrix_cfg.get("max_message_chars", 15000)
+        )
         system = self.system_check.isChecked()
         url_preview = not self.no_preview_check.isChecked()
 
@@ -1544,7 +1605,6 @@ class SendToBitrixDialog(QDialog):
         )
         prefer_chat_folder = forced_folder_id <= 0
 
-        # --- Прогресс-диалог ---
         self._progress_dlg = QProgressDialog(
             "Отправка в Bitrix24…",
             "Отмена",
@@ -1553,12 +1613,13 @@ class SendToBitrixDialog(QDialog):
             self,
         )
         self._progress_dlg.setWindowTitle("Отправка в Bitrix24")
-        self._progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dlg.setWindowModality(
+            Qt.WindowModality.WindowModal
+        )
         self._progress_dlg.setMinimumDuration(0)
         self._progress_dlg.setValue(0)
         self._progress_dlg.canceled.connect(self._on_cancel_send)
 
-        # --- Запуск воркера ---
         self._worker = _SendWorker(
             webhook=webhook,
             chat_ids=chat_ids,
@@ -1567,6 +1628,7 @@ class SendToBitrixDialog(QDialog):
             build_text_cb=self._build_text_message,
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
+            max_message_chars=max_message_chars,
             system=system,
             url_preview=url_preview,
             forced_folder_id=forced_folder_id,
@@ -1578,20 +1640,12 @@ class SendToBitrixDialog(QDialog):
         self._worker.start()
 
     def _on_cancel_send(self) -> None:
-        """
-        Отмена массовой рассылки.
-
-        Полностью прервать сетевые операции aiohttp извне сложно,
-        поэтому используем requestInterruption: воркер проверяет
-        флаг на каждой итерации по чатам и прекращает работу.
-        Текущий (уже начатый) чат будет дообработан.
-        """
         if self._worker is not None and self._worker.isRunning():
             log.info("Запрошена отмена массовой рассылки")
             self._worker.requestInterruption()
 
     def _on_send_progress(
-        self, current: int, total: int, chat_id: str
+        self, current: int, total: int, chat_id: str,
     ) -> None:
         if self._progress_dlg is not None:
             self._progress_dlg.setValue(current - 1)
@@ -1602,7 +1656,9 @@ class SendToBitrixDialog(QDialog):
 
     def _on_send_finished(self, report: Dict[str, Any]) -> None:
         if self._progress_dlg is not None:
-            self._progress_dlg.setValue(self._progress_dlg.maximum())
+            self._progress_dlg.setValue(
+                self._progress_dlg.maximum()
+            )
             self._progress_dlg.close()
             self._progress_dlg = None
         self._worker = None
@@ -1619,7 +1675,9 @@ class SendToBitrixDialog(QDialog):
             self._progress_dlg.close()
             self._progress_dlg = None
         self._worker = None
-        log.error("Bitrix24: массовая рассылка провалена: %s", error)
+        log.error(
+            "Bitrix24: массовая рассылка провалена: %s", error
+        )
         QMessageBox.critical(
             self, "Bitrix24",
             f"Ошибка массовой рассылки:\n\n{error}",
@@ -1637,7 +1695,8 @@ class SendToBitrixDialog(QDialog):
             "Bitrix24: массовая рассылка завершена. "
             "Получателей: %d, успешно: %d, с ошибками: %d, "
             "сообщений отправлено: %d",
-            total_chats, len(ok_chats), len(fail_chats), sent_count,
+            total_chats, len(ok_chats), len(fail_chats),
+            sent_count,
         )
 
         if not fail_chats:
@@ -1654,29 +1713,37 @@ class SendToBitrixDialog(QDialog):
             f"<b>Получателей:</b> {total_chats}<br>"
             f"<b>Успешно:</b> {len(ok_chats)}<br>"
             f"<b>С ошибкой:</b> {len(fail_chats)}<br>"
-            f"<b>Всего отправлено сообщений:</b> {sent_count}<br><br>"
+            f"<b>Всего отправлено сообщений:</b> {sent_count}"
+            f"<br><br>"
         )
 
         if ok_chats:
             lines.append("<b>Успешно отправлено в:</b><br>")
             for cid in ok_chats[:30]:
-                lines.append(f"&nbsp;&nbsp;• {html.escape(cid)}<br>")
+                lines.append(
+                    f"&nbsp;&nbsp;• {html.escape(cid)}<br>"
+                )
             if len(ok_chats) > 30:
                 lines.append(
-                    f"&nbsp;&nbsp;… и ещё {len(ok_chats) - 30}<br>"
+                    f"&nbsp;&nbsp;… и ещё "
+                    f"{len(ok_chats) - 30}<br>"
                 )
             lines.append("<br>")
 
         lines.append("<b>Ошибки:</b><br>")
         for cid, errs in list(errors_by_chat.items())[:15]:
-            joined = "; ".join(html.escape(e) for e in errs)
+            joined = "; ".join(
+                html.escape(e) for e in errs
+            )
             lines.append(
-                f"&nbsp;&nbsp;• <b>{html.escape(cid)}</b>: {joined}<br>"
+                f"&nbsp;&nbsp;• <b>{html.escape(cid)}</b>: "
+                f"{joined}<br>"
             )
         if len(errors_by_chat) > 15:
             lines.append(
-                f"&nbsp;&nbsp;… и ещё {len(errors_by_chat) - 15} "
-                f"получателей с ошибками<br>"
+                f"&nbsp;&nbsp;… и ещё "
+                f"{len(errors_by_chat) - 15} получателей "
+                f"с ошибками<br>"
             )
 
         box = (

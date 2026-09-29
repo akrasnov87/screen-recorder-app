@@ -1,12 +1,21 @@
-"""Плавающая панель управления поверх всех окон."""
+"""Плавающая панель управления поверх всех окон.
+
+Изменения:
+  • Размеры панели, задержка автоскрытия и число строк лога
+    читаются из config["app"]:
+      overlay_hide_delay_ms, overlay_log_lines,
+      overlay_width, overlay_height.
+  • Удалён неиспользуемый метод set_recording_controls_enabled().
+"""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QProgressBar, QPushButton, QTextEdit, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QProgressBar, QPushButton, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 from .logger import get_logger
@@ -21,20 +30,40 @@ class OverlayPanel(QWidget):
     pause_requested = Signal()
     stop_requested = Signal()
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[Dict] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
-        log.debug("Инициализация OverlayPanel")
+        self._config = config or {}
+        app_cfg = self._config.get("app", {}) or {}
+
+        self._hide_delay_ms = int(
+            app_cfg.get("overlay_hide_delay_ms", 5000)
+        )
+        self._log_lines = int(app_cfg.get("overlay_log_lines", 5))
+        self._panel_width = int(app_cfg.get("overlay_width", 340))
+        self._panel_height = int(app_cfg.get("overlay_height", 190))
+
+        log.debug(
+            "Инициализация OverlayPanel "
+            "(hide=%dмс, log_lines=%d, %dx%d)",
+            self._hide_delay_ms, self._log_lines,
+            self._panel_width, self._panel_height,
+        )
+
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(340, 190)
+        self.setFixedSize(self._panel_width, self._panel_height)
 
         self._drag_pos = None
         self._hide_timer = QTimer(self)
-        self._hide_timer.setInterval(5000)
+        self._hide_timer.setInterval(self._hide_delay_ms)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide_panel)
 
@@ -46,7 +75,9 @@ class OverlayPanel(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
 
         self.status_label = QLabel("Готов")
-        self.status_label.setStyleSheet("color: white; font-weight: bold;")
+        self.status_label.setStyleSheet(
+            "color: white; font-weight: bold;"
+        )
         layout.addWidget(self.status_label)
 
         buttons = QHBoxLayout()
@@ -78,7 +109,7 @@ class OverlayPanel(QWidget):
         self.log_view.setFixedHeight(60)
         layout.addWidget(self.log_view)
 
-    # ---------- Обработчики кнопок с логированием ----------
+    # ---------- Обработчики кнопок ----------
     def _on_start_clicked(self) -> None:
         log.info("Overlay: нажата кнопка «Старт»")
         self.start_requested.emit()
@@ -124,14 +155,10 @@ class OverlayPanel(QWidget):
         # т.к. GUI-хук логгера сам вызывает этот метод.
         self.log_view.append(message)
         lines = self.log_view.toPlainText().splitlines()
-        if len(lines) > 5:
-            self.log_view.setPlainText("\n".join(lines[-5:]))
-
-    def set_recording_controls_enabled(self, enabled: bool) -> None:
-        log.debug("Overlay: кнопки записи enabled=%s", enabled)
-        self.start_btn.setEnabled(enabled)
-        self.pause_btn.setEnabled(enabled)
-        self.stop_btn.setEnabled(enabled)
+        if len(lines) > self._log_lines:
+            self.log_view.setPlainText(
+                "\n".join(lines[-self._log_lines:])
+            )
 
     def start_hide_timer(self) -> None:
         log.debug("Overlay: таймер автоскрытия перезапущен")
@@ -140,7 +167,10 @@ class OverlayPanel(QWidget):
     # ---------- Перетаскивание ----------
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._drag_pos = (
+                event.globalPosition().toPoint()
+                - self.frameGeometry().topLeft()
+            )
             log.debug("Overlay: начало перетаскивания")
             event.accept()
 
@@ -160,4 +190,3 @@ class OverlayPanel(QWidget):
         self.log_view.clear()
         self.status_label.setText("Готов")
         self._hide_timer.stop()
-        self.set_recording_controls_enabled(True)

@@ -1,8 +1,14 @@
-"""Управление иконкой в системном трее."""
+"""Управление иконкой в системном трее.
+
+Изменения:
+  • Таймаут уведомлений и максимальные длины берутся из
+    config["app"]: notification_timeout_ms,
+    notification_max_title, notification_max_message.
+"""
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Dict, Optional
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QIcon
@@ -14,7 +20,9 @@ log = get_logger(__name__)
 
 
 def _icon_path(name: str) -> str:
-    base = os.path.join(os.path.dirname(__file__), "..", "resources", "icons")
+    base = os.path.join(
+        os.path.dirname(__file__), "..", "resources", "icons"
+    )
     for ext in (".svg", ".png"):
         p = os.path.join(base, name + ext)
         if os.path.exists(p):
@@ -35,8 +43,22 @@ class TrayManager(QObject):
     upload_video_requested = Signal()
     quit_requested = Signal()
 
-    def __init__(self, parent: Optional[QObject] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[Dict] = None,
+        parent: Optional[QObject] = None,
+    ) -> None:
         super().__init__(parent)
+        self._config = config or {}
+        app_cfg = self._config.get("app", {}) or {}
+        self._notify_timeout_ms = int(
+            app_cfg.get("notification_timeout_ms", 4000)
+        )
+        self._max_title = int(app_cfg.get("notification_max_title", 50))
+        self._max_message = int(
+            app_cfg.get("notification_max_message", 100)
+        )
+
         self._tray: Optional[QSystemTrayIcon] = None
         self._menu: Optional[QMenu] = None
         self._state = "idle"
@@ -44,7 +66,9 @@ class TrayManager(QObject):
 
     def create_tray_icon(self) -> None:
         log.info("Создание иконки в системном трее")
-        self._tray = QSystemTrayIcon(QIcon(_icon_path("app")), self.parent())
+        self._tray = QSystemTrayIcon(
+            QIcon(_icon_path("app")), self.parent()
+        )
         self._tray.setToolTip("Screen Recorder")
         self.create_context_menu()
         self._tray.activated.connect(self._on_activated)
@@ -65,7 +89,6 @@ class TrayManager(QObject):
 
         menu.addSeparator()
 
-        # --- Загрузить видео ---
         upload_action = QAction("Загрузить видео", menu)
         upload_action.setToolTip(
             "Выбрать видеофайл и поставить его в очередь обработки"
@@ -73,7 +96,6 @@ class TrayManager(QObject):
         upload_action.triggered.connect(self.upload_video)
         menu.addAction(upload_action)
 
-        # --- Импорт готовых материалов (новое) ---
         import_action = QAction("Импорт", menu)
         import_action.setToolTip(
             "Импортировать готовые видео, стенограммы и протоколы"
@@ -83,12 +105,10 @@ class TrayManager(QObject):
 
         menu.addSeparator()
 
-        # --- Записи ---
         sessions_action = QAction("Записи", menu)
         sessions_action.triggered.connect(self.open_sessions)
         menu.addAction(sessions_action)
 
-        # --- Библиотека ---
         library_action = QAction("Библиотека", menu)
         library_action.setToolTip(
             "Полнотекстовый поиск по стенограммам, протоколам, "
@@ -97,7 +117,6 @@ class TrayManager(QObject):
         library_action.triggered.connect(self.open_library)
         menu.addAction(library_action)
 
-        # --- Очередь ---
         queue_action = QAction("Очередь задач", menu)
         queue_action.triggered.connect(self.open_queue)
         menu.addAction(queue_action)
@@ -115,7 +134,8 @@ class TrayManager(QObject):
         menu.addAction(quit_action)
 
         self._tray.setContextMenu(menu)
-        log.info("Контекстное меню создано: %d действий", len(menu.actions()))
+        log.info("Контекстное меню создано: %d действий",
+                 len(menu.actions()))
 
     def set_recording_state(self, state: str) -> None:
         log.info("Состояние трея: %s → %s", self._state, state)
@@ -128,19 +148,32 @@ class TrayManager(QObject):
             "paused": "paused",
             "processing": "processing",
         }
-        self._tray.setIcon(QIcon(_icon_path(icon_map.get(state, "app"))))
+        self._tray.setIcon(
+            QIcon(_icon_path(icon_map.get(state, "app")))
+        )
         if self._record_action:
             if state in ("recording", "paused"):
                 self._record_action.setText("Остановить запись")
             else:
                 self._record_action.setText("Начать запись")
 
-    def show_notification(self, title: str, message: str,
-                          icon: QSystemTrayIcon.MessageIcon = QSystemTrayIcon.MessageIcon.Information) -> None:
+    def show_notification(
+        self,
+        title: str,
+        message: str,
+        icon: QSystemTrayIcon.MessageIcon = (
+            QSystemTrayIcon.MessageIcon.Information
+        ),
+    ) -> None:
         log.info("Уведомление: %s — %s", title, message)
         if self._tray is None:
             return
-        self._tray.showMessage(title[:50], message[:100], icon, 4000)
+        self._tray.showMessage(
+            title[:self._max_title],
+            message[:self._max_message],
+            icon,
+            self._notify_timeout_ms,
+        )
 
     def toggle_recording(self) -> None:
         log.debug("Клик: переключить запись")
@@ -174,7 +207,9 @@ class TrayManager(QObject):
         log.info("Запрошен выход из приложения")
         self.quit_requested.emit()
 
-    def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+    def _on_activated(
+        self, reason: QSystemTrayIcon.ActivationReason,
+    ) -> None:
         log.debug("Активация трея: %s", reason)
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.open_settings()

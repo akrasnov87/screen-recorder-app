@@ -4,8 +4,10 @@
 между library_search, main, processor, send_to_bitrix_dialog и другими.
 
 Все функции устойчивы к ошибкам: при невозможности чтения возвращают
-пустую строку и логируют предупреждение, не бросают исключения
-(кроме случаев, когда явно вызван `strict=True`).
+пустую строку и логируют предупреждение.
+
+Изменения:
+  • Удалены неиспользуемые _DOC_EXTS и read_any_text_quiet().
 """
 from __future__ import annotations
 
@@ -20,9 +22,6 @@ log = get_logger(__name__)
 # Расширения, которые читаются как plain text
 _TEXT_EXTS = {".txt", ".md", ".csv", ".log", ".srt", ".vtt", ".html", ".htm"}
 
-# Расширения, для которых нужно извлекать текст
-_DOC_EXTS = {".docx", ".pdf"}
-
 # Максимальный размер читаемого текста (по умолчанию)
 DEFAULT_MAX_CHARS = 5_000_000
 
@@ -31,16 +30,7 @@ def read_text_file(
     path: str,
     max_chars: int = DEFAULT_MAX_CHARS,
 ) -> str:
-    """
-    Читает plain-text файл с ограничением длины.
-
-    Args:
-        path:      путь к файлу.
-        max_chars: максимальное количество символов для чтения.
-
-    Returns:
-        Содержимое файла или пустая строка при ошибке.
-    """
+    """Читает plain-text файл с ограничением длины."""
     if not path or not os.path.isfile(path):
         return ""
     try:
@@ -55,12 +45,7 @@ def read_docx_file(
     path: str,
     max_chars: int = DEFAULT_MAX_CHARS,
 ) -> str:
-    """
-    Извлекает текст из .docx.
-
-    Requires:
-        python-docx
-    """
+    """Извлекает текст из .docx. Требует python-docx."""
     if not path or not os.path.isfile(path):
         return ""
     try:
@@ -82,12 +67,7 @@ def read_pdf_file(
     path: str,
     max_chars: int = DEFAULT_MAX_CHARS,
 ) -> str:
-    """
-    Извлекает текст из .pdf.
-
-    Requires:
-        pypdf
-    """
+    """Извлекает текст из .pdf. Требует pypdf."""
     if not path or not os.path.isfile(path):
         return ""
     try:
@@ -130,10 +110,9 @@ def read_json_as_text(
     max_chars: int = DEFAULT_MAX_CHARS,
 ) -> str:
     """
-    Читает JSON и пытается извлечь из него осмысленный текст.
-
-    Если внутри есть ключ script/text/transcript/content — возвращает
-    его значение. Иначе — pretty-printed JSON целиком.
+    Читает JSON и извлекает из него осмысленный текст.
+    Если внутри есть ключ script/text/transcript/content — вернёт его.
+    Иначе — pretty-printed JSON целиком.
     """
     data = read_json_file(path)
     if data is None:
@@ -153,10 +132,9 @@ def read_any_text(
     max_chars: int = DEFAULT_MAX_CHARS,
 ) -> str:
     """
-    Универсальный ридер: сам определяет формат по расширению.
+    Универсальный ридер: определяет формат по расширению.
 
     Поддерживает: .txt/.md/.csv/.json/.log/.srt/.vtt/.docx/.pdf.
-
     Для неподдерживаемых расширений возвращает пустую строку.
     """
     if not path or not os.path.isfile(path):
@@ -174,26 +152,4 @@ def read_any_text(
         return read_pdf_file(path, max_chars)
 
     log.warning("Неподдерживаемое расширение: %s (%s)", ext, path)
-    return ""
-
-
-def read_any_text_quiet(
-    path: str,
-    max_chars: int = DEFAULT_MAX_CHARS,
-) -> str:
-    """
-    То же, что read_any_text, но без warning-логов для неподдерживаемых
-    расширений — используется в местах, где пустой результат ожидаем.
-    """
-    if not path or not os.path.isfile(path):
-        return ""
-    ext = os.path.splitext(path)[1].lower()
-    if ext in _TEXT_EXTS:
-        return read_text_file(path, max_chars)
-    if ext == ".json":
-        return read_json_as_text(path, max_chars)
-    if ext == ".docx":
-        return read_docx_file(path, max_chars)
-    if ext == ".pdf":
-        return read_pdf_file(path, max_chars)
     return ""

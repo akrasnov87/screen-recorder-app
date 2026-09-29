@@ -1,4 +1,16 @@
-"""Окно настроек с вкладками (локальный режим)."""
+"""Окно настроек с вкладками (локальный режим).
+
+Изменения:
+  • На вкладку «Запись» добавлены поля ffmpeg и Overlay:
+    ffmpeg_start_check_delay, ffmpeg_stop_timeout,
+    ffmpeg_kill_timeout, overlay_hide_delay_ms, overlay_log_lines.
+  • На вкладку «Логи» добавлены: log_max_bytes_mb, log_backup_count.
+  • На вкладку «Bitrix24» добавлены: bitrix_max_message_chars,
+    bitrix_retry_count, bitrix_retry_delay.
+  • На вкладку «Очередь» добавлен: queue_pause_when_recording.
+  • load_settings() / _apply_form_to_config() обновлены
+    для новых параметров.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -31,7 +43,10 @@ log = get_logger(__name__)
 class SettingsWindow(QDialog):
     """Модальное окно настроек."""
 
-    def __init__(self, config: ConfigManager, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self, config: ConfigManager,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.config_manager = config
         self.setWindowTitle("Настройки Screen Recorder")
@@ -47,7 +62,9 @@ class SettingsWindow(QDialog):
         self.tabs = QTabWidget()
         root.addWidget(self.tabs)
 
-        self.tabs.addTab(self._build_projects_tab(), "Проекты и чаты Bitrix24")
+        self.tabs.addTab(
+            self._build_projects_tab(), "Проекты и чаты Bitrix24"
+        )
         self.tabs.addTab(self._build_employees_tab(), "Сотрудники")
         self.tabs.addTab(self._build_bitrix_tab(), "Bitrix24")
         self.tabs.addTab(self._build_metadata_tab(), "Промпты и имена")
@@ -57,7 +74,9 @@ class SettingsWindow(QDialog):
         self.tabs.addTab(self._build_recording_tab(), "Запись")
         self.tabs.addTab(self._build_queue_tab(), "Очередь")
         self.tabs.addTab(self._build_scrum_tab(), "Скрам")
-        self.tabs.addTab(self._build_compression_tab(), "Форматы и сжатие")
+        self.tabs.addTab(
+            self._build_compression_tab(), "Форматы и сжатие"
+        )
         self.tabs.addTab(self._build_storage_tab(), "Хранилище")
         self.tabs.addTab(self._build_logging_tab(), "Логи")
 
@@ -67,11 +86,15 @@ class SettingsWindow(QDialog):
 
         self.export_btn = QPushButton("Экспорт настроек…")
         self.export_btn.clicked.connect(self._export_settings)
-        buttons.addWidget(with_info(self.export_btn, "settings_export", stretch=False))
+        buttons.addWidget(
+            with_info(self.export_btn, "settings_export", stretch=False)
+        )
 
         self.import_btn = QPushButton("Импорт настроек…")
         self.import_btn.clicked.connect(self._import_settings)
-        buttons.addWidget(with_info(self.import_btn, "settings_import", stretch=False))
+        buttons.addWidget(
+            with_info(self.import_btn, "settings_import", stretch=False)
+        )
 
         buttons.addStretch()
 
@@ -106,12 +129,14 @@ class SettingsWindow(QDialog):
         hint = QLabel(
             "ID чата — это идентификатор диалога в Bitrix24. "
             "Найти его можно через API методом "
-            "<code>im.recent.get</code> или из URL чата в веб-интерфейсе.<br><br>"
-            "Формат: <code>chat2101</code> или просто <code>2101</code>. "
-            "Обычно достаточно указать число — метод <code>im.message.add</code> "
-            "примет оба варианта.<br><br>"
-            "Если чат не задан — отправка в Bitrix24 для этого проекта "
-            "будет недоступна."
+            "<code>im.recent.get</code> или из URL чата в "
+            "веб-интерфейсе.<br><br>"
+            "Формат: <code>chat2101</code> или просто "
+            "<code>2101</code>. Обычно достаточно указать число — "
+            "метод <code>im.message.add</code> примет оба варианта."
+            "<br><br>"
+            "Если чат не задан — отправка в Bitrix24 для этого "
+            "проекта будет недоступна."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: #666; }")
@@ -161,7 +186,9 @@ class SettingsWindow(QDialog):
     def _project_add(self) -> None:
         row = self.projects_table.rowCount()
         self.projects_table.insertRow(row)
-        self.projects_table.setItem(row, 0, QTableWidgetItem("Новый проект"))
+        self.projects_table.setItem(
+            row, 0, QTableWidgetItem("Новый проект")
+        )
         self.projects_table.setItem(row, 1, QTableWidgetItem(""))
         self.projects_table.editItem(self.projects_table.item(row, 0))
         log.debug("Добавлен пустой проект (строка %d)", row)
@@ -265,9 +292,13 @@ class SettingsWindow(QDialog):
     def _employee_add(self) -> None:
         row = self.employees_table.rowCount()
         self.employees_table.insertRow(row)
-        self.employees_table.setItem(row, 0, QTableWidgetItem("Фамилия И.О."))
+        self.employees_table.setItem(
+            row, 0, QTableWidgetItem("Фамилия И.О.")
+        )
         self.employees_table.setItem(row, 1, QTableWidgetItem(""))
-        self.employees_table.editItem(self.employees_table.item(row, 0))
+        self.employees_table.editItem(
+            self.employees_table.item(row, 0)
+        )
         log.debug("Добавлен пустой сотрудник (строка %d)", row)
 
     def _employee_delete(self) -> None:
@@ -280,7 +311,8 @@ class SettingsWindow(QDialog):
             self, "Удалить сотрудника",
             f"Удалить сотрудника «{name}»?",
         ) == QMessageBox.StandardButton.Yes:
-            log.info("Удаление сотрудника «%s» (строка %d)", name, row)
+            log.info("Удаление сотрудника «%s» (строка %d)",
+                     name, row)
             self.employees_table.removeRow(row)
 
     def _employee_move(self, delta: int) -> None:
@@ -306,8 +338,9 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Настройки интеграции с Bitrix24. Используется для отправки "
-            "протоколов и кратких описаний в чаты команд из окна «Записи»."
+            "Настройки интеграции с Bitrix24. Используется для "
+            "отправки протоколов и кратких описаний в чаты команд "
+            "из окна «Записи»."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -321,7 +354,9 @@ class SettingsWindow(QDialog):
         form.addRow("", self.bitrix_enabled_check)
 
         self.bitrix_webhook_input = QLineEdit()
-        self.bitrix_webhook_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.bitrix_webhook_input.setEchoMode(
+            QLineEdit.EchoMode.Password
+        )
         self.bitrix_webhook_input.setPlaceholderText(
             "https://portal.bitrix24.ru/rest/1/token/"
         )
@@ -348,7 +383,9 @@ class SettingsWindow(QDialog):
         self.bitrix_connect_timeout.setValue(15)
         form.addRow(
             "Таймаут соединения:",
-            with_info(self.bitrix_connect_timeout, "bitrix_connect_timeout"),
+            with_info(
+                self.bitrix_connect_timeout, "bitrix_connect_timeout"
+            ),
         )
 
         self.bitrix_read_timeout = QSpinBox()
@@ -363,10 +400,14 @@ class SettingsWindow(QDialog):
         self.bitrix_default_send_combo = QComboBox()
         self.bitrix_default_send_combo.addItem("Протокол", "protocol")
         self.bitrix_default_send_combo.addItem("Summary", "summary")
-        self.bitrix_default_send_combo.addItem("И то и другое", "both")
+        self.bitrix_default_send_combo.addItem(
+            "И то и другое", "both"
+        )
         form.addRow(
             "Что отправлять по умолчанию:",
-            with_info(self.bitrix_default_send_combo, "bitrix_default_send"),
+            with_info(
+                self.bitrix_default_send_combo, "bitrix_default_send"
+            ),
         )
 
         self.bitrix_header_check = QCheckBox(
@@ -384,14 +425,18 @@ class SettingsWindow(QDialog):
         self.bitrix_no_preview_check = QCheckBox(
             "Отключить предпросмотр ссылок"
         )
-        attach_tooltip(self.bitrix_no_preview_check, "bitrix_no_preview")
+        attach_tooltip(
+            self.bitrix_no_preview_check, "bitrix_no_preview"
+        )
         form.addRow("", self.bitrix_no_preview_check)
 
         # --- Загрузка файлов ---
         files_header = QHBoxLayout()
         files_header.addWidget(QLabel("<b>Отправка файлов</b>"))
         files_header.addStretch()
-        files_header.addWidget(make_info_icon("bitrix_files_section"))
+        files_header.addWidget(
+            make_info_icon("bitrix_files_section")
+        )
         files_row = QWidget()
         files_row.setLayout(files_header)
         form.addRow("", files_row)
@@ -403,21 +448,61 @@ class SettingsWindow(QDialog):
         self.bitrix_file_threshold.setValue(3000)
         form.addRow(
             "Порог «текст → файл»:",
-            with_info(self.bitrix_file_threshold, "bitrix_file_threshold"),
+            with_info(
+                self.bitrix_file_threshold, "bitrix_file_threshold"
+            ),
         )
 
         self.bitrix_upload_folder = QSpinBox()
         self.bitrix_upload_folder.setRange(0, 999999999)
         self.bitrix_upload_folder.setValue(0)
-        self.bitrix_upload_folder.setSpecialValueText("Папка чата (авто)")
+        self.bitrix_upload_folder.setSpecialValueText(
+            "Папка чата (авто)"
+        )
         form.addRow(
             "Папка для загрузки:",
-            with_info(self.bitrix_upload_folder, "bitrix_upload_folder"),
+            with_info(
+                self.bitrix_upload_folder, "bitrix_upload_folder"
+            ),
+        )
+
+        self.bitrix_max_message_chars = QSpinBox()
+        self.bitrix_max_message_chars.setRange(1000, 20000)
+        self.bitrix_max_message_chars.setSingleStep(500)
+        self.bitrix_max_message_chars.setSuffix(" символов")
+        self.bitrix_max_message_chars.setValue(15000)
+        form.addRow(
+            "Максимальная длина сообщения:",
+            with_info(
+                self.bitrix_max_message_chars,
+                "bitrix_max_message_chars",
+            ),
+        )
+
+        self.bitrix_retry_count = QSpinBox()
+        self.bitrix_retry_count.setRange(0, 20)
+        self.bitrix_retry_count.setValue(3)
+        form.addRow(
+            "Попыток при ошибке:",
+            with_info(self.bitrix_retry_count, "bitrix_retry_count"),
+        )
+
+        self.bitrix_retry_delay = QDoubleSpinBox()
+        self.bitrix_retry_delay.setRange(0.5, 60.0)
+        self.bitrix_retry_delay.setSingleStep(0.5)
+        self.bitrix_retry_delay.setDecimals(1)
+        self.bitrix_retry_delay.setSuffix(" сек")
+        self.bitrix_retry_delay.setValue(2.0)
+        form.addRow(
+            "Пауза между повторами:",
+            with_info(self.bitrix_retry_delay, "bitrix_retry_delay"),
         )
 
         # --- Кнопка проверки ---
         self.bitrix_test_btn = QPushButton("Проверить подключение")
-        self.bitrix_test_btn.clicked.connect(self._test_bitrix_connection)
+        self.bitrix_test_btn.clicked.connect(
+            self._test_bitrix_connection
+        )
         form.addRow("", self.bitrix_test_btn)
 
         layout.addLayout(form)
@@ -437,14 +522,20 @@ class SettingsWindow(QDialog):
 
         connect_timeout = float(self.bitrix_connect_timeout.value())
         read_timeout = float(self.bitrix_read_timeout.value())
+        max_message_chars = int(
+            self.bitrix_max_message_chars.value()
+        )
 
-        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QGuiApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
 
         async def _run_ping() -> str:
             async with Bitrix24Client(
                 webhook_url=webhook,
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
+                max_message_chars=max_message_chars,
             ) as client:
                 return await client.ping()
 
@@ -492,12 +583,16 @@ class SettingsWindow(QDialog):
         layout.addLayout(prompts_header)
 
         self.prompts_table = QTableWidget(0, 2)
-        self.prompts_table.setHorizontalHeaderLabels(["Название", "Текст"])
+        self.prompts_table.setHorizontalHeaderLabels(
+            ["Название", "Текст"]
+        )
         self.prompts_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
         header = self.prompts_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.prompts_table.setMinimumHeight(150)
         layout.addWidget(self.prompts_table)
@@ -529,15 +624,18 @@ class SettingsWindow(QDialog):
         layout.addWidget(self.default_prompt_edit)
 
         names_header = QHBoxLayout()
-        names_header.addWidget(QLabel("<b>Шаблоны названий записи</b>"))
+        names_header.addWidget(
+            QLabel("<b>Шаблоны названий записи</b>")
+        )
         names_header.addStretch()
         names_header.addWidget(make_info_icon("name_templates"))
         layout.addLayout(names_header)
 
         names_hint = QLabel(
-            "Используются в окне метаданных записи — выпадающий список "
-            "«Название». Плейсхолдеры: "
-            "<code>{name}</code> / <code>{название}</code> — введённое имя, "
+            "Используются в окне метаданных записи — выпадающий "
+            "список «Название». Плейсхолдеры: "
+            "<code>{name}</code> / <code>{название}</code> — "
+            "введённое имя, "
             "<code>{abbr}</code> / <code>{сокр}</code> — сокращение, "
             "<code>{date}</code> / <code>{дата}</code> — YYYY-MM-DD, "
             "<code>{time}</code> / <code>{время}</code> — HH-MM, "
@@ -548,12 +646,16 @@ class SettingsWindow(QDialog):
         layout.addWidget(names_hint)
 
         self.name_templates_table = QTableWidget(0, 2)
-        self.name_templates_table.setHorizontalHeaderLabels(["Название", "Шаблон"])
+        self.name_templates_table.setHorizontalHeaderLabels(
+            ["Название", "Шаблон"]
+        )
         self.name_templates_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
         header = self.name_templates_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.name_templates_table.setMinimumHeight(150)
         layout.addWidget(self.name_templates_table)
@@ -569,9 +671,12 @@ class SettingsWindow(QDialog):
         n_down_btn.clicked.connect(lambda: self._name_tpl_move(1))
         n_default_btn = QPushButton("Вернуть стандартные")
         n_default_btn.setToolTip(
-            "Заменить текущий список стандартными шаблонами из поставки"
+            "Заменить текущий список стандартными шаблонами "
+            "из поставки"
         )
-        n_default_btn.clicked.connect(self._name_tpl_restore_defaults)
+        n_default_btn.clicked.connect(
+            self._name_tpl_restore_defaults
+        )
         name_btns.addWidget(n_add_btn)
         name_btns.addWidget(n_del_btn)
         name_btns.addWidget(n_up_btn)
@@ -586,7 +691,9 @@ class SettingsWindow(QDialog):
     def _prompt_add(self) -> None:
         row = self.prompts_table.rowCount()
         self.prompts_table.insertRow(row)
-        self.prompts_table.setItem(row, 0, QTableWidgetItem("Новый промпт"))
+        self.prompts_table.setItem(
+            row, 0, QTableWidgetItem("Новый промпт")
+        )
         self.prompts_table.setItem(row, 1, QTableWidgetItem(""))
         self.prompts_table.editItem(self.prompts_table.item(row, 0))
 
@@ -596,9 +703,10 @@ class SettingsWindow(QDialog):
             return
         name = self.prompts_table.item(row, 0)
         name = name.text() if name else ""
-        if QMessageBox.question(self, "Удалить промпт",
-                                f"Удалить промпт «{name}»?") == \
-                QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(
+            self, "Удалить промпт",
+            f"Удалить промпт «{name}»?",
+        ) == QMessageBox.StandardButton.Yes:
             log.info("Удаление промпта «%s» (строка %d)", name, row)
             self.prompts_table.removeRow(row)
 
@@ -623,12 +731,18 @@ class SettingsWindow(QDialog):
     def _name_tpl_add(self) -> None:
         row = self.name_templates_table.rowCount()
         self.name_templates_table.insertRow(row)
-        self.name_templates_table.setItem(row, 0, QTableWidgetItem("Новый шаблон"))
+        self.name_templates_table.setItem(
+            row, 0, QTableWidgetItem("Новый шаблон")
+        )
         self.name_templates_table.setItem(
             row, 1, QTableWidgetItem("{name} — {date}")
         )
-        self.name_templates_table.editItem(self.name_templates_table.item(row, 0))
-        log.debug("Добавлена пустая строка шаблона имени (строка %d)", row)
+        self.name_templates_table.editItem(
+            self.name_templates_table.item(row, 0)
+        )
+        log.debug(
+            "Добавлена пустая строка шаблона имени (строка %d)", row
+        )
 
     def _name_tpl_delete(self) -> None:
         row = self.name_templates_table.currentRow()
@@ -636,10 +750,12 @@ class SettingsWindow(QDialog):
             return
         item = self.name_templates_table.item(row, 0)
         label = item.text() if item else ""
-        if QMessageBox.question(self, "Удалить шаблон",
-                                f"Удалить шаблон «{label}»?") == \
-                QMessageBox.StandardButton.Yes:
-            log.info("Удаление шаблона имени «%s» (строка %d)", label, row)
+        if QMessageBox.question(
+            self, "Удалить шаблон",
+            f"Удалить шаблон «{label}»?",
+        ) == QMessageBox.StandardButton.Yes:
+            log.info("Удаление шаблона имени «%s» (строка %d)",
+                     label, row)
             self.name_templates_table.removeRow(row)
 
     def _name_tpl_move(self, delta: int) -> None:
@@ -647,7 +763,8 @@ class SettingsWindow(QDialog):
         if row < 0:
             return
         new_row = row + delta
-        if new_row < 0 or new_row >= self.name_templates_table.rowCount():
+        if (new_row < 0
+                or new_row >= self.name_templates_table.rowCount()):
             return
         for col in range(self.name_templates_table.columnCount()):
             a = self.name_templates_table.takeItem(row, col)
@@ -660,7 +777,8 @@ class SettingsWindow(QDialog):
     def _name_tpl_restore_defaults(self) -> None:
         if QMessageBox.question(
             self, "Стандартные шаблоны",
-            "Заменить текущий список шаблонов стандартными из поставки?",
+            "Заменить текущий список шаблонов стандартными "
+            "из поставки?",
         ) != QMessageBox.StandardButton.Yes:
             return
         self.name_templates_table.setRowCount(0)
@@ -673,8 +791,10 @@ class SettingsWindow(QDialog):
             self.name_templates_table.setItem(
                 row, 1, QTableWidgetItem(item.get("template", ""))
             )
-        log.info("Шаблоны имён сброшены к стандартным (%d шт.)",
-                 len(DEFAULT_NAME_TEMPLATES))
+        log.info(
+            "Шаблоны имён сброшены к стандартным (%d шт.)",
+            len(DEFAULT_NAME_TEMPLATES),
+        )
 
     # ------------------------------------------------------------------
     # Транскрибация
@@ -721,10 +841,18 @@ class SettingsWindow(QDialog):
         self.tr_max_wait.setValue(7200)
 
         self.test_tr_btn = QPushButton("Проверить подключение")
-        self.test_tr_btn.clicked.connect(self.test_transcribe_connection)
+        self.test_tr_btn.clicked.connect(
+            self.test_transcribe_connection
+        )
 
-        tr_box.addRow("URL сервера:", with_info(self.tr_url_input, "tr_url"))
-        tr_box.addRow("Access key:", with_info(self.tr_key_input, "tr_key"))
+        tr_box.addRow(
+            "URL сервера:",
+            with_info(self.tr_url_input, "tr_url"),
+        )
+        tr_box.addRow(
+            "Access key:",
+            with_info(self.tr_key_input, "tr_key"),
+        )
         tr_box.addRow("", self.tr_show_key)
         tr_box.addRow(
             "Таймаут соединения:",
@@ -752,21 +880,20 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Выберите, где формируется протокол/резюме (summary) записи. "
-            "Транскрибация всегда выполняется на сервере."
+            "Выберите, где формируется протокол/резюме (summary) "
+            "записи. Транскрибация всегда выполняется на сервере."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        # --- Глобальный флаг «Формировать summary» ---
         self.sum_enabled_check = QCheckBox(
-            "Формировать summary (краткое содержание) для новых записей"
+            "Формировать summary (краткое содержание) "
+            "для новых записей"
         )
-        self.sum_enabled_check.setChecked(False)  # значение по умолчанию
+        self.sum_enabled_check.setChecked(False)
         attach_tooltip(self.sum_enabled_check, "sum_enabled")
         layout.addWidget(self.sum_enabled_check)
 
-        # --- Пояснение ---
         sum_hint = QLabel(
             "<span style='color:#666'>Значение по умолчанию для новых "
             "записей. В карточке конкретной записи пользователь может "
@@ -798,7 +925,9 @@ class SettingsWindow(QDialog):
         lite_form = QFormLayout()
 
         self.sum_litellm_url = QLineEdit()
-        self.sum_litellm_url.setPlaceholderText("http://localhost:4000")
+        self.sum_litellm_url.setPlaceholderText(
+            "http://localhost:4000"
+        )
 
         self.sum_litellm_key = QLineEdit()
         self.sum_litellm_key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -833,7 +962,9 @@ class SettingsWindow(QDialog):
         self.sum_litellm_system.setMinimumHeight(120)
 
         self.sum_test_btn = QPushButton("Проверить подключение")
-        self.sum_test_btn.clicked.connect(self._test_summarizer_connection)
+        self.sum_test_btn.clicked.connect(
+            self._test_summarizer_connection
+        )
 
         lite_form.addRow(
             "Base URL:",
@@ -850,21 +981,31 @@ class SettingsWindow(QDialog):
         )
         lite_form.addRow(
             "Temperature:",
-            with_info(self.sum_litellm_temperature, "sum_litellm_temperature"),
+            with_info(
+                self.sum_litellm_temperature,
+                "sum_litellm_temperature",
+            ),
         )
         lite_form.addRow(
             "Max tokens:",
-            with_info(self.sum_litellm_max_tokens, "sum_litellm_max_tokens"),
+            with_info(
+                self.sum_litellm_max_tokens,
+                "sum_litellm_max_tokens",
+            ),
         )
         lite_form.addRow(
             "Таймаут соединения:",
-            with_info(self.sum_litellm_connect_timeout,
-                      "sum_litellm_connect_timeout"),
+            with_info(
+                self.sum_litellm_connect_timeout,
+                "sum_litellm_connect_timeout",
+            ),
         )
         lite_form.addRow(
             "Таймаут чтения:",
-            with_info(self.sum_litellm_read_timeout,
-                      "sum_litellm_read_timeout"),
+            with_info(
+                self.sum_litellm_read_timeout,
+                "sum_litellm_read_timeout",
+            ),
         )
         lite_form.addRow(
             "System prompt:",
@@ -882,18 +1023,25 @@ class SettingsWindow(QDialog):
         model = self.sum_litellm_model.text().strip() or "gpt-4o-mini"
 
         if not base_url:
-            QMessageBox.warning(self, "Суммаризация",
-                                "Не задан base_url для LiteLLM")
+            QMessageBox.warning(
+                self, "Суммаризация",
+                "Не задан base_url для LiteLLM",
+            )
             return
 
-        log.info("Тест LiteLLM (ping): url=%s, model=%s", base_url, model)
+        log.info("Тест LiteLLM (ping): url=%s, model=%s",
+                 base_url, model)
 
         from .litellm_client import LiteLLMClient, LiteLLMError
 
-        connect_timeout = float(self.sum_litellm_connect_timeout.value())
+        connect_timeout = float(
+            self.sum_litellm_connect_timeout.value()
+        )
         read_timeout = float(self.sum_litellm_read_timeout.value())
 
-        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QGuiApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
 
         async def _run_ping():
             async with LiteLLMClient(
@@ -910,11 +1058,17 @@ class SettingsWindow(QDialog):
             method = asyncio.run(_run_ping())
         except LiteLLMError as exc:
             log.warning("Тест LiteLLM провален: %s", exc)
-            QMessageBox.warning(self, "Суммаризация", f"Ошибка: {exc}")
+            QMessageBox.warning(
+                self, "Суммаризация", f"Ошибка: {exc}"
+            )
             return
         except Exception as exc:
-            log.exception("Тест LiteLLM: неожиданная ошибка: %s", exc)
-            QMessageBox.warning(self, "Суммаризация", f"Ошибка: {exc}")
+            log.exception(
+                "Тест LiteLLM: неожиданная ошибка: %s", exc
+            )
+            QMessageBox.warning(
+                self, "Суммаризация", f"Ошибка: {exc}"
+            )
             return
         finally:
             if QGuiApplication.overrideCursor() is not None:
@@ -944,9 +1098,9 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Список терминов и аббревиатур, которые будут переданы ИИ. "
-            "Помогает модели правильно понимать специфику: названия систем, "
-            "сокращения, ФИО и т.п."
+            "Список терминов и аббревиатур, которые будут переданы "
+            "ИИ. Помогает модели правильно понимать специфику: "
+            "названия систем, сокращения, ФИО и т.п."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -971,12 +1125,16 @@ class SettingsWindow(QDialog):
         layout.addLayout(terms_header)
 
         self.glossary_table = QTableWidget(0, 2)
-        self.glossary_table.setHorizontalHeaderLabels(["Термин", "Пояснение"])
+        self.glossary_table.setHorizontalHeaderLabels(
+            ["Термин", "Пояснение"]
+        )
         self.glossary_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
         header = self.glossary_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.glossary_table.setMinimumHeight(240)
         layout.addWidget(self.glossary_table)
@@ -998,23 +1156,32 @@ class SettingsWindow(QDialog):
         layout.addLayout(g_btns)
 
         send_header = QHBoxLayout()
-        send_header.addWidget(QLabel("<b>Куда передавать глоссарий</b>"))
+        send_header.addWidget(
+            QLabel("<b>Куда передавать глоссарий</b>")
+        )
         send_header.addStretch()
-        send_header.addWidget(make_info_icon("glossary_send_to_summarizer"))
+        send_header.addWidget(
+            make_info_icon("glossary_send_to_summarizer")
+        )
         layout.addLayout(send_header)
 
         self.glossary_send_to_summarizer_check = QCheckBox(
-            "Передавать в суммаризацию (сервер транскрибации или LiteLLM)"
+            "Передавать в суммаризацию "
+            "(сервер транскрибации или LiteLLM)"
         )
-        attach_tooltip(self.glossary_send_to_summarizer_check,
-                       "glossary_send_to_summarizer")
+        attach_tooltip(
+            self.glossary_send_to_summarizer_check,
+            "glossary_send_to_summarizer",
+        )
         layout.addWidget(self.glossary_send_to_summarizer_check)
 
         self.glossary_send_to_deepseek_check = QCheckBox(
             "Передавать в файл промпта DeepSeek (deepseek_prompt.*)"
         )
-        attach_tooltip(self.glossary_send_to_deepseek_check,
-                       "glossary_send_to_deepseek")
+        attach_tooltip(
+            self.glossary_send_to_deepseek_check,
+            "glossary_send_to_deepseek",
+        )
         layout.addWidget(self.glossary_send_to_deepseek_check)
 
         layout.addStretch()
@@ -1025,8 +1192,12 @@ class SettingsWindow(QDialog):
         self.glossary_table.insertRow(row)
         self.glossary_table.setItem(row, 0, QTableWidgetItem(""))
         self.glossary_table.setItem(row, 1, QTableWidgetItem(""))
-        self.glossary_table.editItem(self.glossary_table.item(row, 0))
-        log.debug("Добавлена пустая строка в глоссарий (строка %d)", row)
+        self.glossary_table.editItem(
+            self.glossary_table.item(row, 0)
+        )
+        log.debug(
+            "Добавлена пустая строка в глоссарий (строка %d)", row
+        )
 
     def _glossary_delete(self) -> None:
         row = self.glossary_table.currentRow()
@@ -1066,13 +1237,16 @@ class SettingsWindow(QDialog):
         self.monitor_combo = QComboBox()
         for m in get_system_monitors():
             self.monitor_combo.addItem(
-                f"{m['name']} ({m['width']}x{m['height']})", m["display"]
+                f"{m['name']} ({m['width']}x{m['height']})",
+                m["display"],
             )
 
         self.mic_check = QCheckBox("Записывать микрофон")
         attach_tooltip(self.mic_check, "mic")
 
-        self.watermark_check = QCheckBox("Наложение водяного знака")
+        self.watermark_check = QCheckBox(
+            "Наложение водяного знака"
+        )
         attach_tooltip(self.watermark_check, "watermark")
 
         self.hotkey_start_input = QLineEdit()
@@ -1084,12 +1258,16 @@ class SettingsWindow(QDialog):
         self.metadata_on_start_check = QCheckBox(
             "Показывать окно метаданных при старте записи"
         )
-        attach_tooltip(self.metadata_on_start_check, "metadata_on_start")
+        attach_tooltip(
+            self.metadata_on_start_check, "metadata_on_start"
+        )
 
         self.metadata_on_stop_check = QCheckBox(
             "Показывать окно метаданных при остановке записи"
         )
-        attach_tooltip(self.metadata_on_stop_check, "metadata_on_stop")
+        attach_tooltip(
+            self.metadata_on_stop_check, "metadata_on_stop"
+        )
 
         self.overlay_panel_check = QCheckBox(
             "Показывать плавающую панель управления поверх экрана"
@@ -1099,9 +1277,14 @@ class SettingsWindow(QDialog):
         self.start_notification_check = QCheckBox(
             "Показывать уведомление о начале записи"
         )
-        attach_tooltip(self.start_notification_check, "start_notification")
+        attach_tooltip(
+            self.start_notification_check, "start_notification"
+        )
 
-        layout.addRow("Монитор:", with_info(self.monitor_combo, "monitor"))
+        layout.addRow(
+            "Монитор:",
+            with_info(self.monitor_combo, "monitor"),
+        )
         layout.addRow("", self.mic_check)
         layout.addRow("", self.watermark_check)
         layout.addRow(
@@ -1116,6 +1299,73 @@ class SettingsWindow(QDialog):
         layout.addRow("", self.metadata_on_stop_check)
         layout.addRow("", self.overlay_panel_check)
         layout.addRow("", self.start_notification_check)
+
+        # --- Параметры ffmpeg ---
+        self.ffmpeg_start_check_delay = QDoubleSpinBox()
+        self.ffmpeg_start_check_delay.setRange(0.05, 5.0)
+        self.ffmpeg_start_check_delay.setSingleStep(0.05)
+        self.ffmpeg_start_check_delay.setDecimals(2)
+        self.ffmpeg_start_check_delay.setSuffix(" сек")
+        self.ffmpeg_start_check_delay.setValue(0.3)
+
+        self.ffmpeg_stop_timeout = QSpinBox()
+        self.ffmpeg_stop_timeout.setRange(1, 120)
+        self.ffmpeg_stop_timeout.setSuffix(" сек")
+        self.ffmpeg_stop_timeout.setValue(10)
+
+        self.ffmpeg_kill_timeout = QSpinBox()
+        self.ffmpeg_kill_timeout.setRange(1, 60)
+        self.ffmpeg_kill_timeout.setSuffix(" сек")
+        self.ffmpeg_kill_timeout.setValue(5)
+
+        layout.addRow(
+            "Задержка проверки ffmpeg:",
+            with_info(
+                self.ffmpeg_start_check_delay,
+                "app_ffmpeg_start_check_delay",
+            ),
+        )
+        layout.addRow(
+            "Таймаут остановки ffmpeg:",
+            with_info(
+                self.ffmpeg_stop_timeout,
+                "app_ffmpeg_stop_timeout",
+            ),
+        )
+        layout.addRow(
+            "Таймаут SIGKILL:",
+            with_info(
+                self.ffmpeg_kill_timeout,
+                "app_ffmpeg_kill_timeout",
+            ),
+        )
+
+        # --- Overlay ---
+        self.overlay_hide_delay_ms = QSpinBox()
+        self.overlay_hide_delay_ms.setRange(0, 60000)
+        self.overlay_hide_delay_ms.setSuffix(" мс")
+        self.overlay_hide_delay_ms.setSingleStep(500)
+        self.overlay_hide_delay_ms.setValue(5000)
+
+        self.overlay_log_lines = QSpinBox()
+        self.overlay_log_lines.setRange(1, 50)
+        self.overlay_log_lines.setValue(5)
+
+        layout.addRow(
+            "Панель: скрывать через:",
+            with_info(
+                self.overlay_hide_delay_ms,
+                "app_overlay_hide_delay_ms",
+            ),
+        )
+        layout.addRow(
+            "Панель: строк лога:",
+            with_info(
+                self.overlay_log_lines,
+                "app_overlay_log_lines",
+            ),
+        )
+
         return w
 
     # ------------------------------------------------------------------
@@ -1132,7 +1382,9 @@ class SettingsWindow(QDialog):
         layout.addWidget(info)
 
         form = QFormLayout()
-        self.auto_retry_check = QCheckBox("Автоматически повторять неудачные задачи")
+        self.auto_retry_check = QCheckBox(
+            "Автоматически повторять неудачные задачи"
+        )
         attach_tooltip(self.auto_retry_check, "auto_retry")
 
         self.retry_interval_spin = QSpinBox()
@@ -1144,6 +1396,15 @@ class SettingsWindow(QDialog):
         self.max_retries_spin.setRange(1, 100)
         self.max_retries_spin.setValue(10)
 
+        self.pause_when_recording_check = QCheckBox(
+            "Не обрабатывать очередь во время записи"
+        )
+        attach_tooltip(
+            self.pause_when_recording_check,
+            "queue_pause_when_recording",
+        )
+        self.pause_when_recording_check.setChecked(True)
+
         form.addRow("", self.auto_retry_check)
         form.addRow(
             "Интервал проверки:",
@@ -1153,6 +1414,8 @@ class SettingsWindow(QDialog):
             "Максимум попыток:",
             with_info(self.max_retries_spin, "max_retries"),
         )
+        form.addRow("", self.pause_when_recording_check)
+
         layout.addLayout(form)
         layout.addStretch()
         return w
@@ -1167,8 +1430,9 @@ class SettingsWindow(QDialog):
         info = QLabel(
             "Шаблон промпта для DeepSeek и формат файла, в котором "
             "сохраняется готовый промпт.<br>"
-            "Промпт собирается автоматически при обработке скрам-митинга "
-            "(галочка «Это скрам-митинг» в окне метаданных записи)."
+            "Промпт собирается автоматически при обработке "
+            "скрам-митинга (галочка «Это скрам-митинг» в окне "
+            "метаданных записи)."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -1182,7 +1446,8 @@ class SettingsWindow(QDialog):
         self.scrum_template_edit = QPlainTextEdit()
         self.scrum_template_edit.setMinimumHeight(260)
         self.scrum_template_edit.setPlaceholderText(
-            "Во вложении стенограмма статусного совещания с командой..."
+            "Во вложении стенограмма статусного совещания с "
+            "командой..."
         )
         layout.addWidget(self.scrum_template_edit)
 
@@ -1196,9 +1461,9 @@ class SettingsWindow(QDialog):
         layout.addLayout(form)
 
         hint = QLabel(
-            "Формат экспорта можно изменить в окне «Записи…» при нажатии "
-            "«Экспорт промпта…» — этот параметр используется как значение "
-            "по умолчанию."
+            "Формат экспорта можно изменить в окне «Записи…» при "
+            "нажатии «Экспорт промпта…» — этот параметр "
+            "используется как значение по умолчанию."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1303,11 +1568,33 @@ class SettingsWindow(QDialog):
         form.addRow("Путь к логу:", log_path_container)
 
         self.log_level_combo = QComboBox()
-        self.log_level_combo.addItems(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+        self.log_level_combo.addItems(
+            ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        )
         form.addRow(
             "Уровень логирования:",
             with_info(self.log_level_combo, "log_level"),
         )
+
+        self.log_max_bytes_spin = QSpinBox()
+        self.log_max_bytes_spin.setRange(1, 1024)
+        self.log_max_bytes_spin.setSuffix(" МБ")
+        self.log_max_bytes_spin.setValue(10)
+        form.addRow(
+            "Максимальный размер лога:",
+            with_info(self.log_max_bytes_spin, "log_max_bytes_mb"),
+        )
+
+        self.log_backup_count_spin = QSpinBox()
+        self.log_backup_count_spin.setRange(1, 100)
+        self.log_backup_count_spin.setValue(5)
+        form.addRow(
+            "Сколько архивов хранить:",
+            with_info(
+                self.log_backup_count_spin, "log_backup_count"
+            ),
+        )
+
         layout.addLayout(form)
 
         actions = QHBoxLayout()
@@ -1325,8 +1612,8 @@ class SettingsWindow(QDialog):
 
         current = get_current_log_path()
         self.current_log_label = QLabel(
-            f"<span style='color: gray;'>Текущий логгер пишет в:</span> "
-            f"<code>{current}</code>"
+            f"<span style='color: gray;'>"
+            f"Текущий логгер пишет в:</span> <code>{current}</code>"
         )
         self.current_log_label.setWordWrap(True)
         layout.addWidget(self.current_log_label)
@@ -1340,14 +1627,18 @@ class SettingsWindow(QDialog):
         cfg = self.config_manager.config
         log.debug("Загрузка настроек в окно")
 
-        # --- Проекты (новая логика) ---
+        # --- Проекты ---
         projects = self.config_manager.get_projects()
         self.projects_table.setRowCount(0)
         for p in projects:
             row = self.projects_table.rowCount()
             self.projects_table.insertRow(row)
-            self.projects_table.setItem(row, 0, QTableWidgetItem(p["name"]))
-            self.projects_table.setItem(row, 1, QTableWidgetItem(p["chat_id"]))
+            self.projects_table.setItem(
+                row, 0, QTableWidgetItem(p["name"])
+            )
+            self.projects_table.setItem(
+                row, 1, QTableWidgetItem(p["chat_id"])
+            )
 
         # --- Сотрудники ---
         employees = self.config_manager.get_employees()
@@ -1355,14 +1646,20 @@ class SettingsWindow(QDialog):
         for e in employees:
             row = self.employees_table.rowCount()
             self.employees_table.insertRow(row)
-            self.employees_table.setItem(row, 0, QTableWidgetItem(e["name"]))
-            self.employees_table.setItem(row, 1, QTableWidgetItem(e["chat_id"]))
+            self.employees_table.setItem(
+                row, 0, QTableWidgetItem(e["name"])
+            )
+            self.employees_table.setItem(
+                row, 1, QTableWidgetItem(e["chat_id"])
+            )
 
         # --- Bitrix24 ---
         bitrix = self.config_manager.get_bitrix_settings()
         self.bitrix_enabled_check.setChecked(bitrix["enabled"])
         self.bitrix_webhook_input.setText(bitrix["webhook_url"])
-        self.bitrix_connect_timeout.setValue(bitrix["connect_timeout"])
+        self.bitrix_connect_timeout.setValue(
+            bitrix["connect_timeout"]
+        )
         self.bitrix_read_timeout.setValue(bitrix["read_timeout"])
         idx = self.bitrix_default_send_combo.findData(
             bitrix["default_send"]
@@ -1380,6 +1677,15 @@ class SettingsWindow(QDialog):
         self.bitrix_upload_folder.setValue(
             int(bitrix.get("upload_folder_id", 0))
         )
+        self.bitrix_max_message_chars.setValue(
+            int(bitrix.get("max_message_chars", 15000))
+        )
+        self.bitrix_retry_count.setValue(
+            int(bitrix.get("retry_count", 3))
+        )
+        self.bitrix_retry_delay.setValue(
+            float(bitrix.get("retry_delay", 2.0))
+        )
 
         # --- Промпты ---
         prompts = self.config_manager.get_prompts()
@@ -1387,8 +1693,12 @@ class SettingsWindow(QDialog):
         for p in prompts:
             row = self.prompts_table.rowCount()
             self.prompts_table.insertRow(row)
-            self.prompts_table.setItem(row, 0, QTableWidgetItem(p.get("name", "")))
-            self.prompts_table.setItem(row, 1, QTableWidgetItem(p.get("text", "")))
+            self.prompts_table.setItem(
+                row, 0, QTableWidgetItem(p.get("name", ""))
+            )
+            self.prompts_table.setItem(
+                row, 1, QTableWidgetItem(p.get("text", ""))
+            )
 
         self.default_prompt_edit.setPlainText(
             cfg.get("metadata", {}).get("default_prompt", "")
@@ -1413,13 +1723,17 @@ class SettingsWindow(QDialog):
         tr = cfg.get("transcribe", {})
         self.tr_url_input.setText(tr.get("url", ""))
         self.tr_key_input.setText(tr.get("access_key", ""))
-        self.tr_connect_timeout.setValue(int(tr.get("connect_timeout", 15)))
+        self.tr_connect_timeout.setValue(
+            int(tr.get("connect_timeout", 15))
+        )
         self.tr_read_timeout.setValue(int(tr.get("read_timeout", 120)))
         self.tr_max_wait.setValue(int(tr.get("max_wait", 7200)))
 
         # --- Суммаризация ---
         sum_cfg = self.config_manager.get_summarizer_settings()
-        self.sum_enabled_check.setChecked(bool(sum_cfg.get("enabled", False)))
+        self.sum_enabled_check.setChecked(
+            bool(sum_cfg.get("enabled", False))
+        )
         idx = self.sum_provider_combo.findData(sum_cfg["provider"])
         if idx >= 0:
             self.sum_provider_combo.setCurrentIndex(idx)
@@ -1428,10 +1742,16 @@ class SettingsWindow(QDialog):
         self.sum_litellm_url.setText(l["base_url"])
         self.sum_litellm_key.setText(l["api_key"])
         self.sum_litellm_model.setText(l["model"])
-        self.sum_litellm_temperature.setValue(float(l["temperature"]))
+        self.sum_litellm_temperature.setValue(
+            float(l["temperature"])
+        )
         self.sum_litellm_max_tokens.setValue(int(l["max_tokens"]))
-        self.sum_litellm_connect_timeout.setValue(int(l["connect_timeout"]))
-        self.sum_litellm_read_timeout.setValue(int(l["read_timeout"]))
+        self.sum_litellm_connect_timeout.setValue(
+            int(l["connect_timeout"])
+        )
+        self.sum_litellm_read_timeout.setValue(
+            int(l["read_timeout"])
+        )
         self.sum_litellm_system.setPlainText(l["system_prompt"])
 
         # --- Глоссарий ---
@@ -1440,9 +1760,12 @@ class SettingsWindow(QDialog):
         for item in g["terms"]:
             row = self.glossary_table.rowCount()
             self.glossary_table.insertRow(row)
-            self.glossary_table.setItem(row, 0, QTableWidgetItem(item.get("term", "")))
             self.glossary_table.setItem(
-                row, 1, QTableWidgetItem(item.get("description", ""))
+                row, 0, QTableWidgetItem(item.get("term", ""))
+            )
+            self.glossary_table.setItem(
+                row, 1,
+                QTableWidgetItem(item.get("description", "")),
             )
         self.glossary_send_to_summarizer_check.setChecked(
             bool(g["send_to_summarizer"])
@@ -1456,26 +1779,63 @@ class SettingsWindow(QDialog):
         idx = int(rec.get("monitor", 0))
         if 0 <= idx < self.monitor_combo.count():
             self.monitor_combo.setCurrentIndex(idx)
-        self.mic_check.setChecked(bool(rec.get("with_microphone", True)))
-        self.watermark_check.setChecked(bool(rec.get("show_watermark", True)))
-        self.hotkey_start_input.setText(rec.get("hotkey_start", "Ctrl+Shift+R"))
-        self.hotkey_stop_input.setText(rec.get("hotkey_stop", "Ctrl+Shift+S"))
+        self.mic_check.setChecked(
+            bool(rec.get("with_microphone", True))
+        )
+        self.watermark_check.setChecked(
+            bool(rec.get("show_watermark", True))
+        )
+        self.hotkey_start_input.setText(
+            rec.get("hotkey_start", "Ctrl+Shift+R")
+        )
+        self.hotkey_stop_input.setText(
+            rec.get("hotkey_stop", "Ctrl+Shift+S")
+        )
         self.metadata_on_start_check.setChecked(
             bool(rec.get("show_metadata_on_start", True))
         )
         self.metadata_on_stop_check.setChecked(
             bool(rec.get("show_metadata_on_stop", True))
         )
-        self.overlay_panel_check.setChecked(bool(rec.get("show_overlay_panel", True)))
+        self.overlay_panel_check.setChecked(
+            bool(rec.get("show_overlay_panel", True))
+        )
         self.start_notification_check.setChecked(
             bool(rec.get("show_start_notification", True))
         )
 
+        # --- app ---
+        app_cfg = cfg.get("app", {})
+        self.ffmpeg_start_check_delay.setValue(
+            float(app_cfg.get("ffmpeg_start_check_delay", 0.3))
+        )
+        self.ffmpeg_stop_timeout.setValue(
+            int(app_cfg.get("ffmpeg_stop_timeout", 10))
+        )
+        self.ffmpeg_kill_timeout.setValue(
+            int(app_cfg.get("ffmpeg_kill_timeout", 5))
+        )
+        self.overlay_hide_delay_ms.setValue(
+            int(app_cfg.get("overlay_hide_delay_ms", 5000))
+        )
+        self.overlay_log_lines.setValue(
+            int(app_cfg.get("overlay_log_lines", 5))
+        )
+
         # --- Очередь ---
         q = cfg.get("queue", {})
-        self.auto_retry_check.setChecked(bool(q.get("auto_retry_enabled", True)))
-        self.retry_interval_spin.setValue(int(q.get("retry_interval_minutes", 5)))
-        self.max_retries_spin.setValue(int(q.get("max_retries", 10)))
+        self.auto_retry_check.setChecked(
+            bool(q.get("auto_retry_enabled", True))
+        )
+        self.retry_interval_spin.setValue(
+            int(q.get("retry_interval_minutes", 5))
+        )
+        self.max_retries_spin.setValue(
+            int(q.get("max_retries", 10))
+        )
+        self.pause_when_recording_check.setChecked(
+            bool(q.get("pause_when_recording", True))
+        )
 
         # --- Скрам ---
         scrum = cfg.get("scrum", {})
@@ -1490,25 +1850,45 @@ class SettingsWindow(QDialog):
 
         # --- Сжатие ---
         comp = cfg.get("compression", {})
-        self.audio_fmt_combo.setCurrentText(comp.get("audio_format", "mp3"))
-        self.audio_bitrate_spin.setValue(int(comp.get("audio_bitrate", 192)))
-        self.video_bitrate_spin.setValue(int(comp.get("video_bitrate", 4000)))
-        self.compression_spin.setValue(int(comp.get("compression_level", 5)))
+        self.audio_fmt_combo.setCurrentText(
+            comp.get("audio_format", "mp3")
+        )
+        self.audio_bitrate_spin.setValue(
+            int(comp.get("audio_bitrate", 192))
+        )
+        self.video_bitrate_spin.setValue(
+            int(comp.get("video_bitrate", 4000))
+        )
+        self.compression_spin.setValue(
+            int(comp.get("compression_level", 5))
+        )
 
         # --- Хранилище ---
         st = cfg.get("storage", {})
-        self.temp_path_input.setText(st.get("temp_path", "/tmp/screen-recorder"))
-        self.retention_spin.setValue(int(st.get("retention_hours", 24)))
+        self.temp_path_input.setText(
+            st.get("temp_path", "/tmp/screen-recorder")
+        )
+        self.retention_spin.setValue(
+            int(st.get("retention_hours", 24))
+        )
 
         # --- Логи ---
         logging_cfg = cfg.get("logging", {})
         self.log_path_input.setText(
-            logging_cfg.get("log_path", "/tmp/screen-recorder/app.log")
+            logging_cfg.get(
+                "log_path", "/tmp/screen-recorder/app.log"
+            )
         )
         level = logging_cfg.get("level", "DEBUG")
         i = self.log_level_combo.findText(level)
         if i >= 0:
             self.log_level_combo.setCurrentIndex(i)
+        self.log_max_bytes_spin.setValue(
+            int(logging_cfg.get("max_bytes_mb", 10))
+        )
+        self.log_backup_count_spin.setValue(
+            int(logging_cfg.get("backup_count", 5))
+        )
 
         log.info(
             "Настройки загружены в окно: projects=%d, employees=%d, "
@@ -1526,7 +1906,7 @@ class SettingsWindow(QDialog):
         """
         cfg = self.config_manager.config
 
-        # --- Проекты (новая логика) ---
+        # --- Проекты ---
         projects: List[Dict[str, str]] = []
         for row in range(self.projects_table.rowCount()):
             name_item = self.projects_table.item(row, 0)
@@ -1554,18 +1934,30 @@ class SettingsWindow(QDialog):
         cfg["bitrix"] = {
             "enabled": self.bitrix_enabled_check.isChecked(),
             "webhook_url": self.bitrix_webhook_input.text().strip(),
-            "connect_timeout": int(self.bitrix_connect_timeout.value()),
+            "connect_timeout": int(
+                self.bitrix_connect_timeout.value()
+            ),
             "read_timeout": int(self.bitrix_read_timeout.value()),
             "default_send": (
-                self.bitrix_default_send_combo.currentData() or "protocol"
+                self.bitrix_default_send_combo.currentData()
+                or "protocol"
             ),
             "include_header": self.bitrix_header_check.isChecked(),
             "system_message": self.bitrix_system_check.isChecked(),
-            "disable_url_preview": self.bitrix_no_preview_check.isChecked(),
+            "disable_url_preview": (
+                self.bitrix_no_preview_check.isChecked()
+            ),
             "file_message_max_chars": int(
                 self.bitrix_file_threshold.value()
             ),
-            "upload_folder_id": int(self.bitrix_upload_folder.value()),
+            "upload_folder_id": int(
+                self.bitrix_upload_folder.value()
+            ),
+            "max_message_chars": int(
+                self.bitrix_max_message_chars.value()
+            ),
+            "retry_count": int(self.bitrix_retry_count.value()),
+            "retry_delay": float(self.bitrix_retry_delay.value()),
         }
 
         # --- Промпты ---
@@ -1592,11 +1984,15 @@ class SettingsWindow(QDialog):
                 continue
             if not label:
                 label = template
-            name_templates.append({"label": label, "template": template})
+            name_templates.append(
+                {"label": label, "template": template}
+            )
 
         meta_cfg = cfg.setdefault("metadata", {})
         meta_cfg["prompts"] = prompts
-        meta_cfg["default_prompt"] = self.default_prompt_edit.toPlainText().strip()
+        meta_cfg["default_prompt"] = (
+            self.default_prompt_edit.toPlainText().strip()
+        )
         meta_cfg["name_templates"] = name_templates
 
         cfg["transcribe"] = {
@@ -1610,35 +2006,77 @@ class SettingsWindow(QDialog):
             "monitor": self.monitor_combo.currentIndex(),
             "with_microphone": self.mic_check.isChecked(),
             "show_watermark": self.watermark_check.isChecked(),
-            "hotkey_start": self.hotkey_start_input.text().strip() or "Ctrl+Shift+R",
-            "hotkey_stop": self.hotkey_stop_input.text().strip() or "Ctrl+Shift+S",
-            "show_metadata_on_start": self.metadata_on_start_check.isChecked(),
-            "show_metadata_on_stop": self.metadata_on_stop_check.isChecked(),
-            "show_overlay_panel": self.overlay_panel_check.isChecked(),
-            "show_start_notification": self.start_notification_check.isChecked(),
+            "hotkey_start": (
+                self.hotkey_start_input.text().strip()
+                or "Ctrl+Shift+R"
+            ),
+            "hotkey_stop": (
+                self.hotkey_stop_input.text().strip()
+                or "Ctrl+Shift+S"
+            ),
+            "show_metadata_on_start": (
+                self.metadata_on_start_check.isChecked()
+            ),
+            "show_metadata_on_stop": (
+                self.metadata_on_stop_check.isChecked()
+            ),
+            "show_overlay_panel": (
+                self.overlay_panel_check.isChecked()
+            ),
+            "show_start_notification": (
+                self.start_notification_check.isChecked()
+            ),
         }
         cfg["queue"] = {
-            "auto_retry_enabled": self.auto_retry_check.isChecked(),
-            "retry_interval_minutes": self.retry_interval_spin.value(),
+            "auto_retry_enabled": (
+                self.auto_retry_check.isChecked()
+            ),
+            "retry_interval_minutes": (
+                self.retry_interval_spin.value()
+            ),
             "max_retries": self.max_retries_spin.value(),
+            "pause_when_recording": (
+                self.pause_when_recording_check.isChecked()
+            ),
         }
         cfg["scrum"] = {
-            "prompt_template": self.scrum_template_edit.toPlainText(),
-            "export_format": self.scrum_format_combo.currentText(),
+            "prompt_template": (
+                self.scrum_template_edit.toPlainText()
+            ),
+            "export_format": (
+                self.scrum_format_combo.currentText()
+            ),
         }
         cfg["summarizer"] = {
             "enabled": self.sum_enabled_check.isChecked(),
-            "provider": self.sum_provider_combo.currentData() or "server",
+            "provider": (
+                self.sum_provider_combo.currentData() or "server"
+            ),
             "litellm": {
-                "base_url": self.sum_litellm_url.text().strip().rstrip("/")
-                or "http://localhost:4000",
+                "base_url": (
+                    self.sum_litellm_url.text().strip().rstrip("/")
+                    or "http://localhost:4000"
+                ),
                 "api_key": self.sum_litellm_key.text(),
-                "model": self.sum_litellm_model.text().strip() or "gpt-4o-mini",
-                "temperature": float(self.sum_litellm_temperature.value()),
-                "max_tokens": int(self.sum_litellm_max_tokens.value()),
-                "connect_timeout": int(self.sum_litellm_connect_timeout.value()),
-                "read_timeout": int(self.sum_litellm_read_timeout.value()),
-                "system_prompt": self.sum_litellm_system.toPlainText().strip(),
+                "model": (
+                    self.sum_litellm_model.text().strip()
+                    or "gpt-4o-mini"
+                ),
+                "temperature": float(
+                    self.sum_litellm_temperature.value()
+                ),
+                "max_tokens": int(
+                    self.sum_litellm_max_tokens.value()
+                ),
+                "connect_timeout": int(
+                    self.sum_litellm_connect_timeout.value()
+                ),
+                "read_timeout": int(
+                    self.sum_litellm_read_timeout.value()
+                ),
+                "system_prompt": (
+                    self.sum_litellm_system.toPlainText().strip()
+                ),
             },
         }
 
@@ -1651,12 +2089,18 @@ class SettingsWindow(QDialog):
             desc = desc_item.text().strip() if desc_item else ""
             if not term:
                 continue
-            glossary_terms.append({"term": term, "description": desc})
+            glossary_terms.append(
+                {"term": term, "description": desc}
+            )
 
         cfg["glossary"] = {
             "terms": glossary_terms,
-            "send_to_summarizer": self.glossary_send_to_summarizer_check.isChecked(),
-            "send_to_deepseek": self.glossary_send_to_deepseek_check.isChecked(),
+            "send_to_summarizer": (
+                self.glossary_send_to_summarizer_check.isChecked()
+            ),
+            "send_to_deepseek": (
+                self.glossary_send_to_deepseek_check.isChecked()
+            ),
         }
 
         cfg["compression"] = {
@@ -1666,14 +2110,44 @@ class SettingsWindow(QDialog):
             "compression_level": self.compression_spin.value(),
         }
         cfg["storage"] = {
-            "temp_path": self.temp_path_input.text().strip() or "/tmp/screen-recorder",
+            "temp_path": (
+                self.temp_path_input.text().strip()
+                or "/tmp/screen-recorder"
+            ),
             "retention_hours": self.retention_spin.value(),
         }
-        new_log_path = self.log_path_input.text().strip() or "/tmp/screen-recorder/app.log"
+        new_log_path = (
+            self.log_path_input.text().strip()
+            or "/tmp/screen-recorder/app.log"
+        )
         cfg["logging"] = {
             "log_path": new_log_path,
             "level": self.log_level_combo.currentText(),
+            "max_bytes_mb": int(
+                self.log_max_bytes_spin.value()
+            ),
+            "backup_count": int(
+                self.log_backup_count_spin.value()
+            ),
         }
+
+        # --- app ---
+        app_cfg = cfg.setdefault("app", {})
+        app_cfg["ffmpeg_start_check_delay"] = float(
+            self.ffmpeg_start_check_delay.value()
+        )
+        app_cfg["ffmpeg_stop_timeout"] = int(
+            self.ffmpeg_stop_timeout.value()
+        )
+        app_cfg["ffmpeg_kill_timeout"] = int(
+            self.ffmpeg_kill_timeout.value()
+        )
+        app_cfg["overlay_hide_delay_ms"] = int(
+            self.overlay_hide_delay_ms.value()
+        )
+        app_cfg["overlay_log_lines"] = int(
+            self.overlay_log_lines.value()
+        )
 
         return cfg
 
@@ -1690,7 +2164,9 @@ class SettingsWindow(QDialog):
                 len(cfg.get("projects", [])),
                 len(cfg.get("employees", [])),
                 len(cfg.get("metadata", {}).get("prompts", [])),
-                len(cfg.get("metadata", {}).get("name_templates", [])),
+                len(cfg.get("metadata", {}).get(
+                    "name_templates", []
+                )),
                 cfg.get("summarizer", {}).get("provider"),
                 len(cfg.get("glossary", {}).get("terms", [])),
                 cfg.get("bitrix", {}).get("enabled"),
@@ -1701,51 +2177,49 @@ class SettingsWindow(QDialog):
 
             current = get_current_log_path()
             new_log_path = cfg["logging"]["log_path"]
-            if os.path.abspath(current) != os.path.abspath(new_log_path):
+            if os.path.abspath(current) != os.path.abspath(
+                new_log_path
+            ):
                 QMessageBox.information(
                     self, "Настройки",
                     "Настройки сохранены.\n\n"
-                    "Путь к логу изменён — перезапустите приложение.",
+                    "Путь к логу изменён — перезапустите "
+                    "приложение.",
                 )
             else:
-                QMessageBox.information(self, "Настройки", "Настройки сохранены")
+                QMessageBox.information(
+                    self, "Настройки", "Настройки сохранены"
+                )
             return True
         except Exception as exc:
             log.exception("Ошибка сохранения настроек: %s", exc)
-            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить: {exc}")
+            QMessageBox.critical(
+                self, "Ошибка",
+                f"Не удалось сохранить: {exc}",
+            )
             return False
 
     # ------------------------------------------------------------------
     # Экспорт / импорт настроек
     # ------------------------------------------------------------------
     def _export_settings(self) -> None:
-        """
-        Сохраняет текущий конфиг в выбранный пользователем файл.
-
-        По умолчанию имя файла формируется с временным суффиксом:
-            screen-recorder-config_2026-09-28_14-30-52.json
-
-        Это удобно для резервных копий: файлы не перезаписывают
-        друг друга, и по имени всегда видно, когда снимок был сделан.
-
-        Важно: перед экспортом применяем изменения из формы к конфигу —
-        чтобы пользователь экспортировал то, что видит на экране,
-        а не старое состояние.
-        """
         try:
             self._apply_form_to_config()
         except Exception as exc:
-            log.exception("Экспорт: не удалось собрать конфиг: %s", exc)
+            log.exception(
+                "Экспорт: не удалось собрать конфиг: %s", exc
+            )
             QMessageBox.critical(
                 self, "Экспорт настроек",
                 f"Не удалось собрать настройки:\n{exc}",
             )
             return
 
-        # Формируем имя по умолчанию с временным суффиксом.
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         default_name = f"screen-recorder-config_{stamp}.json"
-        default_path = os.path.join(os.path.expanduser("~"), default_name)
+        default_path = os.path.join(
+            os.path.expanduser("~"), default_name
+        )
 
         target, _ = QFileDialog.getSaveFileName(
             self,
@@ -1757,11 +2231,9 @@ class SettingsWindow(QDialog):
             log.info("Экспорт настроек отменён пользователем")
             return
 
-        # Если пользователь выбрал имя без .json — добавляем расширение.
         if not target.lower().endswith(".json"):
             target += ".json"
 
-        # Если такой файл уже есть — добавляем _1, _2, ... к имени.
         target = self._deduplicate_path(target)
 
         try:
@@ -1789,15 +2261,6 @@ class SettingsWindow(QDialog):
 
     @staticmethod
     def _deduplicate_path(path: str) -> str:
-        """
-        Если файл существует — добавляет _1, _2, ... перед расширением,
-        пока не найдёт свободное имя. Возвращает итоговый путь.
-
-        Пример:
-            /home/user/config.json
-            /home/user/config_1.json
-            /home/user/config_2.json
-        """
         if not os.path.exists(path):
             return path
 
@@ -1808,27 +2271,12 @@ class SettingsWindow(QDialog):
             if not os.path.exists(candidate):
                 return candidate
             i += 1
-            # Защита от бесконечного цикла (маловероятно, но пусть будет).
             if i > 10000:
-                return f"{base}_{int(datetime.now().timestamp())}{ext}"
+                return (
+                    f"{base}_{int(datetime.now().timestamp())}{ext}"
+                )
 
     def _import_settings(self) -> None:
-        """
-        Загружает конфиг из выбранного файла и применяет его к
-        текущему состоянию.
-
-        Логика:
-          1) Выбрать файл.
-          2) Прочитать JSON.
-          3) Показать пользователю сводку: сколько ключей верхнего
-             уровня, какие секции есть в файле.
-          4) Спросить подтверждение.
-          5) Сделать резервную копию текущего конфига (рядом с
-             config.json — .bak).
-          6) Смержить импорт с дефолтами через ConfigManager._merge,
-             чтобы не потерять новые поля, добавленные в код.
-          7) Сохранить и перечитать форму.
-        """
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Выберите файл настроек",
@@ -1872,7 +2320,6 @@ class SettingsWindow(QDialog):
             )
             return
 
-        # Сводка по секциям
         top_keys = sorted(imported.keys())
         preview_keys = ", ".join(top_keys[:20])
         if len(top_keys) > 20:
@@ -1883,48 +2330,54 @@ class SettingsWindow(QDialog):
             "<b>Импортировать настройки из файла?</b><br><br>"
             f"Файл: <code>{html.escape(path)}</code><br>"
             f"Секций верхнего уровня: <b>{len(top_keys)}</b><br>"
-            f"<span style='color:#666'>Ключи: {html.escape(preview_keys)}"
-            "</span><br><br>"
+            f"<span style='color:#666'>Ключи: "
+            f"{html.escape(preview_keys)}</span><br><br>"
             "<b>Внимание:</b> текущие настройки будут перезаписаны. "
             "Перед импортом сохраним резервную копию рядом с "
             "<code>config.json</code>.<br><br>"
             "Продолжить?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
-            log.info("Импорт настроек отменён на этапе подтверждения")
+            log.info(
+                "Импорт настроек отменён на этапе подтверждения"
+            )
             return
 
-        # --- Резервная копия с временным суффиксом ---
         try:
             src = self.config_manager.config_path
             if src.exists():
-                stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                stamp = datetime.now().strftime(
+                    "%Y-%m-%d_%H-%M-%S"
+                )
                 backup = src.with_name(
                     f"{src.stem}.{stamp}.bak"
                 )
                 shutil.copy2(src, backup)
                 log.info("Резервная копия конфига: %s", backup)
         except Exception as exc:
-            log.warning("Импорт: не удалось создать резервную копию: %s", exc)
-            # Не блокируем импорт из-за этого — просто предупреждаем.
+            log.warning(
+                "Импорт: не удалось создать резервную копию: %s",
+                exc,
+            )
 
-        # --- Мержим: дефолты + импорт ---
         try:
             merged = ConfigManager._merge(
                 self.config_manager.get_defaults(),
                 imported,
             )
         except Exception as exc:
-            log.exception("Импорт: не удалось смержить конфиг: %s", exc)
+            log.exception(
+                "Импорт: не удалось смержить конфиг: %s", exc
+            )
             QMessageBox.critical(
                 self, "Импорт настроек",
                 f"Не удалось применить настройки:\n{exc}",
             )
             return
 
-        # --- Сохраняем ---
         try:
             self.config_manager.save(merged)
             log.info(
@@ -1932,18 +2385,21 @@ class SettingsWindow(QDialog):
                 path, len(top_keys),
             )
         except Exception as exc:
-            log.exception("Импорт: не удалось сохранить конфиг: %s", exc)
+            log.exception(
+                "Импорт: не удалось сохранить конфиг: %s", exc
+            )
             QMessageBox.critical(
                 self, "Импорт настроек",
                 f"Не удалось сохранить настройки:\n{exc}",
             )
             return
 
-        # --- Перечитываем форму ---
         try:
             self.load_settings()
         except Exception as exc:
-            log.exception("Импорт: не удалось перечитать форму: %s", exc)
+            log.exception(
+                "Импорт: не удалось перечитать форму: %s", exc
+            )
 
         QMessageBox.information(
             self, "Импорт настроек",
@@ -1957,24 +2413,35 @@ class SettingsWindow(QDialog):
     # Действия
     # ------------------------------------------------------------------
     def reset_to_defaults(self) -> None:
-        log.warning("Сброс настроек к значениям по умолчанию (в окне)")
-        self.config_manager.config = self.config_manager.get_defaults()
+        log.warning(
+            "Сброс настроек к значениям по умолчанию (в окне)"
+        )
+        self.config_manager.config = (
+            self.config_manager.get_defaults()
+        )
         self.load_settings()
 
-    def toggle_password_visibility(self, field: QLineEdit, toggle: QCheckBox) -> None:
+    def toggle_password_visibility(
+        self, field: QLineEdit, toggle: QCheckBox,
+    ) -> None:
         if toggle.isChecked():
             field.setEchoMode(QLineEdit.EchoMode.Normal)
         else:
             field.setEchoMode(QLineEdit.EchoMode.Password)
 
     def browse_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Выберите папку")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выберите папку"
+        )
         if folder:
             log.info("Выбрана папка: %s", folder)
             self.temp_path_input.setText(folder)
 
     def browse_log_file(self) -> None:
-        current = self.log_path_input.text().strip() or "/tmp/screen-recorder/app.log"
+        current = (
+            self.log_path_input.text().strip()
+            or "/tmp/screen-recorder/app.log"
+        )
         filename, _ = QFileDialog.getSaveFileName(
             self, "Выберите файл лога", current,
             "Log files (*.log *.txt);;All files (*)",
@@ -1984,33 +2451,49 @@ class SettingsWindow(QDialog):
             self.log_path_input.setText(filename)
 
     def open_log_file(self) -> None:
-        path = self.log_path_input.text().strip() or get_current_log_path()
+        path = (
+            self.log_path_input.text().strip()
+            or get_current_log_path()
+        )
         path = os.path.expanduser(path)
         if not os.path.exists(path):
-            QMessageBox.warning(self, "Лог", f"Файл не найден:\n{path}")
+            QMessageBox.warning(
+                self, "Лог", f"Файл не найден:\n{path}"
+            )
             return
         log.info("Открытие файла лога: %s", path)
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def open_log_folder(self) -> None:
-        path = self.log_path_input.text().strip() or get_current_log_path()
+        path = (
+            self.log_path_input.text().strip()
+            or get_current_log_path()
+        )
         path = os.path.expanduser(path)
         folder = os.path.dirname(path) or "/tmp"
         if not os.path.isdir(folder):
-            QMessageBox.warning(self, "Лог", f"Папка не найдена:\n{folder}")
+            QMessageBox.warning(
+                self, "Лог", f"Папка не найдена:\n{folder}"
+            )
             return
         log.info("Открытие папки логов: %s", folder)
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def clear_log_file(self) -> None:
-        path = self.log_path_input.text().strip() or get_current_log_path()
+        path = (
+            self.log_path_input.text().strip()
+            or get_current_log_path()
+        )
         path = os.path.expanduser(path)
         if not os.path.exists(path):
-            QMessageBox.information(self, "Лог", f"Файл не найден:\n{path}")
+            QMessageBox.information(
+                self, "Лог", f"Файл не найден:\n{path}"
+            )
             return
-        if QMessageBox.question(self, "Очистить лог",
-                                f"Очистить содержимое файла:\n{path}?") != \
-                QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(
+            self, "Очистить лог",
+            f"Очистить содержимое файла:\n{path}?",
+        ) != QMessageBox.StandardButton.Yes:
             return
         try:
             with open(path, "w", encoding="utf-8"):
@@ -2018,8 +2501,12 @@ class SettingsWindow(QDialog):
             log.info("Файл лога очищен: %s", path)
             QMessageBox.information(self, "Лог", "Файл очищен")
         except Exception as exc:
-            log.exception("Не удалось очистить лог %s: %s", path, exc)
-            QMessageBox.critical(self, "Ошибка", f"Не удалось очистить: {exc}")
+            log.exception(
+                "Не удалось очистить лог %s: %s", path, exc
+            )
+            QMessageBox.critical(
+                self, "Ошибка", f"Не удалось очистить: {exc}"
+            )
 
     def test_transcribe_connection(self) -> None:
         url = self.tr_url_input.text().strip()
@@ -2028,13 +2515,17 @@ class SettingsWindow(QDialog):
         read_timeout = float(self.tr_read_timeout.value())
 
         if not url:
-            QMessageBox.warning(self, "Транскрибация",
-                                "URL сервера пустой. Шаг будет пропускаться.")
+            QMessageBox.warning(
+                self, "Транскрибация",
+                "URL сервера пустой. Шаг будет пропускаться.",
+            )
             return
 
-        log.info("Тест подключения к транскрибации: url=%s, "
-                 "connect=%.0f, read=%.0f",
-                 url, connect_timeout, read_timeout)
+        log.info(
+            "Тест подключения к транскрибации: url=%s, "
+            "connect=%.0f, read=%.0f",
+            url, connect_timeout, read_timeout,
+        )
 
         async def _run():
             async with TranscribeClient(
@@ -2047,10 +2538,16 @@ class SettingsWindow(QDialog):
         try:
             asyncio.run(_run())
             log.info("Тест подключения успешен: %s", url)
-            QMessageBox.information(self, "Транскрибация", "Подключение успешно")
+            QMessageBox.information(
+                self, "Транскрибация", "Подключение успешно"
+            )
         except Exception as exc:
-            log.warning("Тест подключения провален (%s): %s", url, exc)
-            QMessageBox.warning(self, "Транскрибация", f"Ошибка: {exc}")
+            log.warning(
+                "Тест подключения провален (%s): %s", url, exc
+            )
+            QMessageBox.warning(
+                self, "Транскрибация", f"Ошибка: {exc}"
+            )
 
     # ------------------------------------------------------------------
     # Справка
@@ -2059,289 +2556,116 @@ class SettingsWindow(QDialog):
         "Проекты и чаты Bitrix24": (
             "<b>Проекты и чаты Bitrix24</b><br><br>"
             "Таблица «Проект | Чат Bitrix24» — это реестр проектов "
-            "компании и привязка каждого к конкретному чату Bitrix24.<br><br>"
+            "компании и привязка каждого к конкретному чату "
+            "Bitrix24.<br><br>"
             "<b>Зачем это нужно:</b><br>"
             "Когда вы в окне «Записи» нажмёте «Bitrix24 → Отправить "
-            "в чат…», программа возьмёт проект записи и по этой таблице "
-            "определит, <i>в какой именно чат</i> отправлять протокол "
-            "или summary.<br><br>"
+            "в чат…», программа возьмёт проект записи и по этой "
+            "таблице определит, <i>в какой именно чат</i> отправлять "
+            "протокол или summary.<br><br>"
             "<b>Как заполнять:</b><br>"
-            "• <b>Проект</b> — произвольное название (Россети, iserv, "
-            "Внутренние и т.п.). Оно же используется как значение "
-            "по умолчанию для метаданных записи.<br>"
-            "• <b>Чат Bitrix24</b> — ID чата. Формат: <code>chat2101</code> "
-            "или просто <code>2101</code>. Найти ID можно через метод "
-            "<code>im.recent.get</code> или из URL чата в веб-интерфейсе."
+            "• <b>Проект</b> — произвольное название (Россети, "
+            "iserv, Внутренние и т.п.).<br>"
+            "• <b>Чат Bitrix24</b> — ID чата. Формат: "
+            "<code>chat2101</code> или просто <code>2101</code>."
             "<br><br>"
             "<b>Порядок важен:</b> проект, стоящий первым в таблице, "
             "выбирается по умолчанию при старте новой записи.<br><br>"
-            "<b>Кнопки:</b> «Добавить» — новая строка; «Удалить» — удалить "
-            "выделенную; «Вверх» / «Вниз» — изменить порядок.<br><br>"
-            "Если чат для проекта не задан — при попытке отправки "
-            "программа предупредит, но позволит ввести чат вручную "
-            "в самом диалоге отправки."
+            "<b>Кнопки:</b> «Добавить», «Удалить», «Вверх», «Вниз»."
         ),
         "Сотрудники": (
             "<b>Сотрудники</b><br><br>"
-            "Справочник сотрудников с их личными чатами Bitrix24.<br><br>"
+            "Справочник сотрудников с их личными чатами Bitrix24."
+            "<br><br>"
             "<b>Зачем это нужно:</b><br>"
             "Помимо отправки в чат команды (по проекту), вы можете "
             "отправить протокол или summary в <i>личный диалог</i> "
-            "с конкретным сотрудником. Для этого в окне отправки "
-            "выбирается получатель типа «Сотрудник».<br><br>"
+            "с конкретным сотрудником.<br><br>"
             "<b>Как заполнять:</b><br>"
-            "• <b>ФИО</b> — как показывать сотрудника в списке "
-            "(«Иванов Иван Иванович» или «Иванов И.И.»).<br>"
+            "• <b>ФИО</b> — как показывать сотрудника в списке.<br>"
             "• <b>Чат Bitrix24 (ID пользователя)</b> — числовой "
             "идентификатор пользователя в Bitrix24. Формат: "
-            "<code>123</code> (без префикса <code>chat</code>). "
-            "Найти его можно через API методом "
-            "<code>im.recent.get</code> — ищите диалог типа "
-            "<code>user</code>, поле <code>id</code>.<br><br>"
-            "<b>Кнопки:</b> «Добавить» — новая строка; «Удалить» — удалить "
-            "выделенную; «Вверх» / «Вниз» — изменить порядок.<br><br>"
-            "Если у сотрудника не задан ID чата — при попытке отправки "
-            "программа предупредит."
+            "<code>123</code> (без префикса <code>chat</code>)."
         ),
         "Bitrix24": (
             "<b>Bitrix24 — параметры подключения</b><br><br>"
-            "<b>Вебхук</b> — URL входящего вебхука, созданного в Bitrix24 "
-            "через «Приложения → Разработчикам → Вебхуки». Формат: "
-            "<code>https://portal.bitrix24.ru/rest/1/токен/</code>. "
-            "Через вебхук выполняются все API-вызовы: "
-            "<code>im.message.add</code> (сообщения), "
-            "<code>disk.folder.uploadfile</code> (загрузка файлов), "
-            "<code>im.disk.folder.get</code> (папка чата), "
-            "<code>im.disk.file.commit</code> (привязка файла к чату), "
-            "<code>profile</code> (проверка подключения).<br><br>"
+            "<b>Вебхук</b> — URL входящего вебхука, созданного в "
+            "Bitrix24 через «Приложения → Разработчикам → Вебхуки»."
+            "<br><br>"
             "<b>Права вебхука:</b> в Bitrix24 должны быть разрешены "
             "методы <code>im</code>, <code>disk</code> и "
-            "<code>im.disk</code>. Без них часть операций упадёт.<br><br>"
-            "<b>Таймауты</b> — соединения и чтения. Для медленного портала "
-            "или работы через VPN увеличьте.<br><br>"
-            "<b>Что отправлять по умолчанию</b> — подсказка для диалога "
-            "отправки (Протокол / Summary / И то и другое). В самом "
-            "диалоге можно выбрать любой вариант.<br><br>"
-            "<b>Заголовок</b> — добавлять ли перед содержимым строку вида "
-            "«Протокол: Название — дата». Заголовок можно отредактировать "
-            "в диалоге отправки.<br><br>"
-            "<b>Системное сообщение</b> — сообщение без аватара "
-            "отправителя, как уведомление портала.<br><br>"
-            "<b>Отключить предпросмотр ссылок</b> — Bitrix24 не будет "
-            "генерировать карточки для URL в тексте.<br><br>"
-            "<b>Отправка файлов:</b><br>"
-            "• <b>Порог «текст → файл»</b> — работает в режиме "
-            "«Автоматически». Текст длиннее порога отправляется файлом, "
-            "короче — сообщением.<br>"
-            "• <b>Папка для загрузки</b> — папка на Диске, куда "
-            "загружается файл. <code>0</code> = «Папка чата (авто)»: "
-            "у каждого чата в Bitrix24 своя папка, файл живёт вместе "
-            "с сообщением. Если задать ID папки явно — файлы будут "
-            "складываться туда.<br><br>"
-            "<b>Кнопка «Проверить подключение»</b> вызывает метод "
-            "<code>profile</code> и показывает имя пользователя вебхука. "
-            "Если оно вернулось — связь и авторизация в порядке."
+            "<code>im.disk</code>.<br><br>"
+            "<b>Максимальная длина сообщения</b> — обрезает длинные "
+            "протоколы до указанного количества символов. Реальный "
+            "лимит портала ~20 000.<br><br>"
+            "<b>Попыток при ошибке</b> и <b>Пауза между повторами</b> "
+            "— автоматический ретрай при сетевых сбоях."
         ),
         "Промпты и имена": (
             "<b>Промпты и шаблоны имён</b><br><br>"
-            "<b>Библиотека промптов</b> — набор готовых инструкций для "
-            "сервера транскрибации или для LiteLLM. В окне метаданных "
-            "записи эти промпты можно выбрать в выпадающем списке.<br><br>"
-            "<b>Промпт по умолчанию</b> — подставляется автоматически, "
-            "если пользователь не выбрал другой.<br><br>"
-            "<b>Шаблоны названий записи</b> — список строк, по которым "
-            "формируется итоговое имя записи. Используются в диалоге "
-            "метаданных рядом с полем «Название».<br><br>"
-            "<b>Плейсхолдеры шаблонов:</b><br>"
-            "• <code>{name}</code> / <code>{название}</code> — "
-            "введённое имя;<br>"
-            "• <code>{abbr}</code> / <code>{сокр}</code> — сокращение "
-            "из поля «Сокр.»;<br>"
-            "• <code>{date}</code> / <code>{дата}</code> — текущая дата "
-            "YYYY-MM-DD;<br>"
-            "• <code>{time}</code> / <code>{время}</code> — текущее "
-            "время HH-MM;<br>"
-            "• <code>{datetime}</code> — дата и время.<br><br>"
-            "Пример шаблона: <code>{name} ({abbr}) — {date}</code> → "
-            "«Планирование спринта (ПЛ) — 2026-09-28».<br><br>"
-            "Кнопка <b>«Вернуть стандартные»</b> сбрасывает список "
-            "шаблонов к стандартному набору из поставки."
+            "<b>Библиотека промптов</b> — набор готовых инструкций "
+            "для сервера транскрибации или для LiteLLM.<br><br>"
+            "<b>Плейсхолдеры шаблонов:</b> "
+            "<code>{name}</code> / <code>{название}</code>, "
+            "<code>{abbr}</code> / <code>{сокр}</code>, "
+            "<code>{date}</code> / <code>{дата}</code>, "
+            "<code>{time}</code> / <code>{время}</code>, "
+            "<code>{datetime}</code>."
         ),
         "Транскрибация": (
             "<b>Транскрибация</b><br><br>"
             "Параметры подключения к серверу AI-транскрибатора "
-            "(обычно Whisper). Шаг выполняется после конвертации "
-            "видео в аудио.<br><br>"
-            "<b>URL сервера</b> — адрес сервиса, например "
-            "<code>http://localhost:8000</code>. Если поле пустое — "
-            "шаг транскрибации пропускается, остаётся только "
-            "конвертация.<br><br>"
-            "<b>Access key</b> — ключ авторизации, выдаётся "
-            "администратором сервера.<br><br>"
-            "<b>Таймаут соединения</b> — сколько ждать установки "
-            "TCP-соединения.<br><br>"
-            "<b>Таймаут чтения</b> — сколько ждать ответа на один "
-            "HTTP-запрос. Не путать с общим временем ожидания.<br><br>"
-            "<b>Максимум ожидания</b> — общий лимит ожидания результата "
-            "транскрибации. Если задача не завершилась за это время — "
-            "помечается как error.<br><br>"
-            "<b>Кнопка «Проверить подключение»</b> авторизуется на "
-            "сервере и проверяет валидность access key."
+            "(обычно Whisper). Если URL пустой — шаг пропускается."
         ),
         "Суммаризация": (
             "<b>Суммаризация</b><br><br>"
-            "Выбор того, <i>где</i> формируется протокол или краткое "
-            "содержание (summary).<br><br>"
-            "<b>• Сервер транскрибации</b> — промпт уходит на сервер "
-            "вместе с медиафайлом, и сервер сам возвращает расшифровку "
-            "плюс резюме.<br><br>"
-            "<b>• LiteLLM</b> — на сервере выполняется только "
-            "расшифровка (Whisper), а резюме генерируется локально "
-            "в клиенте через OpenAI-совместимый API LiteLLM. Это даёт "
-            "гибкость: можно подключать любые модели (GPT, Claude, "
-            "локальные Llama и т.п.).<br><br>"
-            "<b>Настройки LiteLLM:</b><br>"
-            "• <b>Base URL</b> — адрес прокси, например "
-            "<code>http://localhost:4000</code>. Путь "
-            "<code>/v1/chat/completions</code> добавляется "
-            "автоматически.<br>"
-            "• <b>API key</b> — токен авторизации, если требуется.<br>"
-            "• <b>Модель</b> — имя модели в LiteLLM "
-            "(<code>gpt-4o-mini</code>, <code>claude-3-5-sonnet</code> и т.п.).<br>"
-            "• <b>Temperature</b> — «креативность»: 0.1–0.3 для "
-            "протоколов и других структурированных документов.<br>"
-            "• <b>Max tokens</b> — максимальная длина ответа. "
-            "2200 ≈ 1500–1700 слов.<br>"
-            "• <b>Таймауты</b> — соединения и чтения. Для больших "
-            "моделей увеличьте read timeout до 300–600.<br>"
-            "• <b>System prompt</b> — системное сообщение, задающее "
-            "стиль ответа.<br><br>"
-            "<b>Кнопка «Проверить подключение»</b> сначала пробует "
-            "<code>GET /v1/models</code>, а если сервер его "
-            "не поддерживает — делает короткий chat-запрос."
+            "Выбор того, где формируется протокол или краткое "
+            "содержание (summary) записи."
         ),
         "Глоссарий": (
             "<b>Глоссарий терминов</b><br><br>"
             "Список терминов и аббревиатур, которые ИИ должен "
-            "распознавать и использовать единообразно. Помогает "
-            "в расшифровке и в генерации протокола.<br><br>"
-            "<b>Формат записи:</b><br>"
-            "• <b>Термин</b> — как слово должно появиться в результате "
-            "(<code>ЕЖД</code>, <code>vNext</code>, <code>ПЛ</code>).<br>"
-            "• <b>Пояснение</b> — расшифровка или контекст "
-            "(<code>Единый журнал дежурств</code>). Можно оставить "
-            "пустым.<br><br>"
-            "<b>Куда передаётся:</b><br>"
-            "• <b>В суммаризацию</b> — блок «ГЛОССАРИЙ» дописывается "
-            "к промпту, который уходит на сервер транскрибации или "
-            "в LiteLLM.<br>"
-            "• <b>В файл DeepSeek</b> — отдельный блок «ГЛОССАРИЙ» "
-            "в файле <code>deepseek_prompt.*</code> перед стенограммой.<br><br>"
-            "Галочки включаются независимо друг от друга."
+            "распознавать и использовать единообразно."
         ),
         "Запись": (
             "<b>Запись экрана</b><br><br>"
-            "<b>Монитор</b> — какой экран записывать. Список "
-            "формируется через <code>xrandr</code>. На Wayland реально "
-            "пишется весь DRM-узел, а выбор влияет только на область "
-            "обрезки.<br><br>"
-            "<b>Микрофон</b> — записывать звук с источника по умолчанию "
-            "(PulseAudio). Если снять галочку — только видео.<br><br>"
-            "<b>Водяной знак</b> — накладывать на видео название "
-            "записи и дату/время. Работает только в X11-режиме.<br><br>"
-            "<b>Горячие клавиши:</b><br>"
-            "• <b>Старт/пауза</b> — если запись идёт, ставит на паузу; "
-            "если на паузе — возобновляет; если записи нет — стартует. "
-            "Формат: <code>Ctrl+Shift+R</code>, <code>Alt+F9</code>.<br>"
-            "• <b>Стоп</b> — останавливает запись.<br><br>"
-            "<b>Показывать окно метаданных при старте</b> — если "
-            "включено, при запуске записи выводится диалог с проектом, "
-            "названием и промптом.<br><br>"
-            "<b>Показывать окно метаданных при остановке</b> — "
-            "позволяет уточнить данные после завершения записи.<br><br>"
-            "<b>Плавающая панель</b> — окно управления поверх всех "
-            "окон с кнопками Старт/Пауза/Стоп и логом. Автоскрывается "
-            "через 5 секунд бездействия.<br><br>"
-            "<b>Уведомление о начале записи</b> — системный "
-            "tray-нотификейшн."
+            "<b>Монитор</b>, <b>микрофон</b>, <b>водяной знак</b>, "
+            "<b>горячие клавиши</b> и параметры ffmpeg.<br><br>"
+            "<b>Задержка проверки ffmpeg</b> — пауза после старта "
+            "ffmpeg перед проверкой.<br><br>"
+            "<b>Таймаут остановки ffmpeg</b> — сколько ждать "
+            "корректного завершения перед SIGKILL.<br><br>"
+            "<b>Плавающая панель</b> — размеры, автоскрытие и "
+            "строки лога."
         ),
         "Очередь": (
             "<b>Очередь задач</b><br><br>"
-            "Настройки автоматической обработки видеофайлов "
-            "в фоне.<br><br>"
-            "<b>Автоматически повторять неудачные задачи</b> — "
-            "если включено, задачи со статусом <code>error</code> "
-            "будут периодически возвращаться в очередь.<br><br>"
-            "<b>Интервал проверки</b> — как часто сканировать очередь "
-            "на наличие проваленных задач. Оптимально 5–15 минут.<br><br>"
-            "<b>Максимум попыток</b> — сколько раз пытаться повторить "
-            "одну задачу, прежде чем оставить её в статусе "
-            "<code>error</code> до ручного вмешательства."
+            "Настройки автоматической обработки видеофайлов в фоне."
+            "<br><br>"
+            "<b>Не обрабатывать очередь во время записи</b> — "
+            "воркер ждёт завершения записи, чтобы не перегружать CPU."
         ),
         "Скрам": (
             "<b>Скрам</b><br><br>"
-            "Шаблон промпта и формат файла для сценария «скрам-митинг».<br><br>"
-            "<b>Шаблон промпта</b> — текст, который подставляется "
-            "в начало файла <code>deepseek_prompt.*</code>. "
-            "К шаблону автоматически добавляются:<br>"
-            "• предыдущий протокол (если указан в метаданных),<br>"
-            "• вложения (если включена опция),<br>"
-            "• стенограмма сегодняшнего совещания.<br><br>"
-            "<b>Формат экспорта</b> — <code>docx</code> (удобно "
-            "копировать в чат DeepSeek), <code>md</code> или "
-            "<code>txt</code>. Этот же формат предлагается "
-            "по умолчанию при экспорте промпта из окна «Записи».<br><br>"
-            "Промпт формируется автоматически только если в метаданных "
-            "записи включён флаг «Это скрам-митинг»."
+            "Шаблон промпта и формат файла для сценария "
+            "«скрам-митинг»."
         ),
         "Форматы и сжатие": (
             "<b>Форматы и сжатие</b><br><br>"
-            "<b>Формат аудио</b> — во что конвертируется видео перед "
-            "отправкой на транскрибацию. <code>mp3</code> — универсально; "
-            "<code>aac</code> — лучше качество; <code>wav</code> — "
-            "без сжатия; <code>opus</code> — лучшее качество на "
-            "низких битрейтах.<br><br>"
-            "<b>Битрейт аудио</b> — 192 kbps оптимально для речи.<br><br>"
-            "<b>Битрейт видео</b> — качество записи экрана. "
-            "4000 kbps — Full HD, 8000–15000 kbps — 4K.<br><br>"
-            "<b>Уровень сжатия</b> — 0–9. Больше = медленнее "
-            "кодирование, но меньше файл. Для real-time записи "
-            "рекомендуется 4–6."
+            "Настройки конвертации видео в аудио и параметров "
+            "сжатия видео."
         ),
         "Хранилище": (
             "<b>Хранилище</b><br><br>"
-            "<b>Временная папка</b> — корень для записей и очереди. "
-            "Структура:<br>"
-            "<code>&lt;temp_path&gt;/sessions/ГГГГ-ММ-ДД_ЧЧ-ММ-СС/</code> — "
-            "папки записей;<br>"
-            "<code>&lt;temp_path&gt;/queue.json</code> — очередь задач;<br>"
-            "<code>&lt;temp_path&gt;/app.log</code> — лог приложения.<br><br>"
-            "По умолчанию <code>/tmp/screen-recorder</code>. "
-            "<b>Внимание:</b> <code>/tmp</code> очищается при перезагрузке. "
-            "Для долгого хранения укажите путь в домашней папке.<br><br>"
-            "<b>Хранить (часов)</b> — автоочистка пока не реализована, "
-            "параметр сохраняется в конфиг, но не влияет на работу. "
-            "Удаляйте старые записи вручную через окно «Записи»."
+            "<b>Временная папка</b> — корень для записей и очереди."
         ),
         "Логи": (
             "<b>Логи</b><br><br>"
-            "<b>Путь к логу</b> — файл, куда пишется вся отладочная "
-            "информация. Ротируется при достижении 10 МБ, "
-            "хранится до 5 архивов (<code>app.log.1 … app.log.5</code>)."
-            "<br><br>"
-            "<b>Уровень логирования:</b><br>"
-            "• <b>DEBUG</b> — максимум информации, рекомендуется при "
-            "отладке.<br>"
-            "• <b>INFO</b> — обычная работа.<br>"
-            "• <b>WARNING</b> — только предупреждения и ошибки.<br>"
-            "• <b>ERROR</b> — только ошибки.<br>"
-            "• <b>CRITICAL</b> — только критические сбои.<br><br>"
-            "Изменение уровня и пути вступит в силу только после "
-            "перезапуска приложения.<br><br>"
-            "<b>Кнопки:</b> «Открыть лог» — открыть файл в системном "
-            "просмотрщике; «Открыть папку» — открыть директорию "
-            "в файловом менеджере; «Очистить лог» — обнулить файл "
-            "(с подтверждением)."
+            "<b>Максимальный размер лога</b> — размер файла, после "
+            "которого он ротируется.<br><br>"
+            "<b>Сколько архивов хранить</b> — лимит старых файлов "
+            "лога (app.log.1 … app.log.N).<br><br>"
+            "Изменения вступят в силу после перезапуска."
         ),
     }
 
@@ -2349,8 +2673,6 @@ class SettingsWindow(QDialog):
         "<b>Screen Recorder & Transcriber</b><br><br>"
         "Универсальный рекордер экрана с расшифровкой и "
         "суммаризацией записей.<br><br>"
-        "Подсказки по конкретным вкладкам настроек можно получить, "
-        "нажав кнопку «Помощь» на соответствующей вкладке.<br><br>"
         "Наведите курсор на иконку <b>ⓘ</b> рядом с любым полем — "
         "появится краткая справка по этому параметру."
     )
@@ -2362,7 +2684,9 @@ class SettingsWindow(QDialog):
         text = self._HELP_TEXTS.get(title, self._HELP_DEFAULT)
 
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Справка — {title or 'Screen Recorder'}")
+        dlg.setWindowTitle(
+            f"Справка — {title or 'Screen Recorder'}"
+        )
         dlg.setModal(True)
         dlg.setMinimumSize(640, 520)
 

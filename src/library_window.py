@@ -1,4 +1,11 @@
-"""Окно «Библиотека» — полнотекстовый поиск по записям."""
+"""Окно «Библиотека» — полнотекстовый поиск по записям.
+
+Изменения:
+  • Дефолтные значения полей поиска (fuzzy, context, max_hits)
+    читаются из config["app"] через config_manager.get_app_settings().
+  • search_cancel_wait_ms тоже берётся из конфига.
+  • SearchFilters получает fuzzy_max_word_distance.
+"""
 from __future__ import annotations
 
 import os
@@ -10,10 +17,10 @@ from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
-    QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMenu, QMenuBar, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
-    QTextBrowser, QVBoxLayout, QWidget,
+    QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMenu, QMenuBar, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QSpinBox, QSplitter, QTableWidget,
+    QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .library_search import (
@@ -36,7 +43,9 @@ class SearchThread(QThread):
     failed = Signal(str)
     progress = Signal(int, int)
 
-    def __init__(self, sessions_root: str, filters: SearchFilters) -> None:
+    def __init__(
+        self, sessions_root: str, filters: SearchFilters,
+    ) -> None:
         super().__init__()
         self.sessions_root = sessions_root
         self.filters = filters
@@ -87,13 +96,25 @@ class LibraryWindow(QDialog):
         self._hits: List[SearchHit] = []
         self._thread: Optional[SearchThread] = None
 
+        self._app_cfg: Dict[str, Any] = {}
+        if config_manager is not None:
+            try:
+                self._app_cfg = config_manager.get_app_settings()
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать app-настройки: %s", exc
+                )
+                self._app_cfg = {}
+
         self.setWindowTitle("Библиотека — поиск по записям")
         self.setMinimumSize(1280, 860)
         self.setModal(False)
 
         self._build_ui()
         self._reload_projects()
-        log.info("LibraryWindow открыто, sessions_root=%s", sessions_root)
+        log.info(
+            "LibraryWindow открыто, sessions_root=%s", sessions_root
+        )
 
     # ------------------------------------------------------------------
     # UI
@@ -103,13 +124,14 @@ class LibraryWindow(QDialog):
         root.setContentsMargins(8, 4, 8, 8)
         root.setSpacing(6)
 
-        # --- Меню ---
         bar = QMenuBar(self)
         layout: QVBoxLayout = self.layout()
         layout.insertWidget(0, bar)
 
         m_file = bar.addMenu("Файл")
-        act_refresh = QAction("Обновить список проектов", self)
+        act_refresh = QAction(
+            "Обновить список проектов", self
+        )
         act_refresh.setShortcut(QKeySequence("F5"))
         act_refresh.triggered.connect(self._reload_projects)
         m_file.addAction(act_refresh)
@@ -127,28 +149,30 @@ class LibraryWindow(QDialog):
         # --- Вводная плашка ---
         intro_row = QHBoxLayout()
         intro = QLabel(
-            "Полнотекстовый поиск по сохранённым записям. Ищет по файлам "
-            "в папке <code>sessions/</code> — без базы данных. "
-            "Для стенограмм используется нечёткий поиск, устойчивый к опечаткам. "
-            "Сузьте область фильтрами «Проект» и «Период», чтобы ускорить работу."
+            "Полнотекстовый поиск по сохранённым записям. Ищет "
+            "по файлам в папке <code>sessions/</code> — без базы "
+            "данных. Для стенограмм используется нечёткий поиск, "
+            "устойчивый к опечаткам. Сузьте область фильтрами "
+            "«Проект» и «Период», чтобы ускорить работу."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("QLabel { color: #666; }")
         intro_row.addWidget(intro, 1)
         intro_icon = make_info_icon("lib_intro")
         if intro_icon is not None:
-            intro_row.addWidget(intro_icon, 0, Qt.AlignmentFlag.AlignTop)
+            intro_row.addWidget(
+                intro_icon, 0, Qt.AlignmentFlag.AlignTop
+            )
         root.addLayout(intro_row)
 
         # --- Форма фильтров ---
         filters_box = QVBoxLayout()
 
-        # строка 1: запрос
         row1 = QHBoxLayout()
-
         self.query_input = QLineEdit()
         self.query_input.setPlaceholderText(
-            "Например: миграция на новый стек, ЕЖД, риск по срокам…"
+            "Например: миграция на новый стек, ЕЖД, "
+            "риск по срокам…"
         )
         self.query_input.returnPressed.connect(self._start_search)
         row1.addWidget(QLabel("Запрос:"))
@@ -156,7 +180,9 @@ class LibraryWindow(QDialog):
 
         self.search_btn = QPushButton("Найти")
         self.search_btn.setDefault(True)
-        self.search_btn.setToolTip("Запустить поиск (Enter в поле запроса)")
+        self.search_btn.setToolTip(
+            "Запустить поиск (Enter в поле запроса)"
+        )
         self.search_btn.clicked.connect(self._start_search)
         row1.addWidget(self.search_btn)
 
@@ -168,7 +194,6 @@ class LibraryWindow(QDialog):
 
         filters_box.addLayout(row1)
 
-        # строка 2: где искать
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Искать в:"))
 
@@ -176,12 +201,14 @@ class LibraryWindow(QDialog):
         self.cb_transcripts.setChecked(True)
         self.cb_transcripts.setToolTip(
             "Поиск по файлам video.txt.\n"
-            "Используется нечёткий поиск (fuzzy), устойчивый к опечаткам."
+            "Используется нечёткий поиск (fuzzy), устойчивый "
+            "к опечаткам."
         )
         self.cb_protocols = QCheckBox("Протоколах")
         self.cb_protocols.setChecked(True)
         self.cb_protocols.setToolTip(
-            "Поиск по protocol.* / deepseek_prompt.* / manual_protocol.*"
+            "Поиск по protocol.* / deepseek_prompt.* / "
+            "manual_protocol.*"
         )
         self.cb_summaries = QCheckBox("Summary")
         self.cb_summaries.setChecked(True)
@@ -203,14 +230,15 @@ class LibraryWindow(QDialog):
         row2.addStretch()
         filters_box.addLayout(row2)
 
-        # строка 3: проект / даты / fuzzy
         row3 = QHBoxLayout()
 
         self.project_combo = QComboBox()
         self.project_combo.addItem("— все —", "")
         self.project_combo.setMinimumWidth(180)
         row3.addWidget(QLabel("Проект:"))
-        row3.addWidget(with_info(self.project_combo, "lib_project"))
+        row3.addWidget(
+            with_info(self.project_combo, "lib_project")
+        )
 
         row3.addSpacing(12)
         self.date_from = QDateEdit()
@@ -218,7 +246,9 @@ class LibraryWindow(QDialog):
         self.date_from.setDisplayFormat("yyyy-MM-dd")
         self.date_from.setDate(self._default_from_date())
         row3.addWidget(QLabel("С:"))
-        row3.addWidget(with_info(self.date_from, "lib_date_from"))
+        row3.addWidget(
+            with_info(self.date_from, "lib_date_from")
+        )
 
         self.date_to = QDateEdit()
         self.date_to.setCalendarPopup(True)
@@ -235,7 +265,9 @@ class LibraryWindow(QDialog):
         row3.addSpacing(12)
         self.fuzzy_spin = QSpinBox()
         self.fuzzy_spin.setRange(50, 100)
-        self.fuzzy_spin.setValue(82)
+        self.fuzzy_spin.setValue(
+            int(self._app_cfg.get("search_default_fuzzy", 82))
+        )
         self.fuzzy_spin.setSuffix(" %")
         row3.addWidget(QLabel("Fuzzy:"))
         row3.addWidget(with_info(self.fuzzy_spin, "lib_fuzzy"))
@@ -252,7 +284,7 @@ class LibraryWindow(QDialog):
         self.progress.setVisible(False)
         root.addWidget(self.progress)
 
-        # --- Сплиттер: слева результаты, справа превью ---
+        # --- Сплиттер ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         left_container = QWidget()
@@ -270,7 +302,8 @@ class LibraryWindow(QDialog):
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
-            "Дата", "Название", "Проект", "Где", "Совпадение", "Файл",
+            "Дата", "Название", "Проект", "Где",
+            "Совпадение", "Файл",
         ])
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -284,19 +317,31 @@ class LibraryWindow(QDialog):
         self.table.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
-        self.table.customContextMenuRequested.connect(self._show_context_menu)
-        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.customContextMenuRequested.connect(
+            self._show_context_menu
+        )
+        self.table.itemSelectionChanged.connect(
+            self._on_selection_changed
+        )
         self.table.itemDoubleClicked.connect(
             lambda _item: self._open_session_folder()
         )
 
         hv = self.table.horizontalHeader()
-        hv.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
         hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents
+        )
         hv.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        hv.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(
+            5, QHeaderView.ResizeMode.ResizeToContents
+        )
         left_layout.addWidget(self.table, 1)
 
         splitter.addWidget(left_container)
@@ -334,7 +379,9 @@ class LibraryWindow(QDialog):
 
         self.open_folder_btn = QPushButton("Открыть папку записи")
         attach_tooltip(self.open_folder_btn, "lib_open_folder")
-        self.open_folder_btn.clicked.connect(self._open_session_folder)
+        self.open_folder_btn.clicked.connect(
+            self._open_session_folder
+        )
         bottom.addWidget(self.open_folder_btn)
 
         self.open_file_btn = QPushButton("Открыть найденный файл")
@@ -348,7 +395,9 @@ class LibraryWindow(QDialog):
         bottom.addWidget(self.save_file_btn)
 
         self.close_btn = QPushButton("Закрыть")
-        self.close_btn.setToolTip("Закрыть окно библиотеки (Ctrl+W)")
+        self.close_btn.setToolTip(
+            "Закрыть окно библиотеки (Ctrl+W)"
+        )
         self.close_btn.clicked.connect(self.close)
         bottom.addWidget(self.close_btn)
 
@@ -358,18 +407,21 @@ class LibraryWindow(QDialog):
     # Панель формирования промпта
     # ------------------------------------------------------------------
     def _build_prompt_panel(self) -> QWidget:
-        box = QGroupBox("Формирование промпта из результатов поиска")
+        box = QGroupBox(
+            "Формирование промпта из результатов поиска"
+        )
         layout = QVBoxLayout(box)
         layout.setContentsMargins(10, 6, 10, 8)
         layout.setSpacing(6)
 
-        # --- Строка 1: параметры контекста ---
         params_row = QHBoxLayout()
 
         self.prompt_enabled_check = QCheckBox(
             "Формировать промпт по совпадениям"
         )
-        attach_tooltip(self.prompt_enabled_check, "lib_prompt_enabled")
+        attach_tooltip(
+            self.prompt_enabled_check, "lib_prompt_enabled"
+        )
         self.prompt_enabled_check.setChecked(True)
         params_row.addWidget(self.prompt_enabled_check)
 
@@ -379,11 +431,18 @@ class LibraryWindow(QDialog):
         self.prompt_before_spin = QSpinBox()
         self.prompt_before_spin.setRange(0, 5000)
         self.prompt_before_spin.setSingleStep(50)
-        self.prompt_before_spin.setValue(400)
+        default_ctx = int(
+            self._app_cfg.get(
+                "search_default_context_chars", 400
+            )
+        )
+        self.prompt_before_spin.setValue(default_ctx)
         self.prompt_before_spin.setSuffix(" симв.")
         params_row.addWidget(
-            with_info(self.prompt_before_spin, "lib_prompt_before",
-                      stretch=False)
+            with_info(
+                self.prompt_before_spin, "lib_prompt_before",
+                stretch=False,
+            )
         )
 
         params_row.addSpacing(8)
@@ -391,82 +450,116 @@ class LibraryWindow(QDialog):
         self.prompt_after_spin = QSpinBox()
         self.prompt_after_spin.setRange(0, 5000)
         self.prompt_after_spin.setSingleStep(50)
-        self.prompt_after_spin.setValue(400)
+        self.prompt_after_spin.setValue(default_ctx)
         self.prompt_after_spin.setSuffix(" симв.")
         params_row.addWidget(
-            with_info(self.prompt_after_spin, "lib_prompt_after",
-                      stretch=False)
+            with_info(
+                self.prompt_after_spin, "lib_prompt_after",
+                stretch=False,
+            )
         )
 
         params_row.addSpacing(16)
         params_row.addWidget(QLabel("Максимум фрагментов:"))
         self.prompt_max_spin = QSpinBox()
         self.prompt_max_spin.setRange(1, 500)
-        self.prompt_max_spin.setValue(100)
+        self.prompt_max_spin.setValue(
+            int(self._app_cfg.get(
+                "search_default_max_prompt_hits", 100
+            ))
+        )
         params_row.addWidget(
-            with_info(self.prompt_max_spin, "lib_prompt_max",
-                      stretch=False)
+            with_info(
+                self.prompt_max_spin, "lib_prompt_max",
+                stretch=False,
+            )
         )
 
         params_row.addSpacing(16)
-        self.prompt_dedup_check = QCheckBox("Схлопывать дубликаты")
-        attach_tooltip(self.prompt_dedup_check, "lib_prompt_dedup")
+        self.prompt_dedup_check = QCheckBox(
+            "Схлопывать дубликаты"
+        )
+        attach_tooltip(
+            self.prompt_dedup_check, "lib_prompt_dedup"
+        )
         self.prompt_dedup_check.setChecked(True)
         params_row.addWidget(self.prompt_dedup_check)
 
         params_row.addStretch()
         layout.addLayout(params_row)
 
-        # --- Строка 2: инструкция ---
         instr_row = QHBoxLayout()
         instr_row.addWidget(QLabel("Инструкция для ИИ:"))
         self.prompt_instruction_input = QPlainTextEdit()
         self.prompt_instruction_input.setPlaceholderText(
-            "Например: проанализируй найденные фрагменты и составь "
-            "сводку по упоминаниям рисков с указанием дат и ответственных."
+            "Например: проанализируй найденные фрагменты и "
+            "составь сводку по упоминаниям рисков с указанием "
+            "дат и ответственных."
         )
         self.prompt_instruction_input.setFixedHeight(60)
         instr_row.addWidget(
-            with_info(self.prompt_instruction_input, "lib_prompt_instruction"),
+            with_info(
+                self.prompt_instruction_input,
+                "lib_prompt_instruction",
+            ),
             1,
         )
         layout.addLayout(instr_row)
 
-        # --- Строка 3: кнопки ---
         btn_row = QHBoxLayout()
 
-        self.prompt_preview_btn = QPushButton("Показать промпт…")
+        self.prompt_preview_btn = QPushButton(
+            "Показать промпт…"
+        )
         self.prompt_preview_btn.setToolTip(
             "Показать сформированный промпт в отдельном окне — "
             "удобно проверить содержимое перед сохранением."
         )
-        self.prompt_preview_btn.clicked.connect(self._preview_prompt)
+        self.prompt_preview_btn.clicked.connect(
+            self._preview_prompt
+        )
         btn_row.addWidget(self.prompt_preview_btn)
 
-        self.prompt_save_docx_btn = QPushButton("Скачать промпт (DOCX)…")
-        attach_tooltip(self.prompt_save_docx_btn, "lib_prompt_save_docx")
-        self.prompt_save_docx_btn.clicked.connect(self._save_prompt_docx)
+        self.prompt_save_docx_btn = QPushButton(
+            "Скачать промпт (DOCX)…"
+        )
+        attach_tooltip(
+            self.prompt_save_docx_btn, "lib_prompt_save_docx"
+        )
+        self.prompt_save_docx_btn.clicked.connect(
+            self._save_prompt_docx
+        )
         btn_row.addWidget(self.prompt_save_docx_btn)
 
-        self.prompt_save_md_btn = QPushButton("Скачать промпт (Markdown)…")
-        attach_tooltip(self.prompt_save_md_btn, "lib_prompt_save_md")
-        self.prompt_save_md_btn.clicked.connect(self._save_prompt_md)
+        self.prompt_save_md_btn = QPushButton(
+            "Скачать промпт (Markdown)…"
+        )
+        attach_tooltip(
+            self.prompt_save_md_btn, "lib_prompt_save_md"
+        )
+        self.prompt_save_md_btn.clicked.connect(
+            self._save_prompt_md
+        )
         btn_row.addWidget(self.prompt_save_md_btn)
 
         btn_row.addStretch()
 
         self.prompt_info_label = QLabel(
-            "<span style='color:#666'>Промпт формируется из текущих "
-            "результатов поиска. Сначала выполните поиск.</span>"
+            "<span style='color:#666'>Промпт формируется "
+            "из текущих результатов поиска. Сначала выполните "
+            "поиск.</span>"
         )
         self.prompt_info_label.setWordWrap(True)
         btn_row.addWidget(self.prompt_info_label, 1)
 
         layout.addLayout(btn_row)
 
-        # Связываем чекбокс с доступностью кнопок
-        self.prompt_enabled_check.toggled.connect(self._on_prompt_enabled_toggled)
-        self._on_prompt_enabled_toggled(self.prompt_enabled_check.isChecked())
+        self.prompt_enabled_check.toggled.connect(
+            self._on_prompt_enabled_toggled
+        )
+        self._on_prompt_enabled_toggled(
+            self.prompt_enabled_check.isChecked()
+        )
 
         return box
 
@@ -483,7 +576,8 @@ class LibraryWindow(QDialog):
 
     def _update_prompt_buttons_state(self) -> None:
         enabled = (
-            self.prompt_enabled_check.isChecked() and bool(self._hits)
+            self.prompt_enabled_check.isChecked()
+            and bool(self._hits)
         )
         for btn in (
             self.prompt_preview_btn,
@@ -494,28 +588,27 @@ class LibraryWindow(QDialog):
 
         if not self._hits:
             self.prompt_info_label.setText(
-                "<span style='color:#666'>Промпт формируется из текущих "
-                "результатов поиска. Сначала выполните поиск.</span>"
+                "<span style='color:#666'>Промпт формируется "
+                "из текущих результатов поиска. Сначала выполните "
+                "поиск.</span>"
             )
         else:
             self.prompt_info_label.setText(
-                f"<span style='color:#666'>Доступно совпадений для "
-                f"промпта: <b>{len(self._hits)}</b>.</span>"
+                f"<span style='color:#666'>Доступно совпадений "
+                f"для промпта: <b>{len(self._hits)}</b>.</span>"
             )
 
     # ------------------------------------------------------------------
     # Формирование промпта
     # ------------------------------------------------------------------
     def _build_prompt_text(self) -> str:
-        """
-        Собирает текст промпта по текущим результатам поиска.
-        Возвращает пустую строку, если нечего собирать.
-        """
         if not self._hits:
             return ""
 
         query = self.query_input.text().strip()
-        instruction = self.prompt_instruction_input.toPlainText().strip()
+        instruction = (
+            self.prompt_instruction_input.toPlainText().strip()
+        )
         before = self.prompt_before_spin.value()
         after = self.prompt_after_spin.value()
         max_hits = self.prompt_max_spin.value()
@@ -543,9 +636,11 @@ class LibraryWindow(QDialog):
         if not text:
             QMessageBox.warning(
                 self, "Библиотека",
-                "Не удалось извлечь контекст ни из одного совпадения.\n\n"
+                "Не удалось извлечь контекст ни из одного "
+                "совпадения.\n\n"
                 "Возможные причины:\n"
-                "  • файлы совпадений были перемещены или удалены;\n"
+                "  • файлы совпадений были перемещены или "
+                "удалены;\n"
                 "  • в результатах только нечитаемые форматы.",
             )
             return ""
@@ -553,7 +648,6 @@ class LibraryWindow(QDialog):
         return text
 
     def _preview_prompt(self) -> None:
-        """Показывает промпт в отдельном окне только для чтения."""
         text = self._build_prompt_text()
         if not text:
             return
@@ -567,15 +661,14 @@ class LibraryWindow(QDialog):
 
         info = QLabel(
             "Предпросмотр сформированного промпта. Текст можно "
-            "выделить и скопировать. Для сохранения файла закройте "
-            "окно и используйте кнопки «Скачать промпт»."
+            "выделить и скопировать. Для сохранения файла "
+            "закройте окно и используйте кнопки «Скачать промпт»."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
         browser = QTextBrowser()
         browser.setOpenExternalLinks(False)
-        # Рендерим как Markdown, чтобы было видно структуру
         browser.setMarkdown(text)
         layout.addWidget(browser, 1)
 
@@ -583,10 +676,14 @@ class LibraryWindow(QDialog):
         btn_row.addStretch()
 
         copy_btn = QPushButton("Скопировать в буфер")
+
         def _copy():
             from PySide6.QtWidgets import QApplication
             QApplication.clipboard().setText(text)
-            self.status_label.setText("Промпт скопирован в буфер обмена")
+            self.status_label.setText(
+                "Промпт скопирован в буфер обмена"
+            )
+
         copy_btn.clicked.connect(_copy)
         btn_row.addWidget(copy_btn)
 
@@ -598,7 +695,6 @@ class LibraryWindow(QDialog):
         dlg.exec()
 
     def _default_prompt_filename(self, ext: str) -> str:
-        """Формирует имя файла промпта с датой и временем."""
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         return os.path.join(
             os.path.expanduser("~"),
@@ -622,8 +718,10 @@ class LibraryWindow(QDialog):
             target += ".docx"
 
         try:
-            save_prompt_docx(text, target,
-                             title="Промпт по результатам поиска")
+            save_prompt_docx(
+                text, target,
+                title="Промпт по результатам поиска",
+            )
         except Exception as exc:
             QMessageBox.critical(
                 self, "Сохранение промпта",
@@ -636,8 +734,10 @@ class LibraryWindow(QDialog):
 
         reply = QMessageBox.question(
             self, "Промпт сохранён",
-            f"Документ сохранён:\n{target}\n\nОткрыть его сейчас?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            f"Документ сохранён:\n{target}\n\n"
+            f"Открыть его сейчас?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if reply == QMessageBox.StandardButton.Yes:
@@ -673,8 +773,10 @@ class LibraryWindow(QDialog):
 
         reply = QMessageBox.question(
             self, "Промпт сохранён",
-            f"Файл сохранён:\n{target}\n\nОткрыть его сейчас?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            f"Файл сохранён:\n{target}\n\n"
+            f"Открыть его сейчас?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if reply == QMessageBox.StandardButton.Yes:
@@ -700,7 +802,9 @@ class LibraryWindow(QDialog):
         try:
             projects = list_projects(self.sessions_root)
         except Exception as exc:
-            log.warning("Не удалось получить список проектов: %s", exc)
+            log.warning(
+                "Не удалось получить список проектов: %s", exc
+            )
             projects = []
         current = self.project_combo.currentData() or ""
         self.project_combo.blockSignals(True)
@@ -728,9 +832,18 @@ class LibraryWindow(QDialog):
         if self.date_enabled.isChecked():
             qd_from = self.date_from.date()
             qd_to = self.date_to.date()
-            f.date_from = datetime(qd_from.year(), qd_from.month(), qd_from.day())
-            f.date_to = datetime(qd_to.year(), qd_to.month(), qd_to.day())
-        f.fuzzy_threshold = max(0.5, min(1.0, self.fuzzy_spin.value() / 100.0))
+            f.date_from = datetime(
+                qd_from.year(), qd_from.month(), qd_from.day()
+            )
+            f.date_to = datetime(
+                qd_to.year(), qd_to.month(), qd_to.day()
+            )
+        f.fuzzy_threshold = max(
+            0.5, min(1.0, self.fuzzy_spin.value() / 100.0)
+        )
+        f.fuzzy_max_word_distance = int(
+            self._app_cfg.get("fuzzy_max_word_distance", 200)
+        )
         return f
 
     def _start_search(self) -> None:
@@ -738,8 +851,9 @@ class LibraryWindow(QDialog):
             return
         filters = self._build_filters()
         if not filters.query:
-            QMessageBox.information(self, "Библиотека",
-                                    "Введите поисковый запрос.")
+            QMessageBox.information(
+                self, "Библиотека", "Введите поисковый запрос."
+            )
             return
 
         self._hits = []
@@ -755,16 +869,18 @@ class LibraryWindow(QDialog):
         log.info(
             "Поиск: query=%r, проекты=%s, даты=%s..%s, "
             "транскрипт=%s, протокол=%s, summary=%s, вложения=%s, "
-            "fuzzy=%.2f",
+            "fuzzy=%.2f, mwd=%d",
             filters.query, filters.project or "все",
             filters.date_from.date() if filters.date_from else "—",
             filters.date_to.date() if filters.date_to else "—",
             filters.search_transcripts, filters.search_protocols,
             filters.search_summaries, filters.search_attachments,
-            filters.fuzzy_threshold,
+            filters.fuzzy_threshold, filters.fuzzy_max_word_distance,
         )
 
-        self._thread = SearchThread(self.sessions_root, filters)
+        self._thread = SearchThread(
+            self.sessions_root, filters
+        )
         self._thread.progress.connect(self._on_search_progress)
         self._thread.finished_ok.connect(self._on_search_finished)
         self._thread.failed.connect(self._on_search_failed)
@@ -774,7 +890,10 @@ class LibraryWindow(QDialog):
         if self._thread is not None and self._thread.isRunning():
             log.info("Запрошена отмена поиска")
             self._thread.requestInterruption()
-            self._thread.wait(3000)
+            wait_ms = int(
+                self._app_cfg.get("search_cancel_wait_ms", 3000)
+            )
+            self._thread.wait(wait_ms)
         self._on_search_cancelled()
 
     def _on_search_progress(self, cur: int, total: int) -> None:
@@ -790,7 +909,9 @@ class LibraryWindow(QDialog):
 
     def _on_search_failed(self, error: str) -> None:
         log.error("Поиск провален: %s", error)
-        QMessageBox.critical(self, "Библиотека", f"Ошибка поиска:\n{error}")
+        QMessageBox.critical(
+            self, "Библиотека", f"Ошибка поиска:\n{error}"
+        )
         self._on_search_done(-1)
         self._update_prompt_buttons_state()
 
@@ -816,25 +937,37 @@ class LibraryWindow(QDialog):
             self.table.insertRow(row)
 
             self.table.setItem(row, 0, QTableWidgetItem(h.date))
-            self.table.setItem(row, 1, QTableWidgetItem(h.session_name))
-            self.table.setItem(row, 2, QTableWidgetItem(h.project))
+            self.table.setItem(
+                row, 1, QTableWidgetItem(h.session_name)
+            )
+            self.table.setItem(
+                row, 2, QTableWidgetItem(h.project)
+            )
 
             source_item = QTableWidgetItem(
                 SOURCE_LABELS.get(h.source, h.source)
             )
             if h.source == "transcript":
-                source_item.setForeground(Qt.GlobalColor.darkBlue)
+                source_item.setForeground(
+                    Qt.GlobalColor.darkBlue
+                )
             elif h.source == "protocol":
-                source_item.setForeground(Qt.GlobalColor.darkGreen)
+                source_item.setForeground(
+                    Qt.GlobalColor.darkGreen
+                )
             elif h.source == "summary":
-                source_item.setForeground(Qt.GlobalColor.darkMagenta)
+                source_item.setForeground(
+                    Qt.GlobalColor.darkMagenta
+                )
             self.table.setItem(row, 3, source_item)
 
             kind = (
                 "точное" if h.match_kind == "exact"
                 else f"fuzzy {int(h.score * 100)}%"
             )
-            snippet_item = QTableWidgetItem(f"[{kind}] {h.snippet}")
+            snippet_item = QTableWidgetItem(
+                f"[{kind}] {h.snippet}"
+            )
             snippet_item.setToolTip(h.snippet)
             self.table.setItem(row, 4, snippet_item)
 
@@ -864,13 +997,15 @@ class LibraryWindow(QDialog):
             f"<h3>{h.session_name}</h3>",
             f"<p><b>Проект:</b> {h.project or '—'} &nbsp; "
             f"<b>Дата:</b> {h.date or '—'}</p>",
-            f"<p><b>Где найдено:</b> {SOURCE_LABELS.get(h.source, h.source)} "
+            f"<p><b>Где найдено:</b> "
+            f"{SOURCE_LABELS.get(h.source, h.source)} "
             f"({h.file_label})</p>",
             f"<p><b>Тип совпадения:</b> "
             f"{'точное' if h.match_kind == 'exact' else f'нечёткое (fuzzy, {int(h.score * 100)}%)'}"
             f"</p>",
             "<hr>",
-            f"<pre style='white-space:pre-wrap; font-family:monospace;'>"
+            f"<pre style='white-space:pre-wrap; "
+            f"font-family:monospace;'>"
             f"{self._highlight(h.snippet)}</pre>",
         ]
         self.preview.setHtml("".join(html))
@@ -888,12 +1023,20 @@ class LibraryWindow(QDialog):
         if not h:
             return
         menu = QMenu(self)
-        menu.addAction("Открыть папку записи", self._open_session_folder)
-        menu.addAction("Открыть найденный файл", self._open_found_file)
+        menu.addAction(
+            "Открыть папку записи", self._open_session_folder
+        )
+        menu.addAction(
+            "Открыть найденный файл", self._open_found_file
+        )
         menu.addSeparator()
-        menu.addAction("Сохранить файл как…", self._save_found_file)
+        menu.addAction(
+            "Сохранить файл как…", self._save_found_file
+        )
         menu.addSeparator()
-        menu.addAction("Скопировать путь в буфер", self._copy_path)
+        menu.addAction(
+            "Скопировать путь в буфер", self._copy_path
+        )
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _copy_path(self) -> None:
@@ -902,7 +1045,9 @@ class LibraryWindow(QDialog):
             return
         from PySide6.QtWidgets import QApplication
         QApplication.clipboard().setText(h.file_path)
-        self.status_label.setText("Путь скопирован в буфер обмена")
+        self.status_label.setText(
+            "Путь скопирован в буфер обмена"
+        )
 
     # ------------------------------------------------------------------
     # Действия
@@ -910,35 +1055,54 @@ class LibraryWindow(QDialog):
     def _open_session_folder(self) -> None:
         h = self._selected_hit()
         if not h:
-            QMessageBox.warning(self, "Библиотека", "Выберите результат")
+            QMessageBox.warning(
+                self, "Библиотека", "Выберите результат"
+            )
             return
         if not os.path.isdir(h.session_dir):
-            QMessageBox.warning(self, "Библиотека",
-                                f"Папка не найдена:\n{h.session_dir}")
+            QMessageBox.warning(
+                self, "Библиотека",
+                f"Папка не найдена:\n{h.session_dir}",
+            )
             return
-        log.info("Открытие папки записи из библиотеки: %s", h.session_dir)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(h.session_dir))
+        log.info(
+            "Открытие папки записи из библиотеки: %s",
+            h.session_dir,
+        )
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(h.session_dir)
+        )
 
     def _open_found_file(self) -> None:
         h = self._selected_hit()
         if not h:
-            QMessageBox.warning(self, "Библиотека", "Выберите результат")
+            QMessageBox.warning(
+                self, "Библиотека", "Выберите результат"
+            )
             return
         if not os.path.exists(h.file_path):
-            QMessageBox.warning(self, "Библиотека",
-                                f"Файл не найден:\n{h.file_path}")
+            QMessageBox.warning(
+                self, "Библиотека",
+                f"Файл не найден:\n{h.file_path}",
+            )
             return
         log.info("Открытие найденного файла: %s", h.file_path)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(h.file_path))
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(h.file_path)
+        )
 
     def _save_found_file(self) -> None:
         h = self._selected_hit()
         if not h:
-            QMessageBox.warning(self, "Библиотека", "Выберите результат")
+            QMessageBox.warning(
+                self, "Библиотека", "Выберите результат"
+            )
             return
         if not os.path.exists(h.file_path):
-            QMessageBox.warning(self, "Библиотека",
-                                f"Файл не найден:\n{h.file_path}")
+            QMessageBox.warning(
+                self, "Библиотека",
+                f"Файл не найден:\n{h.file_path}",
+            )
             return
 
         base = os.path.basename(h.file_path)
@@ -958,13 +1122,19 @@ class LibraryWindow(QDialog):
 
         try:
             shutil.copy2(h.file_path, target)
-            log.info("Файл сохранён: %s → %s", h.file_path, target)
-            QMessageBox.information(self, "Библиотека",
-                                    f"Файл сохранён:\n{target}")
+            log.info(
+                "Файл сохранён: %s → %s", h.file_path, target
+            )
+            QMessageBox.information(
+                self, "Библиотека",
+                f"Файл сохранён:\n{target}",
+            )
         except Exception as exc:
             log.exception("Ошибка сохранения файла: %s", exc)
-            QMessageBox.critical(self, "Библиотека",
-                                 f"Не удалось сохранить:\n{exc}")
+            QMessageBox.critical(
+                self, "Библиотека",
+                f"Не удалось сохранить:\n{exc}",
+            )
 
     # ------------------------------------------------------------------
     # Справка
@@ -972,28 +1142,24 @@ class LibraryWindow(QDialog):
     def _show_help(self) -> None:
         QMessageBox.information(
             self, "Как работает поиск",
-            "Поиск выполняется по файлам в папке sessions/ — без базы данных.\n\n"
+            "Поиск выполняется по файлам в папке sessions/ — "
+            "без базы данных.\n\n"
             "Искать можно в:\n"
             "  • стенограммах (video.txt);\n"
-            "  • протоколах (protocol.*, deepseek_prompt.*, manual_protocol.*);\n"
+            "  • протоколах (protocol.*, deepseek_prompt.*, "
+            "manual_protocol.*);\n"
             "  • summary (session.json → summary_bb);\n"
             "  • вложениях (attachments/*).\n\n"
-            "Для стенограмм с опечатками используется нечёткий поиск "
-            "(fuzzy). Сначала ищутся точные вхождения, затем — похожие "
-            "слова. Порог схожести регулируется ползунком «Fuzzy»:\n"
+            "Для стенограмм с опечатками используется нечёткий "
+            "поиск (fuzzy). Сначала ищутся точные вхождения, "
+            "затем — похожие слова. Порог схожести регулируется "
+            "ползунком «Fuzzy»:\n"
             "  • 82% — разумный баланс;\n"
             "  • ниже — больше совпадений, но выше шум;\n"
             "  • 100% — только точные слова.\n\n"
-            "Фильтры по проекту и датам сужают область поиска, что "
-            "ускоряет работу на больших архивах.\n\n"
+            "Фильтры по проекту и датам сужают область поиска, "
+            "что ускоряет работу на больших архивах.\n\n"
             "Кнопка «Стоп» прерывает поиск немедленно — "
             "будут показаны уже найденные результаты.\n\n"
-            "Двойной клик по результату открывает папку записи.\n\n"
-            "---\n\n"
-            "Формирование промпта:\n"
-            "Из результатов поиска можно собрать структурированный "
-            "промпт для ИИ — с расширенным контекстом до и после "
-            "каждого совпадения. Промпт можно сохранить в DOCX или "
-            "Markdown. Полезно для задач вида «найди все упоминания "
-            "рисков и составь сводку».",
+            "Двойной клик по результату открывает папку записи."
         )

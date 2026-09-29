@@ -1,4 +1,10 @@
-"""Запись экрана и аудио через ffmpeg."""
+"""Запись экрана и аудио через ffmpeg.
+
+Изменения:
+  • Таймауты и задержки ffmpeg читаются из config["app"]:
+      ffmpeg_start_check_delay, ffmpeg_stop_timeout, ffmpeg_kill_timeout.
+  • Удалён неиспользуемый метод get_monitors().
+"""
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +31,8 @@ class ScreenRecorder(QObject):
     recording_stopped = Signal(str)
     recording_error = Signal(str)
 
-    def __init__(self, config: Dict, parent: Optional[QObject] = None) -> None:
+    def __init__(self, config: Dict,
+                 parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self.config = config or {}
         self._process: Optional[subprocess.Popen] = None
@@ -33,13 +40,30 @@ class ScreenRecorder(QObject):
         self._paused = False
         self._overlay_text = ""
         self._start_time: Optional[datetime] = None
-        # --- Новые поля для логирования ffmpeg ---
         self._ffmpeg_log = None
         self._ffmpeg_log_path: Optional[str] = None
-        log.info("ScreenRecorder инициализирован")
+
+        app_cfg = self.config.get("app", {}) or {}
+        self._start_check_delay = float(
+            app_cfg.get("ffmpeg_start_check_delay", 0.3)
+        )
+        self._stop_timeout = float(
+            app_cfg.get("ffmpeg_stop_timeout", 10)
+        )
+        self._kill_timeout = float(
+            app_cfg.get("ffmpeg_kill_timeout", 5)
+        )
+
+        log.info(
+            "ScreenRecorder инициализирован "
+            "(start_delay=%.2fс, stop_timeout=%.0fс, kill_timeout=%.0fс)",
+            self._start_check_delay, self._stop_timeout, self._kill_timeout,
+        )
 
     def _build_output_path(self) -> str:
-        temp = self.config.get("storage", {}).get("temp_path", "/tmp/screen-recorder")
+        temp = self.config.get("storage", {}).get(
+            "temp_path", "/tmp/screen-recorder"
+        )
         sessions = os.path.join(
             temp, "sessions", datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         )
@@ -48,7 +72,9 @@ class ScreenRecorder(QObject):
         log.debug("Путь вывода: %s", path)
         return path
 
-    def _build_ffmpeg_cmd(self, monitor: str, with_microphone: bool) -> List[str]:
+    def _build_ffmpeg_cmd(
+        self, monitor: str, with_microphone: bool,
+    ) -> List[str]:
         rec = self.config.get("recording", {})
         comp = self.config.get("compression", {})
         video_bitrate = comp.get("video_bitrate", 4000)
@@ -58,26 +84,30 @@ class ScreenRecorder(QObject):
         log.info("Тип графической сессии: %s", session)
 
         if session == "wayland":
-            # ---------- Wayland ----------
             card = find_drm_card()
             if not card:
-                raise RuntimeError("Не найдено DRM-устройство /dev/dri/cardN")
+                raise RuntimeError(
+                    "Не найдено DRM-устройство /dev/dri/cardN"
+                )
 
-            # Формируем crop (без ведущей запятой)
             crop_expr = ""
             for m in get_system_monitors():
                 if m["display"] == monitor or m["name"] == monitor:
-                    crop_expr = f"crop={m['width']}:{m['height']}:{m['x']}:{m['y']}"
+                    crop_expr = (
+                        f"crop={m['width']}:{m['height']}:"
+                        f"{m['x']}:{m['y']}"
+                    )
                     log.info("kmsgrab: обрезка под %s", m["name"])
                     break
 
-            # Порядок: crop (CPU) → hwmap → scale_vaapi
             if crop_expr:
-                vf = f"{crop_expr},hwmap=derive_device=vaapi,scale_vaapi=format=nv12"
+                vf = (
+                    f"{crop_expr},hwmap=derive_device=vaapi,"
+                    f"scale_vaapi=format=nv12"
+                )
             else:
                 vf = "hwmap=derive_device=vaapi,scale_vaapi=format=nv12"
 
-            # ВСЕ входы сначала
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "kmsgrab", "-device", card, "-i", "-",
@@ -85,10 +115,8 @@ class ScreenRecorder(QObject):
             if with_microphone:
                 cmd += ["-f", "pulse", "-i", "default"]
 
-            # Потом фильтры
             cmd += ["-vf", vf]
 
-            # Потом кодеки
             cmd += [
                 "-c:v", "h264_vaapi",
                 "-b:v", f"{video_bitrate}k",
@@ -99,7 +127,6 @@ class ScreenRecorder(QObject):
             log.info("kmsgrab: card=%s, vf=%s", card, vf)
 
         else:
-            # ---------- X11 ----------
             mons = get_system_monitors()
             size = "1920x1080"
             for m in mons:
@@ -117,9 +144,9 @@ class ScreenRecorder(QObject):
             if with_microphone:
                 cmd += ["-f", "pulse", "-i", "default"]
 
-            # Водяной знак для X11 (drawtext работает с libx264)
             if rec.get("show_watermark") and self._overlay_text:
-                safe = self._overlay_text.replace(":", "\\:").replace("'", "")
+                safe = (self._overlay_text
+                        .replace(":", "\\:").replace("'", ""))
                 drawtext = (
                     f"drawtext=text='{safe}':x=20:y=20:fontsize=24:"
                     f"fontcolor=white@0.8:box=1:boxcolor=black@0.5"
@@ -139,17 +166,21 @@ class ScreenRecorder(QObject):
         log.debug("Полная команда ffmpeg: %s", " ".join(cmd))
         return cmd
 
-    async def start_recording(self, monitor: str, with_microphone: bool) -> bool:
+    async def start_recording(
+        self, monitor: str, with_microphone: bool,
+    ) -> bool:
         if self._process is not None:
             log.warning("Попытка начать запись, но запись уже идёт")
             return False
         try:
-            log.info("Запуск записи: monitor=%s, mic=%s", monitor, with_microphone)
+            log.info("Запуск записи: monitor=%s, mic=%s",
+                     monitor, with_microphone)
             self._output_path = self._build_output_path()
             cmd = self._build_ffmpeg_cmd(monitor, with_microphone)
 
-            # Путь к логу ffmpeg рядом с видео
-            self._ffmpeg_log_path = self._output_path.replace(".mp4", ".ffmpeg.log")
+            self._ffmpeg_log_path = self._output_path.replace(
+                ".mp4", ".ffmpeg.log"
+            )
             self._ffmpeg_log = open(self._ffmpeg_log_path, "w")
             log.info("Лог ffmpeg: %s", self._ffmpeg_log_path)
 
@@ -157,20 +188,23 @@ class ScreenRecorder(QObject):
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=self._ffmpeg_log,     # ← писать в файл
+                stderr=self._ffmpeg_log,
                 preexec_fn=os.setsid,
             )
 
-            # Дать ffmpeg 300 мс, чтобы упасть, если что-то не так
-            await asyncio.sleep(0.3)
+            # Пауза из конфига (ffmpeg_start_check_delay)
+            await asyncio.sleep(self._start_check_delay)
             if self._process.poll() is not None:
                 rc = self._process.returncode
-                log.error("ffmpeg упал сразу после старта (код %d). См. %s",
-                        rc, self._ffmpeg_log_path)
+                log.error(
+                    "ffmpeg упал сразу после старта (код %d). См. %s",
+                    rc, self._ffmpeg_log_path,
+                )
                 try:
                     self._ffmpeg_log.close()
                     self._ffmpeg_log = None
-                    with open(self._ffmpeg_log_path, "r", encoding="utf-8") as f:
+                    with open(self._ffmpeg_log_path, "r",
+                              encoding="utf-8") as f:
                         for line in f.readlines()[-20:]:
                             log.error("ffmpeg: %s", line.rstrip())
                 except Exception:
@@ -229,18 +263,22 @@ class ScreenRecorder(QObject):
             return ""
         path = self._output_path or ""
         try:
-            log.info("Остановка записи (PID=%d, файл=%s)", self._process.pid, path)
+            log.info("Остановка записи (PID=%d, файл=%s)",
+                     self._process.pid, path)
             if self._paused:
                 os.killpg(os.getpgid(self._process.pid), signal.SIGCONT)
                 self._paused = False
             self._process.send_signal(signal.SIGINT)
             try:
-                self._process.wait(timeout=10)
+                self._process.wait(timeout=self._stop_timeout)
                 log.info("ffmpeg корректно завершён")
             except subprocess.TimeoutExpired:
-                log.warning("ffmpeg не завершился за 10с, SIGKILL")
+                log.warning(
+                    "ffmpeg не завершился за %.0fс, SIGKILL",
+                    self._stop_timeout,
+                )
                 os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
-                self._process.wait(timeout=5)
+                self._process.wait(timeout=self._kill_timeout)
         except Exception as exc:
             log.exception("Ошибка остановки записи: %s", exc)
             self.recording_error.emit(str(exc))
@@ -251,20 +289,18 @@ class ScreenRecorder(QObject):
                 except Exception:
                     pass
                 self._ffmpeg_log = None
-            self._ffmpeg_log_path = None      # ← добавить
+            self._ffmpeg_log_path = None
             self._process = None
             self._output_path = None
             self._start_time = None
             if path and os.path.exists(path):
                 size = os.path.getsize(path)
-                log.info("Файл записи: %s (%.2f МБ)", path, size / 1024 / 1024)
+                log.info("Файл записи: %s (%.2f МБ)",
+                         path, size / 1024 / 1024)
             else:
                 log.warning("Файл записи не создан: %s", path)
             self.recording_stopped.emit(path)
         return path
-
-    async def get_monitors(self) -> List[Dict[str, str]]:
-        return get_system_monitors()
 
     def set_overlay_text(self, text: str) -> None:
         self._overlay_text = text
@@ -274,6 +310,7 @@ class ScreenRecorder(QObject):
         return {
             "recording": self._process is not None,
             "paused": self._paused,
-            "start_time": self._start_time.isoformat() if self._start_time else None,
+            "start_time": (self._start_time.isoformat()
+                           if self._start_time else None),
             "output": self._output_path,
         }

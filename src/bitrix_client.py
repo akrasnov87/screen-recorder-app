@@ -1,15 +1,9 @@
 """Клиент Bitrix24 для отправки сообщений в чаты через вебхук.
 
-Использует aiohttp — общая зависимость проекта (см. transcribe_client,
-litellm_client). Не требует requests.
-
-Поддерживает:
-  • отправку текстовых сообщений (im.message.add);
-  • загрузку файлов на Диск (disk.folder.uploadfile с двумя шагами);
-  • привязку файлов к чату (im.disk.file.commit);
-  • отправку одного или нескольких файлов-вложений в чат
-    одним сообщением с общим комментарием;
-  • автоматический выбор папки чата (im.disk.folder.get) для загрузки.
+Изменения:
+  • Лимит длины сообщения теперь настраивается через параметр
+    конструктора max_message_chars (значение из config["bitrix"]).
+  • _truncate — метод класса, а не модульная функция.
 """
 from __future__ import annotations
 
@@ -32,39 +26,27 @@ class Bitrix24Error(RuntimeError):
         self.body = body
 
 
-# Максимальная длина сообщения в Bitrix24 (по документации ~ 20 000).
-# Оставляем запас — режем на 15 000, чтобы избежать отказов.
-MAX_MESSAGE_CHARS = 15000
-
 # Транслитерация кириллицы → латиница для имён файлов Bitrix24.
-# Используется, когда нужно сохранить читаемость имени на Диске
-# и избежать URL-encoding в Content-Disposition.
 _TRANSLIT_MAP = {
     "а": "a",  "б": "b",  "в": "v",  "г": "g",  "д": "d",
     "е": "e",  "ё": "e",  "ж": "zh", "з": "z",  "и": "i",
     "й": "y",  "к": "k",  "л": "l",  "м": "m",  "н": "n",
     "о": "o",  "п": "p",  "р": "r",  "с": "s",  "т": "t",
     "у": "u",  "ф": "f",  "х": "h",  "ц": "ts", "ч": "ch",
-    "ш": "sh", "щ": "sch","ъ": "",   "ы": "y",  "ь": "",
+    "ш": "sh", "щ": "sch", "ъ": "",   "ы": "y",  "ь": "",
     "э": "e",  "ю": "yu", "я": "ya",
     "А": "A",  "Б": "B",  "В": "V",  "Г": "G",  "Д": "D",
     "Е": "E",  "Ё": "E",  "Ж": "Zh", "З": "Z",  "И": "I",
     "Й": "Y",  "К": "K",  "Л": "L",  "М": "M",  "Н": "N",
     "О": "O",  "П": "P",  "Р": "R",  "С": "S",  "Т": "T",
     "У": "U",  "Ф": "F",  "Х": "H",  "Ц": "Ts", "Ч": "Ch",
-    "Ш": "Sh", "Щ": "Sch","Ъ": "",   "Ы": "Y",  "Ь": "",
+    "Ш": "Sh", "Щ": "Sch", "Ъ": "",   "Ы": "Y",  "Ь": "",
     "Э": "E",  "Ю": "Yu", "Я": "Ya",
 }
 
-def _to_ascii_filename(name: str) -> str:
-    """
-    Приводит имя файла к ASCII-only.
 
-    • Кириллица транслитерируется в латиницу.
-    • Пробелы, точки, дефисы и подчёркивания сохраняются.
-    • Остальные не-ASCII и «небезопасные» символы заменяются '_'.
-    • Если после всех замен имя пустое — возвращает 'file'.
-    """
+def _to_ascii_filename(name: str) -> str:
+    """Приводит имя файла к ASCII-only."""
     if not name:
         return "file"
 
@@ -78,20 +60,12 @@ def _to_ascii_filename(name: str) -> str:
             out_chars.append("_")
 
     result = "".join(out_chars).strip()
-    # Схлопываем подряд идущие подчёркивания и пробелы.
     while "__" in result:
         result = result.replace("__", "_")
     while "  " in result:
         result = result.replace("  ", " ")
 
     return result or "file"
-
-
-def _truncate(text: str, limit: int = MAX_MESSAGE_CHARS) -> str:
-    """Обрезает текст до limit символов, добавляя многоточие."""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n\n… (сообщение обрезано — превышен лимит Bitrix24)"
 
 
 class Bitrix24Client:
@@ -101,9 +75,6 @@ class Bitrix24Client:
     Использование:
         async with Bitrix24Client(webhook_url) as client:
             await client.send_message("chat2101", "Текст")
-            await client.send_file_message("chat2101", "/path/file.docx",
-                                           comment="Протокол")
-            # Несколько файлов одним сообщением:
             await client.send_file_message(
                 "chat2101",
                 ["/path/a.docx", "/path/b.md"],
@@ -116,17 +87,21 @@ class Bitrix24Client:
         webhook_url: str,
         connect_timeout: float = 15.0,
         read_timeout: float = 60.0,
+        max_message_chars: int = 15000,
     ) -> None:
         if not webhook_url:
             raise Bitrix24Error("Не задан webhook_url для Bitrix24")
         self.webhook_url = webhook_url.rstrip("/")
         self._connect_timeout = float(connect_timeout)
         self._read_timeout = float(read_timeout)
+        self._max_message_chars = int(max_message_chars)
         self._session: Optional[aiohttp.ClientSession] = None
 
         log.debug(
-            "Bitrix24Client создан: url=%s, connect=%.1f, read=%.1f",
+            "Bitrix24Client создан: url=%s, connect=%.1f, read=%.1f, "
+            "max_message=%d",
             self.webhook_url, self._connect_timeout, self._read_timeout,
+            self._max_message_chars,
         )
 
     # ------------------------------------------------------------------
@@ -156,6 +131,15 @@ class Bitrix24Client:
             return ""
         text = text.strip()
         return (text[:500] + "…") if len(text) > 500 else text
+
+    def _truncate(self, text: str) -> str:
+        """Обрезает текст до self._max_message_chars, добавляя многоточие."""
+        limit = self._max_message_chars
+        if len(text) <= limit:
+            return text
+        return text[:limit] + (
+            "\n\n… (сообщение обрезано — превышен лимит Bitrix24)"
+        )
 
     async def call(
         self,
@@ -189,9 +173,7 @@ class Bitrix24Client:
                         f"(HTTP {resp.status}): {exc}. Тело: {body}"
                     )
                     log.error(msg)
-                    raise Bitrix24Error(
-                        msg, status=resp.status, body=body
-                    )
+                    raise Bitrix24Error(msg, status=resp.status, body=body)
 
                 if isinstance(data, dict) and data.get("error"):
                     descr = data.get("error_description") or data.get("error")
@@ -233,7 +215,7 @@ class Bitrix24Client:
         if not text or not text.strip():
             raise Bitrix24Error("Пустой текст сообщения")
 
-        safe_text = _truncate(text)
+        safe_text = self._truncate(text)
         params = {
             "DIALOG_ID": dialog_id,
             "MESSAGE": safe_text,
@@ -251,7 +233,9 @@ class Bitrix24Client:
         result = data.get("result") or []
         return result if isinstance(result, list) else []
 
-    async def list_folder_children(self, folder_id: int) -> List[Dict[str, Any]]:
+    async def list_folder_children(
+        self, folder_id: int,
+    ) -> List[Dict[str, Any]]:
         """disk.folder.getchildren — содержимое папки."""
         data = await self.call(
             "disk.folder.getchildren", {"id": int(folder_id)}
@@ -261,16 +245,7 @@ class Bitrix24Client:
 
     @staticmethod
     def _extract_root_id(storage: Dict[str, Any]) -> int:
-        """
-        Достаёт ID корневой папки из хранилища.
-
-        Bitrix24 в разных порталах возвращает разные схемы:
-          • ROOT_OBJECT_ID: "25"           — плоское поле (чаще всего);
-          • ROOT_OBJECT: {"ID": 25, ...}   — вложенный словарь (старые
-            версии или отдельные порталы).
-        Обрабатываем оба варианта.
-        """
-        # Схема 1: ROOT_OBJECT_ID (строка или число)
+        """Достаёт ID корневой папки из хранилища."""
         root_id = storage.get("ROOT_OBJECT_ID")
         if root_id is not None:
             try:
@@ -278,7 +253,6 @@ class Bitrix24Client:
             except (TypeError, ValueError):
                 pass
 
-        # Схема 2: ROOT_OBJECT: {"ID": ...}
         root = storage.get("ROOT_OBJECT")
         if isinstance(root, dict):
             rid = root.get("ID")
@@ -291,17 +265,7 @@ class Bitrix24Client:
         return 0
 
     async def get_root_folder_id(self) -> int:
-        """
-        Возвращает ID корневой папки первого доступного хранилища.
-
-        Приоритеты:
-          1) ENTITY_TYPE == "shared" (общий диск);
-          2) ENTITY_TYPE == "common" (общий диск — новая схема Bitrix24);
-          3) первое хранилище с валидным ROOT_OBJECT_ID / ROOT_OBJECT.
-
-        Если хранилищ нет (например, у вебхука нет прав на disk),
-        возвращает 0 — это сигнал «не удалось определить».
-        """
+        """Возвращает ID корневой папки первого доступного хранилища."""
         try:
             storages = await self.list_storages()
         except Bitrix24Error as exc:
@@ -315,7 +279,6 @@ class Bitrix24Client:
             )
             return 0
 
-        # Приоритет 1 и 2: общий диск (shared / common)
         for s in storages:
             etype = (s.get("ENTITY_TYPE") or "").lower()
             if etype in ("shared", "common"):
@@ -327,7 +290,6 @@ class Bitrix24Client:
                     )
                     return fid
 
-        # Приоритет 3: первое хранилище с валидным ROOT_OBJECT*
         for s in storages:
             fid = self._extract_root_id(s)
             if fid:
@@ -345,29 +307,10 @@ class Bitrix24Client:
         return 0
 
     async def get_chat_folder_id(self, dialog_id: str) -> int:
-        """
-        Возвращает ID папки на Диске, привязанной к чату.
-
-        В Bitrix24 у каждого чата есть своя папка на Диске.
-        Для этого используется метод im.disk.folder.get, который
-        ожидает числовой CHAT_ID (например, '39110', а не 'chat39110').
-
-        Если вебхук не является участником диалога, Bitrix24 вернёт
-        ACCESS_ERROR (HTTP 403) — это нормальная ситуация, например,
-        для личного чата другого сотрудника. В этом случае возвращаем 0,
-        и вызывающий код загрузит файл в корень общего диска.
-
-        Args:
-            dialog_id: ID чата ('chat39110' или '39110').
-
-        Returns:
-            ID папки или 0, если получить не удалось.
-        """
+        """Возвращает ID папки на Диске, привязанной к чату."""
         if not dialog_id:
             return 0
 
-        # im.disk.folder.get ожидает ЧИСЛОВОЙ ID чата.
-        # Отрезаем префикс "chat", если он есть.
         raw = dialog_id.strip()
         if raw.lower().startswith("chat"):
             raw = raw[4:]
@@ -400,10 +343,6 @@ class Bitrix24Client:
                 dialog_id, str(data)[:300],
             )
         except Bitrix24Error as exc:
-            # ACCESS_ERROR — типичная ситуация, когда вебхук
-            # не является участником диалога (например, это личный
-            # чат другого сотрудника). Это не критично — просто
-            # загрузим файл в корень общего диска.
             if exc.status == 403:
                 log.info(
                     "Bitrix24: вебхук не имеет доступа к папке чата %s "
@@ -422,28 +361,7 @@ class Bitrix24Client:
         dialog_id: str,
         disk_file_ids: Any,
     ) -> List[int]:
-        """
-        Прикрепляет файлы с Диска к чату через im.disk.file.commit.
-
-        Bitrix24 возвращает вложенную структуру:
-            result: {
-                FILES: {
-                    "upload<id>": {"id": <число>, "chatId": ..., ...},
-                    "upload<id2>": {"id": <число>, ...},
-                    ...
-                }
-            }
-        Может вернуть и плоский результат: {"ID": <число>} или просто число.
-
-        Args:
-            dialog_id:     ID чата (chat39110 или 39110).
-            disk_file_ids: ID файла (int) или список ID (List[int]).
-
-        Returns:
-            Список FILE_ID, готовых к использованию в im.message.add
-            (параметр FILES=[id1, id2, ...]).
-        """
-        # Нормализуем в список
+        """Прикрепляет файлы с Диска к чату через im.disk.file.commit."""
         if isinstance(disk_file_ids, (int, str)):
             ids_list = [int(disk_file_ids)]
         else:
@@ -452,7 +370,6 @@ class Bitrix24Client:
         if not ids_list:
             return []
 
-        # Нормализуем dialog_id
         raw = dialog_id.strip()
         if raw.lower().startswith("chat"):
             raw = raw[4:]
@@ -477,7 +394,6 @@ class Bitrix24Client:
 
         result = data.get("result")
 
-        # --- Вариант 1: result — число (старые версии Bitrix24) ---
         if isinstance(result, (int, str)) and str(result).isdigit():
             file_id = int(result)
             log.info(
@@ -487,7 +403,6 @@ class Bitrix24Client:
             return [file_id]
 
         if isinstance(result, dict):
-            # --- Вариант 2: result.ID / result.FILE_ID ---
             fid = result.get("ID") or result.get("FILE_ID")
             if fid and str(fid).isdigit():
                 file_id = int(fid)
@@ -497,7 +412,6 @@ class Bitrix24Client:
                 )
                 return [file_id]
 
-            # --- Вариант 3: result.FILES.<uploadXXX>.id ---
             files = result.get("FILES")
             if isinstance(files, dict):
                 collected: List[int] = []
@@ -519,7 +433,6 @@ class Bitrix24Client:
                     )
                     return collected
 
-        # --- Ничего не распознали ---
         log.warning(
             "Bitrix24: im.disk.file.commit вернул неожиданную "
             "структуру. Используем исходные disk_file_ids=%s. Ответ: %s",
@@ -531,6 +444,9 @@ class Bitrix24Client:
         """
         Возвращает ID подпапки `name` внутри `parent_id`.
         Создаёт, если её нет.
+
+        Полезно при создании тематических подпапок в общем диске,
+        когда папка чата недоступна.
         """
         children = await self.list_folder_children(parent_id)
         for item in children:
@@ -556,24 +472,7 @@ class Bitrix24Client:
 
     async def upload_file(self, file_path: str, folder_id: int = 0) -> int:
         """
-        Загружает файл на Диск Bitrix24.
-
-        Реализовано через двухэтапную схему:
-
-          1) POST disk.folder.uploadfile.json с multipart (поля id и file)
-             — сервер возвращает {result: {ID, ...}} при успехе,
-             ЛИБО {result: {field: 'file', uploadUrl: '...'}}.
-
-          2) POST на uploadUrl с multipart (поле file).
-
-        Чтобы избежать ошибки DISK_OBJ_22000 («файл с таким именем уже
-        есть»), передаём generateUniqueName=1 и добавляем к имени файла
-        временной отпечаток.
-
-        Args:
-            file_path: путь к файлу на локальной машине.
-            folder_id: ID папки. Если 0 — используется корень
-                       первого доступного хранилища.
+        Загружает файл на Диск Bitrix24 (двухэтапная схема).
 
         Returns:
             FILE_ID (int) — ID файла на Диске Bitrix24.
@@ -589,24 +488,15 @@ class Bitrix24Client:
         if not folder_id:
             raise Bitrix24Error(
                 "Bitrix24: не удалось определить папку для загрузки. "
-                "Проверьте права вебхука (нужен метод disk) и корректность "
-                "CHAT_ID. Также можно вручную указать ID папки в "
-                "Настройках → Bitrix24."
+                "Проверьте права вебхука (нужен метод disk) и "
+                "корректность CHAT_ID. Также можно вручную указать "
+                "ID папки в Настройках → Bitrix24."
             )
 
-        # ─── Готовим уникальное имя файла ───
-        # Исходное имя: manual_protocol.docx
-        # Станет:      manual_protocol_20260928_114602.docx
         orig_name = os.path.basename(file_path)
         stem, ext = os.path.splitext(orig_name)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Bitrix24 не всегда корректно декодирует URL-encoded имена файлов
-        # в Content-Disposition (RFC 5987): сохраняет их как есть —
-        # получается «protocol_%D0%A1%D0%BE%D0%B7...docx».
-        # Чтобы имя файла на Диске было читаемым, используем ASCII-only:
-        #  • если имя уже ASCII — оставляем как есть;
-        #  • если содержит не-ASCII — транслитерируем (см. ниже).
         safe_stem = _to_ascii_filename(stem)
         unique_name = f"{safe_stem}_{stamp}{ext}"
 
@@ -634,8 +524,6 @@ class Bitrix24Client:
         try:
             form1 = aiohttp.FormData()
             form1.add_field("id", str(int(folder_id)))
-            # generateUniqueName=1 — сервер сам придумает уникальное имя,
-            # если такое уже есть. Подстраховка на случай гонок.
             form1.add_field("generateUniqueName", "1")
             form1.add_field(
                 "file",
@@ -663,14 +551,14 @@ class Bitrix24Client:
                     raise Bitrix24Error(msg, status=resp.status, body=body)
 
                 if isinstance(data, dict) and data.get("error"):
-                    descr = data.get("error_description") or data.get("error")
+                    descr = (data.get("error_description")
+                             or data.get("error"))
                     msg = f"Bitrix24 upload: {descr}"
                     log.error(msg)
                     raise Bitrix24Error(msg, body=str(data)[:500])
 
                 result = data.get("result") or {}
 
-                # Успех сразу? Сервер вернул ID.
                 file_id = result.get("ID")
                 if file_id:
                     log.info(
@@ -679,12 +567,11 @@ class Bitrix24Client:
                     )
                     return int(file_id)
 
-                # Иначе — вторая стадия: uploadUrl.
                 upload_url = result.get("uploadUrl")
                 if not upload_url:
                     msg = (
-                        f"Bitrix24 upload: не получен ни ID, ни uploadUrl. "
-                        f"Ответ: {str(data)[:500]}"
+                        f"Bitrix24 upload: не получен ни ID, ни "
+                        f"uploadUrl. Ответ: {str(data)[:500]}"
                     )
                     log.error(msg)
                     raise Bitrix24Error(msg, body=str(data)[:500])
@@ -732,7 +619,8 @@ class Bitrix24Client:
                     raise Bitrix24Error(msg, status=resp.status, body=body)
 
                 if isinstance(data, dict) and data.get("error"):
-                    descr = data.get("error_description") or data.get("error")
+                    descr = (data.get("error_description")
+                             or data.get("error"))
                     msg = f"Bitrix24 upload (шаг 2): {descr}"
                     log.error(msg)
                     raise Bitrix24Error(msg, body=str(data)[:500])
@@ -770,34 +658,10 @@ class Bitrix24Client:
         url_preview: bool = False,
         prefer_chat_folder: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Отправляет один или несколько файлов в чат Bitrix24
-        как вложения + комментарий.
-
-        Порядок действий:
-          1) Определяем папку (папка чата или явный folder_id).
-          2) Загружаем каждый файл на Диск (upload_file → disk_file_id).
-          3) Привязываем файлы к чату (im.disk.file.commit → [file_id]).
-          4) Отправляем ОДНО сообщение с FILES=[id1, id2, ...] и
-             MESSAGE=comment.
-
-        Args:
-            dialog_id:          ID чата (chat2101 или 2101).
-            file_paths:         путь к файлу (str) или список путей
-                                (List[str]).
-            comment:            текст сообщения (обычно заголовок).
-            folder_id:          явный ID папки (0 = авто).
-            system:             системное сообщение.
-            url_preview:        предпросмотр ссылок.
-            prefer_chat_folder: если True — сначала пробуем папку чата.
-
-        Returns:
-            Ответ от im.message.add (dict).
-        """
+        """Отправляет один или несколько файлов в чат Bitrix24."""
         if not dialog_id:
             raise Bitrix24Error("Не указан dialog_id")
 
-        # Нормализуем в список путей
         if isinstance(file_paths, (str, os.PathLike)):
             paths: List[str] = [str(file_paths)]
         else:
@@ -806,12 +670,10 @@ class Bitrix24Client:
         if not paths:
             raise Bitrix24Error("Не указан ни один файл")
 
-        # Проверяем существование всех файлов
         for p in paths:
             if not os.path.exists(p):
                 raise Bitrix24Error(f"Файл не найден: {p}")
 
-        # --- Шаг 1: выбор папки ---
         target_folder_id = int(folder_id or 0)
 
         if target_folder_id <= 0 and prefer_chat_folder:
@@ -827,11 +689,9 @@ class Bitrix24Client:
         if target_folder_id <= 0:
             log.info(
                 "Bitrix24: папка чата недоступна или не задана — "
-                "используем корень общего диска (определяется "
-                "автоматически через disk.storage.getlist)"
+                "используем корень общего диска"
             )
 
-        # --- Шаг 2: загрузка всех файлов на Диск ---
         disk_file_ids: List[int] = []
         for p in paths:
             try:
@@ -841,7 +701,6 @@ class Bitrix24Client:
                 log.error(
                     "Bitrix24: не удалось загрузить %s: %s", p, exc
                 )
-                # Продолжаем с остальными; если упадёт всё — вернём ошибку ниже
                 continue
 
         if not disk_file_ids:
@@ -849,7 +708,6 @@ class Bitrix24Client:
                 "Bitrix24: ни один файл не удалось загрузить на Диск"
             )
 
-        # --- Шаг 3: привязка файлов к чату ---
         file_ids_for_message = await self.commit_file_to_chat(
             dialog_id, disk_file_ids
         )
@@ -859,10 +717,9 @@ class Bitrix24Client:
                 "Bitrix24: не удалось получить ID файлов для отправки"
             )
 
-        # --- Шаг 4: отправка одного сообщения со всеми файлами ---
         params: Dict[str, Any] = {
             "DIALOG_ID": dialog_id,
-            "MESSAGE": _truncate(comment or ""),
+            "MESSAGE": self._truncate(comment or ""),
             "SYSTEM": "Y" if system else "N",
             "URL_PREVIEW": "Y" if url_preview else "N",
             "FILES": file_ids_for_message,
@@ -879,10 +736,7 @@ class Bitrix24Client:
     # Проверка подключения
     # ------------------------------------------------------------------
     async def ping(self) -> str:
-        """
-        Проверяет связность и валидность вебхука через profile.
-        Возвращает имя пользователя вебхука.
-        """
+        """Проверяет связность и валидность вебхука через profile."""
         data = await self.call("profile", {})
         result = data.get("result") or {}
         name = (
