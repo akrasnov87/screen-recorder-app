@@ -41,20 +41,22 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .file_readers import read_any_text, read_json_file
-from .logger import get_logger
-from .markdown_docx import markdown_to_docx
+from ..file_readers import read_any_text, read_json_file
+from ..logger import get_logger
+from ..markdown_docx import markdown_to_docx
+from ..markdown_to_bitrix import markdown_to_plain, markdown_to_plain_with_bb
+from ..screc_client import ScrecError
+from ..sync_manager import (
+    SyncManager,
+    get_record_id,
+    is_record_published,
+)
+from ..task_queue import TaskQueue
 from .markdown_editor import MarkdownEditorDialog, MarkdownViewerDialog
-from .markdown_to_bitrix import markdown_to_plain, markdown_to_plain_with_bb
 from .media_player import (
     is_builtin_player_available, open_media, probe_media_support,
 )
 from .metadata_dialog import MetadataDialog
-from .screc_client import ScrecError
-from .sync_manager import (
-    SyncManager, get_record_id, is_record_published,
-)
-from .task_queue import TaskQueue
 
 log = get_logger(__name__)
 

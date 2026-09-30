@@ -29,8 +29,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .logger import get_logger
-from .markdown_docx import markdown_to_docx
+from ..logger import get_logger
+from ..markdown_docx import markdown_to_docx
 
 log = get_logger(__name__)
 

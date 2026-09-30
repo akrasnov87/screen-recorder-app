@@ -9,8 +9,8 @@ from PySide6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .logger import get_logger
-from .task_queue import TaskQueue
+from ..logger import get_logger
+from ..task_queue import TaskQueue
 
 log = get_logger(__name__)
 

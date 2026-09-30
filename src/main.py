@@ -30,51 +30,51 @@ if __package__ in (None, ""):
     )
     from src.config_manager import ConfigManager
     from src.hotkeys import GlobalHotkeyManager
-    from src.import_window import ImportWindow
-    from src.library_window import LibraryWindow
+    from src.ui.import_window import ImportWindow
+    from src.ui.library_window import LibraryWindow
+    from src.ui.metadata_dialog import MetadataDialog
+    from src.ui.overlay_panel import OverlayPanel
+    from src.ui.queue_window import QueueWindow
+    from src.ui.sessions_window import SessionsWindow
+    from src.ui.settings_window import SettingsWindow
+    from src.ui.sync_window import SyncWindow
+    from src.ui.tray_manager import TrayManager
+    from src.ui.yandex_vm_window import YandexVMDialog
     from src.logger import (
         get_logger,
         register_gui_handler,
         set_log_path,
         setup_logger,
     )
-    from src.metadata_dialog import MetadataDialog
-    from src.overlay_panel import OverlayPanel
     from src.processor import VideoProcessor
-    from src.queue_window import QueueWindow
     from src.recorder import ScreenRecorder
-    from src.sessions_window import SessionsWindow
-    from src.settings_window import SettingsWindow
     from src.sync_manager import SyncManager, is_record_published
-    from src.sync_window import SyncWindow
     from src.task_queue import TaskQueue
-    from src.tray_manager import TrayManager
     from src.utils import check_ffmpeg_installed, get_system_monitors
-    from src.yandex_vm_window import YandexVMDialog
 else:
     from .config_manager import ConfigManager
     from .hotkeys import GlobalHotkeyManager
-    from .import_window import ImportWindow
-    from .library_window import LibraryWindow
+    from .ui.import_window import ImportWindow
+    from .ui.library_window import LibraryWindow
+    from .ui.metadata_dialog import MetadataDialog
+    from .ui.overlay_panel import OverlayPanel
+    from .ui.queue_window import QueueWindow
+    from .ui.sessions_window import SessionsWindow
+    from .ui.settings_window import SettingsWindow
+    from .ui.sync_window import SyncWindow
+    from .ui.tray_manager import TrayManager
+    from .ui.yandex_vm_window import YandexVMDialog
     from .logger import (
         get_logger,
         register_gui_handler,
         set_log_path,
         setup_logger,
     )
-    from .metadata_dialog import MetadataDialog
-    from .overlay_panel import OverlayPanel
     from .processor import VideoProcessor
-    from .queue_window import QueueWindow
     from .recorder import ScreenRecorder
-    from .sessions_window import SessionsWindow
-    from .settings_window import SettingsWindow
     from .sync_manager import SyncManager, is_record_published
-    from .sync_window import SyncWindow
     from .task_queue import TaskQueue
-    from .tray_manager import TrayManager
     from .utils import check_ffmpeg_installed, get_system_monitors
-    from .yandex_vm_window import YandexVMDialog
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Slot
 from PySide6.QtGui import QDesktopServices

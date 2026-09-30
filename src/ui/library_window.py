@@ -25,11 +25,11 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from .library_search import (
+from ..library_search import (
     SearchFilters, SearchHit, build_prompt_from_hits, list_projects,
     list_tags, save_prompt_docx, save_prompt_markdown, search,
 )
-from .logger import get_logger
+from ..logger import get_logger
 from .tooltips import (
     attach_tooltip, attach_tooltip_text, make_info_icon, with_info,
 )

@@ -1,0 +1,1 @@
+"""UI-модули приложения Screen Recorder & Transcriber."""

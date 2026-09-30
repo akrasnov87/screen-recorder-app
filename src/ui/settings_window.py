@@ -41,15 +41,15 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from .config_manager import ConfigManager, DEFAULT_NAME_TEMPLATES
-from .logger import get_current_log_path, get_logger
-from .media_player import probe_media_support
-from .screc_client import ScrecClient, ScrecError
-from .sync_window import SyncWindow
-from .tooltips import attach_tooltip, make_info_icon, with_info
-from .transcribe_client import TranscribeClient
-from .utils import get_system_monitors
-from . import __version__
+from ..config_manager import ConfigManager, DEFAULT_NAME_TEMPLATES
+from ..logger import get_current_log_path, get_logger
+from ..screc_client import ScrecClient, ScrecError
+from ..transcribe_client import TranscribeClient
+from ..utils import get_system_monitors
+from .. import __version__
+from .media_player import probe_media_support      # ui → ui
+from .sync_window import SyncWindow                # ui → ui
+from .tooltips import attach_tooltip, make_info_icon, with_info  # ui → ui
 
 log = get_logger(__name__)
 
@@ -912,7 +912,7 @@ class SettingsWindow(QDialog):
             )
             return
 
-        from .bitrix_client import Bitrix24Client, Bitrix24Error
+        from ..bitrix_client import Bitrix24Client, Bitrix24Error
 
         connect_timeout = float(self.bitrix_connect_timeout.value())
         read_timeout = float(self.bitrix_read_timeout.value())
@@ -1746,7 +1746,7 @@ class SettingsWindow(QDialog):
             )
             return
 
-        from .litellm_client import LiteLLMClient, LiteLLMError
+        from ..litellm_client import LiteLLMClient, LiteLLMError
 
         connect_timeout = float(
             self.sum_litellm_connect_timeout.value()
@@ -2703,7 +2703,7 @@ class SettingsWindow(QDialog):
 
         # --- Скрам ---
         scrum = cfg.get("scrum", {})
-        from .config_manager import DEFAULT_SCRUM_PROMPT
+        from ..config_manager import DEFAULT_SCRUM_PROMPT
         self.scrum_template_edit.setPlainText(
             scrum.get("prompt_template", DEFAULT_SCRUM_PROMPT)
         )

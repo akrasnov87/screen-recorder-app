@@ -9,16 +9,16 @@
   • POST /api/v1/records
   • GET  /api/v1/records/{id}
   • PATCH /api/v1/records/{id}
-  • DELETE /api/v1/records/{id}
+  • DELETE /api/v1/records/{id}                      ← ЗАБЛОКИРОВАНО
   • GET  /api/v1/records/{id}/video-url
   • PUT  /api/v1/records/{id}/video-url
   • GET  /api/v1/records/{id}/artifacts
   • GET  /api/v1/records/{id}/artifacts/{filename}
-  • HEAD /api/v1/records/{id}/artifacts/{filename}   ← проверка перед загрузкой
-  • POST /api/v1/records/{id}/artifacts/check        ← пакетная проверка
+  • HEAD /api/v1/records/{id}/artifacts/{filename}
+  • POST /api/v1/records/{id}/artifacts/check
   • POST /api/v1/records/{id}/artifacts
-  • DELETE /api/v1/records/{id}/artifacts/{filename}
-  • DELETE /api/v1/records/{id}/artifacts
+  • DELETE /api/v1/records/{id}/artifacts/{filename} ← ЗАБЛОКИРОВАНО
+  • DELETE /api/v1/records/{id}/artifacts            ← не реализовано
   • GET  /api/v1/records/{id}/transcript
   • GET  /api/v1/records/{id}/summary
   • GET  /api/v1/records/_/search
@@ -36,6 +36,12 @@
     skip_if_hash_matches: если True — сначала спрашивает сервер
     через HEAD, и если файл уже есть с таким же хэшем — не
     отправляет его.
+
+  • ДОБАВЛЕН ПРЕДОХРАНИТЕЛЬ: удаление данных на сервере
+    запрещено политикой приложения. Флаг _DELETE_ALLOWED_ON_SERVER
+    в начале файла. Пока он False — методы delete_record() и
+    delete_artifact() не отправляют запрос, а сразу бросают
+    ScrecError. Это защищает от случайного вызова в будущем.
 """
 from __future__ import annotations
 
@@ -52,6 +58,17 @@ import aiohttp
 from .logger import get_logger
 
 log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ПРЕДОХРАНИТЕЛЬ: удаление данных на сервере запрещено.
+#
+# Если когда-нибудь потребуется разрешить удаление (например,
+# отдельной утилитой администратора), установите True осознанно.
+# Пока флаг False — методы delete_record() и delete_artifact()
+# не отправляют HTTP-запрос, а сразу бросают ScrecError.
+# ---------------------------------------------------------------------------
+_DELETE_ALLOWED_ON_SERVER: bool = False
 
 
 class ScrecError(RuntimeError):
@@ -103,8 +120,10 @@ class ScrecClient:
         self._session: Optional[aiohttp.ClientSession] = None
 
         log.debug(
-            "ScrecClient создан: base_url=%s, connect=%.1f, read=%.1f",
+            "ScrecClient создан: base_url=%s, connect=%.1f, read=%.1f, "
+            "delete_allowed=%s",
             self.base_url, self._connect_timeout, self._read_timeout,
+            _DELETE_ALLOWED_ON_SERVER,
         )
 
     # ------------------------------------------------------------------
@@ -403,9 +422,38 @@ class ScrecClient:
             context=f"patch_record({record_id})",
         )
 
+    # ------------------------------------------------------------------
+    # УДАЛЕНИЕ — ЗАБЛОКИРОВАНО
+    # ------------------------------------------------------------------
     async def delete_record(
         self, record_id: str, hard: bool = False
     ) -> Dict[str, Any]:
+        """
+        DELETE /api/v1/records/{id} — удалить запись.
+
+        ⚠️  ВНИМАНИЕ: этот метод необратимо удаляет запись
+        на сервере (а также её артефакты, если hard=True).
+
+        В текущем приложении метод ЗАБЛОКИРОВАН флагом
+        _DELETE_ALLOWED_ON_SERVER. Пока флаг False — вызов
+        завершается ScrecError, и HTTP-запрос НЕ уходит.
+
+        Чтобы разрешить удаление, установите
+        _DELETE_ALLOWED_ON_SERVER = True в начале этого модуля —
+        осознанно, например для отдельной утилиты администратора.
+        """
+        if not _DELETE_ALLOWED_ON_SERVER:
+            msg = (
+                "Удаление записей на сервере запрещено политикой "
+                "приложения (см. _DELETE_ALLOWED_ON_SERVER в "
+                "screc_client.py)."
+            )
+            log.warning(
+                "delete_record(%s, hard=%s) заблокировано: %s",
+                record_id, hard, msg,
+            )
+            raise ScrecError(msg)
+
         return await self._request_json(
             "DELETE",
             f"/api/v1/records/{record_id}",
@@ -413,6 +461,40 @@ class ScrecClient:
             context=f"delete_record({record_id})",
         )
 
+    async def delete_artifact(
+        self, record_id: str, filename: str
+    ) -> Dict[str, Any]:
+        """
+        DELETE /api/v1/records/{id}/artifacts/{filename} —
+        удалить один артефакт.
+
+        ⚠️  ВНИМАНИЕ: необратимо удаляет файл на сервере.
+
+        В текущем приложении метод ЗАБЛОКИРОВАН флагом
+        _DELETE_ALLOWED_ON_SERVER. Пока флаг False — вызов
+        завершается ScrecError, и HTTP-запрос НЕ уходит.
+        """
+        if not _DELETE_ALLOWED_ON_SERVER:
+            msg = (
+                "Удаление артефактов на сервере запрещено политикой "
+                "приложения (см. _DELETE_ALLOWED_ON_SERVER в "
+                "screc_client.py)."
+            )
+            log.warning(
+                "delete_artifact(%s, %r) заблокировано: %s",
+                record_id, filename, msg,
+            )
+            raise ScrecError(msg)
+
+        return await self._request_json(
+            "DELETE",
+            f"/api/v1/records/{record_id}/artifacts/{quote(filename)}",
+            context=f"delete_artifact({filename})",
+        )
+
+    # ------------------------------------------------------------------
+    # Видео
+    # ------------------------------------------------------------------
     async def get_video_url(self, record_id: str) -> Dict[str, Any]:
         return await self._request_json(
             "GET",
@@ -799,15 +881,9 @@ class ScrecClient:
             )
             raise ScrecError(f"upload_artifact({file_path}): {exc}")
 
-    async def delete_artifact(
-        self, record_id: str, filename: str
-    ) -> Dict[str, Any]:
-        return await self._request_json(
-            "DELETE",
-            f"/api/v1/records/{record_id}/artifacts/{quote(filename)}",
-            context=f"delete_artifact({filename})",
-        )
-
+    # ------------------------------------------------------------------
+    # Транскрипт и summary
+    # ------------------------------------------------------------------
     async def get_transcript(self, record_id: str) -> str:
         return await self._request_json(
             "GET",

@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from .logger import get_logger
+from ..logger import get_logger
 from .tooltips import attach_tooltip, make_info_icon, with_info
 
 log = get_logger(__name__)

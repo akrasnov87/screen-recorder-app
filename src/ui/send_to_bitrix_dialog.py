@@ -28,11 +28,11 @@ from PySide6.QtWidgets import (
     QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from .bitrix_client import Bitrix24Client, Bitrix24Error
-from .file_readers import read_any_text
-from .logger import get_logger
-from .markdown_docx import markdown_to_docx
-from .markdown_to_bitrix import (
+from ..bitrix_client import Bitrix24Client, Bitrix24Error
+from ..file_readers import read_any_text
+from ..logger import get_logger
+from ..markdown_docx import markdown_to_docx
+from ..markdown_to_bitrix import (
     markdown_to_bitrix,
     markdown_to_plain,
     markdown_to_plain_with_bb,

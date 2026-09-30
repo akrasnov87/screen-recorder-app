@@ -16,14 +16,14 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-from .logger import get_logger
+from ..logger import get_logger
 
 log = get_logger(__name__)
 
 
 def _icon_path(name: str) -> str:
     base = os.path.join(
-        os.path.dirname(__file__), "..", "resources", "icons"
+        os.path.dirname(__file__), "..", "..", "resources", "icons"
     )
     for ext in (".svg", ".png"):
         p = os.path.join(base, name + ext)

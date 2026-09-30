@@ -28,11 +28,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .file_readers import read_json_file
-from .logger import get_logger
-from .screc_client import ScrecClient, ScrecError
-from .sync_manager import (
-    SyncManager, get_record_id, is_record_published,
+from ..file_readers import read_json_file
+from ..logger import get_logger
+from ..screc_client import ScrecClient, ScrecError
+from ..sync_manager import (
+    SyncManager,
+    get_record_id,
+    is_record_published,
 )
 from .tooltips import attach_tooltip, make_info_icon
 
