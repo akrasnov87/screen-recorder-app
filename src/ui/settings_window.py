@@ -1153,6 +1153,8 @@ class SettingsWindow(QDialog):
             "Удалять локальные аудио/видео после публикации "
             "(старое поведение)"
         )
+        self.sync_delete_media_check.setVisible(False)
+        self.sync_delete_media_check.setChecked(False)
         attach_tooltip(
             self.sync_delete_media_check,
             "sync_allow_delete_local_media_after_upload",
