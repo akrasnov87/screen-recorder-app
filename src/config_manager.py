@@ -9,7 +9,17 @@
       – delete_local_on_server_delete — удалять ли локальную папку
         при delete на сервере;
       – force_overwrite_on_download — перезаписывать ли локальные
-        артефакты при скачивании (умная стратегия по sha256).
+        артефакты при скачивании (умная стратегия по sha256);
+      – use_hash_check — использовать ли условную загрузку
+        (HEAD/POST check) перед отправкой файла, чтобы не гонять
+        по сети то, что уже есть на сервере.
+  • Секция config["app"] дополнена ключами для встроенного плеера:
+      – media_prefer_builtin_player — использовать встроенный плеер;
+      – media_auto_download_from_server — авто-скачивание медиа с
+        сервера, если файла нет локально;
+      – media_download_timeout — таймаут скачивания медиа (сек);
+      – media_player_window_width — ширина окна плеера;
+      – media_player_window_height — высота окна плеера.
 """
 from __future__ import annotations
 
@@ -230,6 +240,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # (работает только если send_media_to_server = True и
         # сервер подтвердил загрузку).
         "delete_local_media_after_media_upload": False,
+        # NEW: использовать условную загрузку (HEAD/POST check)
+        # перед отправкой файла. Если включено — клиент сначала
+        # спрашивает сервер, нужно ли грузить файл, и не тратит
+        # трафик зря.
+        "use_hash_check": True,
         "retry_count": 3,
         "retry_delay": 2.0,
     },
@@ -256,6 +271,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "search_default_max_prompt_hits": 100,
         "fuzzy_max_word_distance": 200,
         "search_cancel_wait_ms": 3000,
+        # --- встроенный плеер и скачивание медиа ---
+        "media_prefer_builtin_player": True,
+        "media_auto_download_from_server": True,
+        "media_download_timeout": 600,
+        "media_player_window_width": 960,
+        "media_player_window_height": 640,
     },
 }
 
@@ -873,6 +894,9 @@ class ConfigManager:
                     "delete_local_media_after_media_upload", False
                 )
             ),
+            "use_hash_check": bool(
+                cfg.get("use_hash_check", True)
+            ),
             "retry_count": int(cfg.get("retry_count", 3)),
             "retry_delay": float(cfg.get("retry_delay", 2.0)),
         }
@@ -898,6 +922,7 @@ class ConfigManager:
             "force_overwrite_on_download",
             "send_media_to_server",
             "delete_local_media_after_media_upload",
+            "use_hash_check",
             "retry_count", "retry_delay",
         ):
             if key in settings:
@@ -908,13 +933,14 @@ class ConfigManager:
             "Настройки синхронизации сохранены: enabled=%s, "
             "base_url=%r, auto_upload=%s, auto_pull=%s, "
             "send_media=%s, delete_local_on_delete=%s, "
-            "force_overwrite=%s",
+            "force_overwrite=%s, use_hash_check=%s",
             cfg.get("enabled"), cfg.get("base_url"),
             cfg.get("auto_upload_after_processing"),
             cfg.get("auto_pull_enabled"),
             cfg.get("send_media_to_server"),
             cfg.get("delete_local_on_server_delete"),
             cfg.get("force_overwrite_on_download"),
+            cfg.get("use_hash_check"),
         )
 
     def is_sync_enabled(self) -> bool:

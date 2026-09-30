@@ -9,7 +9,17 @@
       – «Передавать видео и аудио на сервер» (send_media_to_server);
       – «Удалять локальные медиа после загрузки на сервер»
         (delete_local_media_after_media_upload);
-      – «Макс. размер артефакта» до 10240 МБ.
+      – «Макс. размер артефакта» до 10240 МБ;
+      – «Использовать условную загрузку (HEAD/check)»
+        (use_hash_check) — экономит трафик, не отправляя файлы,
+        которые уже есть на сервере с таким же хэшем.
+  • На вкладке «Запись» добавлен блок «Встроенный плеер и
+    скачивание медиа»:
+      – media_prefer_builtin_player;
+      – media_auto_download_from_server;
+      – media_download_timeout;
+      – media_player_window_width;
+      – media_player_window_height.
 """
 from __future__ import annotations
 
@@ -33,6 +43,7 @@ from PySide6.QtWidgets import (
 
 from .config_manager import ConfigManager, DEFAULT_NAME_TEMPLATES
 from .logger import get_current_log_path, get_logger
+from .media_player import probe_media_support
 from .screc_client import ScrecClient, ScrecError
 from .sync_window import SyncWindow
 from .tooltips import attach_tooltip, make_info_icon, with_info
@@ -51,7 +62,7 @@ class SettingsWindow(QDialog):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.config_manager = config
+        self.config_manager = config        
         self.setWindowTitle("Настройки Screen Recorder")
         self.setMinimumSize(1000, 820)
         self.setModal(True)
@@ -1107,6 +1118,17 @@ class SettingsWindow(QDialog):
         )
         behavior_form.addRow("", self.sync_send_media_check)
 
+        # NEW: условная загрузка (HEAD/check)
+        self.sync_use_hash_check_check = QCheckBox(
+            "Использовать условную загрузку (HEAD/check) — "
+            "экономить трафик"
+        )
+        attach_tooltip(
+            self.sync_use_hash_check_check, "sync_use_hash_check"
+        )
+        self.sync_use_hash_check_check.setChecked(True)
+        behavior_form.addRow("", self.sync_use_hash_check_check)
+
         # NEW: удалять локальные медиа после загрузки
         self.sync_delete_media_after_upload_check = QCheckBox(
             "Удалять локальные видео/аудио после успешной "
@@ -1902,7 +1924,10 @@ class SettingsWindow(QDialog):
     # ------------------------------------------------------------------
     def _build_recording_tab(self) -> QWidget:
         w = QWidget()
-        layout = QFormLayout(w)
+        layout = QVBoxLayout(w)
+
+        # --- Блок «Запись» ---
+        main_form = QFormLayout()
 
         self.monitor_combo = QComboBox()
         for m in get_system_monitors():
@@ -1951,24 +1976,24 @@ class SettingsWindow(QDialog):
             self.start_notification_check, "start_notification"
         )
 
-        layout.addRow(
+        main_form.addRow(
             "Монитор:",
             with_info(self.monitor_combo, "monitor"),
         )
-        layout.addRow("", self.mic_check)
-        layout.addRow("", self.watermark_check)
-        layout.addRow(
+        main_form.addRow("", self.mic_check)
+        main_form.addRow("", self.watermark_check)
+        main_form.addRow(
             "Горячая клавиша старт/пауза:",
             with_info(self.hotkey_start_input, "hotkey_start"),
         )
-        layout.addRow(
+        main_form.addRow(
             "Горячая клавиша стоп:",
             with_info(self.hotkey_stop_input, "hotkey_stop"),
         )
-        layout.addRow("", self.metadata_on_start_check)
-        layout.addRow("", self.metadata_on_stop_check)
-        layout.addRow("", self.overlay_panel_check)
-        layout.addRow("", self.start_notification_check)
+        main_form.addRow("", self.metadata_on_start_check)
+        main_form.addRow("", self.metadata_on_stop_check)
+        main_form.addRow("", self.overlay_panel_check)
+        main_form.addRow("", self.start_notification_check)
 
         self.ffmpeg_start_check_delay = QDoubleSpinBox()
         self.ffmpeg_start_check_delay.setRange(0.05, 5.0)
@@ -1987,21 +2012,21 @@ class SettingsWindow(QDialog):
         self.ffmpeg_kill_timeout.setSuffix(" сек")
         self.ffmpeg_kill_timeout.setValue(5)
 
-        layout.addRow(
+        main_form.addRow(
             "Задержка проверки ffmpeg:",
             with_info(
                 self.ffmpeg_start_check_delay,
                 "app_ffmpeg_start_check_delay",
             ),
         )
-        layout.addRow(
+        main_form.addRow(
             "Таймаут остановки ffmpeg:",
             with_info(
                 self.ffmpeg_stop_timeout,
                 "app_ffmpeg_stop_timeout",
             ),
         )
-        layout.addRow(
+        main_form.addRow(
             "Таймаут SIGKILL:",
             with_info(
                 self.ffmpeg_kill_timeout,
@@ -2019,14 +2044,14 @@ class SettingsWindow(QDialog):
         self.overlay_log_lines.setRange(1, 50)
         self.overlay_log_lines.setValue(5)
 
-        layout.addRow(
+        main_form.addRow(
             "Панель: скрывать через:",
             with_info(
                 self.overlay_hide_delay_ms,
                 "app_overlay_hide_delay_ms",
             ),
         )
-        layout.addRow(
+        main_form.addRow(
             "Панель: строк лога:",
             with_info(
                 self.overlay_log_lines,
@@ -2034,6 +2059,98 @@ class SettingsWindow(QDialog):
             ),
         )
 
+        layout.addLayout(main_form)
+
+        # --- Блок «Встроенный плеер и скачивание медиа» ---
+        player_header = QHBoxLayout()
+        player_header.addWidget(
+            QLabel("<b>Встроенный плеер и скачивание медиа</b>")
+        )
+        player_header.addStretch()
+        player_header.addWidget(
+            make_info_icon("app_media_prefer_builtin_player")
+        )
+        layout.addLayout(player_header)
+
+        player_hint = QLabel(
+            "<span style='color:#666'>Настройки воспроизведения "
+            "видео и аудио из окна «Записи». Встроенный плеер "
+            "(Qt Multimedia) не зависит от системного VLC и "
+            "работает даже в snap-окружении.</span>"
+        )
+        player_hint.setWordWrap(True)
+        layout.addWidget(player_hint)
+
+        player_form = QFormLayout()
+
+        self.media_prefer_builtin_check = QCheckBox(
+            "Использовать встроенный плеер для видео и аудио"
+        )
+        attach_tooltip(
+            self.media_prefer_builtin_check,
+            "app_media_prefer_builtin_player",
+        )
+        player_form.addRow("", self.media_prefer_builtin_check)
+
+        self.media_auto_download_check = QCheckBox(
+            "Автоматически скачивать медиа с сервера, если файла "
+            "нет локально"
+        )
+        attach_tooltip(
+            self.media_auto_download_check,
+            "app_media_auto_download_from_server",
+        )
+        player_form.addRow("", self.media_auto_download_check)
+
+        self.media_download_timeout = QSpinBox()
+        self.media_download_timeout.setRange(30, 24 * 3600)
+        self.media_download_timeout.setSingleStep(30)
+        self.media_download_timeout.setSuffix(" сек")
+        self.media_download_timeout.setValue(600)
+        player_form.addRow(
+            "Таймаут скачивания медиа:",
+            with_info(
+                self.media_download_timeout,
+                "app_media_download_timeout",
+            ),
+        )
+
+        self.media_player_width = QSpinBox()
+        self.media_player_width.setRange(320, 3840)
+        self.media_player_width.setSuffix(" px")
+        self.media_player_width.setValue(960)
+        player_form.addRow(
+            "Ширина окна плеера:",
+            with_info(
+                self.media_player_width,
+                "app_media_player_window_width",
+            ),
+        )
+
+        self.media_player_height = QSpinBox()
+        self.media_player_height.setRange(240, 2160)
+        self.media_player_height.setSuffix(" px")
+        self.media_player_height.setValue(640)
+        player_form.addRow(
+            "Высота окна плеера:",
+            with_info(
+                self.media_player_height,
+                "app_media_player_window_height",
+            ),
+        )
+
+        layout.addLayout(player_form)
+
+        # --- Статус встроенного плеера ---
+        status_str = probe_media_support()
+        self.player_status_label = QLabel(
+            f"<span style='color:#666'>Статус: </span>"
+            f"<span style='color:#444'>{status_str}</span>"
+        )
+        self.player_status_label.setWordWrap(True)
+        layout.addWidget(self.player_status_label)
+
+        layout.addStretch()
         return w
 
     # ------------------------------------------------------------------
@@ -2397,6 +2514,9 @@ class SettingsWindow(QDialog):
         self.sync_send_media_check.setChecked(
             bool(sync.get("send_media_to_server", False))
         )
+        self.sync_use_hash_check_check.setChecked(
+            bool(sync.get("use_hash_check", True))
+        )
         self.sync_delete_media_after_upload_check.setChecked(
             bool(
                 sync.get(
@@ -2549,6 +2669,23 @@ class SettingsWindow(QDialog):
             int(app_cfg.get("overlay_log_lines", 5))
         )
 
+        # --- встроенный плеер / скачивание медиа ---
+        self.media_prefer_builtin_check.setChecked(
+            bool(app_cfg.get("media_prefer_builtin_player", True))
+        )
+        self.media_auto_download_check.setChecked(
+            bool(app_cfg.get("media_auto_download_from_server", True))
+        )
+        self.media_download_timeout.setValue(
+            int(app_cfg.get("media_download_timeout", 600))
+        )
+        self.media_player_width.setValue(
+            int(app_cfg.get("media_player_window_width", 960))
+        )
+        self.media_player_height.setValue(
+            int(app_cfg.get("media_player_window_height", 640))
+        )
+
         # --- Очередь ---
         q = cfg.get("queue", {})
         self.auto_retry_check.setChecked(
@@ -2627,19 +2764,22 @@ class SettingsWindow(QDialog):
             "Настройки загружены в окно: projects=%d, "
             "default_project=%r, default_chat_id=%r, "
             "tags=%d, employees=%d, prompts=%d, "
-            "sync_enabled=%s, sync_url=%r, send_media=%s",
+            "sync_enabled=%s, sync_url=%r, send_media=%s, "
+            "media_prefer_builtin=%s, use_hash_check=%s",
             len(projects), default_project,
             self.config_manager.get_default_chat_id(),
             len(tags), len(employees), len(prompts),
             sync.get("enabled"), sync.get("base_url"),
             sync.get("send_media_to_server"),
+            self.media_prefer_builtin_check.isChecked(),
+            self.sync_use_hash_check_check.isChecked(),
         )
 
     def _apply_form_to_config(self) -> Dict[str, Any]:
         """Собирает значения из формы в self.config_manager.config."""
         cfg = self.config_manager.config
 
-        # --- Проекты ---
+        # --- Проекты ---        
         projects: List[Dict[str, str]] = []
         for row in range(self.projects_table.rowCount()):
             name_item = self.projects_table.item(row, 0)
@@ -2746,6 +2886,9 @@ class SettingsWindow(QDialog):
             ),
             "send_media_to_server": (
                 self.sync_send_media_check.isChecked()
+            ),
+            "use_hash_check": (
+                self.sync_use_hash_check_check.isChecked()
             ),
             "delete_local_media_after_media_upload": (
                 self.sync_delete_media_after_upload_check.isChecked()
@@ -2945,6 +3088,22 @@ class SettingsWindow(QDialog):
         app_cfg["overlay_log_lines"] = int(
             self.overlay_log_lines.value()
         )
+        # --- встроенный плеер / скачивание медиа ---
+        app_cfg["media_prefer_builtin_player"] = (
+            self.media_prefer_builtin_check.isChecked()
+        )
+        app_cfg["media_auto_download_from_server"] = (
+            self.media_auto_download_check.isChecked()
+        )
+        app_cfg["media_download_timeout"] = int(
+            self.media_download_timeout.value()
+        )
+        app_cfg["media_player_window_width"] = int(
+            self.media_player_width.value()
+        )
+        app_cfg["media_player_window_height"] = int(
+            self.media_player_height.value()
+        )
 
         return cfg
 
@@ -2956,7 +3115,8 @@ class SettingsWindow(QDialog):
             log.info(
                 "Настройки сохранены: projects=%d, "
                 "default_project=%r, default_chat_id=%r, tags=%d, "
-                "sync_enabled=%s, sync_url=%r, send_media=%s",
+                "sync_enabled=%s, sync_url=%r, send_media=%s, "
+                "media_prefer_builtin=%s, use_hash_check=%s",
                 len(cfg.get("projects", [])),
                 cfg.get("default_project"),
                 cfg.get("default_chat_id"),
@@ -2964,6 +3124,10 @@ class SettingsWindow(QDialog):
                 cfg.get("sync", {}).get("enabled"),
                 cfg.get("sync", {}).get("base_url"),
                 cfg.get("sync", {}).get("send_media_to_server"),
+                cfg.get("app", {}).get(
+                    "media_prefer_builtin_player"
+                ),
+                cfg.get("sync", {}).get("use_hash_check"),
             )
 
             current = get_current_log_path()
@@ -3381,6 +3545,14 @@ class SettingsWindow(QDialog):
             "(<code>kind=video</code> / <code>kind=audio</code>). "
             "При скачивании записи на другом устройстве они "
             "вернутся как <code>video.&lt;ext&gt;</code>.<br><br>"
+            "<b>Условная загрузка (HEAD/check).</b> Если "
+            "включена галочка «Использовать условную загрузку», "
+            "клиент перед отправкой файла спрашивает сервер "
+            "(через HEAD или POST /check), нужно ли грузить "
+            "файл. Если файл уже есть с таким же SHA-256 — "
+            "содержимое НЕ отправляется по сети. Это экономит "
+            "трафик при повторной публикации (например, "
+            "268 МБ видео не уйдут второй раз).<br><br>"
             "Ограничения:<br>"
             "• Медиафайл не может превышать <b>«Макс. размер "
             "артефакта»</b> (и <code>SCREC_MAX_ARTIFACT_MB</code> "
@@ -3410,7 +3582,16 @@ class SettingsWindow(QDialog):
             "<b>Глоссарий терминов</b>"
         ),
         "Запись": (
-            "<b>Запись экрана</b>"
+            "<b>Запись экрана</b><br><br>"
+            "Параметры записи экрана и встроенного плеера.<br><br>"
+            "<b>Встроенный плеер</b> — используется для просмотра "
+            "видео и прослушивания аудио из окна «Записи» без "
+            "зависимости от системного VLC. Если видеоплеер "
+            "недоступен (нет QtMultimedia или GStreamer-плагинов), "
+            "медиа откроется системным приложением.<br><br>"
+            "<b>Автоскачивание медиа</b> — если файла нет локально, "
+            "но запись опубликована на сервере, можно скачать его "
+            "прямо в окне «Записи» перед воспроизведением."
         ),
         "Очередь": (
             "<b>Очередь задач</b>"

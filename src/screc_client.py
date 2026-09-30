@@ -1,6 +1,6 @@
 """Клиент к удалённому серверу синхронизации screc-server.
 
-Реализует API из DOCS.md (v1.0.0):
+Реализует API из DOCS.md (v1.1.0):
   • GET  /health
   • GET  /api/v1/tree
   • GET  /api/v1/tree/{project}
@@ -14,8 +14,11 @@
   • PUT  /api/v1/records/{id}/video-url
   • GET  /api/v1/records/{id}/artifacts
   • GET  /api/v1/records/{id}/artifacts/{filename}
+  • HEAD /api/v1/records/{id}/artifacts/{filename}   ← проверка перед загрузкой
+  • POST /api/v1/records/{id}/artifacts/check        ← пакетная проверка
   • POST /api/v1/records/{id}/artifacts
   • DELETE /api/v1/records/{id}/artifacts/{filename}
+  • DELETE /api/v1/records/{id}/artifacts
   • GET  /api/v1/records/{id}/transcript
   • GET  /api/v1/records/{id}/summary
   • GET  /api/v1/records/_/search
@@ -24,10 +27,20 @@
 
 Клиент полностью асинхронный (aiohttp), поддерживает потоковую
 загрузку и скачивание артефактов.
+
+Изменения:
+  • Добавлены методы check_artifact() и check_artifacts_batch() —
+    позволяют перед отправкой файла узнать, нужно ли его
+    загружать (условная загрузка, см. §7.6 документации).
+  • upload_artifact_path() теперь принимает параметр
+    skip_if_hash_matches: если True — сначала спрашивает сервер
+    через HEAD, и если файл уже есть с таким же хэшем — не
+    отправляет его.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -53,6 +66,19 @@ class ScrecError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+def _sha256_file(path: str) -> str:
+    """Вычисляет SHA-256 хэш файла."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception as exc:
+        log.warning("Не удалось посчитать sha256 для %s: %s", path, exc)
+        return ""
 
 
 class ScrecClient:
@@ -256,6 +282,7 @@ class ScrecClient:
         self,
         payload: Dict[str, Any],
         artifacts: Optional[List[Tuple[str, str]]] = None,
+        artifact_hashes: Optional[Dict[str, str]] = None,
         *,
         artifact_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -267,23 +294,27 @@ class ScrecClient:
             artifacts:    список пар (kind, filename). Файлы ищутся
                           в artifact_dir (или берутся как абсолютные
                           пути, если filename — полный путь).
+            artifact_hashes: словарь {filename: sha256_hash}, где
+                          filename — basename файла.
             artifact_dir: папка сессии, где лежат артефакты.
 
         Returns:
             {"id": ..., "revision": ..., "action": ...,
-             "path": ..., "artifacts": [...]}
+             "path": ..., "artifacts": [...],
+             "skipped_artifacts": [...], "uploaded_artifacts": [...]}
         """
         if self._session is None:
             raise ScrecError("aiohttp-сессия не открыта")
 
         url = f"{self.base_url}/api/v1/records"
         artifacts = artifacts or []
+        artifact_hashes = artifact_hashes or {}
 
         log.info(
             "ScrecClient.publish_record: project=%r, folder=%r, "
-            "artifacts=%d",
+            "artifacts=%d, hashes=%d",
             payload.get("project"), payload.get("folder_name"),
-            len(artifacts),
+            len(artifacts), len(artifact_hashes),
         )
 
         form = aiohttp.FormData()
@@ -317,6 +348,9 @@ class ScrecClient:
                 )
                 form.add_field("kinds", kind)
 
+                sha = artifact_hashes.get(os.path.basename(full_path), "")
+                form.add_field("sha256", sha)
+
             async with self._session.post(
                 url, data=form, headers=self._headers()
             ) as resp:
@@ -333,9 +367,11 @@ class ScrecClient:
                 data = await resp.json()
                 log.info(
                     "ScrecClient.publish_record: OK id=%s, "
-                    "action=%s, revision=%s",
+                    "action=%s, revision=%s, uploaded=%d, skipped=%d",
                     data.get("id"), data.get("action"),
                     data.get("revision"),
+                    len(data.get("uploaded_artifacts", [])),
+                    len(data.get("skipped_artifacts", [])),
                 )
                 return data
         except ScrecError:
@@ -481,6 +517,168 @@ class ScrecClient:
             )
             raise ScrecError(f"download_artifact({filename}): {exc}")
 
+    # ------------------------------------------------------------------
+    # Условная загрузка: проверка перед отправкой
+    # ------------------------------------------------------------------
+    async def check_artifact(
+        self,
+        record_id: str,
+        filename: str,
+        sha256: str,
+    ) -> Dict[str, Any]:
+        """
+        HEAD /api/v1/records/{id}/artifacts/{filename} — спросить
+        сервер, нужно ли загружать файл. Файл при этом НЕ
+        отправляется.
+
+        Args:
+            record_id: ID записи.
+            filename:  имя файла (basename).
+            sha256:    SHA-256 клиента (hex-нижний регистр).
+
+        Returns:
+            {
+              "skip": bool,             # True — файл есть, хэш совпал
+              "exists": bool,           # файл есть на сервере
+              "sha256": str,            # хэш существующего файла
+              "size": int,
+              "kind": str,
+              "status_code": int,       # 200 или 404
+            }
+        """
+        if self._session is None:
+            raise ScrecError("aiohttp-сессия не открыта")
+
+        url = (
+            f"{self.base_url}/api/v1/records/{record_id}/artifacts/"
+            f"{quote(filename)}"
+        )
+
+        headers = self._headers()
+        if sha256:
+            headers["X-Content-SHA256"] = sha256
+
+        log.debug(
+            "check_artifact: record=%s, filename=%r, sha=%s",
+            record_id, filename, sha256[:12] if sha256 else "—",
+        )
+
+        try:
+            async with self._session.head(
+                url, headers=headers, allow_redirects=True,
+            ) as resp:
+                if resp.status >= 500:
+                    body = await self._read_body(resp)
+                    msg = (
+                        f"check_artifact({filename}): HTTP "
+                        f"{resp.status} — {body}"
+                    )
+                    log.error(msg)
+                    raise ScrecError(
+                        msg, status=resp.status, body=body
+                    )
+
+                info = {
+                    "skip": False,
+                    "exists": False,
+                    "sha256": "",
+                    "size": 0,
+                    "kind": "",
+                    "status_code": resp.status,
+                }
+
+                if resp.status == 200:
+                    info["exists"] = True
+                    info["skip"] = (
+                        resp.headers.get("X-Artifact-Skip") == "true"
+                    )
+                    info["sha256"] = (
+                        resp.headers.get("X-Artifact-SHA256") or ""
+                    )
+                    try:
+                        info["size"] = int(
+                            resp.headers.get("X-Artifact-Size") or 0
+                        )
+                    except (TypeError, ValueError):
+                        info["size"] = 0
+                    info["kind"] = (
+                        resp.headers.get("X-Artifact-Kind") or ""
+                    )
+
+                log.debug(
+                    "check_artifact: %s → exists=%s, skip=%s, "
+                    "server_sha=%s",
+                    filename, info["exists"], info["skip"],
+                    info["sha256"][:12] if info["sha256"] else "—",
+                )
+                return info
+        except ScrecError:
+            raise
+        except aiohttp.ClientConnectorError as exc:
+            msg = f"check_artifact: ошибка подключения к {url}: {exc}"
+            log.error(msg)
+            raise ScrecError(msg)
+        except aiohttp.ServerTimeoutError:
+            msg = (
+                f"check_artifact: таймаут ({self._read_timeout:.0f} с)"
+            )
+            log.error(msg)
+            raise ScrecError(msg)
+        except Exception as exc:
+            log.exception("check_artifact: ошибка: %s", exc)
+            raise ScrecError(f"check_artifact: {exc}")
+
+    async def check_artifacts_batch(
+        self,
+        record_id: str,
+        items: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """
+        POST /api/v1/records/{id}/artifacts/check — пакетная
+        проверка нескольких файлов одним запросом.
+
+        Args:
+            record_id: ID записи.
+            items:     список [{"filename": str, "sha256": str}, ...]
+
+        Returns:
+            {
+              "id": str,
+              "results": [
+                {"filename": str, "sha256": str, "skip": bool,
+                 "reason": str, "size": int, "kind": str},
+                ...
+              ],
+            }
+        """
+        if self._session is None:
+            raise ScrecError("aiohttp-сессия не открыта")
+
+        if not items:
+            return {"id": record_id, "results": []}
+
+        log.debug(
+            "check_artifacts_batch: record=%s, items=%d",
+            record_id, len(items),
+        )
+
+        result = await self._request_json(
+            "POST",
+            f"/api/v1/records/{record_id}/artifacts/check",
+            json_body={"artifacts": items},
+            context=f"check_artifacts_batch({record_id})",
+        )
+
+        results = result.get("results") or []
+        skipped = sum(1 for r in results if r.get("skip"))
+        log.info(
+            "check_artifacts_batch: record=%s — проверено %d, "
+            "skip=%d, upload=%d",
+            record_id, len(results), skipped,
+            len(results) - skipped,
+        )
+        return result
+
     async def upload_artifact_path(
         self,
         record_id: str,
@@ -488,20 +686,22 @@ class ScrecClient:
         file_path: str,
         *,
         progress_cb: Optional[Any] = None,
+        skip_if_hash_matches: bool = True,
     ) -> Dict[str, Any]:
         """
         POST /api/v1/records/{id}/artifacts — загрузить артефакт.
 
-        Файл читается с диска потоково через file-like объект.
-        Для больших медиафайлов это критично.
+        Если skip_if_hash_matches=True — сначала спрашивает сервер
+        через HEAD, нужно ли загружать файл. Если файл уже есть с
+        таким же хэшем — не отправляет содержимое (экономит трафик).
 
         Args:
-            record_id:   ID записи.
-            kind:        "video" / "audio" / "attachment" / ...
-            file_path:   путь к файлу на диске.
-            progress_cb: необязательный колбэк
-                         (bytes_sent, total_bytes).
-                         total_bytes = -1, если размер неизвестен.
+            record_id:             ID записи.
+            kind:                  "video" / "audio" / "attachment" / ...
+            file_path:             путь к файлу на диске.
+            progress_cb:           необязательный колбэк.
+            skip_if_hash_matches:  если True — использовать HEAD-
+                                   проверку перед загрузкой.
         """
         if self._session is None:
             raise ScrecError("aiohttp-сессия не открыта")
@@ -516,16 +716,53 @@ class ScrecClient:
         except OSError:
             total = -1
 
+        sha = _sha256_file(file_path)
+        filename = os.path.basename(file_path)
+
+        # --- Условная загрузка: спрашиваем сервер ---
+        if skip_if_hash_matches and sha:
+            try:
+                info = await self.check_artifact(
+                    record_id, filename, sha
+                )
+                if info.get("skip"):
+                    log.info(
+                        "upload_artifact: %s (%s) пропущен — "
+                        "сервер уже имеет файл с таким хэшем "
+                        "(size=%d, server_sha=%s)",
+                        filename, kind, info.get("size", 0),
+                        info.get("sha256", "")[:12],
+                    )
+                    return {
+                        "id": record_id,
+                        "filename": filename,
+                        "size": info.get("size", 0),
+                        "sha256": info.get("sha256", sha),
+                        "skipped": True,
+                        "reason": "sha256_match",
+                    }
+            except ScrecError as exc:
+                # Если HEAD-запрос упал (например, старый сервер
+                # не поддерживает эндпоинт) — продолжаем обычную
+                # загрузку.
+                log.warning(
+                    "upload_artifact: HEAD-проверка не удалась "
+                    "(%s) — отправляем файл как обычно", exc,
+                )
+
+        # --- Отправка файла ---
         try:
             with open(file_path, "rb") as fh:
                 form = aiohttp.FormData()
                 form.add_field(
                     "file",
                     fh,
-                    filename=os.path.basename(file_path),
+                    filename=filename,
                     content_type="application/octet-stream",
                 )
                 form.add_field("kind", kind)
+                if sha:
+                    form.add_field("sha256", sha)
 
                 async with self._session.post(
                     url, data=form, headers=self._headers()
@@ -543,8 +780,9 @@ class ScrecClient:
                     data = await resp.json()
                     log.info(
                         "ScrecClient: загружен артефакт %s (%s) → "
-                        "record=%s",
-                        os.path.basename(file_path), kind, record_id,
+                        "record=%s, skipped=%s, reason=%s",
+                        filename, kind, record_id,
+                        data.get("skipped"), data.get("reason"),
                     )
                     if progress_cb is not None:
                         try:

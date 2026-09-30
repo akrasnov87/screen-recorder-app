@@ -12,6 +12,13 @@
       – колонка «Синхр.»;
       – диалог SyncOneRecordDialog с выбором передавать ли медиа,
         ссылку file://, удалять ли локальные медиа после загрузки.
+  • Добавлен встроенный медиаплеер (см. media_player.py):
+      – пункт меню «Файл → Смотреть видео» / «Прослушать аудио»;
+      – пункты контекстного меню;
+      – если медиа нет локально, но запись опубликована на сервере —
+        предлагается скачать его (SyncManager.download_media_only);
+      – поддерживается fallback на системный плеер, если встроенный
+        недоступен.
 """
 from __future__ import annotations
 
@@ -39,6 +46,9 @@ from .logger import get_logger
 from .markdown_docx import markdown_to_docx
 from .markdown_editor import MarkdownEditorDialog, MarkdownViewerDialog
 from .markdown_to_bitrix import markdown_to_plain, markdown_to_plain_with_bb
+from .media_player import (
+    is_builtin_player_available, open_media, probe_media_support,
+)
 from .metadata_dialog import MetadataDialog
 from .screc_client import ScrecError
 from .sync_manager import (
@@ -338,6 +348,54 @@ class _OneSyncWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Фоновый воркер для скачивания медиа с сервера
+# ---------------------------------------------------------------------------
+class _MediaDownloadWorker(QThread):
+    """Скачивает только медиа-артефакты записи с сервера."""
+
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        manager: SyncManager,
+        session_dir: str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._manager = manager
+        self._session_dir = session_dir
+
+    def run(self) -> None:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(
+                    self._manager.download_media_only(
+                        self._session_dir,
+                        progress_cb=self._emit_progress,
+                    )
+                )
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
+            self.finished_ok.emit(result)
+        except ScrecError as exc:
+            log.error("MediaDownloadWorker: ScrecError: %s", exc)
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            log.exception("MediaDownloadWorker: ошибка: %s", exc)
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+    def _emit_progress(self, message: str) -> None:
+        self.progress.emit(message)
+
+
+# ---------------------------------------------------------------------------
 # Диалог синхронизации одной записи
 # ---------------------------------------------------------------------------
 class SyncOneRecordDialog(QDialog):
@@ -619,10 +677,28 @@ class SessionsWindow(QDialog):
         self._thread: Optional[SessionsScanThread] = None
         self._sync_worker: Optional[_OneSyncWorker] = None
         self._sync_progress_dlg: Optional[QProgressDialog] = None
+        self._media_worker: Optional[_MediaDownloadWorker] = None
+        self._media_progress_dlg: Optional[QProgressDialog] = None
+        self._pending_media_request: Optional[Dict[str, Any]] = None
+
+        self._app_cfg: Dict[str, Any] = {}
+        if config_manager is not None:
+            try:
+                self._app_cfg = config_manager.get_app_settings()
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать app-настройки: %s", exc
+                )
 
         self._build_ui()
         self._build_menu_bar()
         self.refresh()
+
+        log.debug(
+            "SessionsWindow: встроенный плеер %s",
+            "доступен" if is_builtin_player_available()
+            else f"недоступен ({probe_media_support()})",
+        )
 
     # ------------------------------------------------------------------
     # UI
@@ -709,6 +785,24 @@ class SessionsWindow(QDialog):
 
         bottom = QHBoxLayout()
         bottom.addStretch()
+
+        self.play_video_btn = QPushButton("Смотреть видео")
+        self.play_video_btn.setToolTip(
+            "Открыть видео во встроенном плеере.\n\n"
+            "Если файла нет локально, но он есть на сервере — "
+            "будет предложено скачать его."
+        )
+        self.play_video_btn.clicked.connect(self._open_video)
+        bottom.addWidget(self.play_video_btn)
+
+        self.play_audio_btn = QPushButton("Прослушать аудио")
+        self.play_audio_btn.setToolTip(
+            "Открыть аудио во встроенном плеере.\n\n"
+            "Если файла нет локально, но он есть на сервере — "
+            "будет предложено скачать его."
+        )
+        self.play_audio_btn.clicked.connect(self._open_audio)
+        bottom.addWidget(self.play_audio_btn)
 
         self.sync_btn = QPushButton("Синхронизировать…")
         self.sync_btn.setToolTip(
@@ -828,10 +922,25 @@ class SessionsWindow(QDialog):
         act_open_folder.triggered.connect(self._open_folder)
         m_file.addAction(act_open_folder)
 
-        act_open_video = QAction("Открыть видео", self)
+        act_open_video = QAction("Смотреть видео", self)
         act_open_video.setShortcut(QKeySequence("Ctrl+Shift+V"))
+        act_open_video.setToolTip(
+            "Открыть видео во встроенном плеере.\n"
+            "Если файла нет локально, но он есть на сервере — "
+            "будет предложено скачать его."
+        )
         act_open_video.triggered.connect(self._open_video)
         m_file.addAction(act_open_video)
+
+        act_open_audio = QAction("Прослушать аудио", self)
+        act_open_audio.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        act_open_audio.setToolTip(
+            "Открыть аудио во встроенном плеере.\n"
+            "Если файла нет локально, но он есть на сервере — "
+            "будет предложено скачать его."
+        )
+        act_open_audio.triggered.connect(self._open_audio)
+        m_file.addAction(act_open_audio)
 
         m_file.addSeparator()
 
@@ -1041,8 +1150,35 @@ class SessionsWindow(QDialog):
         act_shortcuts.triggered.connect(self._show_shortcuts)
         m_help.addAction(act_shortcuts)
 
+        act_player_info = QAction("Статус встроенного плеера…", self)
+        act_player_info.setToolTip(
+            "Показать информацию о доступности встроенного плеера "
+            "(Qt Multimedia)"
+        )
+        act_player_info.triggered.connect(self._show_player_info)
+        m_help.addAction(act_player_info)
+
     def _on_import_requested(self) -> None:
         self.import_requested.emit()
+
+    def _show_player_info(self) -> None:
+        status = probe_media_support()
+        if is_builtin_player_available():
+            QMessageBox.information(
+                self, "Встроенный плеер", status,
+            )
+        else:
+            QMessageBox.warning(
+                self, "Встроенный плеер",
+                f"{status}\n\n"
+                "Медиафайлы будут открываться системным "
+                "приложением (xdg-open). Для работы встроенного "
+                "плеера установите пакет PySide6-Addons и "
+                "необходимые GStreamer-плагины:\n\n"
+                "sudo apt install python3-pyside6.qmultimedia "
+                "gstreamer1.0-plugins-good gstreamer1.0-plugins-bad "
+                "gstreamer1.0-libav",
+            )
 
     # ------------------------------------------------------------------
     # Легенда
@@ -1101,6 +1237,8 @@ class SessionsWindow(QDialog):
         if not r:
             self.selection_label.setText("")
             self.sync_btn.setEnabled(False)
+            self.play_video_btn.setEnabled(False)
+            self.play_audio_btn.setEnabled(False)
             return
 
         parts = [f"<b>{r['name']}</b>"]
@@ -1123,6 +1261,19 @@ class SessionsWindow(QDialog):
 
         # Кнопка синхронизации доступна, если есть папка сессии.
         self.sync_btn.setEnabled(bool(r.get("dir")))
+
+        # Кнопки воспроизведения: разрешены, если есть локальный файл
+        # ИЛИ запись опубликована на сервере (можно скачать).
+        has_local_video = bool(r.get("has_video"))
+        has_local_audio = bool(r.get("has_audio"))
+        is_published = bool(r.get("published"))
+
+        self.play_video_btn.setEnabled(
+            has_local_video or is_published
+        )
+        self.play_audio_btn.setEnabled(
+            has_local_audio or is_published
+        )
 
     # ------------------------------------------------------------------
     # Обновление
@@ -1277,6 +1428,297 @@ class SessionsWindow(QDialog):
                 QTableWidgetItem(r["task_id"] or "—"),
             )
             self.table.setItem(row, 11, QTableWidgetItem(r["dir"]))
+
+    # ------------------------------------------------------------------
+    # Просмотр / прослушивание медиа
+    # ------------------------------------------------------------------
+    def _open_video(self) -> None:
+        self._open_media_kind("video")
+
+    def _open_audio(self) -> None:
+        self._open_media_kind("audio")
+
+    def _open_media_kind(self, kind: str) -> None:
+        """
+        Универсальная точка входа для воспроизведения медиа.
+
+        Логика:
+          1. Найти локальный файл нужного kind.
+          2. Если локального нет, но запись опубликована —
+             предложить скачать с сервера.
+          3. Открыть встроенным плеером (или fallback).
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        local_path = ""
+        if kind == "video":
+            local_path = r.get("video_path") or ""
+        elif kind == "audio":
+            local_path = r.get("audio_path") or ""
+
+        # 1. Локальный файл есть — воспроизводим.
+        if local_path and os.path.isfile(local_path):
+            self._play_media(local_path, r, kind)
+            return
+
+        # 2. Локального нет. Проверяем, что можно скачать с сервера.
+        if not r.get("published") or not r.get("record_id"):
+            QMessageBox.information(
+                self, "Записи",
+                f"Локальный файл {'видео' if kind == 'video' else 'аудио'}"
+                f" не найден, и запись не опубликована на сервере.\n\n"
+                f"Опубликуйте запись через «Файл → Синхронизировать "
+                f"выбранную запись…» — и, если включена передача медиа "
+                f"на сервер, файл можно будет скачать.",
+            )
+            return
+
+        # 3. Запись опубликована. Спрашиваем про скачивание.
+        auto_download = bool(
+            self._app_cfg.get("media_auto_download_from_server", True)
+        )
+
+        if not auto_download:
+            reply = QMessageBox.question(
+                self, "Записи",
+                f"Локального файла нет, но запись опубликована "
+                f"на сервере.\n\n"
+                f"Скачать {'видео' if kind == 'video' else 'аудио'} "
+                f"с сервера?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        else:
+            log.info(
+                "Записи: авто-скачивание медиа (%s) для %s",
+                kind, r["name"],
+            )
+
+        self._download_and_play_media(r, kind)
+
+    def _download_and_play_media(
+        self, row: Dict[str, Any], kind: str,
+    ) -> None:
+        """Запускает скачивание медиа с сервера и воспроизведение."""
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "Записи",
+                "Нет доступа к настройкам (ConfigManager).",
+            )
+            return
+
+        if self._media_worker is not None and self._media_worker.isRunning():
+            QMessageBox.information(
+                self, "Записи",
+                "Скачивание медиа уже выполняется. "
+                "Дождитесь завершения.",
+            )
+            return
+
+        cfg = self.config_manager.get_sync_settings()
+        if not (cfg.get("enabled") and cfg.get("base_url")
+                and cfg.get("api_key")):
+            QMessageBox.warning(
+                self, "Записи",
+                "Синхронизация не настроена.\n\n"
+                "Откройте Настройки → Синхронизация.",
+            )
+            return
+
+        manager = SyncManager(
+            sessions_root=self.sessions_root,
+            sync_settings=cfg,
+            config_manager=self.config_manager,
+        )
+
+        self._pending_media_request = {
+            "row": row,
+            "kind": kind,
+        }
+
+        self._media_progress_dlg = QProgressDialog(
+            f"Скачивание медиа: {row['name']}…",
+            "Отмена",
+            0, 0, self,
+        )
+        self._media_progress_dlg.setWindowTitle("Скачивание медиа")
+        self._media_progress_dlg.setWindowModality(
+            Qt.WindowModality.WindowModal
+        )
+        self._media_progress_dlg.setMinimumDuration(0)
+        self._media_progress_dlg.setCancelButton(None)
+        self._media_progress_dlg.show()
+
+        self._media_worker = _MediaDownloadWorker(
+            manager=manager,
+            session_dir=row["dir"],
+            parent=self,
+        )
+        self._media_worker.progress.connect(self._on_media_download_progress)
+        self._media_worker.finished_ok.connect(
+            self._on_media_download_finished
+        )
+        self._media_worker.failed.connect(self._on_media_download_failed)
+        self._media_worker.finished.connect(
+            self._on_media_worker_done
+        )
+        self._media_worker.start()
+
+    def _on_media_download_progress(self, message: str) -> None:
+        if self._media_progress_dlg is not None:
+            self._media_progress_dlg.setLabelText(message)
+
+    def _on_media_download_finished(self, result: Dict[str, Any]) -> None:
+        if self._media_progress_dlg is not None:
+            self._media_progress_dlg.close()
+            self._media_progress_dlg = None
+
+        pending = self._pending_media_request
+        self._pending_media_request = None
+
+        if not pending:
+            return
+
+        row = pending["row"]
+        kind = pending["kind"]
+
+        downloaded = result.get("downloaded") or []
+        missing = result.get("missing") or []
+
+        # --- Обновляем запись, чтобы найти локальный путь ---
+        target_path = ""
+        for item in downloaded:
+            item_kind = str(item.get("kind") or "")
+            if item_kind == kind and not item.get("skipped"):
+                target_path = str(item.get("local_path") or "")
+                break
+            # Если уже был актуален — тоже подойдёт.
+            if item_kind == kind and item.get("skipped"):
+                target_path = str(item.get("local_path") or "")
+
+        if not target_path:
+            # Fallback: поищем локально ещё раз.
+            if kind == "video":
+                for ext in _VIDEO_EXTS:
+                    candidate = os.path.join(
+                        row["dir"], f"video{ext}"
+                    )
+                    if os.path.isfile(candidate):
+                        target_path = candidate
+                        break
+            elif kind == "audio":
+                for ext in _AUDIO_EXTS:
+                    candidate = os.path.join(
+                        row["dir"], f"video{ext}"
+                    )
+                    if os.path.isfile(candidate):
+                        target_path = candidate
+                        break
+
+        if not target_path or not os.path.isfile(target_path):
+            # Показываем диагностику.
+            missing_kind = next(
+                (m for m in missing if str(m.get("kind")) == kind),
+                None,
+            )
+            if missing_kind is not None:
+                reason = missing_kind.get("reason") or ""
+                QMessageBox.warning(
+                    self, "Записи",
+                    f"Не удалось получить медиа с сервера.\n\n"
+                    f"Возможные причины:\n"
+                    f"  • медиа не было передано на сервер "
+                    f"(включите «Передавать видео и аудио на сервер» "
+                    f"в Настройки → Синхронизация);\n"
+                    f"  • файл удалён с сервера.\n\n"
+                    + (f"Дополнительно: {reason}" if reason else ""),
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Записи",
+                    "Не удалось найти скачанный медиафайл.\n\n"
+                    "Возможно, на сервере нет видео/аудио для этой "
+                    "записи — включите передачу медиа в "
+                    "Настройки → Синхронизация и синхронизируйте "
+                    "запись заново.",
+                )
+            self.refresh()
+            return
+
+        # --- Воспроизводим ---
+        self._play_media(target_path, row, kind)
+        self.refresh()
+
+    def _on_media_download_failed(self, error: str) -> None:
+        if self._media_progress_dlg is not None:
+            self._media_progress_dlg.close()
+            self._media_progress_dlg = None
+        self._pending_media_request = None
+
+        log.error("Скачивание медиа не удалось: %s", error)
+        QMessageBox.critical(
+            self, "Записи",
+            f"Не удалось скачать медиа с сервера:\n\n{error}",
+        )
+
+    def _on_media_worker_done(self) -> None:
+        self._media_worker = None
+
+    def _play_media(
+        self,
+        file_path: str,
+        row: Dict[str, Any],
+        kind: str,
+    ) -> None:
+        """Открывает медиафайл в встроенном плеере или fallback."""
+        if not file_path or not os.path.isfile(file_path):
+            QMessageBox.warning(
+                self, "Записи",
+                f"Файл не найден:\n{file_path or '(путь не задан)'}",
+            )
+            return
+
+        prefer_builtin = bool(
+            self._app_cfg.get("media_prefer_builtin_player", True)
+        )
+        win_w = int(
+            self._app_cfg.get("media_player_window_width", 960)
+        )
+        win_h = int(
+            self._app_cfg.get("media_player_window_height", 640)
+        )
+
+        title = f"{row.get('name') or 'Запись'} — "
+        title += "видео" if kind == "video" else "аудио"
+
+        log.info(
+            "Воспроизведение медиа (%s): %s (builtin=%s)",
+            kind, file_path, prefer_builtin,
+        )
+
+        used_builtin = open_media(
+            file_path,
+            title=title,
+            prefer_builtin=prefer_builtin,
+            window_width=win_w,
+            window_height=win_h,
+            parent=self,
+        )
+
+        if not used_builtin and prefer_builtin:
+            QMessageBox.information(
+                self, "Записи",
+                "Встроенный плеер недоступен — файл открыт "
+                "системным приложением.\n\n"
+                "Установите PySide6-Addons и GStreamer-плагины "
+                "для встроенного воспроизведения.",
+            )
 
     # ------------------------------------------------------------------
     # Синхронизация одной записи
@@ -2683,6 +3125,33 @@ class SessionsWindow(QDialog):
             return
         menu = QMenu(self)
 
+        # --- Воспроизведение ---
+        act_play_video = menu.addAction(
+            "Смотреть видео", self._open_video
+        )
+        act_play_video.setEnabled(
+            bool(r.get("has_video")) or bool(r.get("published"))
+        )
+        act_play_video.setToolTip(
+            "Открыть видео во встроенном плеере.\n"
+            "Если файла нет локально, но он есть на сервере — "
+            "будет предложено скачать."
+        )
+
+        act_play_audio = menu.addAction(
+            "Прослушать аудио", self._open_audio
+        )
+        act_play_audio.setEnabled(
+            bool(r.get("has_audio")) or bool(r.get("published"))
+        )
+        act_play_audio.setToolTip(
+            "Открыть аудио во встроенном плеере.\n"
+            "Если файла нет локально, но он есть на сервере — "
+            "будет предложено скачать."
+        )
+
+        menu.addSeparator()
+
         # --- Синхронизация ---
         act_sync = menu.addAction(
             "Синхронизировать…", self._sync_one_record
@@ -2710,7 +3179,6 @@ class SessionsWindow(QDialog):
         )
         menu.addSeparator()
         menu.addAction("Открыть папку записи", self._open_folder)
-        menu.addAction("Открыть видео", self._open_video)
         menu.addSeparator()
         menu.addAction(
             "Изменить summary (Markdown)…", self._edit_summary_bb
@@ -2918,20 +3386,6 @@ class SessionsWindow(QDialog):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
-    def _open_video(self) -> None:
-        r = self._selected_row()
-        if not r:
-            QMessageBox.warning(self, "Записи", "Выберите запись")
-            return
-        video = r["video_path"]
-        if not video or not os.path.exists(video):
-            QMessageBox.warning(
-                self, "Записи",
-                f"Видео не найдено:\n{video}",
-            )
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(video))
-
     def _delete_session(self) -> None:
         r = self._selected_row()
         if not r:
@@ -2968,13 +3422,14 @@ class SessionsWindow(QDialog):
             "Ctrl+I        — импорт материалов\n"
             "Ctrl+Shift+Y  — окно синхронизации\n"
             "Ctrl+Shift+S  — синхронизировать выбранную запись\n"
+            "Ctrl+Shift+V  — смотреть видео\n"
+            "Ctrl+Shift+A  — прослушать аудио\n"
             "Ctrl+M        — создать/редактировать протокол\n"
             "Ctrl+Shift+M  — экспорт протокола в DOCX\n"
             "Ctrl+B        — отправить протокол/summary в Bitrix24\n"
             "Ctrl+E        — редактировать метаданные и перезапустить\n"
             "Ctrl+T        — изменить теги\n"
             "Ctrl+Shift+E  — открыть папку записи\n"
-            "Ctrl+Shift+V  — открыть видео\n"
             "Ctrl+P        — изменить summary (Markdown)\n"
             "Ctrl+Shift+P  — просмотр summary\n"
             "Ctrl+D        — открыть промпт DeepSeek\n"
