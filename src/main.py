@@ -77,7 +77,7 @@ else:
     from .utils import check_ffmpeg_installed, get_system_monitors
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Slot
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QMessageBox, QSystemTrayIcon,
 )
@@ -1360,10 +1360,38 @@ def main() -> int:
 
     log.info("ffmpeg найден: OK")
 
+    # --- Инициализация QApplication ---
     app = QApplication(sys.argv)
     app.setApplicationName("Screen Recorder")
+    app.setApplicationDisplayName("Screen Recorder")
+    app.setOrganizationName("ScreenRecorder")
+    app.setOrganizationDomain("screen-recorder.local")
+    # Связь с .desktop-файлом (для правильной иконки в доке на Linux).
+    # Должно совпадать с StartupWMClass в screen-recorder.desktop.
+    app.setDesktopFileName("screen-recorder")
     app.setQuitOnLastWindowClosed(False)
 
+    # --- Иконка приложения: одинаковая для дока, alt-tab и трея ---
+    _icon_candidates = [
+        _resource("icons/app.png"),
+        _resource("icons/app.svg"),
+    ]
+    _icon_set = False
+    for _icon_path in _icon_candidates:
+        if os.path.exists(_icon_path):
+            app.setWindowIcon(QIcon(_icon_path))
+            log.info("Иконка приложения установлена: %s", _icon_path)
+            _icon_set = True
+            break
+
+    if not _icon_set:
+        log.warning(
+            "Иконка приложения не найдена ни в %s. "
+            "В трее и доке будет системная заглушка.",
+            " или ".join(_icon_candidates),
+        )
+
+    # --- Стили ---
     qss_path = _resource("styles.qss")
     if os.path.exists(qss_path):
         try:

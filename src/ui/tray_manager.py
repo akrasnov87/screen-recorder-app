@@ -6,6 +6,11 @@
     notification_max_title, notification_max_message.
   • Добавлен пункт меню «Синхронизация» и сигнал
     open_sync_requested.
+  • Иконка трея берётся из QApplication.windowIcon(), чтобы
+    совпадала с иконкой панели задач / дока. Если у приложения
+    иконка не задана — используется fallback на resources/icons/app.*
+  • Путь к ресурсам скорректирован с учётом нового расположения
+    модуля в src/ui/.
 """
 from __future__ import annotations
 
@@ -14,23 +19,76 @@ from typing import Dict, Optional
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import (
+    QApplication, QMenu, QSystemTrayIcon,
+)
 
 from ..logger import get_logger
 
 log = get_logger(__name__)
 
 
-def _icon_path(name: str) -> str:
-    base = os.path.join(
-        os.path.dirname(__file__), "..", "..", "resources", "icons"
+def _resources_dir() -> str:
+    """
+    Возвращает абсолютный путь к папке resources/.
+
+    Модуль лежит в src/ui/tray_manager.py, а resources/ — на два
+    уровня выше (рядом с src/).
+    """
+    return os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..", "..",
+            "resources",
+        )
     )
-    for ext in (".svg", ".png"):
+
+
+def _icon_path(name: str) -> str:
+    """
+    Ищет иконку в resources/icons/<name>.svg или .png.
+
+    Возвращает абсолютный путь или "" если файл не найден.
+    """
+    base = os.path.join(_resources_dir(), "icons")
+
+    # Сначала .png (для панели задач / дока это надёжнее),
+    # потом .svg.
+    for ext in (".png", ".svg"):
         p = os.path.join(base, name + ext)
         if os.path.exists(p):
             return p
-    log.warning("Иконка не найдена: %s", name)
+
+    log.warning("Иконка не найдена: %s (искали в %s)", name, base)
     return ""
+
+
+def _app_icon() -> QIcon:
+    """
+    Возвращает иконку приложения.
+
+    Приоритет:
+      1. QApplication.windowIcon() — если уже задана в main.py
+         (одинаковая иконка в доке и в трее).
+      2. resources/icons/app.png / .svg — fallback.
+      3. Пустая QIcon — тогда трей покажет системную заглушку.
+    """
+    app = QApplication.instance()
+    if app is not None:
+        icon = app.windowIcon()
+        if not icon.isNull():
+            return icon
+
+    path = _icon_path("app")
+    if path:
+        return QIcon(path)
+
+    log.warning(
+        "Не удалось получить иконку приложения: "
+        "ни QApplication.windowIcon(), ни resources/icons/app.* "
+        "не найдены"
+    )
+    return QIcon()
 
 
 class TrayManager(QObject):
@@ -70,9 +128,15 @@ class TrayManager(QObject):
 
     def create_tray_icon(self) -> None:
         log.info("Создание иконки в системном трее")
-        self._tray = QSystemTrayIcon(
-            QIcon(_icon_path("app")), self.parent()
-        )
+
+        icon = _app_icon()
+        if icon.isNull():
+            log.warning(
+                "Иконка трея пустая — будет использована "
+                "системная заглушка"
+            )
+
+        self._tray = QSystemTrayIcon(icon, self.parent())
         self._tray.setToolTip("Screen Recorder")
         self.create_context_menu()
         self._tray.activated.connect(self._on_activated)
@@ -154,23 +218,33 @@ class TrayManager(QObject):
         menu.addAction(quit_action)
 
         self._tray.setContextMenu(menu)
-        log.info("Контекстное меню создано: %d действий",
-                 len(menu.actions()))
+        log.info(
+            "Контекстное меню создано: %d действий",
+            len(menu.actions()),
+        )
 
     def set_recording_state(self, state: str) -> None:
         log.info("Состояние трея: %s → %s", self._state, state)
         self._state = state
         if self._tray is None:
             return
+
         icon_map = {
             "idle": "app",
             "recording": "recording",
             "paused": "paused",
             "processing": "processing",
         }
-        self._tray.setIcon(
-            QIcon(_icon_path(icon_map.get(state, "app")))
-        )
+        name = icon_map.get(state, "app")
+        path = _icon_path(name)
+
+        if path:
+            self._tray.setIcon(QIcon(path))
+        else:
+            # Иконки конкретного состояния нет — используем иконку
+            # приложения, чтобы в трее не было «пусто».
+            self._tray.setIcon(_app_icon())
+
         if self._record_action:
             if state in ("recording", "paused"):
                 self._record_action.setText("Остановить запись")

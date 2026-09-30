@@ -951,11 +951,11 @@ class VideoProcessor(QObject):
             if title:
                 doc.add_heading(title, level=2)
 
-            # --- Text-блок ---
+            # --- Text-блок: парсим Markdown и добавляем с форматированием ---
             if kind == "text":
                 text = b.get("text") or ""
-                for line in text.splitlines():
-                    doc.add_paragraph(line)
+                if text.strip():
+                    self._append_markdown_text_to_docx(doc, text)
                 continue
 
             # --- File-блок ---
@@ -1017,26 +1017,206 @@ class VideoProcessor(QObject):
                         f"{os.path.basename(path)})"
                     )
 
+    def _append_markdown_text_to_docx(self, doc, text: str) -> None:
+        """
+        Разбирает Markdown-текст и добавляет его в существующий
+        python-docx Document с сохранением разметки:
+
+          • заголовки # ## ### → Heading N
+          • **жирный** → bold
+          • *курсив* → italic
+          • `код` → моноширинный
+          • - / * / + → List Bullet
+          • 1. 2. → List Number
+          • > цитата → italic + отступ
+          • ```…``` → моноширинный блок
+          • --- → горизонтальная линия
+          • [текст](url) → текст + (url)
+
+        Используется для text-блоков DeepSeek-промпта, чтобы
+        инструкция и стенограмма выглядели как настоящий документ,
+        а не как «сырой» Markdown.
+        """
+        from docx.shared import Pt  # type: ignore
+        from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
+
+        try:
+            from .markdown_docx import _add_inline  # type: ignore
+        except Exception:
+            # Fallback: если по какой-то причине функция недоступна,
+            # добавляем строки как обычные абзацы.
+            for line in text.splitlines():
+                doc.add_paragraph(line)
+            return
+
+        import re
+
+        _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+        _ULIST_RE = re.compile(r"^[-*+]\s+(.*)$")
+        _OLIST_RE = re.compile(r"^(\d+)\.\s+(.*)$")
+        _HR_RE = re.compile(r"^-{3,}$|^\*{3,}$|^_{3,}$")
+        _CODE_FENCE_RE = re.compile(r"^```")
+
+        lines = text.splitlines()
+        i = 0
+        n = len(lines)
+
+        while i < n:
+            raw = lines[i]
+            stripped = raw.strip()
+
+            # --- Пустая строка ---
+            if not stripped:
+                i += 1
+                continue
+
+            # --- Блок кода ---
+            if _CODE_FENCE_RE.match(stripped):
+                i += 1
+                code_lines: List[str] = []
+                while i < n and not _CODE_FENCE_RE.match(
+                    lines[i].strip()
+                ):
+                    code_lines.append(lines[i])
+                    i += 1
+                if i < n:
+                    i += 1
+                p = doc.add_paragraph()
+                run = p.add_run("\n".join(code_lines))
+                run.font.name = "Consolas"
+                run.font.size = Pt(10)
+                p.paragraph_format.left_indent = Pt(12)
+                continue
+
+            # --- Горизонтальная линия ---
+            if _HR_RE.match(stripped):
+                p = doc.add_paragraph()
+                run = p.add_run("─" * 40)
+                run.font.size = Pt(9)
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                i += 1
+                continue
+
+            # --- Заголовок ---
+            m = _HEADING_RE.match(stripped)
+            if m:
+                level = min(len(m.group(1)), 4)
+                doc.add_heading(m.group(2).strip(), level=level)
+                i += 1
+                continue
+
+            # --- Цитата ---
+            if stripped.startswith(">"):
+                quote_lines: List[str] = []
+                while i < n and lines[i].strip().startswith(">"):
+                    quote_lines.append(
+                        lines[i].strip().lstrip(">").strip()
+                    )
+                    i += 1
+                p = doc.add_paragraph()
+                _add_inline(p, " ".join(quote_lines))
+                p.paragraph_format.left_indent = Pt(24)
+                for run in p.runs:
+                    run.italic = True
+                continue
+
+            # --- Маркированный список ---
+            m = _ULIST_RE.match(stripped)
+            if m:
+                while i < n:
+                    m2 = _ULIST_RE.match(lines[i].strip())
+                    if not m2:
+                        break
+                    p = doc.add_paragraph(style="List Bullet")
+                    _add_inline(p, m2.group(1))
+                    i += 1
+                continue
+
+            # --- Нумерованный список ---
+            m = _OLIST_RE.match(stripped)
+            if m:
+                while i < n:
+                    m2 = _OLIST_RE.match(lines[i].strip())
+                    if not m2:
+                        break
+                    p = doc.add_paragraph(style="List Number")
+                    _add_inline(p, m2.group(2))
+                    i += 1
+                continue
+
+            # --- Обычный абзац ---
+            p = doc.add_paragraph()
+            _add_inline(p, stripped)
+            i += 1
+
     @staticmethod
     def _append_docx_content(target_doc, src_path: str) -> None:
         """
         Вставляет содержимое .docx в целевой Document,
         сохраняя форматирование на уровне runs (bold/italic/
-        underline, размер шрифта) и стили абзацев
-        (Heading 1..N, List Bullet, List Number, Quote).
+        underline, размер шрифта), стилей абзацев
+        (Heading 1..N, List Bullet, List Number, Quote)
+        и нумерации через numPr (если стиль нестандартный).
+
+        Исправления:
+        • Определяем список не только по style.name, но и по numPr
+            (numId/ilvl) — так ловятся списки, у которых стиль
+            'Normal' или 'List Paragraph', но маркер задан через
+            numbering.
+        • Учитываем локализованные имена стилей (русские названия
+            заголовков и списков).
+        • Дополнительно проверяем префикс 'List' — так ловятся
+            'List Paragraph' и другие производные.
         """
         from docx import Document  # type: ignore
         from docx.shared import Pt  # type: ignore
 
         src = Document(src_path)
 
+        # Локализованные названия стилей, которые Word может отдать
+        # в русской версии.
+        _BULLET_STYLE_ALIASES = {
+            "list bullet", "list bullet 1", "list bullet 2",
+            "list paragraph",
+            "маркированный список", "маркированный список 1",
+        }
+        _NUMBER_STYLE_ALIASES = {
+            "list number", "list number 1", "list number 2",
+            "нумерованный список", "нумерованный список 1",
+        }
+        _QUOTE_STYLE_ALIASES = {
+            "quote", "intense quote", "цитата", "выделенная цитата",
+        }
+
+        def _has_numbering(para) -> bool:
+            """Есть ли у абзаца свойства нумерации (numPr)."""
+            try:
+                ppr = para._p.pPr
+                if ppr is None:
+                    return False
+                numpr = ppr.numPr
+                return numpr is not None
+            except Exception:
+                return False
+
+        def _numbering_level(para) -> int:
+            """ilvl (0-based). 0 — верхний уровень."""
+            try:
+                ilvl = para._p.pPr.numPr.ilvl
+                return int(ilvl.val) if ilvl is not None else 0
+            except Exception:
+                return 0
+
         for para in src.paragraphs:
             text = para.text or ""
             style_name = (para.style.name if para.style else "") or ""
+            style_lower = style_name.strip().lower()
 
-            # Определяем, какой стиль использовать в целевом
-            # документе. Heading N → Heading N. Списки → списки.
+            # --- Определяем целевой стиль ---
             target_style = None
+            num_level = 0
+
+            # Заголовки: "Heading 1" ... "Heading 6", "Заголовок 1" ...
             if style_name.startswith("Heading "):
                 try:
                     level = int(style_name.split(" ")[1])
@@ -1044,24 +1224,124 @@ class VideoProcessor(QObject):
                     target_style = f"Heading {level}"
                 except (IndexError, ValueError):
                     target_style = None
-            elif style_name in ("List Bullet", "List Number",
-                                "Quote", "Intense Quote"):
-                target_style = style_name
+            elif style_lower.startswith("заголовок "):
+                try:
+                    level = int(style_lower.split(" ")[1])
+                    level = max(1, min(level, 6))
+                    target_style = f"Heading {level}"
+                except (IndexError, ValueError):
+                    target_style = None
 
+            # Списки — по имени стиля
+            if target_style is None:
+                if style_lower in _BULLET_STYLE_ALIASES:
+                    target_style = "List Bullet"
+                elif style_lower in _NUMBER_STYLE_ALIASES:
+                    target_style = "List Number"
+                elif style_lower in _QUOTE_STYLE_ALIASES:
+                    target_style = "Quote"
+
+            # Списки — по numPr (если стиль не сработал)
+            if target_style is None and _has_numbering(para):
+                num_level = _numbering_level(para)
+                # Как отличить маркированный от нумерованного:
+                #   смотрим abstractNumId в numbering part.
+                #   Это сложно без доступа к numbering.xml,
+                #   поэтому используем эвристику: если стиль
+                #   абзаца содержит 'bullet' или текст начинается
+                #   с типичного маркера — bullet; иначе number.
+                # Более надёжно: попробуем найти abstractNum по numId.
+                is_bullet = False
+                try:
+                    numbering_part = src.part.numbering_part
+                    numbering_xml = numbering_part.element
+                    # numId абзаца
+                    num_id_el = para._p.pPr.numPr.numId
+                    num_id = (
+                        int(num_id_el.val)
+                        if num_id_el is not None else None
+                    )
+                    if num_id is not None:
+                        # Ищем <w:num w:numId="N"> и его abstractNumId
+                        abstract_id = None
+                        for num in numbering_xml.findall(
+                            "{http://schemas.openxmlformats.org/"
+                            "wordprocessingml/2006/main}num"
+                        ):
+                            if int(num.get(
+                                "{http://schemas.openxmlformats.org/"
+                                "wordprocessingml/2006/main}numId"
+                            )) == num_id:
+                                abs_el = num.find(
+                                    "{http://schemas.openxmlformats.org/"
+                                    "wordprocessingml/2006/main}"
+                                    "abstractNumId"
+                                )
+                                if abs_el is not None:
+                                    abstract_id = int(
+                                        abs_el.get(
+                                            "{http://schemas.openxml"
+                                            "formats.org/wordprocessingml/"
+                                            "2006/main}val"
+                                        )
+                                    )
+                                break
+                        # Ищем abstractNum и его первый lvl
+                        if abstract_id is not None:
+                            for absnum in numbering_xml.findall(
+                                "{http://schemas.openxmlformats.org/"
+                                "wordprocessingml/2006/main}abstractNum"
+                            ):
+                                if int(absnum.get(
+                                    "{http://schemas.openxml"
+                                    "formats.org/wordprocessingml/"
+                                    "2006/main}abstractNumId"
+                                )) == abstract_id:
+                                    lvl = absnum.find(
+                                        "{http://schemas.openxml"
+                                        "formats.org/wordprocessingml/"
+                                        "2006/main}lvl"
+                                    )
+                                    if lvl is not None:
+                                        numfmt = lvl.find(
+                                            "{http://schemas.openxml"
+                                            "formats.org/wordprocessingml/"
+                                            "2006/main}numFmt"
+                                        )
+                                        if numfmt is not None:
+                                            fmt_val = numfmt.get(
+                                                "{http://schemas.openxml"
+                                                "formats.org/wordprocessing"
+                                                "ml/2006/main}val"
+                                            )
+                                            if fmt_val == "bullet":
+                                                is_bullet = True
+                                    break
+                except Exception as exc:
+                    log.debug(
+                        "Не удалось определить тип списка по numPr: %s",
+                        exc,
+                    )
+
+                target_style = "List Bullet" if is_bullet else "List Number"
+
+            # --- Создаём целевой абзац ---
             if target_style:
                 try:
                     new_para = target_doc.add_paragraph(
                         style=target_style
                     )
                 except KeyError:
-                    # Стиль не существует в целевом doc — обычный
+                    log.debug(
+                        "Стиль %r отсутствует в целевом документе — "
+                        "используем обычный абзац", target_style,
+                    )
                     new_para = target_doc.add_paragraph()
             else:
                 new_para = target_doc.add_paragraph()
 
             # Копируем runs с их форматированием
             if not para.runs:
-                # Пустой абзац — просто перенос
                 continue
 
             for run in para.runs:
@@ -1069,10 +1349,8 @@ class VideoProcessor(QObject):
                 new_run.bold = run.bold
                 new_run.italic = run.italic
                 new_run.underline = run.underline
-                # Размер шрифта
                 if run.font.size is not None:
                     new_run.font.size = run.font.size
-                # Имя шрифта
                 if run.font.name:
                     new_run.font.name = run.font.name
 
