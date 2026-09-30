@@ -497,6 +497,28 @@ class SettingsWindow(QDialog):
         hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.tags_table.setMinimumHeight(320)
+        # Явные цвета, чтобы текст был виден и в обычном состоянии,
+        # и при выделении строки (глобальный QSS может перекрывать
+        # индивидуальные setForeground).
+        self.tags_table.setStyleSheet(
+            "QTableWidget {"
+            "  color: palette(text);"
+            "  background-color: palette(base);"
+            "  gridline-color: palette(mid);"
+            "}"
+            "QTableWidget::item {"
+            "  color: palette(text);"
+            "  padding: 3px;"
+            "}"
+            "QTableWidget::item:selected {"
+            "  background-color: #2D7FF9;"
+            "  color: #FFFFFF;"
+            "}"
+            "QTableWidget::item:selected:!active {"
+            "  background-color: #2D7FF9;"
+            "  color: #FFFFFF;"
+            "}"
+        )
         self.tags_table.cellDoubleClicked.connect(
             self._on_tag_cell_double_clicked
         )
@@ -1046,6 +1068,26 @@ class SettingsWindow(QDialog):
             ),
         )
 
+        self.attachment_name_max_chars = QSpinBox()
+        self.attachment_name_max_chars.setRange(10, 200)
+        self.attachment_name_max_chars.setSingleStep(5)
+        self.attachment_name_max_chars.setSuffix(" символов")
+        self.attachment_name_max_chars.setValue(50)
+        self.attachment_name_max_chars.setToolTip(
+            "Максимальная длина имени вложения при сохранении "
+            "в папку attachments/.\n\n"
+            "Слишком длинные имена (особенно с кириллицей) "
+            "приводили к ошибке 500 при публикации на сервер."
+        )
+
+        form.addRow(
+            "Длина имени вложения:",
+            with_info(
+                self.attachment_name_max_chars,
+                "app_attachment_name_max_chars",
+            ),
+        )
+
         layout.addLayout(form)
 
         # --- Поведение ---
@@ -1201,6 +1243,14 @@ class SettingsWindow(QDialog):
             "Макс. размер артефакта:",
             with_info(
                 self.sync_max_artifact_mb, "sync_max_artifact_mb"
+            ),
+        )
+        adv_form.addRow(
+            "",
+            with_info(
+                QLabel(""),
+                "sync_attachments_names",
+                stretch=False,
             ),
         )
 
@@ -2422,6 +2472,7 @@ class SettingsWindow(QDialog):
         for t in tags:
             row = self.tags_table.rowCount()
             self.tags_table.insertRow(row)
+
             name_item = QTableWidgetItem(t.get("name", ""))
             self.tags_table.setItem(row, 0, name_item)
 
@@ -2436,11 +2487,15 @@ class SettingsWindow(QDialog):
                     qcolor = QColor(color)
                     if qcolor.isValid():
                         color_item.setBackground(qcolor)
-                        name_item.setForeground(
-                            QColor("#FFFFFF")
-                            if qcolor.lightness() < 128
-                            else QColor("#000000")
-                        )
+                        # Светлый текст только для тёмного фона.
+                        # При выделении строки Qt перекроет это
+                        # цветом из QSS :selected.
+                        if qcolor.lightness() < 128:
+                            name_item.setForeground(QColor("#FFFFFF"))
+                            color_item.setForeground(QColor("#FFFFFF"))
+                        else:
+                            name_item.setForeground(QColor("#000000"))
+                            color_item.setForeground(QColor("#000000"))
                 except Exception:
                     pass
             self.tags_table.setItem(row, 1, color_item)
@@ -2457,6 +2512,10 @@ class SettingsWindow(QDialog):
             self.employees_table.setItem(
                 row, 1, QTableWidgetItem(e["chat_id"])
             )
+
+        self.attachment_name_max_chars.setValue(
+            int(cfg.get("attachment_name_max_chars", 50))
+        )
 
         # --- Bitrix24 ---
         bitrix = self.config_manager.get_bitrix_settings()
@@ -2792,6 +2851,10 @@ class SettingsWindow(QDialog):
                 continue
             projects.append({"name": name, "chat_id": chat_id})
         cfg["projects"] = projects
+
+        cfg["attachment_name_max_chars"] = int(
+            self.attachment_name_max_chars.value()
+        )
 
         cfg["yandex_vm"] = {
             "root_path": self.yandex_vm_root_input.text().strip(),

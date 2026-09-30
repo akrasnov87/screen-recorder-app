@@ -57,6 +57,7 @@ from .media_player import (
     is_builtin_player_available, open_media, probe_media_support,
 )
 from .metadata_dialog import MetadataDialog
+from ..utils import sanitize_filename
 
 log = get_logger(__name__)
 
@@ -3329,10 +3330,20 @@ class SessionsWindow(QDialog):
         current = list(meta.get("attachments", []) or [])
 
         added = 0
+        max_chars = int(
+            self._app_cfg.get("attachment_name_max_chars", 50)
+        )
+
         for src in files:
             if not os.path.exists(src):
                 continue
-            base = os.path.basename(src)
+
+            # Санитизируем имя: убираем URL-encoding, недопустимые
+            # символы, обрезаем по длине.
+            base = sanitize_filename(
+                os.path.basename(src),
+                max_chars=max_chars,
+            )
             dst = os.path.join(att_dir, base)
             if os.path.exists(dst):
                 stem, ext = os.path.splitext(base)

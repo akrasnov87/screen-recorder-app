@@ -534,7 +534,7 @@ class ScreenRecorderApp(QObject):
 
     @staticmethod
     def _copy_attachments_to_session(
-        meta: Dict[str, Any], session_dir: str,
+        meta: Dict[str, Any], session_dir: str, 
     ) -> None:
         src_paths = list(meta.get("attachments", []) or [])
         if not src_paths:
@@ -546,12 +546,20 @@ class ScreenRecorderApp(QObject):
         log.info("Копирование вложений: %d файлов → %s",
                  len(src_paths), att_dir)
 
+        max_chars = int(
+            self.app_cfg.get("attachment_name_max_chars", 50)
+        )
+
         new_paths: List[str] = []
         for src in src_paths:
             if not src or not os.path.exists(src):
                 log.warning("Вложение не найдено, пропуск: %s", src)
                 continue
-            base = os.path.basename(src)
+
+            base = sanitize_filename(
+                os.path.basename(src),
+                max_chars=max_chars,
+            )
             dst = os.path.join(att_dir, base)
             if os.path.exists(dst):
                 stem, ext = os.path.splitext(base)

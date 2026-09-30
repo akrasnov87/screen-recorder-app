@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Dict, List
 
 from .logger import get_logger
+from urllib.parse import unquote
 
 log = get_logger(__name__)
 
@@ -107,3 +108,98 @@ def find_drm_card() -> str | None:
             return c
     log.warning("DRM-узлы найдены, но ни один не доступен: %s", cards)
     return cards[0]
+# ---------------------------------------------------------------------------
+# Санитизация имён файлов
+# ---------------------------------------------------------------------------
+
+# Символы, недопустимые в именах файлов на большинстве ФС.
+_FILENAME_BAD_CHARS = '<>:"/\\|?*\n\r\t'
+
+# Значение по умолчанию для лимита имени вложения (символы).
+# Должно совпадать с config["app"]["attachment_name_max_chars"].
+DEFAULT_ATTACHMENT_NAME_MAX_CHARS = 50
+
+
+def sanitize_filename(
+    name: str,
+    max_chars: int = DEFAULT_ATTACHMENT_NAME_MAX_CHARS,
+) -> str:
+    """
+    Приводит имя файла к безопасному виду:
+      • убирает путь (берёт только basename);
+      • декодирует URL-encoding (%D0%9A → К), если он есть;
+      • удаляет недопустимые символы;
+      • сохраняет кириллицу, точки и дефисы;
+      • обрезает имя по СИМВОЛАМ, сохраняя расширение.
+
+    Кириллица в UTF-8 занимает 2 байта на символ, поэтому
+    лимит в 50 символов даёт ~100 байт — с большим запасом
+    до лимита файловой системы (255 байт).
+
+    Args:
+        name:      исходное имя (может содержать путь).
+        max_chars: максимум символов в basename (без учёта
+                   расширения оно тоже входит в лимит).
+
+    Returns:
+        Безопасное имя файла. Если ничего не осталось — "file".
+    """
+    if not name:
+        return "file"
+
+    base = os.path.basename(name).strip()
+    if not base:
+        return "file"
+
+    # --- Декодируем URL-encoding (до 3 раз — бывает двойное) ---
+    decoded = base
+    for _ in range(3):
+        try:
+            new_val = unquote(decoded, errors="strict")
+        except Exception:
+            break
+        if new_val == decoded:
+            break
+        decoded = new_val
+    base = decoded
+
+    # --- Удаляем недопустимые символы ---
+    cleaned = "".join(
+        ("_" if ch in _FILENAME_BAD_CHARS else ch)
+        for ch in base
+    )
+
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+
+    cleaned = cleaned.strip(" .")
+    if not cleaned:
+        return "file"
+
+    # --- Обрезка по СИМВОЛАМ с сохранением расширения ---
+    limit = max(5, int(max_chars))
+
+    if len(cleaned) <= limit:
+        return cleaned
+
+    stem, ext = os.path.splitext(cleaned)
+
+    # Если расширение слишком длинное — игнорируем его.
+    if len(ext) > 10:
+        stem = cleaned
+        ext = ""
+
+    # Резервируем место под расширение.
+    stem_limit = max(1, limit - len(ext))
+    if len(stem) > stem_limit:
+        stem = stem[:stem_limit]
+
+    result = (stem + ext).strip(" .")
+    if not result:
+        result = "file"
+
+    log.debug(
+        "sanitize_filename: %r → %r (%d → %d символов)",
+        name, result, len(cleaned), len(result),
+    )
+    return result

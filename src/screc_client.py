@@ -56,6 +56,7 @@ from urllib.parse import quote
 import aiohttp
 
 from .logger import get_logger
+from .utils import sanitize_filename
 
 log = get_logger(__name__)
 
@@ -359,13 +360,21 @@ class ScrecClient:
 
                 fh = open(full_path, "rb")
                 opened_files.append(fh)
+
+                raw_name = os.path.basename(full_path)
+                safe_name = sanitize_filename(raw_name)
+                if safe_name != raw_name:
+                    log.info(
+                        "publish_record: имя файла сокращено/очищено: "
+                        "%r → %r", raw_name, safe_name,
+                    )
+
                 form.add_field(
                     "files",
                     fh,
-                    filename=os.path.basename(full_path),
+                    filename=safe_name,
                     content_type="application/octet-stream",
                 )
-                form.add_field("kinds", kind)
 
                 sha = artifact_hashes.get(os.path.basename(full_path), "")
                 form.add_field("sha256", sha)
@@ -799,7 +808,7 @@ class ScrecClient:
             total = -1
 
         sha = _sha256_file(file_path)
-        filename = os.path.basename(file_path)
+        filename = sanitize_filename(os.path.basename(file_path))
 
         # --- Условная загрузка: спрашиваем сервер ---
         if skip_if_hash_matches and sha:

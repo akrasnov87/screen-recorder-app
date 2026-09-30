@@ -339,10 +339,26 @@ def collect_artifacts(
         try:
             for name in sorted(os.listdir(att_dir)):
                 full = os.path.join(att_dir, name)
-                if os.path.isfile(full):
-                    small.append(
-                        ("attachment", os.path.join("attachments", name))
+                if not os.path.isfile(full):
+                    continue
+
+                # Клиент санитизирует имя перед отправкой
+                # (см. utils.sanitize_filename), но если исходное
+                # имя заведомо огромное — предупредим пользователя,
+                # чтобы он понимал, что на сервере файл будет
+                # под другим именем.
+                name_bytes = len(name.encode("utf-8"))
+                if name_bytes > 200:
+                    log.warning(
+                        "Вложение %r: имя длинное (%d байт UTF-8) — "
+                        "будет автоматически сокращено перед "
+                        "отправкой на сервер.",
+                        name, name_bytes,
                     )
+
+                small.append(
+                    ("attachment", os.path.join("attachments", name))
+                )
         except OSError as exc:
             log.warning("Не удалось прочитать %s: %s", att_dir, exc)
 
