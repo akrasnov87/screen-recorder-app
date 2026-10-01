@@ -1,7 +1,25 @@
 """Конвертер Markdown → BB-код Bitrix24 + сопутствующие утилиты.
 
-Изменения:
-  • Удалён неиспользуемый импорт html.
+ВАЖНО: Bitrix24 (модуль im) НЕ поддерживает теги [LIST] и [*].
+Поэтому списки конвертируются в юникод-буллеты «• » для
+маркированного и «N. » для нумерованного. Это единственный
+способ передать список в чат Bitrix24 через im.message.add.
+
+Поддерживаемые BB-теги Bitrix24:
+  • [B]...[/B]         — жирный
+  • [I]...[/I]         — курсив
+  • [U]...[/U]         — подчёркнутый
+  • [S]...[/S]         — зачёркнутый
+  • [URL=...]...[/URL] — ссылка
+  • [IMG]...[/IMG]     — картинка
+  • [CODE]...[/CODE]   — код
+  • [QUOTE]...[/QUOTE] — цитата
+  • [SPOILER]...[/SPOILER] — спойлер
+
+НЕ поддерживаются:
+  • [LIST]...[/LIST]
+  • [LIST=1]...[/LIST]
+  • [*]...[/LIST]
 """
 from __future__ import annotations
 
@@ -88,7 +106,17 @@ def _inline_to_bb(text: str) -> str:
 
 
 def markdown_to_bitrix(text: str) -> str:
-    """Конвертирует Markdown в BB-код Bitrix24."""
+    """
+    Конвертирует Markdown в BB-код Bitrix24.
+
+    Особенности:
+      • Списки конвертируются в юникод-буллеты «• » и «N. »,
+        потому что Bitrix24 НЕ поддерживает [LIST] и [*].
+      • Заголовки → [B]...[/B] (Bitrix24 не знает [H1]/[H2]).
+      • Цитаты → [QUOTE]...[/QUOTE].
+      • Код → [CODE]...[/CODE].
+      • Горизонтальная линия → «────» (юникод).
+    """
     if not text:
         return ""
 
@@ -106,6 +134,7 @@ def markdown_to_bitrix(text: str) -> str:
             i += 1
             continue
 
+        # --- Блок кода ---
         if _CODE_FENCE_RE.match(stripped):
             i += 1
             code_lines: List[str] = []
@@ -120,11 +149,13 @@ def markdown_to_bitrix(text: str) -> str:
             out.append("[/CODE]")
             continue
 
+        # --- Горизонтальная линия ---
         if _HR_RE.match(stripped):
             out.append("─" * 40)
             i += 1
             continue
 
+        # --- Заголовок ---
         m = _HEADING_RE.match(stripped)
         if m:
             out.append(
@@ -134,6 +165,7 @@ def markdown_to_bitrix(text: str) -> str:
             i += 1
             continue
 
+        # --- Цитата ---
         if stripped.startswith(">"):
             quote_lines: List[str] = []
             while (i < n
@@ -150,28 +182,32 @@ def markdown_to_bitrix(text: str) -> str:
             out.append("[/QUOTE]")
             continue
 
+        # --- Маркированный список ---
+        # ВАЖНО: Bitrix24 не понимает [LIST]/[*].
+        # Используем юникод-буллет «• ».
         if _ULIST_RE.match(stripped):
-            out.append("[LIST]")
             while i < n:
                 m2 = _ULIST_RE.match(lines[i].strip())
                 if not m2:
                     break
-                out.append(f"[*]{_inline_to_bb(m2.group(1))}")
+                out.append(f"• {_inline_to_bb(m2.group(1))}")
                 i += 1
-            out.append("[/LIST]")
             continue
 
+        # --- Нумерованный список ---
+        # Сохраняем исходные номера (1., 2., ...).
         if _OLIST_RE.match(stripped):
-            out.append("[LIST=1]")
             while i < n:
                 m2 = _OLIST_RE.match(lines[i].strip())
                 if not m2:
                     break
-                out.append(f"[*]{_inline_to_bb(m2.group(2))}")
+                out.append(
+                    f"{m2.group(1)}. {_inline_to_bb(m2.group(2))}"
+                )
                 i += 1
-            out.append("[/LIST]")
             continue
 
+        # --- Обычный абзац ---
         out.append(_inline_to_bb(stripped))
         i += 1
 
