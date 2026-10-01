@@ -41,8 +41,9 @@ from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
-    QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QTableWidget,
+    QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QSizePolicy, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
@@ -76,38 +77,122 @@ class SettingsWindow(QDialog):
         self.load_settings()
         log.debug("Окно настроек готово")
 
+    # ------------------------------------------------------------------
+    # Скролл для вкладок
+    # ------------------------------------------------------------------
+    def _wrap_in_scroll(self, widget: QWidget) -> QScrollArea:
+        """
+        Оборачивает содержимое вкладки в QScrollArea.
+
+        Делает виджет прокручиваемым, если его содержимое
+        не помещается по вертикали (или горизонтали).
+
+        Правила:
+          • вертикальная прокрутка — по мере необходимости;
+          • горизонтальная — только если реально нужна
+            (виджеты шире окна);
+          • фон вкладки остаётся системным (без рамки);
+          • содержимое «прижимается» к верху.
+        """
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        # Обёртка нужна, чтобы содержимое «прижималось» к верху,
+        # а не растягивалось QScrollArea.
+        container = QWidget()
+        container.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
+        inner_layout = QVBoxLayout(container)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.setSpacing(0)
+        inner_layout.addWidget(widget)
+        inner_layout.addStretch(1)
+
+        scroll.setWidget(container)
+        return scroll
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         self.tabs = QTabWidget()
         root.addWidget(self.tabs)
 
         self.tabs.addTab(
-            self._build_projects_tab(), "Проекты и чаты Bitrix24"
-        )
-        self.tabs.addTab(self._build_tags_tab(), "Теги")
-        self.tabs.addTab(self._build_employees_tab(), "Сотрудники")
-        self.tabs.addTab(self._build_bitrix_tab(), "Bitrix24")
-        self.tabs.addTab(
-            self._build_sync_tab(), "Синхронизация"
+            self._wrap_in_scroll(self._build_projects_tab()),
+            "Проекты и чаты Bitrix24",
         )
         self.tabs.addTab(
-            self._build_compression_tab(), "Сжатие медиа"
-        )
-        self.tabs.addTab(self._build_metadata_tab(), "Промпты и имена")
-        self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
-        self.tabs.addTab(self._build_summarizer_tab(), "Суммаризация")
-        self.tabs.addTab(self._build_glossary_tab(), "Глоссарий")
-        self.tabs.addTab(self._build_recording_tab(), "Запись")
-        self.tabs.addTab(self._build_queue_tab(), "Очередь")
-        self.tabs.addTab(self._build_scrum_tab(), "Скрам")
-        self.tabs.addTab(
-            self._build_yandex_vm_tab(), "ВМ Yandex"
+            self._wrap_in_scroll(self._build_tags_tab()),
+            "Теги",
         )
         self.tabs.addTab(
-            self._build_compression_old_tab(), "Форматы и сжатие"
+            self._wrap_in_scroll(self._build_employees_tab()),
+            "Сотрудники",
         )
-        self.tabs.addTab(self._build_storage_tab(), "Хранилище")
-        self.tabs.addTab(self._build_logging_tab(), "Логи")
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_bitrix_tab()),
+            "Bitrix24",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_sync_tab()),
+            "Синхронизация",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_compression_tab()),
+            "Сжатие медиа",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_metadata_tab()),
+            "Промпты и имена",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_transcribe_tab()),
+            "Транскрибация",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_summarizer_tab()),
+            "Суммаризация",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_glossary_tab()),
+            "Глоссарий",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_recording_tab()),
+            "Запись",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_queue_tab()),
+            "Очередь",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_scrum_tab()),
+            "Скрам",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_yandex_vm_tab()),
+            "ВМ Yandex",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_compression_old_tab()),
+            "Форматы и сжатие",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_storage_tab()),
+            "Хранилище",
+        )
+        self.tabs.addTab(
+            self._wrap_in_scroll(self._build_logging_tab()),
+            "Логи",
+        )
 
         buttons = QHBoxLayout()
         self.help_btn = QPushButton("Помощь")
