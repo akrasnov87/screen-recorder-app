@@ -20,6 +20,11 @@
       – media_download_timeout;
       – media_player_window_width;
       – media_player_window_height.
+  • Настройки автосжатия медиа вынесены в отдельную вкладку
+    «Сжатие медиа» (compress_*). Поле «Макс. размер артефакта»
+    перенесено туда же — оно логически связано с автосжатием.
+    На «Синхронизации» остались только параметры подключения
+    и передачи данных.
 """
 from __future__ import annotations
 
@@ -85,6 +90,9 @@ class SettingsWindow(QDialog):
         self.tabs.addTab(
             self._build_sync_tab(), "Синхронизация"
         )
+        self.tabs.addTab(
+            self._build_compression_tab(), "Сжатие медиа"
+        )
         self.tabs.addTab(self._build_metadata_tab(), "Промпты и имена")
         self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
         self.tabs.addTab(self._build_summarizer_tab(), "Суммаризация")
@@ -96,7 +104,7 @@ class SettingsWindow(QDialog):
             self._build_yandex_vm_tab(), "ВМ Yandex"
         )
         self.tabs.addTab(
-            self._build_compression_tab(), "Форматы и сжатие"
+            self._build_compression_old_tab(), "Форматы и сжатие"
         )
         self.tabs.addTab(self._build_storage_tab(), "Хранилище")
         self.tabs.addTab(self._build_logging_tab(), "Логи")
@@ -498,9 +506,6 @@ class SettingsWindow(QDialog):
         hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.tags_table.setMinimumHeight(320)
-        # Явные цвета, чтобы текст был виден и в обычном состоянии,
-        # и при выделении строки (глобальный QSS может перекрывать
-        # индивидуальные setForeground).
         self.tags_table.setStyleSheet(
             "QTableWidget {"
             "  color: palette(text);"
@@ -991,7 +996,9 @@ class SettingsWindow(QDialog):
             "На сервер передаются метаданные и текстовые артефакты: "
             "стенограмма, протокол, summary, промпт DeepSeek, "
             "вложения. Опционально — видео и аудио (см. галочку "
-            "«Передавать видео и аудио на сервер»)."
+            "«Передавать видео и аудио на сервер»).\n\n"
+            "Настройки автосжатия медиа — на вкладке "
+            "<b>«Сжатие медиа»</b>."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -1140,7 +1147,6 @@ class SettingsWindow(QDialog):
         )
         behavior_form.addRow("", self.sync_send_video_link_check)
 
-        # NEW: передавать медиа как артефакты
         self.sync_send_media_check = QCheckBox(
             "Передавать видео и аудио на сервер "
             "(как артефакты kind=video/audio)"
@@ -1152,16 +1158,14 @@ class SettingsWindow(QDialog):
             "придут вместе с остальными файлами и будут "
             "разложены как video.<ext>.\n\n"
             "ВНИМАНИЕ: большие видеофайлы могут занять много "
-            "времени и места. Учитывайте лимит "
-            "«Макс. размер артефакта» и SCREC_MAX_ARTIFACT_MB "
-            "на сервере."
+            "времени и места. Настройки автосжатия — на вкладке "
+            "«Сжатие медиа»."
         )
         attach_tooltip(
             self.sync_send_media_check, "sync_send_media_to_server"
         )
         behavior_form.addRow("", self.sync_send_media_check)
 
-        # NEW: условная загрузка (HEAD/check)
         self.sync_use_hash_check_check = QCheckBox(
             "Использовать условную загрузку (HEAD/check) — "
             "экономить трафик"
@@ -1172,7 +1176,6 @@ class SettingsWindow(QDialog):
         self.sync_use_hash_check_check.setChecked(True)
         behavior_form.addRow("", self.sync_use_hash_check_check)
 
-        # NEW: удалять локальные медиа после загрузки
         self.sync_delete_media_after_upload_check = QCheckBox(
             "Удалять локальные видео/аудио после успешной "
             "загрузки на сервер"
@@ -1184,7 +1187,6 @@ class SettingsWindow(QDialog):
             "копия удаляется. Ссылка file:// перестанет "
             "работать, но файл можно скачать с сервера."
         )
-        
         attach_tooltip(
             self.sync_delete_media_after_upload_check,
             "sync_delete_local_media_after_media_upload",
@@ -1205,84 +1207,7 @@ class SettingsWindow(QDialog):
         )
         behavior_form.addRow("", self.sync_delete_media_check)
 
-        # --- Автосжатие медиа ---
         layout.addLayout(behavior_form)
-
-        compress_header = QHBoxLayout()
-        compress_header.addWidget(
-            QLabel("<b>Автосжатие медиа</b>")
-        )
-        compress_header.addStretch()
-        compress_header.addWidget(
-            make_info_icon("sync_compress_media_if_too_large")
-        )
-        layout.addLayout(compress_header)
-
-        compress_form = QFormLayout()
-        compress_form.setLabelAlignment(
-            Qt.AlignmentFlag.AlignRight
-            | Qt.AlignmentFlag.AlignVCenter
-        )
-
-        self.sync_compress_media_check = QCheckBox(
-            "Сжимать видео, если его размер превышает "
-            "«Макс. размер артефакта»"
-        )
-        self.sync_compress_media_check.setToolTip(
-            "Перед публикацией видео перекодируется через ffmpeg "
-            "до целевого размера. Оригинал ПЕРЕЗАПИСЫВАЕТСЯ "
-            "сжатой версией.\n\n"
-            "Если выключено — файлы сверх лимита просто "
-            "пропускаются."
-        )
-        self.sync_compress_media_check.setChecked(True)
-        attach_tooltip(
-            self.sync_compress_media_check,
-            "sync_compress_media_if_too_large",
-        )
-        compress_form.addRow("", self.sync_compress_media_check)
-
-        self.sync_compression_min_video_bitrate = QSpinBox()
-        self.sync_compression_min_video_bitrate.setRange(50, 10000)
-        self.sync_compression_min_video_bitrate.setSingleStep(50)
-        self.sync_compression_min_video_bitrate.setSuffix(" kbps")
-        self.sync_compression_min_video_bitrate.setValue(200)
-        compress_form.addRow(
-            "Мин. битрейт видео:",
-            with_info(
-                self.sync_compression_min_video_bitrate,
-                "sync_compression_min_video_bitrate_kbps",
-            ),
-        )
-
-        self.sync_compression_audio_bitrate = QSpinBox()
-        self.sync_compression_audio_bitrate.setRange(32, 320)
-        self.sync_compression_audio_bitrate.setSingleStep(16)
-        self.sync_compression_audio_bitrate.setSuffix(" kbps")
-        self.sync_compression_audio_bitrate.setValue(96)
-        compress_form.addRow(
-            "Битрейт аудио:",
-            with_info(
-                self.sync_compression_audio_bitrate,
-                "sync_compression_audio_bitrate_kbps",
-            ),
-        )
-
-        self.sync_compression_preset_combo = QComboBox()
-        self.sync_compression_preset_combo.addItems([
-            "ultrafast", "superfast", "veryfast", "faster",
-            "fast", "medium", "slow", "slower", "veryslow",
-        ])
-        self.sync_compression_preset_combo.setCurrentText("veryfast")
-        compress_form.addRow(
-            "Пресет x264:",
-            with_info(
-                self.sync_compression_preset_combo,
-                "sync_compression_preset",
-            ),
-        )
-
-        layout.addLayout(compress_form)
 
         # --- Тонкие настройки ---
         adv_header = QHBoxLayout()
@@ -1302,35 +1227,6 @@ class SettingsWindow(QDialog):
         adv_form.addRow(
             "Размер страницы sync:",
             with_info(self.sync_page_size, "sync_page_size"),
-        )
-
-        # Увеличенный лимит: до 10 ГБ.
-        self.sync_max_artifact_mb = QSpinBox()
-        self.sync_max_artifact_mb.setRange(1, 10240)
-        self.sync_max_artifact_mb.setSingleStep(50)
-        self.sync_max_artifact_mb.setSuffix(" МБ")
-        self.sync_max_artifact_mb.setValue(50)
-        self.sync_max_artifact_mb.setToolTip(
-            "Максимальный размер одного артефакта в мегабайтах.\n\n"
-            "Применяется и к текстовым артефактам, и к видео/аудио "
-            "(если они передаются).\n\n"
-            "Не должен превышать SCREC_MAX_ARTIFACT_MB на сервере "
-            "(по умолчанию 50 МБ). Если задать больше — сервер "
-            "вернёт ошибку 413 (Payload Too Large)."
-        )
-        adv_form.addRow(
-            "Макс. размер артефакта:",
-            with_info(
-                self.sync_max_artifact_mb, "sync_max_artifact_mb"
-            ),
-        )
-        adv_form.addRow(
-            "",
-            with_info(
-                QLabel(""),
-                "sync_attachments_names",
-                stretch=False,
-            ),
         )
 
         self.sync_retry_count = QSpinBox()
@@ -1378,6 +1274,143 @@ class SettingsWindow(QDialog):
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
+
+        layout.addStretch()
+        return w
+
+    # ------------------------------------------------------------------
+    # Сжатие медиа
+    # ------------------------------------------------------------------
+    def _build_compression_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        # --- Вводная плашка ---
+        intro = QLabel(
+            "<b>Автосжатие медиа перед публикацией</b><br><br>"
+            "Если видеофайл превышает «Макс. размер артефакта», "
+            "он автоматически перекодируется через <code>ffmpeg</code> "
+            "до целевого размера. Это позволяет публиковать длинные "
+            "записи, не упираясь в лимит сервера "
+            "(<code>SCREC_MAX_ARTIFACT_MB</code>)."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # --- Предупреждение ---
+        warning = QLabel(
+            "<span style='color:#c62828'><b>Внимание:</b> "
+            "сжатие необратимо. Оригинал ПЕРЕЗАПИСЫВАЕТСЯ "
+            "сжатой версией, на диске остаётся только сжатое "
+            "видео. Качество теряется безвозвратно.</span>"
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        # --- Основной блок ---
+        form = QFormLayout()
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.compress_enabled_check = QCheckBox(
+            "Сжимать видео, если его размер превышает "
+            "«Макс. размер артефакта»"
+        )
+        self.compress_enabled_check.setChecked(True)
+        attach_tooltip(
+            self.compress_enabled_check,
+            "sync_compress_media_if_too_large",
+        )
+        form.addRow("", self.compress_enabled_check)
+
+        self.compress_max_artifact_mb = QSpinBox()
+        self.compress_max_artifact_mb.setRange(1, 10240)
+        self.compress_max_artifact_mb.setSingleStep(50)
+        self.compress_max_artifact_mb.setSuffix(" МБ")
+        self.compress_max_artifact_mb.setValue(2048)
+        self.compress_max_artifact_mb.setToolTip(
+            "Максимальный размер одного артефакта (файла) "
+            "в мегабайтах.\n\n"
+            "Если видео больше этого значения — оно будет сжато "
+            "до этого размера перед отправкой на сервер.\n\n"
+            "ВАЖНО: на сервере есть свой лимит — "
+            "SCREC_MAX_ARTIFACT_MB (по умолчанию 50 МБ). "
+            "Если задать больше — сервер вернёт ошибку 413.\n\n"
+            "Проверьте значение на сервере и увеличьте его при "
+            "необходимости."
+        )
+        form.addRow(
+            "Макс. размер артефакта:",
+            with_info(
+                self.compress_max_artifact_mb,
+                "sync_max_artifact_mb",
+            ),
+        )
+
+        self.compress_min_video_bitrate = QSpinBox()
+        self.compress_min_video_bitrate.setRange(50, 10000)
+        self.compress_min_video_bitrate.setSingleStep(50)
+        self.compress_min_video_bitrate.setSuffix(" kbps")
+        self.compress_min_video_bitrate.setValue(200)
+        form.addRow(
+            "Мин. битрейт видео:",
+            with_info(
+                self.compress_min_video_bitrate,
+                "sync_compression_min_video_bitrate_kbps",
+            ),
+        )
+
+        self.compress_audio_bitrate = QSpinBox()
+        self.compress_audio_bitrate.setRange(32, 320)
+        self.compress_audio_bitrate.setSingleStep(16)
+        self.compress_audio_bitrate.setSuffix(" kbps")
+        self.compress_audio_bitrate.setValue(96)
+        form.addRow(
+            "Битрейт аудио:",
+            with_info(
+                self.compress_audio_bitrate,
+                "sync_compression_audio_bitrate_kbps",
+            ),
+        )
+
+        self.compress_preset_combo = QComboBox()
+        self.compress_preset_combo.addItems([
+            "ultrafast", "superfast", "veryfast", "faster",
+            "fast", "medium", "slow", "slower", "veryslow",
+        ])
+        self.compress_preset_combo.setCurrentText("veryfast")
+        form.addRow(
+            "Пресет x264:",
+            with_info(
+                self.compress_preset_combo,
+                "sync_compression_preset",
+            ),
+        )
+
+        layout.addLayout(form)
+
+        # --- Пояснение про алгоритм ---
+        algo = QLabel(
+            "<b>Как работает сжатие</b><br><br>"
+            "1. Перед публикацией проверяется размер видеофайла.<br>"
+            "2. Если он больше лимита — создаётся временная "
+            "резервная копия (<code>video.mp4.orig</code>).<br>"
+            "3. Запускается <code>ffmpeg</code> с целевым размером "
+            "файла (<code>-fs</code>). ffmpeg сам остановится, "
+            "когда размер достигнет лимита.<br>"
+            "4. По завершении оригинал перезаписывается сжатой "
+            "версией, резервная копия удаляется.<br>"
+            "5. Если сжатие не удалось — оригинал "
+            "восстанавливается из резервной копии, файл "
+            "пропускается, публикация продолжается.<br><br>"
+            "<b>Прогресс сжатия</b> отображается в окне "
+            "синхронизации и в прогресс-диалоге при публикации "
+            "одной записи."
+        )
+        algo.setWordWrap(True)
+        layout.addWidget(algo)
 
         layout.addStretch()
         return w
@@ -1882,7 +1915,9 @@ class SettingsWindow(QDialog):
         connect_timeout = float(
             self.sum_litellm_connect_timeout.value()
         )
-        read_timeout = float(self.sum_litellm_read_timeout.value())
+        read_timeout = float(
+            self.sum_litellm_read_timeout.value()
+        )
 
         QGuiApplication.setOverrideCursor(
             Qt.CursorShape.WaitCursor
@@ -2371,9 +2406,9 @@ class SettingsWindow(QDialog):
         return w
 
     # ------------------------------------------------------------------
-    # Форматы и сжатие
+    # Форматы и сжатие (старая вкладка для записи)
     # ------------------------------------------------------------------
-    def _build_compression_tab(self) -> QWidget:
+    def _build_compression_old_tab(self) -> QWidget:
         w = QWidget()
         layout = QFormLayout(w)
 
@@ -2566,9 +2601,6 @@ class SettingsWindow(QDialog):
                     qcolor = QColor(color)
                     if qcolor.isValid():
                         color_item.setBackground(qcolor)
-                        # Светлый текст только для тёмного фона.
-                        # При выделении строки Qt перекроет это
-                        # цветом из QSS :selected.
                         if qcolor.lightness() < 128:
                             name_item.setForeground(QColor("#FFFFFF"))
                             color_item.setForeground(QColor("#FFFFFF"))
@@ -2668,26 +2700,26 @@ class SettingsWindow(QDialog):
             bool(sync["allow_delete_local_media_after_upload"])
         )
         self.sync_page_size.setValue(int(sync["sync_page_size"]))
-        self.sync_max_artifact_mb.setValue(
-            int(sync["max_artifact_mb"])
-        )
         self.sync_retry_count.setValue(int(sync["retry_count"]))
         self.sync_retry_delay.setValue(float(sync["retry_delay"]))
 
-
-        self.sync_compress_media_check.setChecked(
+        # --- Сжатие медиа (отдельная вкладка) ---
+        self.compress_enabled_check.setChecked(
             bool(sync.get("compress_media_if_too_large", True))
         )
-        self.sync_compression_min_video_bitrate.setValue(
+        self.compress_max_artifact_mb.setValue(
+            int(sync.get("max_artifact_mb", 2048))
+        )
+        self.compress_min_video_bitrate.setValue(
             int(sync.get("compression_min_video_bitrate_kbps", 200))
         )
-        self.sync_compression_audio_bitrate.setValue(
+        self.compress_audio_bitrate.setValue(
             int(sync.get("compression_audio_bitrate_kbps", 96))
         )
         preset = str(sync.get("compression_preset", "veryfast"))
-        idx = self.sync_compression_preset_combo.findText(preset)
-        if idx >= 0:
-            self.sync_compression_preset_combo.setCurrentIndex(idx)
+        i = self.compress_preset_combo.findText(preset)
+        if i >= 0:
+            self.compress_preset_combo.setCurrentIndex(i)
 
         # --- Промпты ---
         prompts = self.config_manager.get_prompts()
@@ -2873,7 +2905,7 @@ class SettingsWindow(QDialog):
             str(ycfg.get("root_path", "") or "")
         )
 
-        # --- Сжатие ---
+        # --- Сжатие (старая вкладка «Форматы и сжатие») ---
         comp = cfg.get("compression", {})
         self.audio_fmt_combo.setCurrentText(
             comp.get("audio_format", "mp3")
@@ -2920,7 +2952,8 @@ class SettingsWindow(QDialog):
             "default_project=%r, default_chat_id=%r, "
             "tags=%d, employees=%d, prompts=%d, "
             "sync_enabled=%s, sync_url=%r, send_media=%s, "
-            "media_prefer_builtin=%s, use_hash_check=%s",
+            "media_prefer_builtin=%s, use_hash_check=%s, "
+            "compress_media=%s, max_artifact_mb=%d",
             len(projects), default_project,
             self.config_manager.get_default_chat_id(),
             len(tags), len(employees), len(prompts),
@@ -2928,6 +2961,8 @@ class SettingsWindow(QDialog):
             sync.get("send_media_to_server"),
             self.media_prefer_builtin_check.isChecked(),
             self.sync_use_hash_check_check.isChecked(),
+            self.compress_enabled_check.isChecked(),
+            self.compress_max_artifact_mb.value(),
         )
 
     def _apply_form_to_config(self) -> Dict[str, Any]:
@@ -3037,9 +3072,6 @@ class SettingsWindow(QDialog):
                 self.sync_auto_pull_interval.value()
             ),
             "sync_page_size": int(self.sync_page_size.value()),
-            "max_artifact_mb": int(
-                self.sync_max_artifact_mb.value()
-            ),
             "send_video_link": (
                 self.sync_send_video_link_check.isChecked()
             ),
@@ -3058,17 +3090,21 @@ class SettingsWindow(QDialog):
             "sync_projects_and_tags": True,
             "retry_count": int(self.sync_retry_count.value()),
             "retry_delay": float(self.sync_retry_delay.value()),
-                        "compress_media_if_too_large": (
-                self.sync_compress_media_check.isChecked()
+            # --- Автосжатие (перенесено с вкладки «Синхронизация») ---
+            "max_artifact_mb": int(
+                self.compress_max_artifact_mb.value()
+            ),
+            "compress_media_if_too_large": (
+                self.compress_enabled_check.isChecked()
             ),
             "compression_min_video_bitrate_kbps": int(
-                self.sync_compression_min_video_bitrate.value()
+                self.compress_min_video_bitrate.value()
             ),
             "compression_audio_bitrate_kbps": int(
-                self.sync_compression_audio_bitrate.value()
+                self.compress_audio_bitrate.value()
             ),
             "compression_preset": (
-                self.sync_compression_preset_combo.currentText()
+                self.compress_preset_combo.currentText()
             ),
         })
 
@@ -3259,7 +3295,6 @@ class SettingsWindow(QDialog):
         app_cfg["overlay_log_lines"] = int(
             self.overlay_log_lines.value()
         )
-        # --- встроенный плеер / скачивание медиа ---
         app_cfg["media_prefer_builtin_player"] = (
             self.media_prefer_builtin_check.isChecked()
         )
@@ -3287,7 +3322,8 @@ class SettingsWindow(QDialog):
                 "Настройки сохранены: projects=%d, "
                 "default_project=%r, default_chat_id=%r, tags=%d, "
                 "sync_enabled=%s, sync_url=%r, send_media=%s, "
-                "media_prefer_builtin=%s, use_hash_check=%s",
+                "media_prefer_builtin=%s, use_hash_check=%s, "
+                "compress_media=%s, max_artifact_mb=%d",
                 len(cfg.get("projects", [])),
                 cfg.get("default_project"),
                 cfg.get("default_chat_id"),
@@ -3299,6 +3335,10 @@ class SettingsWindow(QDialog):
                     "media_prefer_builtin_player"
                 ),
                 cfg.get("sync", {}).get("use_hash_check"),
+                cfg.get("sync", {}).get(
+                    "compress_media_if_too_large"
+                ),
+                cfg.get("sync", {}).get("max_artifact_mb"),
             )
 
             current = get_current_log_path()
@@ -3356,6 +3396,7 @@ class SettingsWindow(QDialog):
         if not target:
             log.info("Экспорт настроек отменён пользователем")
             return
+
         target = safe_local_path(target)
 
         if not target.lower().endswith(".json"):
@@ -3728,13 +3769,8 @@ class SettingsWindow(QDialog):
             "содержимое НЕ отправляется по сети. Это экономит "
             "трафик при повторной публикации (например, "
             "268 МБ видео не уйдут второй раз).<br><br>"
-            "Ограничения:<br>"
-            "• Медиафайл не может превышать <b>«Макс. размер "
-            "артефакта»</b> (и <code>SCREC_MAX_ARTIFACT_MB</code> "
-            "на сервере).<br>"
-            "• Загрузка больших видео может занимать минуты.<br>"
-            "• Файл хранится и локально, и на сервере, если "
-            "не включено удаление после загрузки.<br><br>"
+            "<b>Автосжатие медиа</b> настраивается на отдельной "
+            "вкладке <b>«Сжатие медиа»</b>.<br><br>"
             "<b>Автопубликация</b> — сразу после успешной "
             "обработки запись уходит на сервер.<br>"
             "<b>Автоподтягивание</b> — фоновая дельта-"
@@ -3743,6 +3779,50 @@ class SettingsWindow(QDialog):
             "открывает полноценный менеджер: публикация выбранных "
             "записей, скачивание с сервера, дельта-синхронизация, "
             "справочники проектов и тегов и журнал операций."
+        ),
+        "Сжатие медиа": (
+            "<b>Автосжатие медиа перед публикацией</b><br><br>"
+            "Если видеофайл превышает «Макс. размер артефакта», "
+            "он автоматически перекодируется через "
+            "<code>ffmpeg</code> до целевого размера. Это "
+            "позволяет публиковать длинные записи, не упираясь "
+            "в лимит сервера (<code>SCREC_MAX_ARTIFACT_MB</code>)."
+            "<br><br>"
+            "<b style='color:#c62828'>Внимание:</b> сжатие "
+            "необратимо. Оригинал ПЕРЕЗАПИСЫВАЕТСЯ сжатой "
+            "версией, на диске остаётся только сжатое видео. "
+            "Качество теряется безвозвратно.<br><br>"
+            "<b>Макс. размер артефакта</b> — целевой размер "
+            "файла. Также проверяется на сервере "
+            "(<code>SCREC_MAX_ARTIFACT_MB</code>, по умолчанию "
+            "50 МБ). Если на сервере меньше — увеличьте его "
+            "или уменьшите значение здесь.<br><br>"
+            "<b>Мин. битрейт видео</b> — минимальный битрейт "
+            "при сжатии. Если для достижения целевого размера "
+            "требуется меньше — итоговый файл окажется чуть "
+            "больше лимита, зато картинка не рассыпется "
+            "на квадраты.<br><br>"
+            "<b>Битрейт аудио</b> — 96 kbps достаточно для "
+            "речи, 128+ — если важны детали.<br><br>"
+            "<b>Пресет x264</b> — компромисс между скоростью "
+            "и качеством сжатия. <code>veryfast</code> — "
+            "рекомендуемый баланс; <code>ultrafast</code> — "
+            "быстрее, но больше размер; <code>veryslow</code> — "
+            "медленнее, но меньше размер.<br><br>"
+            "<b>Как работает сжатие:</b><br>"
+            "1. Перед публикацией проверяется размер видео.<br>"
+            "2. Если он больше лимита — создаётся временная "
+            "резервная копия (<code>video.mp4.orig</code>).<br>"
+            "3. Запускается ffmpeg с целевым размером "
+            "(<code>-fs</code>). ffmpeg сам остановится при "
+            "достижении лимита.<br>"
+            "4. По завершении оригинал перезаписывается сжатой "
+            "версией, резервная копия удаляется.<br>"
+            "5. Если сжатие не удалось — оригинал "
+            "восстанавливается из резервной копии, файл "
+            "пропускается, публикация продолжается.<br><br>"
+            "Прогресс сжатия отображается в окне синхронизации "
+            "и в прогресс-диалоге при публикации одной записи."
         ),
         "Промпты и имена": (
             "<b>Промпты и шаблоны имён</b>"
