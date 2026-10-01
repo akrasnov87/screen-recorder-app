@@ -289,8 +289,17 @@ class SettingsWindow(QDialog):
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        form = QFormLayout()
-        form.setLabelAlignment(
+        # --- Блок: корневая папка ---
+        root_header = QHBoxLayout()
+        root_header.addWidget(QLabel("<b>Корневая папка</b>"))
+        root_header.addStretch()
+        root_icon = make_info_icon("yandex_vm_root")
+        if root_icon is not None:
+            root_header.addWidget(root_icon)
+        layout.addLayout(root_header)
+
+        root_form = QFormLayout()
+        root_form.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight
             | Qt.AlignmentFlag.AlignVCenter
         )
@@ -311,12 +320,9 @@ class SettingsWindow(QDialog):
         row.setSpacing(6)
         row.addWidget(self.yandex_vm_root_input, 1)
         row.addWidget(browse_btn, 0)
-        icon = make_info_icon("yandex_vm_root")
-        if icon is not None:
-            row.addWidget(icon, 0)
 
-        form.addRow("Корневая папка ВМ:", container)
-        layout.addLayout(form)
+        root_form.addRow("Корневая папка ВМ:", container)
+        layout.addLayout(root_form)
 
         hint = QLabel(
             "<span style='color:#666'>Пример структуры:</span>\n"
@@ -336,6 +342,94 @@ class SettingsWindow(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        # --- Блок: ВМ для транскрибации ---
+        sep = QLabel("<hr>")
+        layout.addWidget(sep)
+
+        tr_header = QHBoxLayout()
+        tr_header.addWidget(
+            QLabel("<b>ВМ для сервиса транскрибации</b>")
+        )
+        tr_header.addStretch()
+        tr_icon = make_info_icon("yandex_vm_transcribe_vm")
+        if tr_icon is not None:
+            tr_header.addWidget(tr_icon)
+        layout.addLayout(tr_header)
+
+        tr_hint = QLabel(
+            "<span style='color:#666'>Если сервис транскрибации "
+            "недоступен (ВМ выключена по расписанию), приложение "
+            "может временно продлить расписание ВМ, дождаться её "
+            "запуска и продолжить транскрибацию. После обработки "
+            "приложение спросит, отключить ли ВМ (восстановить "
+            "исходное расписание).<br><br>"
+            "Укажите имя подпапки ВМ (например, "
+            "<code>vm-prod-01</code>), которая отвечает за "
+            "транскрибацию. Если оставить поле пустым — "
+            "приложение НЕ управляет ВМ, а при недоступности "
+            "сервиса просто пропускает транскрибацию.</span>"
+        )
+        tr_hint.setWordWrap(True)
+        layout.addWidget(tr_hint)
+
+        tr_form = QFormLayout()
+        tr_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.transcribe_vm_name_input = QLineEdit()
+        self.transcribe_vm_name_input.setPlaceholderText(
+            "Например: vm-prod-01 (пусто = не управлять ВМ)"
+        )
+        tr_form.addRow(
+            "Имя ВМ:",
+            with_info(
+                self.transcribe_vm_name_input,
+                "yandex_vm_transcribe_vm",
+            ),
+        )
+
+        self.transcribe_vm_timeout_spin = QSpinBox()
+        self.transcribe_vm_timeout_spin.setRange(30, 24 * 3600)
+        self.transcribe_vm_timeout_spin.setSingleStep(30)
+        self.transcribe_vm_timeout_spin.setSuffix(" сек")
+        self.transcribe_vm_timeout_spin.setValue(600)
+        tr_form.addRow(
+            "Таймаут ожидания запуска:",
+            with_info(
+                self.transcribe_vm_timeout_spin,
+                "yandex_vm_transcribe_timeout",
+            ),
+        )
+
+        self.transcribe_vm_interval_spin = QSpinBox()
+        self.transcribe_vm_interval_spin.setRange(2, 600)
+        self.transcribe_vm_interval_spin.setSingleStep(2)
+        self.transcribe_vm_interval_spin.setSuffix(" сек")
+        self.transcribe_vm_interval_spin.setValue(10)
+        tr_form.addRow(
+            "Интервал проверки:",
+            with_info(
+                self.transcribe_vm_interval_spin,
+                "yandex_vm_transcribe_interval",
+            ),
+        )
+
+        self.transcribe_vm_extension_spin = QSpinBox()
+        self.transcribe_vm_extension_spin.setRange(5, 24 * 60)
+        self.transcribe_vm_extension_spin.setSingleStep(5)
+        self.transcribe_vm_extension_spin.setSuffix(" мин")
+        self.transcribe_vm_extension_spin.setValue(30)
+        tr_form.addRow(
+            "Продление расписания:",
+            with_info(
+                self.transcribe_vm_extension_spin,
+                "yandex_vm_transcribe_extension",
+            ),
+        )
+
+        layout.addLayout(tr_form)
         layout.addStretch()
         return w
 
@@ -3060,6 +3154,20 @@ class SettingsWindow(QDialog):
         self.yandex_vm_root_input.setText(
             str(ycfg.get("root_path", "") or "")
         )
+        self.transcribe_vm_name_input.setText(
+            str(ycfg.get("transcribe_vm_name", "") or "")
+        )
+        self.transcribe_vm_timeout_spin.setValue(
+            int(ycfg.get("transcribe_vm_start_timeout", 600))
+        )
+        self.transcribe_vm_interval_spin.setValue(
+            int(ycfg.get("transcribe_vm_check_interval", 10))
+        )
+        self.transcribe_vm_extension_spin.setValue(
+            int(ycfg.get(
+                "transcribe_vm_schedule_extension_minutes", 30
+            ))
+        )
 
         # --- Сжатие (старая вкладка «Форматы и сжатие») ---
         comp = cfg.get("compression", {})
@@ -3145,6 +3253,18 @@ class SettingsWindow(QDialog):
 
         cfg["yandex_vm"] = {
             "root_path": self.yandex_vm_root_input.text().strip(),
+            "transcribe_vm_name": (
+                self.transcribe_vm_name_input.text().strip()
+            ),
+            "transcribe_vm_start_timeout": int(
+                self.transcribe_vm_timeout_spin.value()
+            ),
+            "transcribe_vm_check_interval": int(
+                self.transcribe_vm_interval_spin.value()
+            ),
+            "transcribe_vm_schedule_extension_minutes": int(
+                self.transcribe_vm_extension_spin.value()
+            ),
         }
 
         default_project = (

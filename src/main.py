@@ -14,6 +14,11 @@
   • Автопубликация проверяет флаг sync_ready (если включена
     настройка sync_auto_publish_ready_only). Это защищает от
     публикации черновиков и от гонки publish/pull.
+  • Управление ВМ Yandex: при недоступности сервиса
+    транскрибации приложение может временно включить ВМ,
+    дождаться запуска и продолжить обработку. После
+    обработки пользователю предлагается отключить ВМ
+    (восстановить исходное расписание).
 """
 from __future__ import annotations
 
@@ -54,6 +59,7 @@ if __package__ in (None, ""):
     from src.recorder import ScreenRecorder
     from src.sync_manager import SyncManager, is_record_published
     from src.task_queue import TaskQueue
+    from src.yandex_vm_manager import YandexVMManager
     from src.platform_utils import (
         IS_LINUX,
         IS_WINDOWS,
@@ -92,6 +98,7 @@ else:
     from .recorder import ScreenRecorder
     from .sync_manager import SyncManager, is_record_published
     from .task_queue import TaskQueue
+    from .yandex_vm_manager import YandexVMManager
     from src.platform_utils import (
         IS_LINUX,
         IS_WINDOWS,
@@ -154,6 +161,7 @@ class ScreenRecorderApp(QObject):
             self.config_manager.config,
             self.task_queue,
             is_recording_cb=self._is_recording,
+            config_manager=self.config_manager,
         )
         self.tray_manager = TrayManager(self.config_manager.config, self)
         self.overlay_panel = OverlayPanel(self.config_manager.config)
@@ -1197,6 +1205,105 @@ class ScreenRecorderApp(QObject):
         if output_dir:
             self._auto_publish_after_processing(task_id, output_dir)
 
+        # --- Завершение VM-сессии (отключение ВМ) ---
+        vm_info = result.get("vm_session")
+        if vm_info and vm_info.get("schedule_modified"):
+            self._finish_vm_session(vm_info)
+
+    def _finish_vm_session(self, vm_info: dict) -> None:
+        """
+        Спрашивает пользователя, отключить ли ВМ после обработки.
+
+        Восстанавливает расписание из резервной копии, если
+        пользователь согласен. Иначе — предупреждает, до какого
+        времени ВМ продолжит работу.
+        """
+        vm_name = vm_info.get("vm_name", "")
+        schedule_path = vm_info.get("schedule_path", "")
+
+        if not schedule_path:
+            log.warning(
+                "_finish_vm_session: не передан schedule_path — "
+                "нечего восстанавливать"
+            )
+            return
+
+        try:
+            vm_settings = self.config_manager.get_yandex_vm_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать настройки ВМ: %s", exc
+            )
+            return
+
+        vm_manager = YandexVMManager(vm_settings)
+        backup_path = schedule_path + ".transcribe_bak"
+
+        info = vm_manager.get_modified_schedule_info(
+            schedule_path=schedule_path
+        )
+        next_stop = info.get("next_stop_time", "")
+
+        if next_stop:
+            msg = (
+                f"<b>Транскрибация завершена.</b><br><br>"
+                f"ВМ «{vm_name}» была временно включена для "
+                f"транскрибации.<br><br>"
+                f"<b>Отключить ВМ сейчас?</b><br>"
+                f"Если да — расписание будет восстановлено, "
+                f"и ВМ выключится при следующем запуске "
+                f"vm_manager.py.<br><br>"
+                f"Если нет — ВМ будет работать до "
+                f"<b>{next_stop}</b>."
+            )
+        else:
+            msg = (
+                f"<b>Транскрибация завершена.</b><br><br>"
+                f"ВМ «{vm_name}» была временно включена. "
+                f"Отключить её сейчас?"
+            )
+
+        reply = QMessageBox.question(
+            None, "Управление ВМ Yandex",
+            msg,
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            restore = vm_manager.restore_from_backup(
+                schedule_path=schedule_path,
+                backup_path=backup_path,
+            )
+            if restore["ok"]:
+                self._notify(
+                    "ВМ Yandex",
+                    f"Расписание ВМ «{vm_name}» восстановлено",
+                )
+            else:
+                QMessageBox.warning(
+                    None, "ВМ Yandex",
+                    f"Не удалось восстановить расписание:\n"
+                    f"{restore['message']}",
+                )
+        else:
+            if next_stop:
+                QMessageBox.information(
+                    None, "ВМ Yandex",
+                    f"ВМ «{vm_name}» продолжит работу до "
+                    f"{next_stop}.\n\n"
+                    f"Отключить её позже можно через окно "
+                    f"«ВМ Yandex» (трей) — вручную поправить "
+                    f"schedule.cron.",
+                )
+            else:
+                QMessageBox.information(
+                    None, "ВМ Yandex",
+                    f"ВМ «{vm_name}» продолжит работу по "
+                    f"изменённому расписанию.",
+                )
+
     def _on_task_failed(self, task_id: str, error: str) -> None:
         log.error("Задача %s провалена: %s", task_id, error)
         if not self._is_recording():
@@ -1299,6 +1406,9 @@ class ScreenRecorderApp(QObject):
             self.app_cfg = self.config_manager.get_app_settings()
             self.recorder.config = self.config_manager.config
             self.processor.config = self.config_manager.config
+            # Обновляем ссылку на ConfigManager в процессоре —
+            # на случай, если он был пересоздан.
+            self.processor._config_manager = self.config_manager
             self.hotkey_manager.update_hotkeys(
                 self.config_manager.config
             )

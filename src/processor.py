@@ -39,12 +39,14 @@ class VideoProcessor(QObject):
         config: Dict,
         task_queue: TaskQueue,
         is_recording_cb: Optional[Callable[[], bool]] = None,
+        config_manager=None,   # ← добавить
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self.config = config or {}
         self.task_queue = task_queue
         self._is_recording_cb = is_recording_cb
+        self._config_manager = config_manager   # ← добавить
         self._cancel_events: Dict[str, asyncio.Event] = {}
         self._running = False
         self._last_retry_check = 0.0
@@ -128,9 +130,64 @@ class VideoProcessor(QObject):
 
             self._raise_if_cancelled(task_id, cancel_event)
 
-            # --- Шаг 2: транскрибация + суммаризация ---
+            # ============================================================
+            # Шаг 2: транскрибация + суммаризация
+            # ============================================================
             transcribe_cfg = self.config.get("transcribe", {})
             transcribe_url = (transcribe_cfg.get("url") or "").strip()
+            transcribe_available = bool(transcribe_url)
+            vm_session = None
+
+            # --- Проверка доступности транскрибации и ВМ ---
+            if transcribe_url and self._config_manager is not None:
+                from .transcribe_vm_controller import (
+                    TranscribeVMController,
+                )
+
+                controller = TranscribeVMController(
+                    self._config_manager
+                )
+
+                self.task_progress.emit(
+                    task_id, 45,
+                    "Проверка сервиса транскрибации…"
+                )
+
+                try:
+                    prep = await controller.prepare_for_transcribe(
+                        progress_cb=lambda msg: self.task_progress.emit(
+                            task_id, 45, msg
+                        ),
+                        cancel_event=cancel_event,
+                    )
+                except Exception as exc:
+                    log.exception(
+                        "[%s] Ошибка проверки ВМ: %s", task_id, exc
+                    )
+                    prep = None
+
+                if prep is not None:
+                    if prep.can_transcribe:
+                        transcribe_available = True
+                        vm_session = prep.vm_session
+                        log.info(
+                            "[%s] Транскрибация доступна "
+                            "(ВМ: %s)",
+                            task_id,
+                            "использована"
+                            if vm_session else "не требовалась",
+                        )
+                    else:
+                        transcribe_available = False
+                        log.warning(
+                            "[%s] Транскрибация недоступна: %s",
+                            task_id, prep.skipped_reason,
+                        )
+                        self.task_progress.emit(
+                            task_id, 45,
+                            f"Транскрибация пропущена: "
+                            f"{prep.skipped_reason[:60]}"
+                        )
 
             sum_cfg = self.config.get("summarizer", {}) or {}
             provider = str(sum_cfg.get("provider", "server")).strip().lower()
@@ -148,7 +205,7 @@ class VideoProcessor(QObject):
             transcript_path = ""
             summary_path = ""
 
-            if transcribe_url:
+            if transcribe_available:
                 log.info(
                     "[%s] Шаг 2/2: транскрибация "
                     "(провайдер суммаризации: %s, summary: %s)",
@@ -326,8 +383,18 @@ class VideoProcessor(QObject):
                         self._save_summary, transcript, summary_path
                     )
             else:
-                log.info("[%s] Транскрибация пропущена: URL сервера "
-                         "не задан", task_id)
+                if not transcribe_url:
+                    log.info(
+                        "[%s] Транскрибация пропущена: URL сервера "
+                        "не задан", task_id,
+                    )
+                else:
+                    log.info(
+                        "[%s] Транскрибация пропущена: сервис "
+                        "недоступен и ВМ не настроена "
+                        "(или не запустилась)",
+                        task_id,
+                    )
 
             self._raise_if_cancelled(task_id, cancel_event)
 
@@ -407,6 +474,25 @@ class VideoProcessor(QObject):
                 "transcript": transcript_path,
                 "summary": summary_path if transcript_path else "",
                 "output_dir": os.path.dirname(video_path),
+                # --- Информация о VM-сессии для UI ---
+                "vm_session": (
+                    {
+                        "schedule_modified": (
+                            vm_session.schedule_modified
+                            if vm_session else False
+                        ),
+                        "schedule_path": (
+                            vm_session.schedule_path
+                            if vm_session else ""
+                        ),
+                        "vm_name": (
+                            vm_session.vm_manager.vm_name
+                            if vm_session and vm_session.vm_manager
+                            else ""
+                        ),
+                    }
+                    if vm_session else None
+                ),
             }
             total = time.monotonic() - t0
             log.info("[%s] Задача завершена за %.1f с. Файлы: %s",

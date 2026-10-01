@@ -81,6 +81,19 @@ DEFAULT_NAME_TEMPLATES: List[Dict[str, str]] = [
 DEFAULT_CONFIG: Dict[str, Any] = {
     "yandex_vm": {
         "root_path": "",
+        # --- ВМ для транскрибации ---
+        # Имя подпапки в root_path, соответствующей ВМ, которая
+        # отвечает за сервис транскрибации. Если пусто — приложение
+        # НЕ управляет ВМ, транскрибация просто пропускается при
+        # недоступности сервиса.
+        "transcribe_vm_name": "",
+        # Сколько секунд ждать запуска ВМ после продления расписания.
+        "transcribe_vm_start_timeout": 600,
+        # Интервал опроса доступности сервиса транскрибации (сек).
+        "transcribe_vm_check_interval": 10,
+        # На сколько минут продлевать расписание при старте, чтобы
+        # ВМ гарантированно запустилась и успела отработать.
+        "transcribe_vm_schedule_extension_minutes": 30,
     },
     "projects": [
         {"name": "Россети",     "chat_id": ""},
@@ -295,7 +308,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # Если True — при переключении sync_ready с false на true
         # запись автоматически публикуется на сервер в фоне.
         "sync_publish_on_ready": True,
-    },
+    }
 }
 
 _SERVICE_NAME = "screen-recorder-app"
@@ -435,6 +448,20 @@ class ConfigManager:
         cfg = self.config.get("yandex_vm", {}) or {}
         return {
             "root_path": str(cfg.get("root_path", "")).strip(),
+            "transcribe_vm_name": str(
+                cfg.get("transcribe_vm_name", "") or ""
+            ).strip(),
+            "transcribe_vm_start_timeout": int(
+                cfg.get("transcribe_vm_start_timeout", 600)
+            ),
+            "transcribe_vm_check_interval": int(
+                cfg.get("transcribe_vm_check_interval", 10)
+            ),
+            "transcribe_vm_schedule_extension_minutes": int(
+                cfg.get(
+                    "transcribe_vm_schedule_extension_minutes", 30
+                )
+            ),
         }
 
     # ------------------------------------------------------------------
