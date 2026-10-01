@@ -23,6 +23,12 @@
     под Wayland/GTK Qt может вернуть percent-encoded путь
     (например, %D0%9A%D0%A1%D0%A3%D0%9E_...), из-за чего файлы
     вложений сохранялись с «сырыми» именами.
+  • Добавлен просмотр стенограммы (video.txt):
+      – пункт меню «Файл → Просмотреть стенограмму»;
+      – кнопка «Стенограмма» на нижней панели;
+      – пункт контекстного меню «Просмотреть стенограмму»;
+      – открывается во встроенном TextViewDialog (read-only,
+        поиск с подсветкой, Ctrl+F, F3 / Shift+F3).
 """
 from __future__ import annotations
 
@@ -62,6 +68,8 @@ from .media_player import (
     is_builtin_player_available, open_media, probe_media_support,
 )
 from .metadata_dialog import MetadataDialog
+from .text_viewer import TextViewerDialog
+from .tooltips import attach_tooltip
 
 log = get_logger(__name__)
 
@@ -187,9 +195,8 @@ class SessionsScanThread(QThread):
 
             video_path = self._find_first_video(session_dir)
             has_video = bool(video_path)
-            has_transcript = os.path.exists(
-                os.path.join(session_dir, "video.txt")
-            )
+            transcript_path = os.path.join(session_dir, "video.txt")
+            has_transcript = os.path.exists(transcript_path)
             audio_path = self._find_first_audio(session_dir)
             has_audio = bool(audio_path)
 
@@ -283,6 +290,10 @@ class SessionsScanThread(QThread):
                 "audio_path": audio_path,
                 "has_video": has_video,
                 "has_audio": has_audio,
+                "transcript_path": (
+                    transcript_path if has_transcript else ""
+                ),
+                "has_transcript": has_transcript,
                 "task_id": task_id,
                 "prompt_path": prompt_path,
                 "attachments": attachments,
@@ -440,7 +451,6 @@ class SyncOneRecordDialog(QDialog):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
 
-        # --- Заголовок ---
         name = self._row.get("name") or "(без названия)"
         project = self._row.get("project") or "—"
         dt = self._row.get("datetime") or "—"
@@ -465,7 +475,6 @@ class SyncOneRecordDialog(QDialog):
         header.setWordWrap(True)
         root.addWidget(header)
 
-        # --- Список файлов ---
         files_label = QLabel("<b>Локальные файлы:</b>")
         root.addWidget(files_label)
 
@@ -474,7 +483,6 @@ class SyncOneRecordDialog(QDialog):
         self.files_view.setMaximumHeight(140)
         root.addWidget(self.files_view)
 
-        # --- Чекбоксы ---
         self.send_media_check = QCheckBox(
             "Передавать медиа (видео и аудио) на сервер"
         )
@@ -523,7 +531,6 @@ class SyncOneRecordDialog(QDialog):
         )
         root.addWidget(self.delete_after_check)
 
-        # Связываем: delete_after доступен только при send_media.
         self.send_media_check.toggled.connect(
             self.delete_after_check.setEnabled
         )
@@ -531,7 +538,6 @@ class SyncOneRecordDialog(QDialog):
             self.send_media_check.isChecked()
         )
 
-        # --- Инфо о лимите ---
         max_mb = int(
             self._sync_settings.get("max_artifact_mb", 50)
         )
@@ -543,7 +549,6 @@ class SyncOneRecordDialog(QDialog):
         limit_label.setWordWrap(True)
         root.addWidget(limit_label)
 
-        # --- Кнопки ---
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel,
@@ -560,11 +565,9 @@ class SyncOneRecordDialog(QDialog):
         root.addWidget(buttons)
 
     def _populate(self) -> None:
-        """Показывает список локальных файлов с размерами."""
         lines: List[str] = []
         session_dir = self._row.get("dir") or ""
 
-        # Медиа
         for kind, exts in (
             ("video", (".mp4", ".mkv", ".mov", ".avi", ".webm",
                        ".flv", ".wmv")),
@@ -583,7 +586,6 @@ class SyncOneRecordDialog(QDialog):
                     )
                     break
 
-        # Текстовые артефакты
         text_files = [
             ("transcript", "video.txt"),
             ("summary", "video_summary.md"),
@@ -614,7 +616,6 @@ class SyncOneRecordDialog(QDialog):
                 )
                 seen_kinds.add(kind)
 
-        # Вложения
         att_dir = os.path.join(session_dir, "attachments")
         if os.path.isdir(att_dir):
             try:
@@ -637,9 +638,6 @@ class SyncOneRecordDialog(QDialog):
 
         self.files_view.setPlainText("\n".join(lines))
 
-    # ------------------------------------------------------------------
-    # Результат
-    # ------------------------------------------------------------------
     def _on_accept(self) -> None:
         self._result_data = {
             "include_media": bool(self.send_media_check.isChecked()),
@@ -811,6 +809,15 @@ class SessionsWindow(QDialog):
         self.play_audio_btn.clicked.connect(self._open_audio)
         bottom.addWidget(self.play_audio_btn)
 
+        self.open_transcript_btn = QPushButton("Стенограмма")
+        attach_tooltip(
+            self.open_transcript_btn, "sess_transcript_button"
+        )
+        self.open_transcript_btn.clicked.connect(
+            self._open_transcript
+        )
+        bottom.addWidget(self.open_transcript_btn)
+
         self.sync_btn = QPushButton("Синхронизировать…")
         self.sync_btn.setToolTip(
             "Опубликовать выбранную запись на сервер "
@@ -948,6 +955,16 @@ class SessionsWindow(QDialog):
         )
         act_open_audio.triggered.connect(self._open_audio)
         m_file.addAction(act_open_audio)
+
+        act_open_transcript = QAction(
+            "Просмотреть стенограмму", self
+        )
+        act_open_transcript.setShortcut(QKeySequence("Ctrl+Shift+T"))
+        attach_tooltip(
+            act_open_transcript, "sess_transcript_action"
+        )
+        act_open_transcript.triggered.connect(self._open_transcript)
+        m_file.addAction(act_open_transcript)
 
         m_file.addSeparator()
 
@@ -1246,6 +1263,7 @@ class SessionsWindow(QDialog):
             self.sync_btn.setEnabled(False)
             self.play_video_btn.setEnabled(False)
             self.play_audio_btn.setEnabled(False)
+            self.open_transcript_btn.setEnabled(False)
             return
 
         parts = [f"<b>{r['name']}</b>"]
@@ -1260,17 +1278,16 @@ class SessionsWindow(QDialog):
             parts.append("протокол: прикреплён")
         if (r.get("summary_bb") or "").strip():
             parts.append("summary: есть")
+        if r.get("has_transcript"):
+            parts.append("стенограмма: есть")
         if r.get("published"):
             parts.append(
                 f"на сервере: {r.get('record_id', '')[:8]}"
             )
         self.selection_label.setText(" | ".join(parts))
 
-        # Кнопка синхронизации доступна, если есть папка сессии.
         self.sync_btn.setEnabled(bool(r.get("dir")))
 
-        # Кнопки воспроизведения: разрешены, если есть локальный файл
-        # ИЛИ запись опубликована на сервере (можно скачать).
         has_local_video = bool(r.get("has_video"))
         has_local_audio = bool(r.get("has_audio"))
         is_published = bool(r.get("published"))
@@ -1280,6 +1297,11 @@ class SessionsWindow(QDialog):
         )
         self.play_audio_btn.setEnabled(
             has_local_audio or is_published
+        )
+
+        # Стенограмма: только если есть локальный файл video.txt.
+        self.open_transcript_btn.setEnabled(
+            bool(r.get("has_transcript"))
         )
 
     # ------------------------------------------------------------------
@@ -1446,15 +1468,6 @@ class SessionsWindow(QDialog):
         self._open_media_kind("audio")
 
     def _open_media_kind(self, kind: str) -> None:
-        """
-        Универсальная точка входа для воспроизведения медиа.
-
-        Логика:
-          1. Найти локальный файл нужного kind.
-          2. Если локального нет, но запись опубликована —
-             предложить скачать с сервера.
-          3. Открыть встроенным плеером (или fallback).
-        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -1466,12 +1479,10 @@ class SessionsWindow(QDialog):
         elif kind == "audio":
             local_path = r.get("audio_path") or ""
 
-        # 1. Локальный файл есть — воспроизводим.
         if local_path and os.path.isfile(local_path):
             self._play_media(local_path, r, kind)
             return
 
-        # 2. Локального нет. Проверяем, что можно скачать с сервера.
         if not r.get("published") or not r.get("record_id"):
             QMessageBox.information(
                 self, "Записи",
@@ -1483,7 +1494,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # 3. Запись опубликована. Спрашиваем про скачивание.
         auto_download = bool(
             self._app_cfg.get("media_auto_download_from_server", True)
         )
@@ -1512,7 +1522,6 @@ class SessionsWindow(QDialog):
     def _download_and_play_media(
         self, row: Dict[str, Any], kind: str,
     ) -> None:
-        """Запускает скачивание медиа с сервера и воспроизведение."""
         if self.config_manager is None:
             QMessageBox.warning(
                 self, "Записи",
@@ -1598,19 +1607,16 @@ class SessionsWindow(QDialog):
         downloaded = result.get("downloaded") or []
         missing = result.get("missing") or []
 
-        # --- Обновляем запись, чтобы найти локальный путь ---
         target_path = ""
         for item in downloaded:
             item_kind = str(item.get("kind") or "")
             if item_kind == kind and not item.get("skipped"):
                 target_path = str(item.get("local_path") or "")
                 break
-            # Если уже был актуален — тоже подойдёт.
             if item_kind == kind and item.get("skipped"):
                 target_path = str(item.get("local_path") or "")
 
         if not target_path:
-            # Fallback: поищем локально ещё раз.
             if kind == "video":
                 for ext in _VIDEO_EXTS:
                     candidate = os.path.join(
@@ -1629,7 +1635,6 @@ class SessionsWindow(QDialog):
                         break
 
         if not target_path or not os.path.isfile(target_path):
-            # Показываем диагностику.
             missing_kind = next(
                 (m for m in missing if str(m.get("kind")) == kind),
                 None,
@@ -1658,7 +1663,6 @@ class SessionsWindow(QDialog):
             self.refresh()
             return
 
-        # --- Воспроизводим ---
         self._play_media(target_path, row, kind)
         self.refresh()
 
@@ -1683,7 +1687,6 @@ class SessionsWindow(QDialog):
         row: Dict[str, Any],
         kind: str,
     ) -> None:
-        """Открывает медиафайл в встроенном плеере или fallback."""
         if not file_path or not os.path.isfile(file_path):
             QMessageBox.warning(
                 self, "Записи",
@@ -1728,6 +1731,107 @@ class SessionsWindow(QDialog):
             )
 
     # ------------------------------------------------------------------
+    # Просмотр стенограммы
+    # ------------------------------------------------------------------
+    def _open_transcript(self) -> None:
+        """
+        Открывает стенограмму (video.txt) во встроенном
+        read-only просмотрщике с поиском.
+
+        Поиск файла выполняется в двух местах:
+          1. В корне папки записи.
+          2. В подпапке attachments.
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        session_dir = r.get("dir") or ""
+        transcript_path = ""
+
+        # 1. Проверяем файл в корне папки записи
+        root_path = os.path.join(session_dir, "video.txt")
+        if os.path.isfile(root_path):
+            transcript_path = root_path
+
+        # 2. Если в корне нет, ищем в папке attachments
+        if not transcript_path:
+            attachments_path = os.path.join(
+                session_dir, "attachments", "video.txt"
+            )
+            if os.path.isfile(attachments_path):
+                transcript_path = attachments_path
+
+        if not transcript_path:
+            QMessageBox.information(
+                self, "Записи",
+                "У этой записи нет стенограммы (video.txt) ни в "
+                "корне папки, ни в папке attachments.\n\n"
+                "Стенограмма создаётся при обработке, если задан "
+                "URL сервера транскрибации "
+                "(Настройки → Транскрибация).",
+            )
+            return
+
+        try:
+            size_bytes = os.path.getsize(transcript_path)
+        except OSError:
+            size_bytes = 0
+
+        # Лимит 20 МБ — как в TextViewerDialog.
+        if size_bytes > 20 * 1024 * 1024:
+            reply = QMessageBox.question(
+                self, "Стенограмма",
+                f"Файл стенограммы очень большой: "
+                f"{size_bytes / 1024 / 1024:.1f} МБ.\n\n"
+                f"Открытие может занять время и замедлить "
+                f"интерфейс.\n\n"
+                f"Открыть всё равно?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            with open(
+                transcript_path, "r",
+                encoding="utf-8", errors="replace",
+            ) as f:
+                text = f.read()
+        except Exception as exc:
+            log.exception(
+                "Не удалось прочитать стенограмму %s: %s",
+                transcript_path, exc,
+            )
+            QMessageBox.critical(
+                self, "Записи",
+                f"Не удалось прочитать стенограмму:\n{exc}",
+            )
+            return
+
+        source_label = (
+            f"{os.path.basename(transcript_path)} "
+            f"({size_bytes / 1024:.1f} КБ)"
+        )
+
+        dlg = TextViewerDialog(
+            text=text,
+            title=f"Стенограмма — {r['name']}",
+            parent=self,
+            source_label=source_label,
+            default_save_name="video.txt",
+        )
+        dlg.exec()
+
+        log.info(
+            "Записи: просмотр стенограммы для «%s» (%d символов, файл=%s)",
+            r["name"], len(text), transcript_path,
+        )
+
+    # ------------------------------------------------------------------
     # Синхронизация одной записи
     # ------------------------------------------------------------------
     def _sync_one_record(self) -> None:
@@ -1753,7 +1857,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # Открываем диалог выбора опций.
         dlg = SyncOneRecordDialog(
             row=r,
             sync_settings=cfg,
@@ -1769,7 +1872,6 @@ class SessionsWindow(QDialog):
             config_manager=self.config_manager,
         )
 
-        # Прогресс-диалог.
         self._sync_progress_dlg = QProgressDialog(
             f"Синхронизация: {r['name']}…",
             "Отмена",
@@ -1780,10 +1882,9 @@ class SessionsWindow(QDialog):
             Qt.WindowModality.WindowModal
         )
         self._sync_progress_dlg.setMinimumDuration(0)
-        self._sync_progress_dlg.setCancelButton(None)  # пока нельзя отменить
+        self._sync_progress_dlg.setCancelButton(None)
         self._sync_progress_dlg.show()
 
-        # Воркер.
         self._sync_worker = _OneSyncWorker(
             manager=manager,
             session_dir=r["dir"],
@@ -1854,7 +1955,6 @@ class SessionsWindow(QDialog):
             self, "Синхронизация", "".join(lines),
         )
 
-        # Обновляем список, чтобы колонка «Синхр.» обновилась.
         self.refresh()
 
     def _on_sync_failed(self, error: str) -> None:
@@ -3160,6 +3260,17 @@ class SessionsWindow(QDialog):
             "будет предложено скачать."
         )
 
+        act_open_transcript = menu.addAction(
+            "Просмотреть стенограмму", self._open_transcript
+        )
+        act_open_transcript.setEnabled(
+            bool(r.get("has_transcript")) or bool(r.get("published"))
+        )
+        act_open_transcript.setToolTip(
+            "Открыть стенограмму (video.txt) во встроенном "
+            "просмотрщике с поиском (Ctrl+F, F3 / Shift+F3)."
+        )
+
         menu.addSeparator()
 
         # --- Синхронизация ---
@@ -3330,9 +3441,6 @@ class SessionsWindow(QDialog):
         if not files:
             return
 
-        # Нормализуем пути: под Wayland/GTK Qt может вернуть
-        # percent-encoded строки (%D0%9A...), из-за чего файлы
-        # сохранялись с «сырыми» именами.
         files = [safe_local_path(f) for f in files]
 
         att_dir = os.path.join(r["dir"], "attachments")
@@ -3351,8 +3459,6 @@ class SessionsWindow(QDialog):
             if not os.path.exists(src):
                 continue
 
-            # Санитизируем имя: убираем URL-encoding, недопустимые
-            # символы, обрезаем по длине.
             base = sanitize_filename(
                 os.path.basename(src),
                 max_chars=max_chars,
@@ -3450,6 +3556,7 @@ class SessionsWindow(QDialog):
             "Ctrl+Shift+S  — синхронизировать выбранную запись\n"
             "Ctrl+Shift+V  — смотреть видео\n"
             "Ctrl+Shift+A  — прослушать аудио\n"
+            "Ctrl+Shift+T  — просмотреть стенограмму\n"
             "Ctrl+M        — создать/редактировать протокол\n"
             "Ctrl+Shift+M  — экспорт протокола в DOCX\n"
             "Ctrl+B        — отправить протокол/summary в Bitrix24\n"
