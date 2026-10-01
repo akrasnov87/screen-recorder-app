@@ -18,7 +18,7 @@
   • POST /api/v1/records/{id}/artifacts/check
   • POST /api/v1/records/{id}/artifacts
   • DELETE /api/v1/records/{id}/artifacts/{filename} ← ЗАБЛОКИРОВАНО
-  • DELETE /api/v1/records/{id}/artifacts            ← не реализовано
+  • DELETE /api/v1/records/{id}/artifacts            ← НЕ РЕАЛИЗОВАНО на сервере
   • GET  /api/v1/records/{id}/transcript
   • GET  /api/v1/records/{id}/summary
   • GET  /api/v1/records/_/search
@@ -42,6 +42,16 @@
     в начале файла. Пока он False — методы delete_record() и
     delete_artifact() не отправляют запрос, а сразу бросают
     ScrecError. Это защищает от случайного вызова в будущем.
+
+  • УТОЧНЕНЫ КОММЕНТАРИИ про DELETE-эндпоинты. В DOCS.md сервера
+    DELETE описан как рабочий, но:
+      – DELETE /records/{id}/artifacts (массовый) НЕ реализован
+        на сервере (реализован только одиночный);
+      – в приложении удаление на сервере запрещено политикой,
+        поэтому клиентские методы delete_record()/delete_artifact()
+        заблокированы флагом _DELETE_ALLOWED_ON_SERVER.
+    При включении флага в будущем — сначала нужно убедиться,
+    что серверная часть соответствует документации.
 """
 from __future__ import annotations
 
@@ -68,6 +78,13 @@ log = get_logger(__name__)
 # отдельной утилитой администратора), установите True осознанно.
 # Пока флаг False — методы delete_record() и delete_artifact()
 # не отправляют HTTP-запрос, а сразу бросают ScrecError.
+#
+# ВАЖНО: перед включением убедитесь, что серверная часть
+# соответствует DOCS.md. На момент v1.1.0:
+#   • DELETE /records/{id} — реализован;
+#   • DELETE /records/{id}/artifacts/{filename} — реализован;
+#   • DELETE /records/{id}/artifacts (массовый) — НЕ реализован,
+#     хотя упомянут в DOCS.md как рабочий.
 # ---------------------------------------------------------------------------
 _DELETE_ALLOWED_ON_SERVER: bool = False
 
@@ -393,14 +410,45 @@ class ScrecClient:
                         msg, status=resp.status, body=body
                     )
                 data = await resp.json()
+
+                # Детальное логирование результата — в том числе
+                # по текстовым артефактам: какие загружены,
+                # какие пропущены (по хэшу или по иным причинам).
+                uploaded = data.get("uploaded_artifacts") or []
+                skipped = data.get("skipped_artifacts") or []
                 log.info(
                     "ScrecClient.publish_record: OK id=%s, "
                     "action=%s, revision=%s, uploaded=%d, skipped=%d",
                     data.get("id"), data.get("action"),
                     data.get("revision"),
-                    len(data.get("uploaded_artifacts", [])),
-                    len(data.get("skipped_artifacts", [])),
+                    len(uploaded), len(skipped),
                 )
+                if skipped:
+                    for item in skipped:
+                        if isinstance(item, dict):
+                            fname = item.get("filename") or "?"
+                            reason = item.get("reason") or "—"
+                            log.info(
+                                "publish_record: артефакт пропущен "
+                                "сервером: %s (reason=%s)",
+                                fname, reason,
+                            )
+                        else:
+                            log.info(
+                                "publish_record: артефакт пропущен "
+                                "сервером: %s", item,
+                            )
+                if uploaded:
+                    for item in uploaded:
+                        if isinstance(item, dict):
+                            fname = item.get("filename") or "?"
+                            kind = item.get("kind") or "?"
+                            size = item.get("size") or 0
+                            log.debug(
+                                "publish_record: артефакт загружен: "
+                                "%s (kind=%s, size=%d)",
+                                fname, kind, size,
+                            )
                 return data
         except ScrecError:
             raise
@@ -447,6 +495,14 @@ class ScrecClient:
         _DELETE_ALLOWED_ON_SERVER. Пока флаг False — вызов
         завершается ScrecError, и HTTP-запрос НЕ уходит.
 
+        ⚠️  Документация сервера (DOCS.md) описывает DELETE как
+        рабочий эндпоинт, но фактически на сервере:
+          • DELETE /records/{id} — реализован;
+          • DELETE /records/{id}/artifacts/{filename} — реализован;
+          • DELETE /records/{id}/artifacts (массовый) — НЕ реализован.
+        Перед включением флага — синхронизируйте документацию
+        с фактической реализацией сервера.
+
         Чтобы разрешить удаление, установите
         _DELETE_ALLOWED_ON_SERVER = True в начале этого модуля —
         осознанно, например для отдельной утилиты администратора.
@@ -482,6 +538,10 @@ class ScrecClient:
         В текущем приложении метод ЗАБЛОКИРОВАН флагом
         _DELETE_ALLOWED_ON_SERVER. Пока флаг False — вызов
         завершается ScrecError, и HTTP-запрос НЕ уходит.
+
+        ⚠️  Массовый DELETE /records/{id}/artifacts (без указания
+        имени файла) НЕ реализован на сервере, хотя упомянут
+        в DOCS.md. Метод удаляет только один конкретный файл.
         """
         if not _DELETE_ALLOWED_ON_SERVER:
             msg = (
@@ -530,6 +590,95 @@ class ScrecClient:
             f"/api/v1/records/{record_id}/artifacts",
             context=f"list_artifacts({record_id})",
         )
+
+    async def get_artifact_info(
+        self, record_id: str, filename: str
+    ) -> Dict[str, Any]:
+        """
+        HEAD /api/v1/records/{id}/artifacts/{filename} — метаданные
+        одного артефакта без скачивания содержимого.
+
+        Возвращает словарь:
+            {
+              "exists": bool,
+              "size": int,
+              "sha256": str,
+              "kind": str,
+              "status_code": int,
+            }
+
+        Используется для точечного скачивания (см.
+        SyncManager._apply_change → artifact_upload): сначала
+        проверяем существование и хэш, потом решаем, надо ли
+        скачивать.
+        """
+        if self._session is None:
+            raise ScrecError("aiohttp-сессия не открыта")
+
+        url = (
+            f"{self.base_url}/api/v1/records/{record_id}/artifacts/"
+            f"{quote(filename)}"
+        )
+
+        log.debug(
+            "get_artifact_info: record=%s, filename=%r",
+            record_id, filename,
+        )
+
+        try:
+            async with self._session.head(
+                url, headers=self._headers(), allow_redirects=True,
+            ) as resp:
+                if resp.status >= 500:
+                    body = await self._read_body(resp)
+                    msg = (
+                        f"get_artifact_info({filename}): HTTP "
+                        f"{resp.status} — {body}"
+                    )
+                    log.error(msg)
+                    raise ScrecError(
+                        msg, status=resp.status, body=body
+                    )
+
+                info = {
+                    "exists": False,
+                    "size": 0,
+                    "sha256": "",
+                    "kind": "",
+                    "status_code": resp.status,
+                }
+
+                if resp.status == 200:
+                    info["exists"] = True
+                    info["sha256"] = (
+                        resp.headers.get("X-Artifact-SHA256") or ""
+                    )
+                    try:
+                        info["size"] = int(
+                            resp.headers.get("X-Artifact-Size") or 0
+                        )
+                    except (TypeError, ValueError):
+                        info["size"] = 0
+                    info["kind"] = (
+                        resp.headers.get("X-Artifact-Kind") or ""
+                    )
+
+                return info
+        except ScrecError:
+            raise
+        except aiohttp.ClientConnectorError as exc:
+            msg = f"get_artifact_info: ошибка подключения к {url}: {exc}"
+            log.error(msg)
+            raise ScrecError(msg)
+        except aiohttp.ServerTimeoutError:
+            msg = (
+                f"get_artifact_info: таймаут ({self._read_timeout:.0f} с)"
+            )
+            log.error(msg)
+            raise ScrecError(msg)
+        except Exception as exc:
+            log.exception("get_artifact_info: ошибка: %s", exc)
+            raise ScrecError(f"get_artifact_info: {exc}")
 
     async def download_artifact(
         self,
@@ -906,6 +1055,53 @@ class ScrecClient:
             f"/api/v1/records/{record_id}/summary",
             context=f"get_summary({record_id})",
         )
+
+    async def get_config_json(self, record_id: str) -> Any:
+        """
+        Загружает JSON-конфиг из записи проекта _config.
+
+        ВАЖНО: сервер не имеет отдельного эндпоинта для config-записей,
+        поэтому JSON хранится в поле summary_bb с префиксом-маркером
+        (см. SyncManager._CONFIG_JSON_PREFIX). Этот метод:
+          1. Запрашивает summary_bb через GET /records/{id}/summary;
+          2. Проверяет наличие префикса;
+          3. Возвращает распарсенный JSON (или None при ошибке).
+
+        Если префикса нет — значит, запись _config была создана старой
+        версией приложения (без префикса). В этом случае пытаемся
+        распарсить весь ответ как JSON (для обратной совместимости).
+
+        Raises:
+            ScrecError: если ответ не удаётся распарсить как JSON.
+        """
+        from .sync_manager import _CONFIG_JSON_PREFIX
+
+        raw = await self.get_summary(record_id)
+        if not isinstance(raw, str):
+            raw = str(raw or "")
+
+        text = raw.strip()
+        if text.startswith(_CONFIG_JSON_PREFIX):
+            text = text[len(_CONFIG_JSON_PREFIX):].strip()
+            log.debug(
+                "get_config_json: record=%s, префикс обнаружен, "
+                "%d символов JSON",
+                record_id, len(text),
+            )
+        else:
+            log.debug(
+                "get_config_json: record=%s, префикс отсутствует "
+                "(старая версия или другой формат), парсим как есть",
+                record_id,
+            )
+
+        try:
+            return json.loads(text)
+        except Exception as exc:
+            raise ScrecError(
+                f"get_config_json({record_id}): не удалось "
+                f"распарсить JSON: {exc}"
+            )
 
     # ------------------------------------------------------------------
     # Поиск

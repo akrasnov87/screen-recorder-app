@@ -35,6 +35,21 @@
     размера (см. video_compressor.compress_video_to_target_size).
     Оригинал перезаписывается. Управляется настройкой
     sync_compress_media_if_too_large.
+
+  • (КРИТИЧНО 2) _apply_change для action="artifact_upload" больше
+    не перезагружает всю запись. Скачивается только изменённый
+    артефакт. Для action="create"/"update" — прежнее поведение
+    (полный download_record).
+  • (КРИТИЧНО 3) _find_local_session больше не обходит все папки
+    sessions/ при каждом изменении. Индекс record_id → session_dir
+    хранится в sync_state.json и обновляется при публикации и
+    скачивании.
+  • (КРИТИЧНО 4) JSON-конфиги хранятся в summary_bb с префиксом-
+    маркером _CONFIG_JSON_PREFIX. Это позволяет отличать config-
+    записи от обычных summary и не путать их с FTS-индексом.
+    Чтение — через ScrecClient.get_config_json().
+  • (КРИТИЧНО 5) Логирование skipped_artifacts/uploaded_artifacts
+    для текстовых артефактов при публикации.
 """
 from __future__ import annotations
 
@@ -71,6 +86,11 @@ _SYNC_MARKER_FILE = ".sync_published.json"
 _CONFIG_PROJECT = "_config"
 _CONFIG_FOLDER_PROJECTS = "projects"
 _CONFIG_FOLDER_TAGS = "tags"
+
+# Префикс-маркер для JSON-конфигов в summary_bb. Позволяет
+# отличить config-записи от обычных summary (и от старых версий
+# без префикса). Формат: "§CONFIG_JSON§\n{...json...}".
+_CONFIG_JSON_PREFIX = "§CONFIG_JSON§\n"
 
 
 # Соответствие локальных файлов и kind на сервере (текстовые артефакты).
@@ -477,23 +497,35 @@ class SyncManager:
         )
 
     # ------------------------------------------------------------------
-    # Локальное состояние (last_synced_revision)
+    # Локальное состояние (last_synced_revision + индекс)
     # ------------------------------------------------------------------
     def load_state(self) -> Dict[str, Any]:
         if not os.path.isfile(self._state_path):
-            return {"last_synced_revision": 0}
+            return {
+                "last_synced_revision": 0,
+                "record_index": {},
+            }
         try:
             with open(self._state_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
-                return {"last_synced_revision": 0}
+                return {
+                    "last_synced_revision": 0,
+                    "record_index": {},
+                }
             data.setdefault("last_synced_revision", 0)
+            data.setdefault("record_index", {})
+            if not isinstance(data.get("record_index"), dict):
+                data["record_index"] = {}
             return data
         except Exception as exc:
             log.warning(
                 "Не удалось прочитать sync_state: %s", exc
             )
-            return {"last_synced_revision": 0}
+            return {
+                "last_synced_revision": 0,
+                "record_index": {},
+            }
 
     def save_state(self, state: Dict[str, Any]) -> None:
         _ensure_dirs(self.sessions_root)
@@ -517,6 +549,67 @@ class SyncManager:
         state["last_synced_revision"] = int(revision)
         state["updated_at"] = _iso_now()
         self.save_state(state)
+
+    # ------------------------------------------------------------------
+    # Индекс record_id → session_dir
+    # ------------------------------------------------------------------
+    def _update_record_index(
+        self, record_id: str, session_dir: str
+    ) -> None:
+        """Обновляет запись в индексе record_id → session_dir."""
+        if not record_id or not session_dir:
+            return
+        try:
+            state = self.load_state()
+            index = state.setdefault("record_index", {})
+            index[str(record_id)] = os.path.abspath(session_dir)
+            state["updated_at"] = _iso_now()
+            self.save_state(state)
+        except Exception as exc:
+            log.warning(
+                "Не удалось обновить индекс record_id → session_dir: %s",
+                exc,
+            )
+
+    def _remove_from_record_index(self, record_id: str) -> None:
+        """Удаляет запись из индекса (например, при delete на сервере)."""
+        if not record_id:
+            return
+        try:
+            state = self.load_state()
+            index = state.setdefault("record_index", {})
+            if record_id in index:
+                del index[record_id]
+                state["updated_at"] = _iso_now()
+                self.save_state(state)
+        except Exception as exc:
+            log.warning(
+                "Не удалось удалить %s из индекса: %s",
+                record_id, exc,
+            )
+
+    def _lookup_in_record_index(self, record_id: str) -> str:
+        """Возвращает путь к папке сессии по record_id или ""."""
+        if not record_id:
+            return ""
+        try:
+            state = self.load_state()
+            index = state.get("record_index") or {}
+            path = index.get(record_id) or ""
+            if path and os.path.isdir(path):
+                return path
+            if path:
+                log.debug(
+                    "Индекс указывает на несуществующую папку: %s "
+                    "(record_id=%s) — удаляем из индекса",
+                    path, record_id,
+                )
+                self._remove_from_record_index(record_id)
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать индекс по %s: %s", record_id, exc
+            )
+        return ""
 
     # ------------------------------------------------------------------
     # Сжатие медиа
@@ -777,6 +870,27 @@ class SyncManager:
 
             record_id = result.get("id") or ""
 
+            # (КРИТИЧНО 5) Логируем, что сервер сделал с текстовыми
+            # артефактами: uploaded / skipped. Это помогает понять,
+            # почему, например, video.txt не обновился.
+            skipped_small = result.get("skipped_artifacts") or []
+            uploaded_small = result.get("uploaded_artifacts") or []
+            if skipped_small or uploaded_small:
+                log.info(
+                    "publish_session: текстовые артефакты — "
+                    "uploaded=%d, skipped=%d",
+                    len(uploaded_small), len(skipped_small),
+                )
+                for item in skipped_small:
+                    if isinstance(item, dict):
+                        fname = item.get("filename") or "?"
+                        reason = item.get("reason") or "—"
+                        log.info(
+                            "publish_session: текстовый артефакт "
+                            "пропущен сервером: %s (reason=%s)",
+                            fname, reason,
+                        )
+
             # --- Шаг 2: медиа-артефакты ---
             if record_id and media_artifacts:
                 # Собираем локальные хэши для медиа (после сжатия).
@@ -938,7 +1052,7 @@ class SyncManager:
                             "reason": str(exc),
                         })
 
-        # --- Сохраняем состояние ---
+        # --- Сохраняем состояние и обновляем индекс ---
         if record_id:
             state = _read_sync_state(session_dir)
             state.update({
@@ -955,6 +1069,11 @@ class SyncManager:
                 ],
             })
             _write_sync_state(session_dir, state)
+
+            # (КРИТИЧНО 3) Обновляем индекс record_id → session_dir,
+            # чтобы pull_changes не обходил все папки.
+            self._update_record_index(record_id, session_dir)
+
             log.info(
                 "SyncManager: запись опубликована, record_id=%s "
                 "(revision=%s, action=%s, media_uploaded=%d, "
@@ -965,9 +1084,6 @@ class SyncManager:
             )
 
         # --- Опциональное удаление локальных медиа ---
-        # После сжатия оригинал уже перезаписан сжатой версией,
-        # поэтому «удаление оригинала» становится no-op.
-        # Но если сжатие было выключено — удаляем как раньше.
         if (self.settings.get("delete_local_media_after_media_upload")
                 and media_uploaded):
             self._maybe_delete_uploaded_media(
@@ -1433,6 +1549,9 @@ class SyncManager:
             })
             _write_sync_state(session_dir, state)
 
+            # (КРИТИЧНО 3) Обновляем индекс.
+            self._update_record_index(record_id, session_dir)
+
         if progress_cb:
             progress_cb(
                 f"Готово: {record_id} → {session_dir} "
@@ -1445,6 +1564,89 @@ class SyncManager:
             "artifacts": downloaded,
             "renamed_from": renamed_from,
         }
+
+    # ------------------------------------------------------------------
+    # Скачивание одного артефакта
+    # ------------------------------------------------------------------
+    async def download_single_artifact(
+        self,
+        record_id: str,
+        session_dir: str,
+        kind: str,
+        filename: str,
+        *,
+        progress_cb: Optional[Callable[[str], None]] = None,
+    ) -> Optional[str]:
+        """
+        Скачивает ОДИН артефакт записи. Используется в
+        _apply_change для action="artifact_upload" — чтобы не
+        перекачивать всю запись из-за одного изменённого файла.
+
+        Возвращает локальный путь скачанного файла или None,
+        если скачивание не удалось / файл не нужен.
+        """
+        if kind in ("video", "audio"):
+            target_rel = os.path.basename(filename)
+        else:
+            target_rel = self._artifact_target_relpath(kind, filename)
+        target_path = os.path.join(session_dir, target_rel)
+
+        async with self._make_client() as client:
+            # Сначала уточняем метаданные артефакта через HEAD,
+            # чтобы решить, нужно ли скачивать (умная стратегия).
+            try:
+                info = await client.get_artifact_info(
+                    record_id, filename
+                )
+            except ScrecError as exc:
+                log.warning(
+                    "download_single_artifact: HEAD не удался "
+                    "(%s) — скачиваем как обычно", exc,
+                )
+                info = {"exists": True}
+
+            if not info.get("exists"):
+                log.info(
+                    "download_single_artifact: артефакт %s/%s "
+                    "не существует на сервере — пропускаем",
+                    record_id, filename,
+                )
+                return None
+
+            # Проверяем, надо ли перекачивать (сравнение sha256).
+            server_sha = str(info.get("sha256") or "")
+            if server_sha and os.path.isfile(target_path):
+                local_sha = _sha256_file(target_path)
+                if local_sha and local_sha == server_sha:
+                    log.info(
+                        "download_single_artifact: %s уже актуален "
+                        "(sha256 совпал)", target_path,
+                    )
+                    return target_path
+
+            if progress_cb:
+                size_mb = int(info.get("size") or 0) / 1024 / 1024
+                progress_cb(
+                    f"Скачивание {kind}: {filename} "
+                    f"({size_mb:.1f} МБ)"
+                )
+
+            try:
+                await client.download_artifact(
+                    record_id, filename, target_path,
+                    progress_cb=None,
+                )
+                log.info(
+                    "download_single_artifact: %s → %s",
+                    filename, target_path,
+                )
+                return target_path
+            except ScrecError as exc:
+                log.error(
+                    "download_single_artifact: не удалось скачать "
+                    "%s/%s: %s", record_id, filename, exc,
+                )
+                return None
 
     # ------------------------------------------------------------------
     # Вспомогательные методы скачивания
@@ -1714,6 +1916,78 @@ class SyncManager:
             await self._handle_delete(record_id, path)
             return
 
+        # (КРИТИЧНО 2) Для artifact_upload/artifact_delete скачиваем
+        # только изменённый артефакт, а не всю запись целиком.
+        # Имя изменённого файла приходит в change["filename"].
+        if action in ("artifact_upload", "artifact_delete",
+                      "artifact_soft_delete"):
+            artifact_filename = (
+                change.get("filename")
+                or change.get("artifact_filename")
+                or change.get("artifact")
+                or ""
+            )
+
+            session_dir = self._find_local_session(record_id, path)
+
+            # Если локальной папки ещё нет — значит, запись новая
+            # для этого клиента; скачиваем целиком.
+            if not session_dir:
+                log.info(
+                    "apply_change: локальной папки нет для "
+                    "record_id=%s — скачиваю запись целиком",
+                    record_id,
+                )
+                await self.download_record(record_id)
+                return
+
+            # Для artifact_delete — просто удаляем локальный файл,
+            # скачивать нечего.
+            if action in ("artifact_delete", "artifact_soft_delete"):
+                if artifact_filename:
+                    self._delete_local_artifact(
+                        session_dir, artifact_filename
+                    )
+                return
+
+            # action == "artifact_upload"
+            if artifact_filename:
+                kind = str(change.get("kind") or "")
+                log.info(
+                    "apply_change: точечное скачивание артефакта "
+                    "%s (kind=%s) для record_id=%s",
+                    artifact_filename, kind or "?", record_id,
+                )
+                await self.download_single_artifact(
+                    record_id, session_dir, kind, artifact_filename,
+                    progress_cb=None,
+                )
+
+                # Обновляем метаданные записи (revision и т.п.).
+                try:
+                    record = await client.get_record(record_id)
+                    self._save_remote_meta(session_dir, record)
+                except ScrecError as exc:
+                    log.debug(
+                        "apply_change: не удалось обновить метаданные "
+                        "после точечного скачивания: %s", exc,
+                    )
+            else:
+                # Имени файла нет — на всякий случай обновляем метаданные.
+                log.info(
+                    "apply_change: artifact_upload без filename — "
+                    "обновляю только метаданные записи"
+                )
+                try:
+                    record = await client.get_record(record_id)
+                    self._save_remote_meta(session_dir, record)
+                except ScrecError as exc:
+                    log.warning(
+                        "apply_change: не удалось получить запись %s: %s",
+                        record_id, exc,
+                    )
+            return
+
         if action in ("create", "update", "update_links"):
             session_dir = self._find_local_session(record_id, path)
             if session_dir:
@@ -1724,8 +1998,7 @@ class SyncManager:
                 await self.download_record(record_id)
             return
 
-        if action in ("artifact_upload", "artifact_delete",
-                      "artifact_soft_delete", "artifact_delete_all"):
+        if action == "artifact_delete_all":
             session_dir = self._find_local_session(record_id, path)
             if session_dir:
                 await self.download_record(
@@ -1736,6 +2009,29 @@ class SyncManager:
             return
 
         log.debug("Неизвестный action=%r — пропускаю", action)
+
+    def _delete_local_artifact(
+        self, session_dir: str, filename: str
+    ) -> None:
+        """Удаляет локальный файл, соответствующий артефакту на сервере."""
+        base = os.path.basename(filename)
+        # Пытаемся найти как в корне сессии, так и в attachments.
+        candidates = [
+            os.path.join(session_dir, base),
+            os.path.join(session_dir, "attachments", base),
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                try:
+                    os.remove(p)
+                    log.info(
+                        "apply_change: локальный артефакт удалён "
+                        "(удалён на сервере): %s", p,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Не удалось удалить %s: %s", p, exc
+                    )
 
     async def _handle_delete(
         self, record_id: str, path: str
@@ -1763,6 +2059,8 @@ class SyncManager:
                 log.error(
                     "Не удалось удалить %s: %s", session_dir, exc
                 )
+            finally:
+                self._remove_from_record_index(record_id)
         else:
             state = _read_sync_state(session_dir)
             state["deleted_on_server"] = True
@@ -1776,13 +2074,33 @@ class SyncManager:
     def _find_local_session(
         self, record_id: str, path: str
     ) -> str:
+        """
+        Ищет локальную папку сессии по record_id.
+
+        Порядок:
+          1. Индекс record_id → session_dir в sync_state.json
+             (O(1), обновляется при publish/download).
+          2. Fallback: обход всех папок sessions/ (используется
+             только если индекс пуст/устарел — например, для
+             записей, скачанных до появления индекса).
+          3. Fallback: поиск по basename(path) из change.
+
+        Результат индексируется, чтобы следующее обращение было O(1).
+        """
+        # 1. Быстрый путь: индекс.
+        indexed = self._lookup_in_record_index(record_id)
+        if indexed:
+            return indexed
+
         if not os.path.isdir(self.sessions_root):
             return ""
 
+        # 2. Медленный путь: обход всех папок (один раз).
+        found = ""
         try:
             entries = os.listdir(self.sessions_root)
         except OSError:
-            return ""
+            entries = []
 
         for name in entries:
             full = os.path.join(self.sessions_root, name)
@@ -1795,17 +2113,22 @@ class SyncManager:
                 with open(marker, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if str(data.get("record_id") or "") == record_id:
-                    return full
+                    found = full
+                    break
             except Exception:
                 continue
 
-        if path:
+        # 3. Fallback: поиск по имени папки.
+        if not found and path:
             folder = os.path.basename(path.rstrip("/"))
             candidate = os.path.join(self.sessions_root, folder)
             if os.path.isdir(candidate):
-                return candidate
+                found = candidate
 
-        return ""
+        # Индексируем, чтобы больше не обходить.
+        if found:
+            self._update_record_index(record_id, found)
+        return found
 
     # ------------------------------------------------------------------
     # Синхронизация "всё"
@@ -1913,6 +2236,15 @@ class SyncManager:
         data: Any,
         progress_cb: Optional[Callable[[str], None]],
     ) -> Dict[str, Any]:
+        """
+        Публикует справочник (projects/tags) как config-запись.
+
+        (КРИТИЧНО 4) JSON кладётся в summary_bb с префиксом
+        _CONFIG_JSON_PREFIX, чтобы:
+          • можно было отличить config-запись от обычного summary;
+          • при обратном чтении (get_config_json) не парсить
+            произвольный текст как JSON.
+        """
         payload = {
             "project": _CONFIG_PROJECT,
             "year": "0000",
@@ -1920,7 +2252,11 @@ class SyncManager:
             "folder_name": folder_name,
             "name": folder_name,
             "source": "config",
-            "summary_bb": json.dumps(data, ensure_ascii=False),
+            # Явный префикс-маркер + JSON.
+            "summary_bb": (
+                _CONFIG_JSON_PREFIX
+                + json.dumps(data, ensure_ascii=False)
+            ),
         }
         if progress_cb:
             progress_cb(
@@ -1973,8 +2309,9 @@ class SyncManager:
 
                 if folder == _CONFIG_FOLDER_PROJECTS:
                     try:
-                        raw = await client.get_summary(rid)
-                        data = json.loads(raw)
+                        # (КРИТИЧНО 4) Читаем JSON через
+                        # отдельный метод, который проверяет префикс.
+                        data = await client.get_config_json(rid)
                         if isinstance(data, list):
                             self.config_manager.set_projects(data)
                             applied["projects"] = True
@@ -1986,6 +2323,12 @@ class SyncManager:
                                 progress_cb(
                                     f"Применены проекты: {len(data)} шт."
                                 )
+                        else:
+                            log.warning(
+                                "pull_configs: projects — "
+                                "ожидался list, получен %s",
+                                type(data).__name__,
+                            )
                     except Exception as exc:
                         msg = f"Ошибка применения проектов: {exc}"
                         log.warning(msg)
@@ -1993,8 +2336,7 @@ class SyncManager:
 
                 elif folder == _CONFIG_FOLDER_TAGS:
                     try:
-                        raw = await client.get_summary(rid)
-                        data = json.loads(raw)
+                        data = await client.get_config_json(rid)
                         if isinstance(data, list):
                             self.config_manager.set_tags(data)
                             applied["tags"] = True
@@ -2006,6 +2348,12 @@ class SyncManager:
                                 progress_cb(
                                     f"Применены теги: {len(data)} шт."
                                 )
+                        else:
+                            log.warning(
+                                "pull_configs: tags — "
+                                "ожидался list, получен %s",
+                                type(data).__name__,
+                            )
                     except Exception as exc:
                         msg = f"Ошибка применения тегов: {exc}"
                         log.warning(msg)
