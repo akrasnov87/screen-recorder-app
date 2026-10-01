@@ -227,10 +227,10 @@ class SyncWindow(QDialog):
 
         layout.addLayout(filter_row)
 
-        self.upload_table = QTableWidget(0, 6)
+        self.upload_table = QTableWidget(0, 7)
         self.upload_table.setHorizontalHeaderLabels([
             "Дата", "Название", "Проект", "Локально",
-            "На сервере", "Record ID",
+            "На сервере", "Готово", "Record ID",
         ])
         self.upload_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -247,7 +247,8 @@ class SyncWindow(QDialog):
         hv.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         hv.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         hv.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.upload_table, 1)
 
         btns = QHBoxLayout()
@@ -265,6 +266,28 @@ class SyncWindow(QDialog):
         )
         self.upload_all_btn.clicked.connect(self._on_upload_all)
         btns.addWidget(self.upload_all_btn)
+
+        btns.addSpacing(12)
+
+        self.mark_ready_btn = QPushButton("Отметить готовыми")
+        self.mark_ready_btn.setToolTip(
+            "Проставить sync_ready=true у выбранных записей.\n\n"
+            "После этого их можно публиковать на сервер и "
+            "разрешить фоновую синхронизацию (pull будет "
+            "перезаписывать локальные файлы серверной версией)."
+        )
+        self.mark_ready_btn.clicked.connect(self._on_mark_ready)
+        btns.addWidget(self.mark_ready_btn)
+
+        self.unmark_ready_btn = QPushButton("Снять отметку")
+        self.unmark_ready_btn.setToolTip(
+            "Снять sync_ready у выбранных записей.\n\n"
+            "Запись снова станет черновиком: автопубликация "
+            "не запускается, фоновый pull игнорирует, "
+            "локальные артефакты не удаляются."
+        )
+        self.unmark_ready_btn.clicked.connect(self._on_unmark_ready)
+        btns.addWidget(self.unmark_ready_btn)
 
         btns.addStretch()
 
@@ -873,6 +896,8 @@ class SyncWindow(QDialog):
             if project_filter and project != project_filter:
                 continue
 
+            sync_ready = bool(meta.get("sync_ready", False))
+
             published = is_record_published(full)
             if only_new and published:
                 continue
@@ -910,6 +935,8 @@ class SyncWindow(QDialog):
                 "project": project or "—",
                 "local": ", ".join(local_parts) or "—",
                 "published": published,
+                # --- Флаг готовности к синхронизации ---
+                "sync_ready": sync_ready,
                 "record_id": get_record_id(full),
             })
 
@@ -950,13 +977,35 @@ class SyncWindow(QDialog):
                 )
                 published_count += 1
             self.upload_table.setItem(row, 4, published_item)
+
+            # --- Колонка «Готово» ---
+            if r.get("sync_ready"):
+                ready_item = QTableWidgetItem("готово")
+                ready_item.setForeground(Qt.GlobalColor.darkYellow)
+                ready_item.setToolTip(
+                    "Запись помечена как «готова к синхронизации»."
+                )
+            else:
+                ready_item = QTableWidgetItem("черновик")
+                ready_item.setForeground(Qt.GlobalColor.gray)
+                ready_item.setToolTip(
+                    "Черновик (sync_ready=false). Автопубликация "
+                    "не запускается, фоновый pull игнорирует."
+                )
+            self.upload_table.setItem(row, 5, ready_item)
+
             self.upload_table.setItem(
-                row, 5, QTableWidgetItem(r["record_id"] or "—")
+                row, 6, QTableWidgetItem(r["record_id"] or "—")
             )
 
+        ready_count = sum(
+            1 for r in rows
+            if r.get("sync_ready") and not r.get("published")
+        )
         self.upload_stats_label.setText(
             f"Показано: {len(rows)} | "
-            f"Уже на сервере: {published_count}"
+            f"Уже на сервере: {published_count} | "
+            f"Готовы к синхр.: {ready_count}"
         )
         self._local_rows = rows
 
@@ -989,6 +1038,46 @@ class SyncWindow(QDialog):
                 "Настройки → Синхронизация.",
             )
             return
+
+        # --- Предупреждение о черновиках ---
+        drafts = [r for r in rows if not r.get("sync_ready")]
+        if drafts:
+            reply = QMessageBox.question(
+                self, "Синхронизация",
+                f"Среди выбранных записей есть {len(drafts)} "
+                f"черновиков (sync_ready=false).\n\n"
+                f"Публикация возможна, но фоновый pull будет "
+                f"игнорировать эти записи, пока вы не поставите "
+                f"галочку «Готово к синхронизации».\n\n"
+                f"Отметить их готовыми и продолжить?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                for r in drafts:
+                    session_json = os.path.join(
+                        r["dir"], "session.json"
+                    )
+                    meta = read_json_file(session_json) or {}
+                    meta["sync_ready"] = True
+                    meta["sync_ready_at"] = datetime.now().isoformat()
+                    try:
+                        tmp = session_json + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(
+                                meta, f, indent=2, ensure_ascii=False
+                            )
+                        os.replace(tmp, session_json)
+                    except Exception as exc:
+                        log.warning(
+                            "Не удалось отметить %s: %s",
+                            r["dir"], exc,
+                        )
+                self._refresh_local_sessions()
+                # Обновляем локальный список rows
+                for r in rows:
+                    r["sync_ready"] = True
 
         send_media = bool(
             manager.settings.get("send_media_to_server", False)
@@ -1088,6 +1177,12 @@ class SyncWindow(QDialog):
             manager.settings.get("send_media_to_server", False)
         )
 
+        drafts = [r for r in rows if not r.get("sync_ready")]
+        draft_note = (
+            f"\nЧерновиков (sync_ready=false): {len(drafts)}"
+            if drafts else ""
+        )
+
         reply = QMessageBox.question(
             self, "Публикация на сервер",
             f"Опубликовать {len(rows)} записей на сервер?\n\n"
@@ -1096,13 +1191,47 @@ class SyncWindow(QDialog):
             f"только новые="
             f"{'да' if self.upload_only_new_check.isChecked() else 'нет'}\n"
             f"Передача медиа: "
-            f"{'включена' if send_media else 'выключена'}",
+            f"{'включена' if send_media else 'выключена'}"
+            f"{draft_note}",
             QMessageBox.StandardButton.Yes
             | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+
+        # --- Автоматически пометить черновики готовыми ---
+        if drafts:
+            reply2 = QMessageBox.question(
+                self, "Черновики",
+                f"Среди записей {len(drafts)} черновиков.\n\n"
+                f"Отметить их как «готово к синхронизации» "
+                f"перед публикацией?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply2 == QMessageBox.StandardButton.Yes:
+                for r in drafts:
+                    session_json = os.path.join(
+                        r["dir"], "session.json"
+                    )
+                    meta = read_json_file(session_json) or {}
+                    meta["sync_ready"] = True
+                    meta["sync_ready_at"] = datetime.now().isoformat()
+                    try:
+                        tmp = session_json + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(
+                                meta, f, indent=2, ensure_ascii=False
+                            )
+                        os.replace(tmp, session_json)
+                    except Exception as exc:
+                        log.warning(
+                            "Не удалось отметить %s: %s",
+                            r["dir"], exc,
+                        )
+                self._refresh_local_sessions()
 
         if not manager.is_configured():
             QMessageBox.warning(
@@ -1148,6 +1277,246 @@ class SyncWindow(QDialog):
                 )
 
         self._start_worker(_factory, on_ok=_on_ok)
+
+    # ------------------------------------------------------------------
+    # Отметка «готово к синхронизации»
+    # ------------------------------------------------------------------
+    def _on_mark_ready(self) -> None:
+        """Проставляет sync_ready=true у выбранных записей.
+
+        Если включена настройка app.sync_publish_on_ready —
+        дополнительно запускает публикацию в фоне.
+        """
+        rows = self._selected_upload_rows()
+        if not rows:
+            QMessageBox.information(
+                self, "Синхронизация",
+                "Выберите одну или несколько записей в таблице.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "Готово к синхронизации",
+            f"Отметить {len(rows)} записей как готовые "
+            f"к синхронизации?\n\n"
+            f"После этого:\n"
+            f"  • автопубликация может отправить их на сервер;\n"
+            f"  • фоновый pull может перезаписывать локальные "
+            f"файлы серверной версией;\n"
+            f"  • локальные артефакты, которых нет на сервере, "
+            f"могут быть удалены.\n\n"
+            f"Убедитесь, что протоколы, summary и вложения "
+            f"на месте.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        count = 0
+        errors: List[str] = []
+        for r in rows:
+            session_json = os.path.join(r["dir"], "session.json")
+            meta = read_json_file(session_json) or {}
+            if meta.get("sync_ready", False):
+                continue
+            meta["sync_ready"] = True
+            meta["sync_ready_at"] = datetime.now().isoformat()
+            try:
+                tmp = session_json + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2, ensure_ascii=False)
+                os.replace(tmp, session_json)
+                count += 1
+            except Exception as exc:
+                log.exception(
+                    "Не удалось обновить %s: %s", session_json, exc
+                )
+                errors.append(f"{os.path.basename(r['dir'])}: {exc}")
+
+        self._refresh_local_sessions()
+        self._append_log(
+            f"Отмечено как «готово к синхронизации»: {count} "
+            f"(ошибок: {len(errors)})"
+        )
+
+        if errors:
+            QMessageBox.warning(
+                self, "Синхронизация",
+                f"Отмечено записей: {count}\n"
+                f"Ошибок: {len(errors)}\n\n"
+                + "\n".join(errors[:20]),
+            )
+        else:
+            QMessageBox.information(
+                self, "Синхронизация",
+                f"Отмечено записей: {count}",
+            )
+
+        # --- НОВОЕ: авто-публикация отмеченных записей ---
+        if self._is_publish_on_ready_enabled():
+            not_published = [
+                r for r in rows if not r.get("published")
+            ]
+            if not_published:
+                self._append_log(
+                    f"Авто-публикация включена: запускаю публикацию "
+                    f"для {len(not_published)} записей"
+                )
+                self._publish_rows_after_ready(not_published)
+
+    def _is_publish_on_ready_enabled(self) -> bool:
+        """Проверяет настройку app.sync_publish_on_ready."""
+        try:
+            cfg = self.config_manager.get_app_settings()
+            return bool(cfg.get("sync_publish_on_ready", True))
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать app-настройки: %s", exc
+            )
+            return False
+
+    def _publish_rows_after_ready(
+        self, rows: List[Dict[str, Any]]
+    ) -> None:
+        """Запускает публикацию списка записей в фоне."""
+        manager = self._get_manager()
+        if not manager.is_configured():
+            self._append_log(
+                "Авто-публикация пропущена: синхронизация не "
+                "настроена"
+            )
+            return
+
+        if self._worker is not None and self._worker.isRunning():
+            self._append_log(
+                "Авто-публикация отложена: уже выполняется другая "
+                "операция синхронизации"
+            )
+            return
+
+        send_media = bool(
+            manager.settings.get("send_media_to_server", False)
+        )
+        self._append_log(
+            f"Авто-публикация {len(rows)} записей "
+            f"(медиа={'да' if send_media else 'нет'})…"
+        )
+
+        async def _factory(progress):
+            results = []
+            for i, r in enumerate(rows, start=1):
+                progress(
+                    f"[{i}/{len(rows)}] "
+                    f"{os.path.basename(r['dir'])}"
+                )
+                try:
+                    res = await manager.publish_session(
+                        r["dir"], progress_cb=progress
+                    )
+                    results.append({
+                        "session": r["dir"], "ok": True,
+                        "result": res,
+                    })
+                except ScrecError as exc:
+                    results.append({
+                        "session": r["dir"], "ok": False,
+                        "error": str(exc),
+                    })
+            return results
+
+        def _on_ok(results: List[Dict[str, Any]]) -> None:
+            ok = sum(1 for r in results if r["ok"])
+            fail = len(results) - ok
+
+            self._append_log(
+                f"Авто-публикация завершена: {ok} ок, {fail} ошибок"
+            )
+            self._refresh_local_sessions()
+
+            if fail == 0:
+                QMessageBox.information(
+                    self, "Авто-публикация",
+                    f"Опубликовано записей: {ok}",
+                )
+            else:
+                lines = [
+                    f"• {os.path.basename(r['session'])}: "
+                    f"{r['error']}"
+                    for r in results if not r["ok"]
+                ]
+                QMessageBox.warning(
+                    self, "Авто-публикация",
+                    f"Опубликовано: {ok}\nОшибок: {fail}\n\n"
+                    + "\n".join(lines[:20]),
+                )
+
+        self._start_worker(_factory, on_ok=_on_ok)
+
+    def _on_unmark_ready(self) -> None:
+        """Снимает sync_ready у выбранных записей."""
+        rows = self._selected_upload_rows()
+        if not rows:
+            QMessageBox.information(
+                self, "Синхронизация",
+                "Выберите одну или несколько записей в таблице.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "Снять отметку",
+            f"Снять отметку «готово к синхронизации» у "
+            f"{len(rows)} записей?\n\n"
+            f"Записи снова станут черновиками: автопубликация "
+            f"не запускается, фоновый pull игнорирует, "
+            f"локальные артефакты не удаляются.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        count = 0
+        errors: List[str] = []
+        for r in rows:
+            session_json = os.path.join(r["dir"], "session.json")
+            meta = read_json_file(session_json) or {}
+            if not meta.get("sync_ready", False):
+                continue
+            meta["sync_ready"] = False
+            meta["sync_ready_at"] = ""
+            try:
+                tmp = session_json + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2, ensure_ascii=False)
+                os.replace(tmp, session_json)
+                count += 1
+            except Exception as exc:
+                log.exception(
+                    "Не удалось обновить %s: %s", session_json, exc
+                )
+                errors.append(f"{os.path.basename(r['dir'])}: {exc}")
+
+        self._refresh_local_sessions()
+        self._append_log(
+            f"Снято «готово к синхронизации»: {count} "
+            f"(ошибок: {len(errors)})"
+        )
+
+        if errors:
+            QMessageBox.warning(
+                self, "Синхронизация",
+                f"Снято отметок: {count}\n"
+                f"Ошибок: {len(errors)}\n\n"
+                + "\n".join(errors[:20]),
+            )
+        else:
+            QMessageBox.information(
+                self, "Синхронизация",
+                f"Снято отметок: {count}",
+            )
 
     # ------------------------------------------------------------------
     # Скачивание

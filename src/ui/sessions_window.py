@@ -12,31 +12,16 @@
       – колонка «Синхр.»;
       – диалог SyncOneRecordDialog с выбором передавать ли медиа,
         ссылку file://, удалять ли локальные медиа после загрузки.
-  • Добавлен встроенный медиаплеер (см. media_player.py):
-      – пункт меню «Файл → Смотреть видео» / «Прослушать аудио»;
-      – пункты контекстного меню;
-      – если медиа нет локально, но запись опубликована на сервере —
-        предлагается скачать его (SyncManager.download_media_only);
-      – поддерживается fallback на системный плеер, если встроенный
-        недоступен.
-  • Пути из QFileDialog нормализуются через safe_local_path():
-    под Wayland/GTK Qt может вернуть percent-encoded путь
-    (например, %D0%9A%D0%A1%D0%A3%D0%9E_...), из-за чего файлы
-    вложений сохранялись с «сырыми» именами.
-  • Добавлен просмотр стенограммы (video.txt):
-      – пункт меню «Файл → Просмотреть стенограмму»;
-      – кнопка «Стенограмма» на нижней панели;
-      – пункт контекстного меню «Просмотреть стенограмму»;
-      – открывается во встроенном TextViewDialog (read-only,
-        поиск с подсветкой, Ctrl+F, F3 / Shift+F3).
-  • Добавлен просмотр протокола (.docx) во встроенном просмотрщике:
-      – пункт меню «Файл → Просмотреть протокол»;
-      – кнопка «Протокол» на нижней панели;
-      – пункт контекстного меню «Просмотреть протокол»;
-      – поиск файла в корне папки записи и в attachments;
-      – открывается в DocxViewerDialog (read-only, поиск с
-        подсветкой, Ctrl+F, F3 / Shift+F3, сохранение копии,
-        открытие внешним приложением).
+  • Добавлен встроенный медиаплеер (см. media_player.py).
+  • Пути из QFileDialog нормализуются через safe_local_path().
+  • Добавлен просмотр стенограммы (video.txt).
+  • Добавлен просмотр протокола (.docx).
+  • Добавлен флаг «готово к синхронизации» (sync_ready):
+      – колонка «Синхр.» показывает «да» / «готово» / «черновик»;
+      – пункт контекстного меню «Отметить как готово к синхронизации»
+        / «Снять отметку»;
+      – кнопка «Готово к синхронизации» на нижней панели;
+      – метод _toggle_sync_ready.
 """
 from __future__ import annotations
 
@@ -287,6 +272,9 @@ class SessionsScanThread(QThread):
             published = is_record_published(session_dir)
             record_id = get_record_id(session_dir)
 
+            # --- Флаг готовности к синхронизации ---
+            sync_ready = bool(meta.get("sync_ready", False))
+
             rows.append({
                 "dir": session_dir,
                 "name": meta.get("name") or name,
@@ -311,6 +299,8 @@ class SessionsScanThread(QThread):
                 "tags": tags,
                 "published": published,
                 "record_id": record_id,
+                # --- Флаг готовности к синхронизации ---
+                "sync_ready": sync_ready,
             })
 
         rows.sort(key=lambda r: r["datetime"], reverse=True)
@@ -428,11 +418,6 @@ class _MediaDownloadWorker(QThread):
 class SyncOneRecordDialog(QDialog):
     """
     Диалог настройки публикации одной записи на сервер.
-
-    Показывает список локальных файлов и позволяет выбрать:
-      • передавать ли медиа (видео и аудио);
-      • передавать ли ссылку на видео (file://);
-      • удалять ли локальные медиа после успешной загрузки.
     """
 
     def __init__(
@@ -454,9 +439,6 @@ class SyncOneRecordDialog(QDialog):
         self._build_ui()
         self._populate()
 
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
 
@@ -465,6 +447,7 @@ class SyncOneRecordDialog(QDialog):
         dt = self._row.get("datetime") or "—"
         published = bool(self._row.get("published"))
         record_id = self._row.get("record_id") or ""
+        sync_ready = bool(self._row.get("sync_ready"))
 
         status_html = (
             f"<span style='color:#2E7D32'><b>Опубликована</b> "
@@ -473,16 +456,35 @@ class SyncOneRecordDialog(QDialog):
             "<span style='color:#B8860B'><b>Ещё не опубликована</b></span>"
         )
 
+        ready_html = (
+            "<span style='color:#2E7D32'>готово</span>"
+            if sync_ready else
+            "<span style='color:#B8860B'>черновик (sync_ready=false)"
+            "</span>"
+        )
+
         header = QLabel(
             f"<b>{html.escape(name)}</b><br>"
             f"<span style='color:#666'>Проект:</span> "
             f"{html.escape(project)} &nbsp;|&nbsp; "
             f"<span style='color:#666'>Дата:</span> "
             f"{html.escape(dt)}<br>"
-            f"<span style='color:#666'>Статус:</span> {status_html}"
+            f"<span style='color:#666'>Статус:</span> {status_html}<br>"
+            f"<span style='color:#666'>Готовность:</span> {ready_html}"
         )
         header.setWordWrap(True)
         root.addWidget(header)
+
+        if not sync_ready:
+            warn = QLabel(
+                "<span style='color:#B8860B'><b>Запись ещё не "
+                "помечена как «готова к синхронизации».</b> "
+                "Публикация возможна, но фоновый pull будет "
+                "игнорировать эту запись, пока вы не поставите "
+                "галочку.</span>"
+            )
+            warn.setWordWrap(True)
+            root.addWidget(warn)
 
         files_label = QLabel("<b>Локальные файлы:</b>")
         root.addWidget(files_label)
@@ -836,6 +838,13 @@ class SessionsWindow(QDialog):
         )
         bottom.addWidget(self.open_protocol_btn)
 
+        self.sync_ready_btn = QPushButton("Готово к синхронизации")
+        attach_tooltip(
+            self.sync_ready_btn, "sess_sync_ready_button"
+        )
+        self.sync_ready_btn.clicked.connect(self._toggle_sync_ready)
+        bottom.addWidget(self.sync_ready_btn)
+
         self.sync_btn = QPushButton("Синхронизировать…")
         self.sync_btn.setToolTip(
             "Опубликовать выбранную запись на сервер "
@@ -1031,6 +1040,17 @@ class SessionsWindow(QDialog):
         act_edit_tags.setShortcut(QKeySequence("Ctrl+T"))
         act_edit_tags.triggered.connect(self._edit_tags)
         m_meta.addAction(act_edit_tags)
+
+        m_meta.addSeparator()
+
+        act_toggle_sync_ready = QAction(
+            "Переключить «готово к синхронизации»", self
+        )
+        act_toggle_sync_ready.setShortcut(QKeySequence("Ctrl+Shift+G"))
+        act_toggle_sync_ready.triggered.connect(
+            self._toggle_sync_ready
+        )
+        m_meta.addAction(act_toggle_sync_ready)
 
         m_meta.addSeparator()
 
@@ -1306,6 +1326,7 @@ class SessionsWindow(QDialog):
         if not r:
             self.selection_label.setText("")
             self.sync_btn.setEnabled(False)
+            self.sync_ready_btn.setEnabled(False)
             self.play_video_btn.setEnabled(False)
             self.play_audio_btn.setEnabled(False)
             self.open_transcript_btn.setEnabled(False)
@@ -1320,6 +1341,8 @@ class SessionsWindow(QDialog):
                 f"теги: {', '.join(r['tags'])}"
             )
         parts.append(f"статус: {r['status']}")
+        if r.get("sync_ready"):
+            parts.append("<span style='color:#2E7D32'>готово к синхр.</span>")
         if r.get("manual_protocol_path"):
             parts.append("протокол: прикреплён")
         if (r.get("summary_bb") or "").strip():
@@ -1333,6 +1356,13 @@ class SessionsWindow(QDialog):
         self.selection_label.setText(" | ".join(parts))
 
         self.sync_btn.setEnabled(bool(r.get("dir")))
+        self.sync_ready_btn.setEnabled(bool(r.get("dir")))
+
+        # Обновляем текст кнопки в зависимости от текущего состояния
+        if r.get("sync_ready"):
+            self.sync_ready_btn.setText("Снять готовность")
+        else:
+            self.sync_ready_btn.setText("Готово к синхронизации")
 
         has_local_video = bool(r.get("has_video"))
         has_local_audio = bool(r.get("has_audio"))
@@ -1345,13 +1375,10 @@ class SessionsWindow(QDialog):
             has_local_audio or is_published
         )
 
-        # Стенограмма: только если есть локальный файл video.txt.
         self.open_transcript_btn.setEnabled(
             bool(r.get("has_transcript"))
         )
 
-        # Протокол: кнопка активна, если файл найден в корне
-        # папки записи или в attachments.
         protocol_path = self._find_manual_protocol_path(r)
         self.open_protocol_btn.setEnabled(bool(protocol_path))
 
@@ -1417,11 +1444,15 @@ class SessionsWindow(QDialog):
             1 for r in rows if r["status"] == STATUS_ERROR
         )
         published = sum(1 for r in rows if r.get("published"))
+        ready_count = sum(
+            1 for r in rows if r.get("sync_ready") and not r.get("published")
+        )
 
         self.summary_label.setText(
             f"Всего: {total} | Обработан: {processed} | "
             f"Сохранено: {uploaded} | В обработке: {in_progress} | "
-            f"Ошибок: {errors} | На сервере: {published}"
+            f"Ошибок: {errors} | На сервере: {published} | "
+            f"Готовы к синхр.: {ready_count}"
         )
         self._on_selection_changed()
 
@@ -1490,17 +1521,36 @@ class SessionsWindow(QDialog):
                 summary_item = QTableWidgetItem("—")
             self.table.setItem(row, 8, summary_item)
 
+            # --- Колонка «Синхр.» ---
             published = bool(r.get("published"))
-            sync_text = "да" if published else "—"
-            sync_item = QTableWidgetItem(sync_text)
+            sync_ready = bool(r.get("sync_ready"))
+
             if published:
+                sync_text = "да"
+                sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.darkGreen)
                 sync_item.setToolTip(
-                    f"Record ID: {r.get('record_id', '')}"
+                    f"Опубликовано. Record ID: "
+                    f"{r.get('record_id', '')}"
+                )
+            elif sync_ready:
+                sync_text = "готово"
+                sync_item = QTableWidgetItem(sync_text)
+                sync_item.setForeground(Qt.GlobalColor.darkYellow)
+                sync_item.setToolTip(
+                    "Запись помечена как «готова к синхронизации». "
+                    "Можно публиковать на сервер, фоновый pull "
+                    "будет её учитывать."
                 )
             else:
+                sync_text = "черновик"
+                sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.gray)
-                sync_item.setToolTip("Запись ещё не опубликована")
+                sync_item.setToolTip(
+                    "Запись — черновик (sync_ready=false). "
+                    "Автопубликация не запускается, фоновый pull "
+                    "игнорирует, локальные артефакты не удаляются."
+                )
             self.table.setItem(row, 9, sync_item)
 
             self.table.setItem(
@@ -1508,6 +1558,97 @@ class SessionsWindow(QDialog):
                 QTableWidgetItem(r["task_id"] or "—"),
             )
             self.table.setItem(row, 11, QTableWidgetItem(r["dir"]))
+
+    # ------------------------------------------------------------------
+    # Готовность к синхронизации
+    # ------------------------------------------------------------------
+    def _toggle_sync_ready(self) -> None:
+        """
+        Переключает флаг sync_ready в session.json для выбранной
+        записи. Показывается диалог подтверждения.
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        session_json = os.path.join(r["dir"], "session.json")
+        meta = read_json_file(session_json) or {}
+        current = bool(meta.get("sync_ready", False))
+        new_value = not current
+
+        if new_value:
+            # Отметить как готовую — предупреждаем, что фоновый pull
+            # начнёт перезаписывать локальные файлы.
+            reply = QMessageBox.question(
+                self, "Готово к синхронизации",
+                f"Отметить запись «{r['name']}» как готовую "
+                f"к синхронизации?\n\n"
+                f"После этого:\n"
+                f"  • автопубликация может отправить запись "
+                f"на сервер;\n"
+                f"  • фоновый pull может перезаписывать локальные "
+                f"файлы серверной версией;\n"
+                f"  • локальные артефакты, которых нет на сервере, "
+                f"могут быть удалены.\n\n"
+                f"Убедитесь, что протокол, summary и вложения "
+                f"на месте.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        meta["sync_ready"] = new_value
+        meta["sync_ready_at"] = (
+            datetime.now().isoformat() if new_value else ""
+        )
+
+        if not self._write_json(session_json, meta):
+            QMessageBox.critical(
+                self, "Синхронизация",
+                "Не удалось сохранить session.json",
+            )
+            return
+
+        log.info(
+            "Запись «%s»: sync_ready = %s",
+            r["name"], new_value,
+        )
+
+        self.refresh()
+
+        # --- НОВОЕ: авто-публикация при установке «Готово» ---
+        if new_value:
+            # Обновляем запись в self._rows, чтобы _publish_after_ready
+            # видела свежие данные.
+            r["sync_ready"] = True
+            self._publish_after_ready(r)
+        else:
+            self._notify_sync_ready(r, False)
+
+    def _notify_sync_ready(
+        self, r: Dict[str, Any], ready: bool,
+    ) -> None:
+        """Показывает уведомление после смены флага."""
+        if ready:
+            QMessageBox.information(
+                self, "Синхронизация",
+                f"Запись «{r['name']}» помечена как «готова "
+                f"к синхронизации».\n\n"
+                f"Теперь её можно публиковать на сервер "
+                f"(вручную или автоматически) и разрешить "
+                f"фоновую синхронизацию.",
+            )
+        else:
+            QMessageBox.information(
+                self, "Синхронизация",
+                f"Запись «{r['name']}» снова стала черновиком.\n\n"
+                f"Автопубликация не запускается, фоновый pull "
+                f"не перезаписывает локальные файлы, локальные "
+                f"артефакты не удаляются.",
+            )
 
     # ------------------------------------------------------------------
     # Просмотр / прослушивание медиа
@@ -1785,14 +1926,6 @@ class SessionsWindow(QDialog):
     # Просмотр стенограммы
     # ------------------------------------------------------------------
     def _open_transcript(self) -> None:
-        """
-        Открывает стенограмму (video.txt) во встроенном
-        read-only просмотрщике с поиском.
-
-        Поиск файла выполняется в двух местах:
-          1. В корне папки записи.
-          2. В подпапке attachments.
-        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -1801,12 +1934,10 @@ class SessionsWindow(QDialog):
         session_dir = r.get("dir") or ""
         transcript_path = ""
 
-        # 1. Проверяем файл в корне папки записи
         root_path = os.path.join(session_dir, "video.txt")
         if os.path.isfile(root_path):
             transcript_path = root_path
 
-        # 2. Если в корне нет, ищем в папке attachments
         if not transcript_path:
             attachments_path = os.path.join(
                 session_dir, "attachments", "video.txt"
@@ -1830,7 +1961,6 @@ class SessionsWindow(QDialog):
         except OSError:
             size_bytes = 0
 
-        # Лимит 20 МБ — как в TextViewerDialog.
         if size_bytes > 20 * 1024 * 1024:
             reply = QMessageBox.question(
                 self, "Стенограмма",
@@ -1887,34 +2017,19 @@ class SessionsWindow(QDialog):
     # ------------------------------------------------------------------
     @staticmethod
     def _find_manual_protocol_path(r: Dict[str, Any]) -> str:
-        """
-        Ищет файл протокола (.docx) для записи.
-
-        Порядок поиска:
-          1. Путь из session.json → manual_protocol_path.
-          2. Корень папки записи: manual_protocol.docx,
-             protocol.docx.
-          3. Подпапка attachments: manual_protocol.docx,
-             protocol.docx.
-
-        Возвращает путь к найденному файлу или "".
-        """
         session_dir = r.get("dir") or ""
         if not session_dir:
             return ""
 
-        # 1. Из session.json
         meta_path = r.get("manual_protocol_path") or ""
         if meta_path and os.path.isfile(meta_path):
             return meta_path
 
-        # 2. В корне папки записи
         for name in ("manual_protocol.docx", "protocol.docx"):
             candidate = os.path.join(session_dir, name)
             if os.path.isfile(candidate):
                 return candidate
 
-        # 3. В подпапке attachments
         att_dir = os.path.join(session_dir, "attachments")
         if os.path.isdir(att_dir):
             for name in ("manual_protocol.docx", "protocol.docx"):
@@ -1925,16 +2040,6 @@ class SessionsWindow(QDialog):
         return ""
 
     def _view_manual_protocol(self) -> None:
-        """
-        Открывает прикреплённый протокол (.docx) во встроенном
-        read-only просмотрщике с поиском.
-
-        Поиск файла выполняется:
-          1. По пути из session.json → manual_protocol_path.
-          2. В корне папки записи (manual_protocol.docx,
-             protocol.docx).
-          3. В подпапке attachments.
-        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -2045,6 +2150,135 @@ class SessionsWindow(QDialog):
             self._on_sync_worker_done
         )
         self._sync_worker.start()
+
+    # ------------------------------------------------------------------
+    # Авто-публикация при установке «Готово к синхронизации»
+    # ------------------------------------------------------------------
+    def _publish_after_ready(self, r: Dict[str, Any]) -> None:
+        """
+        Запускает публикацию записи в фоне сразу после того, как
+        пользователь поставил галочку «Готово к синхронизации».
+
+        Проверяет:
+          • настройка app.sync_publish_on_ready включена;
+          • синхронизация настроена (enabled, base_url, api_key);
+          • запись не публикуется прямо сейчас.
+        """
+        # --- Проверка настройки ---
+        if not self._app_cfg.get("sync_publish_on_ready", True):
+            log.info(
+                "Авто-публикация при отметке «Готово» выключена "
+                "в настройках — запись %s останется локальной "
+                "до ручной синхронизации", r["name"],
+            )
+            return
+
+        if self.config_manager is None:
+            return
+
+        try:
+            cfg = self.config_manager.get_sync_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать sync-настройки: %s", exc
+            )
+            return
+
+        if not (cfg.get("enabled") and cfg.get("base_url")
+                and cfg.get("api_key")):
+            log.info(
+                "Авто-публикация пропущена: синхронизация не "
+                "настроена (запись %s)", r["name"],
+            )
+            return
+
+        # --- Защита от параллельных публикаций ---
+        if (self._sync_worker is not None
+                and self._sync_worker.isRunning()):
+            log.info(
+                "Авто-публикация отложена: уже выполняется "
+                "синхронизация другой записи"
+            )
+            self._notify_ready_no_publish(r, reason="busy")
+            return
+
+        manager = SyncManager(
+            sessions_root=self.sessions_root,
+            sync_settings=cfg,
+            config_manager=self.config_manager,
+        )
+
+        # --- Используем настройки по умолчанию ---
+        include_media = bool(
+            cfg.get("send_media_to_server", False)
+        )
+        send_video_link = bool(cfg.get("send_video_link", True))
+        delete_after = bool(
+            cfg.get(
+                "delete_local_media_after_media_upload", False
+            )
+        )
+
+        log.info(
+            "Авто-публикация записи «%s» после отметки «Готово» "
+            "(медиа=%s, ссылка=%s, удалять после загрузки=%s)",
+            r["name"], include_media, send_video_link, delete_after,
+        )
+
+        self._sync_progress_dlg = QProgressDialog(
+            f"Авто-публикация: {r['name']}…",
+            "Отмена",
+            0, 0, self,
+        )
+        self._sync_progress_dlg.setWindowTitle(
+            "Авто-публикация на сервер"
+        )
+        self._sync_progress_dlg.setWindowModality(
+            Qt.WindowModality.WindowModal
+        )
+        self._sync_progress_dlg.setMinimumDuration(0)
+        self._sync_progress_dlg.setCancelButton(None)
+        self._sync_progress_dlg.show()
+
+        self._sync_worker = _OneSyncWorker(
+            manager=manager,
+            session_dir=r["dir"],
+            include_media=include_media,
+            send_video_link=send_video_link,
+            delete_media_after_upload=delete_after,
+            parent=self,
+        )
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        self._sync_worker.finished_ok.connect(
+            self._on_sync_finished
+        )
+        self._sync_worker.failed.connect(self._on_sync_failed)
+        self._sync_worker.finished.connect(
+            self._on_sync_worker_done
+        )
+        self._sync_worker.start()
+
+    def _notify_ready_no_publish(
+        self, r: Dict[str, Any], reason: str = "",
+    ) -> None:
+        """Показывает уведомление, что публикация не запущена."""
+        if reason == "busy":
+            QMessageBox.information(
+                self, "Готово к синхронизации",
+                f"Запись «{r['name']}» помечена как «готова к "
+                f"синхронизации».\n\n"
+                f"Авто-публикация не запущена: уже выполняется "
+                f"синхронизация другой записи. Опубликуйте эту "
+                f"запись вручную через «Синхронизировать…».",
+            )
+        else:
+            QMessageBox.information(
+                self, "Готово к синхронизации",
+                f"Запись «{r['name']}» помечена как «готова к "
+                f"синхронизации».\n\n"
+                f"Авто-публикация не запущена. Опубликуйте запись "
+                f"через «Синхронизировать…» (Ctrl+Shift+S).",
+            )
 
     def _on_sync_progress(self, message: str) -> None:
         if self._sync_progress_dlg is not None:
@@ -2303,18 +2537,20 @@ class SessionsWindow(QDialog):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        new_tags = dlg.result_data.get("tags", [])
-        meta["tags"] = list(new_tags)
+        new_meta = dlg.result_data
+        meta["tags"] = list(new_meta.get("tags", []))
+        # Обновляем также sync_ready, если пользователь его поменял
+        meta["sync_ready"] = bool(new_meta.get("sync_ready", False))
         if not self._write_json(session_json, meta):
             QMessageBox.critical(
                 self, "Теги",
-                "Не удалось сохранить теги в session.json",
+                "Не удалось сохранить session.json",
             )
             return
 
         log.info(
-            "Теги записи «%s» обновлены: %s",
-            r["name"], new_tags,
+            "Теги записи «%s» обновлены: %s (sync_ready=%s)",
+            r["name"], meta["tags"], meta["sync_ready"],
         )
         self.refresh()
 
@@ -3201,6 +3437,9 @@ class SessionsWindow(QDialog):
 
         new_meta = dlg.result_data
 
+        old_sync_ready = bool(meta.get("sync_ready", False))
+        new_sync_ready = bool(new_meta.get("sync_ready", False))
+
         for keep_key in (
             "date", "time", "monitor",
             "summary_bb",
@@ -3256,6 +3495,16 @@ class SessionsWindow(QDialog):
             f"Запись поставлена в очередь на обработку: {task_id}",
         )
         self.refresh()
+
+        # --- Авто-публикация, если флаг только что установлен ---
+        if (not old_sync_ready and new_sync_ready
+                and self._app_cfg.get("sync_publish_on_ready", True)):
+            # Ищем актуальную строку в self._rows
+            for row in self._rows:
+                if row["dir"] == r["dir"]:
+                    row["sync_ready"] = True
+                    self._publish_after_ready(row)
+                    break
 
     # ------------------------------------------------------------------
     # Помощники для MetadataDialog
@@ -3431,6 +3680,22 @@ class SessionsWindow(QDialog):
         menu.addSeparator()
 
         # --- Синхронизация ---
+        sync_ready_text = (
+            "Снять отметку «готово к синхронизации»"
+            if r.get("sync_ready")
+            else "Отметить как «готово к синхронизации»"
+        )
+        act_sync_ready = menu.addAction(
+            sync_ready_text, self._toggle_sync_ready
+        )
+        act_sync_ready.setToolTip(
+            "Переключить флаг sync_ready.\n\n"
+            "Пока флаг не выставлен — запись считается черновиком: "
+            "автопубликация не запускается, фоновый pull не "
+            "перезаписывает локальные файлы, локальные артефакты "
+            "не удаляются."
+        )
+
         act_sync = menu.addAction(
             "Синхронизировать…", self._sync_one_record
         )
@@ -3715,6 +3980,7 @@ class SessionsWindow(QDialog):
             "Ctrl+I        — импорт материалов\n"
             "Ctrl+Shift+Y  — окно синхронизации\n"
             "Ctrl+Shift+S  — синхронизировать выбранную запись\n"
+            "Ctrl+Shift+G  — переключить «готово к синхронизации»\n"
             "Ctrl+Shift+V  — смотреть видео\n"
             "Ctrl+Shift+A  — прослушать аудио\n"
             "Ctrl+Shift+T  — просмотреть стенограмму\n"

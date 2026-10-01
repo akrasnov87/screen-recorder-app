@@ -10,10 +10,10 @@
       – окно «Синхронизация» (SyncWindow);
       – автопубликация записи после успешной обработки;
       – фоновый воркер дельта-синхронизации.
-  • Пути из QFileDialog нормализуются через safe_local_path():
-    под Wayland/GTK Qt может вернуть percent-encoded путь
-    (например, %D0%9A%D0%A1%D0%A3%D0%9E_...), из-за чего файлы
-    сохранялись с «сырыми» именами.
+  • Пути из QFileDialog нормализуются через safe_local_path().
+  • Автопубликация проверяет флаг sync_ready (если включена
+    настройка sync_auto_publish_ready_only). Это защищает от
+    публикации черновиков и от гонки publish/pull.
 """
 from __future__ import annotations
 
@@ -392,7 +392,6 @@ class ScreenRecorderApp(QObject):
 
         init = dict(initial or {})
 
-        # Если проект не задан явно — подставляем проект по умолчанию
         if not init.get("project"):
             init["project"] = self._resolve_default_project()
 
@@ -442,11 +441,8 @@ class ScreenRecorderApp(QObject):
         """
         Формирует метаданные по умолчанию.
 
-        Проект берётся через _resolve_default_project():
-        сначала config.default_project, потом первый из списка.
-
-        Чекбоксы контекста записи в промпте («Название»,
-        «Проект», «Комментарий», «Теги») включены по умолчанию.
+        По умолчанию sync_ready=False — запись считается
+        черновиком, пока пользователь явно не поставит галочку.
         """
         default_project = self._resolve_default_project()
         now_str = f"{datetime.now():%Y-%m-%d %H-%M}"
@@ -462,6 +458,8 @@ class ScreenRecorderApp(QObject):
             "name_abbr": "",
             "comment": "",
             "tags": [],
+            # --- Флаг готовности к синхронизации ---
+            "sync_ready": False,
             "prompt": self.config_manager.get_default_prompt(),
             "prompt_name": "",
             "prompt_edited": False,
@@ -479,7 +477,7 @@ class ScreenRecorderApp(QObject):
         }
         log.debug(
             "Сформированы метаданные по умолчанию: project=%r, "
-            "ctx: name=%s project=%s comment=%s tags=%s",
+            "sync_ready=False, ctx: name=%s project=%s comment=%s tags=%s",
             default_project,
             meta["include_name_in_prompt"],
             meta["include_project_in_prompt"],
@@ -561,7 +559,6 @@ class ScreenRecorderApp(QObject):
         log.info("Копирование вложений: %d файлов → %s",
                 len(src_paths), att_dir)
 
-        # app_cfg читается из self — метод теперь обычный.
         max_chars = int(
             self.app_cfg.get("attachment_name_max_chars", 50)
         )
@@ -610,6 +607,20 @@ class ScreenRecorderApp(QObject):
             log.info("Метаданные сохранены: %s", path)
         except Exception as exc:
             log.error("Не удалось сохранить метаданные: %s", exc)
+
+    @staticmethod
+    def _read_session_meta(session_dir: str) -> Dict[str, Any]:
+        """Читает session.json. Возвращает {} при ошибке."""
+        path = os.path.join(session_dir, "session.json")
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            log.warning("Не удалось прочитать %s: %s", path, exc)
+            return {}
 
     def _new_session_dir(self) -> str:
         temp = self.config_manager.config["storage"].get(
@@ -707,8 +718,6 @@ class ScreenRecorderApp(QObject):
         )
         if not file_path:
             return
-        # Нормализуем путь: под Wayland/GTK Qt может вернуть
-        # percent-encoded строку.
         file_path = safe_local_path(file_path)
 
         if not os.path.isfile(file_path):
@@ -725,7 +734,7 @@ class ScreenRecorderApp(QObject):
             "include_comment_in_prompt": True,
             "include_tags_in_prompt": True,
         }
-        
+
         meta = self._ask_metadata(
             title="Метаданные загружаемого видео",
             initial=initial,
@@ -911,6 +920,8 @@ class ScreenRecorderApp(QObject):
             "time": date_dt.strftime("%H:%M:%S"),
             "comment": comment,
             "tags": list(data.get("tags") or []),
+            # --- Флаг готовности к синхронизации ---
+            "sync_ready": False,
             "source": "import",
             "source_files": {
                 "video": video_src,
@@ -1131,7 +1142,6 @@ class ScreenRecorderApp(QObject):
                 hide_after, self.overlay_panel.hide_panel
             )
 
-        # Автопубликация на сервер синхронизации.
         if output_dir:
             self._auto_publish_after_processing(task_id, output_dir)
 
@@ -1151,7 +1161,13 @@ class ScreenRecorderApp(QObject):
     def _auto_publish_after_processing(
         self, task_id: str, output_dir: str
     ) -> None:
-        """Публикует запись на сервер, если это включено в настройках."""
+        """
+        Публикует запись на сервер, если это включено в настройках.
+
+        Если включена настройка sync_auto_publish_ready_only —
+        публикация выполняется только для записей с флагом
+        sync_ready=true (защита от гонки publish/pull).
+        """
         try:
             cfg = self.config_manager.get_sync_settings()
         except Exception as exc:
@@ -1171,6 +1187,19 @@ class ScreenRecorderApp(QObject):
                 "Автопубликация: папка не найдена: %s", output_dir
             )
             return
+
+        # --- Проверка флага готовности ---
+        if self.app_cfg.get("sync_auto_publish_ready_only", True):
+            meta = self._read_session_meta(output_dir)
+            if not meta.get("sync_ready", False):
+                log.info(
+                    "Автопубликация пропущена: запись %s не помечена "
+                    "как «готова к синхронизации» (sync_ready=false). "
+                    "Поставьте галочку в карточке метаданных или в "
+                    "окне «Записи».",
+                    task_id,
+                )
+                return
 
         log.info(
             "Автопубликация записи %s на сервер (%s)",
@@ -1387,18 +1416,14 @@ def main() -> int:
 
     log.info("ffmpeg найден: OK")
 
-    # --- Инициализация QApplication ---
     app = QApplication(sys.argv)
     app.setApplicationName("Screen Recorder")
     app.setApplicationDisplayName("Screen Recorder")
     app.setOrganizationName("ScreenRecorder")
     app.setOrganizationDomain("screen-recorder.local")
-    # Связь с .desktop-файлом (для правильной иконки в доке на Linux).
-    # Должно совпадать с StartupWMClass в screen-recorder.desktop.
     app.setDesktopFileName("screen-recorder")
     app.setQuitOnLastWindowClosed(False)
 
-    # --- Иконка приложения: одинаковая для дока, alt-tab и трея ---
     _icon_candidates = [
         _resource("icons/app.png"),
         _resource("icons/app.svg"),
@@ -1418,7 +1443,6 @@ def main() -> int:
             " или ".join(_icon_candidates),
         )
 
-    # --- Стили ---
     qss_path = _resource("styles.qss")
     if os.path.exists(qss_path):
         try:

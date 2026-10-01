@@ -2,54 +2,36 @@
 
 Задачи модуля:
   • Собрать RecordPayload из локального session.json.
-  • Опубликовать запись на сервер (POST /api/v1/records) — метаданные
-    + текстовые артефакты.
-  • Опционально загрузить видео и аудио как артефакты
-    (kind=video / kind=audio).
-  • Скачать запись с сервера и разложить по локальным папкам,
-    включая видео/аудио, если они есть на сервере.
+  • Опубликовать запись на сервер (POST /api/v1/records).
+  • Опционально загрузить видео и аудио как артефакты.
+  • Скачать запись с сервера и разложить по локальным папкам.
   • Дельта-синхронизация через /sync/changes.
-  • Синхронизация справочников проектов и тегов через фиктивные
-    записи в проекте "_config".
+  • Синхронизация справочников проектов и тегов.
 
 Ключевые особенности:
-  • Медиа передаётся как обычные артефакты — не требует
-    доработок сервера.
-  • Ограничение размера — max_artifact_mb (не больше
-    SCREC_MAX_ARTIFACT_MB на сервере).
-  • Умная стратегия скачивания по sha256; force_overwrite
-    позволяет перезаписать всё.
-  • Артефакты, которых нет на сервере, удаляются локально,
-    НО видео/аудио не удаляются, если они не загружались
-    на сервер (send_media_to_server=False).
+  • Медиа передаётся как обычные артефакты.
+  • Ограничение размера — max_artifact_mb.
+  • Умная стратегия скачивания по sha256.
+  • Артефакты, которых нет на сервере, НЕ удаляются, если
+    запись помечена как черновик (sync_ready=false).
+  • Локальный мьютекс на session_dir — publish и download для
+    одной папки не выполняются одновременно.
 
 Изменения:
   • Перед загрузкой медиа-файлов выполняется пакетная проверка
-    через POST /records/{id}/artifacts/check. Файлы, у которых
-    хэш совпадает с серверным, НЕ отправляются по сети (экономия
-    трафика).
-  • Управляется настройкой sync_use_hash_check (включена по
-    умолчанию).
-  • Добавлено автосжатие медиа: если файл превышает лимит
-    max_artifact_mb, он перекодируется через ffmpeg до целевого
-    размера (см. video_compressor.compress_video_to_target_size).
-    Оригинал перезаписывается. Управляется настройкой
-    sync_compress_media_if_too_large.
-
-  • (КРИТИЧНО 2) _apply_change для action="artifact_upload" больше
-    не перезагружает всю запись. Скачивается только изменённый
-    артефакт. Для action="create"/"update" — прежнее поведение
-    (полный download_record).
-  • (КРИТИЧНО 3) _find_local_session больше не обходит все папки
-    sessions/ при каждом изменении. Индекс record_id → session_dir
-    хранится в sync_state.json и обновляется при публикации и
-    скачивании.
-  • (КРИТИЧНО 4) JSON-конфиги хранятся в summary_bb с префиксом-
-    маркером _CONFIG_JSON_PREFIX. Это позволяет отличать config-
-    записи от обычных summary и не путать их с FTS-индексом.
-    Чтение — через ScrecClient.get_config_json().
-  • (КРИТИЧНО 5) Логирование skipped_artifacts/uploaded_artifacts
-    для текстовых артефактов при публикации.
+    через POST /records/{id}/artifacts/check.
+  • Добавлено автосжатие медиа.
+  • (КРИТИЧНО 2) _apply_change для artifact_upload не
+    перезагружает всю запись.
+  • (КРИТИЧНО 3) Индекс record_id → session_dir в sync_state.json.
+  • (КРИТИЧНО 4) JSON-конфиги в summary_bb с префиксом-маркером.
+  • (КРИТИЧНО 5) Логирование skipped/uploaded артефактов.
+  • (НОВОЕ) Флаг sync_ready:
+      – build_payload_from_meta передаёт sync_ready на сервер;
+      – publish_session сохраняет sync_ready в sync_state.json;
+      – _prune_local_artifacts пропускается для черновиков;
+      – _apply_change игнорирует изменения для черновиков;
+      – локальный мьютекс на session_dir (asyncio.Lock).
 """
 from __future__ import annotations
 
@@ -87,13 +69,11 @@ _CONFIG_PROJECT = "_config"
 _CONFIG_FOLDER_PROJECTS = "projects"
 _CONFIG_FOLDER_TAGS = "tags"
 
-# Префикс-маркер для JSON-конфигов в summary_bb. Позволяет
-# отличить config-записи от обычных summary (и от старых версий
-# без префикса). Формат: "§CONFIG_JSON§\n{...json...}".
+# Префикс-маркер для JSON-конфигов в summary_bb.
 _CONFIG_JSON_PREFIX = "§CONFIG_JSON§\n"
 
 
-# Соответствие локальных файлов и kind на сервере (текстовые артефакты).
+# Соответствие локальных файлов и kind на сервере.
 _ARTIFACT_KINDS: List[Tuple[str, str]] = [
     ("transcript", "video.txt"),
     ("summary", "video_summary.md"),
@@ -208,6 +188,19 @@ def get_record_id(session_dir: str) -> str:
     return str(state.get("record_id") or "")
 
 
+def _is_sync_ready(session_dir: str) -> bool:
+    """
+    Читает флаг sync_ready из session.json.
+
+    Если файла нет или флаг не выставлен — запись считается
+    черновиком (sync_ready=False).
+    """
+    meta = read_json_file(
+        os.path.join(session_dir, "session.json")
+    ) or {}
+    return bool(meta.get("sync_ready", False))
+
+
 # ---------------------------------------------------------------------------
 # Сборка payload
 # ---------------------------------------------------------------------------
@@ -272,6 +265,10 @@ def build_payload_from_meta(
         if key in meta:
             payload[key] = bool(meta[key])
 
+    # --- Флаг готовности к синхронизации ---
+    if "sync_ready" in meta:
+        payload["sync_ready"] = bool(meta["sync_ready"])
+
     raw_tags = meta.get("tags")
     if isinstance(raw_tags, list):
         tags: List[str] = []
@@ -307,13 +304,7 @@ def build_payload_from_meta(
 
 
 def _find_media_in_session(session_dir: str) -> Dict[str, str]:
-    """
-    Возвращает словарь {"video": "/path/video.mp4",
-                       "audio": "/path/video.mp3"}
-    с найденными в папке сессии медиафайлами.
-
-    Если файла нет — ключ отсутствует.
-    """
+    """Возвращает {"video": path, "audio": path} для найденных медиа."""
     result: Dict[str, str] = {}
 
     for ext in _VIDEO_EXTS:
@@ -340,33 +331,11 @@ def collect_artifacts(
     List[Tuple[str, str]],
     List[Dict[str, Any]],
 ]:
-    """
-    Возвращает два списка:
-      • small_artifacts — (kind, filename) для отправки в
-        POST /records (метаданные + текстовые артефакты +
-        вложения);
-      • media_artifacts — список словарей с полями kind, filename,
-        path, size_bytes, needs_compression, target_bytes.
-        Медиа-артефакты отделены потому, что их может быть
-        много / они большие, и удобнее грузить их по одному
-        после создания записи.
-
-    Если медиафайл превышает max_artifact_mb и в настройках
-    включено автосжатие — в элементе media_artifacts
-    выставляется needs_compression=True. Сжатие выполняется
-    в publish_session.
-
-    Args:
-        include_media:    если True — в media_artifacts попадут
-                          найденные видео/аудио.
-        max_artifact_mb:  ограничение на размер каждого
-                          медиафайла (в МБ).
-    """
+    """Возвращает (small_artifacts, media_artifacts)."""
     small: List[Tuple[str, str]] = []
     media: List[Dict[str, Any]] = []
     seen_kinds: Dict[str, bool] = {}
 
-    # --- Текстовые артефакты ---
     for kind, filename in _ARTIFACT_KINDS:
         if seen_kinds.get(kind):
             continue
@@ -375,7 +344,6 @@ def collect_artifacts(
             small.append((kind, filename))
             seen_kinds[kind] = True
 
-    # --- Вложения ---
     att_dir = os.path.join(session_dir, "attachments")
     if os.path.isdir(att_dir):
         try:
@@ -399,7 +367,6 @@ def collect_artifacts(
         except OSError as exc:
             log.warning("Не удалось прочитать %s: %s", att_dir, exc)
 
-    # --- Медиа ---
     if include_media:
         max_bytes = max_artifact_mb * 1024 * 1024
         found = _find_media_in_session(session_dir)
@@ -433,7 +400,29 @@ def collect_artifacts(
 # Менеджер синхронизации
 # ---------------------------------------------------------------------------
 class SyncManager:
-    """Управляет синхронизацией записей и конфигов с сервером."""
+    """
+    Управляет синхронизацией записей и конфигов с сервером.
+
+    Локальный мьютекс на session_dir (class-level asyncio.Lock)
+    защищает от гонки publish/download для одной папки.
+    """
+
+    # --- Локальные мьютексы на session_dir (publish vs download) ---
+    _session_locks: Dict[str, asyncio.Lock] = {}
+    _session_locks_guard = asyncio.Lock()
+
+    @classmethod
+    async def _get_session_lock(
+        cls, session_dir: str
+    ) -> asyncio.Lock:
+        """Возвращает asyncio.Lock для конкретной папки сессии."""
+        key = os.path.abspath(session_dir)
+        async with cls._session_locks_guard:
+            lock = cls._session_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                cls._session_locks[key] = lock
+            return lock
 
     def __init__(
         self,
@@ -487,17 +476,15 @@ class SyncManager:
         )
 
     def _use_hash_check(self) -> bool:
-        """Нужно ли использовать условную загрузку (HEAD/check)."""
         return bool(self.settings.get("use_hash_check", True))
 
     def _use_compression(self) -> bool:
-        """Нужно ли автоматически сжимать медиа при превышении лимита."""
         return bool(
             self.settings.get("compress_media_if_too_large", True)
         )
 
     # ------------------------------------------------------------------
-    # Локальное состояние (last_synced_revision + индекс)
+    # Локальное состояние
     # ------------------------------------------------------------------
     def load_state(self) -> Dict[str, Any]:
         if not os.path.isfile(self._state_path):
@@ -556,7 +543,6 @@ class SyncManager:
     def _update_record_index(
         self, record_id: str, session_dir: str
     ) -> None:
-        """Обновляет запись в индексе record_id → session_dir."""
         if not record_id or not session_dir:
             return
         try:
@@ -572,7 +558,6 @@ class SyncManager:
             )
 
     def _remove_from_record_index(self, record_id: str) -> None:
-        """Удаляет запись из индекса (например, при delete на сервере)."""
         if not record_id:
             return
         try:
@@ -589,7 +574,6 @@ class SyncManager:
             )
 
     def _lookup_in_record_index(self, record_id: str) -> str:
-        """Возвращает путь к папке сессии по record_id или ""."""
         if not record_id:
             return ""
         try:
@@ -621,15 +605,6 @@ class SyncManager:
         progress_cb: Optional[Callable[[str], None]] = None,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> bool:
-        """
-        Сжимает медиафайл, если он помечен как needs_compression.
-
-        Возвращает True, если файл успешно сжат (или сжатие
-        не требовалось), и False, если сжатие не удалось —
-        в этом случае файл следует пропустить.
-
-        Оригинал перезаписывается по месту (см. video_compressor).
-        """
         if not item.get("needs_compression"):
             return True
 
@@ -638,19 +613,16 @@ class SyncManager:
         kind = item.get("kind") or ""
 
         if not path or not os.path.isfile(path):
-            log.warning(
-                "Сжатие: файл не найден: %s", path
-            )
+            log.warning("Сжатие: файл не найден: %s", path)
             return False
 
         if target_bytes <= 0:
             log.warning(
-                "Сжатие: некорректный целевой размер %d "
-                "для %s", target_bytes, path,
+                "Сжатие: некорректный целевой размер %d для %s",
+                target_bytes, path,
             )
             return False
 
-        # Настройки сжатия.
         min_video_kbps = int(
             self.settings.get(
                 "compression_min_video_bitrate_kbps",
@@ -701,7 +673,6 @@ class SyncManager:
             )
             return False
 
-        # Обновляем размер в item — после сжатия файл стал меньше.
         try:
             new_size = os.path.getsize(path)
             item["size_bytes"] = new_size
@@ -727,21 +698,21 @@ class SyncManager:
         """
         Публикует одну запись на сервер.
 
-        Этапы:
-          1. POST /records — метаданные + текстовые артефакты
-             (с sha256 для каждого файла).
-          2. Если send_media_to_server:
-             a. При необходимости — сжатие медиа до max_artifact_mb.
-             b. POST /records/{id}/artifacts/check — пакетная
-                проверка хэшей всех медиафайлов.
-             c. Отправка только тех файлов, для которых сервер
-                ответил skip=false.
-
-        Returns:
-            {"action": ..., "record_id": ..., "revision": ...,
-             "path": ..., "media_uploaded": [...],
-             "media_skipped": [...], "media_compressed": [...]}
+        Защищено локальным мьютексом на session_dir — параллельный
+        download_record для этой же папки будет ждать.
         """
+        lock = await self._get_session_lock(session_dir)
+        async with lock:
+            return await self._publish_session_impl(
+                session_dir, progress_cb=progress_cb
+            )
+
+    async def _publish_session_impl(
+        self,
+        session_dir: str,
+        *,
+        progress_cb: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
         if not self.is_configured():
             raise ScrecError(
                 "Синхронизация не настроена: укажите base_url и api_key "
@@ -753,6 +724,16 @@ class SyncManager:
 
         session_json = os.path.join(session_dir, "session.json")
         meta = read_json_file(session_json) or {}
+
+        # --- Проверка флага sync_ready ---
+        if not meta.get("sync_ready", False):
+            log.warning(
+                "publish_session: запись %s не помечена как «готова "
+                "к синхронизации» (sync_ready=false). Публикация "
+                "выполняется принудительно (вызов из UI), но "
+                "рекомендуется сначала поставить галочку.",
+                os.path.basename(session_dir),
+            )
 
         if progress_cb:
             progress_cb(f"Сбор метаданных: {os.path.basename(session_dir)}")
@@ -777,7 +758,6 @@ class SyncManager:
             max_artifact_mb=max_artifact_mb,
         )
 
-        # --- Хэши для текстовых артефактов ---
         small_artifact_hashes: Dict[str, str] = {}
         if small_artifacts:
             for kind, filename in small_artifacts:
@@ -789,10 +769,12 @@ class SyncManager:
 
         log.info(
             "SyncManager.publish_session: session=%s, project=%r, "
-            "folder=%r, small_artifacts=%d, media_artifacts=%d "
-            "(include_media=%s, max=%d МБ, hashes=%d, compress=%s)",
+            "folder=%r, sync_ready=%s, small_artifacts=%d, "
+            "media_artifacts=%d (include_media=%s, max=%d МБ, "
+            "hashes=%d, compress=%s)",
             os.path.basename(session_dir),
             payload.get("project"), payload.get("folder_name"),
+            meta.get("sync_ready", False),
             len(small_artifacts), len(media_artifacts),
             include_media, max_artifact_mb,
             len(small_artifact_hashes),
@@ -814,7 +796,6 @@ class SyncManager:
         media_skipped: List[Dict[str, Any]] = []
         media_compressed: List[Dict[str, Any]] = []
 
-        # --- Сжатие медиа (до обращения к серверу) ---
         if include_media and media_artifacts and self._use_compression():
             for idx, item in enumerate(media_artifacts, start=1):
                 if not item.get("needs_compression"):
@@ -860,7 +841,6 @@ class SyncManager:
                     })
 
         async with self._make_client() as client:
-            # --- Шаг 1: запись с текстовыми артефактами ---
             result = await client.publish_record(
                 payload=payload,
                 artifacts=small_artifacts,
@@ -870,9 +850,6 @@ class SyncManager:
 
             record_id = result.get("id") or ""
 
-            # (КРИТИЧНО 5) Логируем, что сервер сделал с текстовыми
-            # артефактами: uploaded / skipped. Это помогает понять,
-            # почему, например, video.txt не обновился.
             skipped_small = result.get("skipped_artifacts") or []
             uploaded_small = result.get("uploaded_artifacts") or []
             if skipped_small or uploaded_small:
@@ -891,16 +868,13 @@ class SyncManager:
                             fname, reason,
                         )
 
-            # --- Шаг 2: медиа-артефакты ---
             if record_id and media_artifacts:
-                # Собираем локальные хэши для медиа (после сжатия).
                 media_items: List[Dict[str, Any]] = []
                 for item in media_artifacts:
                     kind = item["kind"]
                     filename = item["filename"]
                     full_path = item["path"]
 
-                    # Пропускаем те, что уже отмечены как failed.
                     if any(
                         s.get("filename") == filename
                         and s.get("reason") == "compression_failed"
@@ -932,7 +906,6 @@ class SyncManager:
                         "sha256": sha,
                     })
 
-                # --- Пакетная проверка хэшей ---
                 skip_flags: Dict[str, bool] = {}
                 if self._use_hash_check() and media_items:
                     if progress_cb:
@@ -976,7 +949,6 @@ class SyncManager:
                             "отправим все файлы как обычно", exc,
                         )
 
-                # --- Загрузка только тех файлов, которые нужны ---
                 for idx, item in enumerate(media_items, start=1):
                     kind = item["kind"]
                     filename = item["filename"]
@@ -985,8 +957,6 @@ class SyncManager:
                     sha = item["sha256"]
                     size_mb = size_bytes / 1024 / 1024
 
-                    # Файл уже есть на сервере с таким же хэшем —
-                    # не отправляем содержимое.
                     if skip_flags.get(filename):
                         log.info(
                             "SyncManager: медиа %s (%s) пропущено — "
@@ -1052,7 +1022,6 @@ class SyncManager:
                             "reason": str(exc),
                         })
 
-        # --- Сохраняем состояние и обновляем индекс ---
         if record_id:
             state = _read_sync_state(session_dir)
             state.update({
@@ -1063,6 +1032,7 @@ class SyncManager:
                 "published_at": _iso_now(),
                 "folder_name": payload.get("folder_name", ""),
                 "project": payload.get("project", ""),
+                "sync_ready": bool(meta.get("sync_ready", False)),
                 "media_uploaded": [
                     m["filename"] for m in media_uploaded
                     if not m.get("skipped")
@@ -1070,20 +1040,19 @@ class SyncManager:
             })
             _write_sync_state(session_dir, state)
 
-            # (КРИТИЧНО 3) Обновляем индекс record_id → session_dir,
-            # чтобы pull_changes не обходил все папки.
             self._update_record_index(record_id, session_dir)
 
             log.info(
                 "SyncManager: запись опубликована, record_id=%s "
-                "(revision=%s, action=%s, media_uploaded=%d, "
-                "media_compressed=%d)",
+                "(revision=%s, action=%s, sync_ready=%s, "
+                "media_uploaded=%d, media_compressed=%d)",
                 record_id, result.get("revision"),
-                result.get("action"), len(media_uploaded),
+                result.get("action"),
+                meta.get("sync_ready", False),
+                len(media_uploaded),
                 len(media_compressed),
             )
 
-        # --- Опциональное удаление локальных медиа ---
         if (self.settings.get("delete_local_media_after_media_upload")
                 and media_uploaded):
             self._maybe_delete_uploaded_media(
@@ -1127,10 +1096,6 @@ class SyncManager:
         delete_media_after_upload: Optional[bool] = None,
         progress_cb: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        """
-        Синхронизирует ОДНУ запись с явными параметрами,
-        переопределяя настройки из config на время операции.
-        """
         old_settings = dict(self.settings)
 
         try:
@@ -1175,7 +1140,6 @@ class SyncManager:
         session_dir: str,
         uploaded: List[Dict[str, Any]],
     ) -> None:
-        """Удаляет локальные медиафайлы, которые успешно ушли на сервер."""
         for item in uploaded:
             filename = item.get("filename") or ""
             if not filename:
@@ -1199,7 +1163,6 @@ class SyncManager:
     def _maybe_delete_local_media(
         self, session_dir: str, meta: Dict[str, Any]
     ) -> None:
-        """Старое поведение: удалить video.* после публикации."""
         video_path = (meta.get("video_path") or "").strip()
         if not video_path or not os.path.isfile(video_path):
             return
@@ -1226,14 +1189,9 @@ class SyncManager:
         *,
         progress_cb: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        """
-        Скачивает с сервера только медиа-артефакты (video/audio)
-        для конкретной записи.
-        """
         if not self.is_configured():
             raise ScrecError(
-                "Синхронизация не настроена: укажите base_url и api_key "
-                "в Настройки → Синхронизация."
+                "Синхронизация не настроена: укажите base_url и api_key."
             )
         if not os.path.isdir(session_dir):
             raise ScrecError(f"Папка сессии не найдена: {session_dir}")
@@ -1241,10 +1199,7 @@ class SyncManager:
         record_id = get_record_id(session_dir)
         if not record_id:
             raise ScrecError(
-                "Запись не опубликована на сервере — нечего скачивать. "
-                "Опубликуйте её через «Файл → Синхронизировать "
-                "выбранную запись…» или включите передачу медиа "
-                "на сервер в настройках."
+                "Запись не опубликована на сервере — нечего скачивать."
             )
 
         if progress_cb:
@@ -1255,90 +1210,93 @@ class SyncManager:
         downloaded: List[Dict[str, Any]] = []
         missing: List[Dict[str, Any]] = []
 
-        async with self._make_client() as client:
-            record = await client.get_record(record_id)
-            artifacts = record.get("artifacts") or []
+        lock = await self._get_session_lock(session_dir)
+        async with lock:
+            async with self._make_client() as client:
+                record = await client.get_record(record_id)
+                artifacts = record.get("artifacts") or []
 
-            media_items: List[Dict[str, Any]] = []
-            for art in artifacts:
-                kind = str(art.get("kind") or "")
-                if kind in ("video", "audio"):
-                    media_items.append(art)
+                media_items: List[Dict[str, Any]] = []
+                for art in artifacts:
+                    kind = str(art.get("kind") or "")
+                    if kind in ("video", "audio"):
+                        media_items.append(art)
 
-            if not media_items:
-                log.info(
-                    "download_media_only: на сервере нет медиа для "
-                    "record=%s (артефактов всего: %d)",
-                    record_id, len(artifacts),
-                )
-                for kind in ("video", "audio"):
-                    missing.append({
-                        "kind": kind,
-                        "filename": f"video.{kind}",
-                    })
-                return {
-                    "downloaded": [],
-                    "missing": missing,
-                    "session_dir": session_dir,
-                    "record_id": record_id,
-                }
-
-            for idx, art in enumerate(media_items, start=1):
-                kind = str(art.get("kind") or "")
-                filename = str(art.get("filename") or "")
-                if not filename:
-                    continue
-
-                target_rel = os.path.basename(filename)
-                target_path = os.path.join(session_dir, target_rel)
-
-                size_mb = int(art.get("size") or 0) / 1024 / 1024
-                if progress_cb:
-                    progress_cb(
-                        f"Скачивание {kind} [{idx}/{len(media_items)}]: "
-                        f"{filename} ({size_mb:.1f} МБ)…"
-                    )
-
-                if self._should_skip_download(
-                    target_path, art, force_overwrite=False
-                ):
+                if not media_items:
                     log.info(
-                        "download_media_only: %s уже актуален "
-                        "(совпадает по sha256/size)", target_path,
+                        "download_media_only: на сервере нет медиа для "
+                        "record=%s (артефактов всего: %d)",
+                        record_id, len(artifacts),
                     )
-                    downloaded.append({
-                        "kind": kind,
-                        "filename": filename,
-                        "local_path": target_path,
-                        "skipped": True,
-                    })
-                    continue
+                    for kind in ("video", "audio"):
+                        missing.append({
+                            "kind": kind,
+                            "filename": f"video.{kind}",
+                        })
+                    return {
+                        "downloaded": [],
+                        "missing": missing,
+                        "session_dir": session_dir,
+                        "record_id": record_id,
+                    }
 
-                try:
-                    await client.download_artifact(
-                        record_id, filename, target_path,
-                        progress_cb=None,
-                    )
-                    downloaded.append({
-                        "kind": kind,
-                        "filename": filename,
-                        "local_path": target_path,
-                        "skipped": False,
-                    })
-                    log.info(
-                        "download_media_only: %s скачан в %s (%.1f МБ)",
-                        filename, target_path, size_mb,
-                    )
-                except ScrecError as exc:
-                    log.error(
-                        "download_media_only: не удалось скачать %s: %s",
-                        filename, exc,
-                    )
-                    missing.append({
-                        "kind": kind,
-                        "filename": filename,
-                        "reason": str(exc),
-                    })
+                for idx, art in enumerate(media_items, start=1):
+                    kind = str(art.get("kind") or "")
+                    filename = str(art.get("filename") or "")
+                    if not filename:
+                        continue
+
+                    target_rel = os.path.basename(filename)
+                    target_path = os.path.join(session_dir, target_rel)
+
+                    size_mb = int(art.get("size") or 0) / 1024 / 1024
+                    if progress_cb:
+                        progress_cb(
+                            f"Скачивание {kind} "
+                            f"[{idx}/{len(media_items)}]: "
+                            f"{filename} ({size_mb:.1f} МБ)…"
+                        )
+
+                    if self._should_skip_download(
+                        target_path, art, force_overwrite=False
+                    ):
+                        log.info(
+                            "download_media_only: %s уже актуален "
+                            "(совпадает по sha256/size)", target_path,
+                        )
+                        downloaded.append({
+                            "kind": kind,
+                            "filename": filename,
+                            "local_path": target_path,
+                            "skipped": True,
+                        })
+                        continue
+
+                    try:
+                        await client.download_artifact(
+                            record_id, filename, target_path,
+                            progress_cb=None,
+                        )
+                        downloaded.append({
+                            "kind": kind,
+                            "filename": filename,
+                            "local_path": target_path,
+                            "skipped": False,
+                        })
+                        log.info(
+                            "download_media_only: %s скачан в %s "
+                            "(%.1f МБ)", filename, target_path, size_mb,
+                        )
+                    except ScrecError as exc:
+                        log.error(
+                            "download_media_only: не удалось скачать "
+                            "%s: %s", filename, exc,
+                        )
+                        missing.append({
+                            "kind": kind,
+                            "filename": filename,
+                            "reason": str(exc),
+                        })
 
         if progress_cb:
             progress_cb(
@@ -1364,7 +1322,12 @@ class SyncManager:
         force_overwrite: Optional[bool] = None,
         download_media: bool = True,
     ) -> Dict[str, Any]:
-        """Скачивает запись с сервера и раскладывает по локальной папке."""
+        """
+        Скачивает запись с сервера и раскладывает по локальной папке.
+
+        Если известна локальная session_dir — защищено мьютексом
+        (не пересекается с publish_session).
+        """
         if not self.is_configured():
             raise ScrecError(
                 "Синхронизация не настроена: укажите base_url и api_key."
@@ -1375,6 +1338,38 @@ class SyncManager:
                 self.settings.get("force_overwrite_on_download", False)
             )
 
+        # --- Определяем session_dir заранее, чтобы взять мьютекс ---
+        if session_dir is None:
+            session_dir = self._find_local_session(record_id, "")
+
+        if session_dir:
+            lock = await self._get_session_lock(session_dir)
+            async with lock:
+                return await self._download_record_impl(
+                    record_id,
+                    session_dir=session_dir,
+                    progress_cb=progress_cb,
+                    force_overwrite=force_overwrite,
+                    download_media=download_media,
+                )
+
+        return await self._download_record_impl(
+            record_id,
+            session_dir=None,
+            progress_cb=progress_cb,
+            force_overwrite=force_overwrite,
+            download_media=download_media,
+        )
+
+    async def _download_record_impl(
+        self,
+        record_id: str,
+        *,
+        session_dir: Optional[str],
+        progress_cb: Optional[Callable[[str], None]],
+        force_overwrite: bool,
+        download_media: bool,
+    ) -> Dict[str, Any]:
         if progress_cb:
             progress_cb(f"Получение записи {record_id} с сервера")
 
@@ -1549,7 +1544,6 @@ class SyncManager:
             })
             _write_sync_state(session_dir, state)
 
-            # (КРИТИЧНО 3) Обновляем индекс.
             self._update_record_index(record_id, session_dir)
 
         if progress_cb:
@@ -1577,76 +1571,67 @@ class SyncManager:
         *,
         progress_cb: Optional[Callable[[str], None]] = None,
     ) -> Optional[str]:
-        """
-        Скачивает ОДИН артефакт записи. Используется в
-        _apply_change для action="artifact_upload" — чтобы не
-        перекачивать всю запись из-за одного изменённого файла.
-
-        Возвращает локальный путь скачанного файла или None,
-        если скачивание не удалось / файл не нужен.
-        """
         if kind in ("video", "audio"):
             target_rel = os.path.basename(filename)
         else:
             target_rel = self._artifact_target_relpath(kind, filename)
         target_path = os.path.join(session_dir, target_rel)
 
-        async with self._make_client() as client:
-            # Сначала уточняем метаданные артефакта через HEAD,
-            # чтобы решить, нужно ли скачивать (умная стратегия).
-            try:
-                info = await client.get_artifact_info(
-                    record_id, filename
-                )
-            except ScrecError as exc:
-                log.warning(
-                    "download_single_artifact: HEAD не удался "
-                    "(%s) — скачиваем как обычно", exc,
-                )
-                info = {"exists": True}
+        lock = await self._get_session_lock(session_dir)
+        async with lock:
+            async with self._make_client() as client:
+                try:
+                    info = await client.get_artifact_info(
+                        record_id, filename
+                    )
+                except ScrecError as exc:
+                    log.warning(
+                        "download_single_artifact: HEAD не удался "
+                        "(%s) — скачиваем как обычно", exc,
+                    )
+                    info = {"exists": True}
 
-            if not info.get("exists"):
-                log.info(
-                    "download_single_artifact: артефакт %s/%s "
-                    "не существует на сервере — пропускаем",
-                    record_id, filename,
-                )
-                return None
-
-            # Проверяем, надо ли перекачивать (сравнение sha256).
-            server_sha = str(info.get("sha256") or "")
-            if server_sha and os.path.isfile(target_path):
-                local_sha = _sha256_file(target_path)
-                if local_sha and local_sha == server_sha:
+                if not info.get("exists"):
                     log.info(
-                        "download_single_artifact: %s уже актуален "
-                        "(sha256 совпал)", target_path,
+                        "download_single_artifact: артефакт %s/%s "
+                        "не существует на сервере — пропускаем",
+                        record_id, filename,
+                    )
+                    return None
+
+                server_sha = str(info.get("sha256") or "")
+                if server_sha and os.path.isfile(target_path):
+                    local_sha = _sha256_file(target_path)
+                    if local_sha and local_sha == server_sha:
+                        log.info(
+                            "download_single_artifact: %s уже актуален "
+                            "(sha256 совпал)", target_path,
+                        )
+                        return target_path
+
+                if progress_cb:
+                    size_mb = int(info.get("size") or 0) / 1024 / 1024
+                    progress_cb(
+                        f"Скачивание {kind}: {filename} "
+                        f"({size_mb:.1f} МБ)"
+                    )
+
+                try:
+                    await client.download_artifact(
+                        record_id, filename, target_path,
+                        progress_cb=None,
+                    )
+                    log.info(
+                        "download_single_artifact: %s → %s",
+                        filename, target_path,
                     )
                     return target_path
-
-            if progress_cb:
-                size_mb = int(info.get("size") or 0) / 1024 / 1024
-                progress_cb(
-                    f"Скачивание {kind}: {filename} "
-                    f"({size_mb:.1f} МБ)"
-                )
-
-            try:
-                await client.download_artifact(
-                    record_id, filename, target_path,
-                    progress_cb=None,
-                )
-                log.info(
-                    "download_single_artifact: %s → %s",
-                    filename, target_path,
-                )
-                return target_path
-            except ScrecError as exc:
-                log.error(
-                    "download_single_artifact: не удалось скачать "
-                    "%s/%s: %s", record_id, filename, exc,
-                )
-                return None
+                except ScrecError as exc:
+                    log.error(
+                        "download_single_artifact: не удалось скачать "
+                        "%s/%s: %s", record_id, filename, exc,
+                    )
+                    return None
 
     # ------------------------------------------------------------------
     # Вспомогательные методы скачивания
@@ -1703,6 +1688,22 @@ class SyncManager:
         server_targets: Dict[str, Dict[str, Any]],
         server_media_kinds: set,
     ) -> None:
+        """
+        Удаляет локальные артефакты, которых нет на сервере.
+
+        ВАЖНО: если запись не помечена как «готова к синхронизации»
+        (sync_ready=false) — prune пропускается. Это защищает
+        черновик от удаления локальных файлов, которые ещё не
+        публиковались.
+        """
+        if not _is_sync_ready(session_dir):
+            log.info(
+                "SyncManager: prune пропущен — запись %s не помечена "
+                "как «готова к синхронизации» (sync_ready=false)",
+                os.path.basename(session_dir),
+            )
+            return
+
         candidates: List[str] = []
         for _kind, fname in _ARTIFACT_KINDS:
             candidates.append(fname)
@@ -1799,6 +1800,8 @@ class SyncManager:
             "generate_summary", "generate_deepseek_prompt",
             "include_name_in_prompt", "include_project_in_prompt",
             "include_comment_in_prompt", "include_tags_in_prompt",
+            # --- Флаг готовности к синхронизации ---
+            "sync_ready",
         )
         for key in server_fields:
             if key in record:
@@ -1892,6 +1895,14 @@ class SyncManager:
     async def _apply_change(
         self, change: Dict[str, Any], client: ScrecClient
     ) -> None:
+        """
+        Применяет одно изменение с сервера.
+
+        ВАЖНО: если локальная запись не помечена как
+        «готова к синхронизации» (sync_ready=false), изменение
+        игнорируется. Это защищает черновик от перезаписи
+        серверной версией.
+        """
         action = change.get("action")
         record_id = change.get("id") or ""
         path = change.get("path") or ""
@@ -1907,6 +1918,20 @@ class SyncManager:
             )
             return
 
+        # --- Проверка флага sync_ready ---
+        session_dir = self._find_local_session(record_id, path)
+        if session_dir:
+            meta = read_json_file(
+                os.path.join(session_dir, "session.json")
+            ) or {}
+            if not meta.get("sync_ready", False):
+                log.info(
+                    "apply_change: пропускаю %s для record_id=%s — "
+                    "запись не помечена как «готова к синхронизации»",
+                    action, record_id,
+                )
+                return
+
         log.info(
             "SyncManager: применяю изменение action=%s id=%s path=%s",
             action, record_id, path,
@@ -1916,9 +1941,6 @@ class SyncManager:
             await self._handle_delete(record_id, path)
             return
 
-        # (КРИТИЧНО 2) Для artifact_upload/artifact_delete скачиваем
-        # только изменённый артефакт, а не всю запись целиком.
-        # Имя изменённого файла приходит в change["filename"].
         if action in ("artifact_upload", "artifact_delete",
                       "artifact_soft_delete"):
             artifact_filename = (
@@ -1930,8 +1952,6 @@ class SyncManager:
 
             session_dir = self._find_local_session(record_id, path)
 
-            # Если локальной папки ещё нет — значит, запись новая
-            # для этого клиента; скачиваем целиком.
             if not session_dir:
                 log.info(
                     "apply_change: локальной папки нет для "
@@ -1941,8 +1961,6 @@ class SyncManager:
                 await self.download_record(record_id)
                 return
 
-            # Для artifact_delete — просто удаляем локальный файл,
-            # скачивать нечего.
             if action in ("artifact_delete", "artifact_soft_delete"):
                 if artifact_filename:
                     self._delete_local_artifact(
@@ -1950,7 +1968,6 @@ class SyncManager:
                     )
                 return
 
-            # action == "artifact_upload"
             if artifact_filename:
                 kind = str(change.get("kind") or "")
                 log.info(
@@ -1963,7 +1980,6 @@ class SyncManager:
                     progress_cb=None,
                 )
 
-                # Обновляем метаданные записи (revision и т.п.).
                 try:
                     record = await client.get_record(record_id)
                     self._save_remote_meta(session_dir, record)
@@ -1973,7 +1989,6 @@ class SyncManager:
                         "после точечного скачивания: %s", exc,
                     )
             else:
-                # Имени файла нет — на всякий случай обновляем метаданные.
                 log.info(
                     "apply_change: artifact_upload без filename — "
                     "обновляю только метаданные записи"
@@ -2013,9 +2028,7 @@ class SyncManager:
     def _delete_local_artifact(
         self, session_dir: str, filename: str
     ) -> None:
-        """Удаляет локальный файл, соответствующий артефакту на сервере."""
         base = os.path.basename(filename)
-        # Пытаемся найти как в корне сессии, так и в attachments.
         candidates = [
             os.path.join(session_dir, base),
             os.path.join(session_dir, "attachments", base),
@@ -2078,16 +2091,10 @@ class SyncManager:
         Ищет локальную папку сессии по record_id.
 
         Порядок:
-          1. Индекс record_id → session_dir в sync_state.json
-             (O(1), обновляется при publish/download).
-          2. Fallback: обход всех папок sessions/ (используется
-             только если индекс пуст/устарел — например, для
-             записей, скачанных до появления индекса).
+          1. Индекс record_id → session_dir в sync_state.json.
+          2. Fallback: обход всех папок sessions/.
           3. Fallback: поиск по basename(path) из change.
-
-        Результат индексируется, чтобы следующее обращение было O(1).
         """
-        # 1. Быстрый путь: индекс.
         indexed = self._lookup_in_record_index(record_id)
         if indexed:
             return indexed
@@ -2095,7 +2102,6 @@ class SyncManager:
         if not os.path.isdir(self.sessions_root):
             return ""
 
-        # 2. Медленный путь: обход всех папок (один раз).
         found = ""
         try:
             entries = os.listdir(self.sessions_root)
@@ -2118,14 +2124,12 @@ class SyncManager:
             except Exception:
                 continue
 
-        # 3. Fallback: поиск по имени папки.
         if not found and path:
             folder = os.path.basename(path.rstrip("/"))
             candidate = os.path.join(self.sessions_root, folder)
             if os.path.isdir(candidate):
                 found = candidate
 
-        # Индексируем, чтобы больше не обходить.
         if found:
             self._update_record_index(record_id, found)
         return found
@@ -2236,15 +2240,6 @@ class SyncManager:
         data: Any,
         progress_cb: Optional[Callable[[str], None]],
     ) -> Dict[str, Any]:
-        """
-        Публикует справочник (projects/tags) как config-запись.
-
-        (КРИТИЧНО 4) JSON кладётся в summary_bb с префиксом
-        _CONFIG_JSON_PREFIX, чтобы:
-          • можно было отличить config-запись от обычного summary;
-          • при обратном чтении (get_config_json) не парсить
-            произвольный текст как JSON.
-        """
         payload = {
             "project": _CONFIG_PROJECT,
             "year": "0000",
@@ -2252,7 +2247,7 @@ class SyncManager:
             "folder_name": folder_name,
             "name": folder_name,
             "source": "config",
-            # Явный префикс-маркер + JSON.
+            "sync_ready": True,
             "summary_bb": (
                 _CONFIG_JSON_PREFIX
                 + json.dumps(data, ensure_ascii=False)
@@ -2309,8 +2304,6 @@ class SyncManager:
 
                 if folder == _CONFIG_FOLDER_PROJECTS:
                     try:
-                        # (КРИТИЧНО 4) Читаем JSON через
-                        # отдельный метод, который проверяет префикс.
                         data = await client.get_config_json(rid)
                         if isinstance(data, list):
                             self.config_manager.set_projects(data)

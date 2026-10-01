@@ -11,6 +11,12 @@
   • Если в initial нет prompt_name, но prompt/default_prompt
     совпадает с одним из промптов библиотеки — этот промпт
     автоматически выбирается в комбобоксе.
+  • Добавлен блок «Синхронизация» на вкладке «Основное»:
+    чекбокс «Готово к синхронизации с сервером» (sync_ready).
+    Пока галочка не стоит — запись считается черновиком:
+    автопубликация не запускается, фоновый pull не
+    перезаписывает локальные файлы, prune не удаляет
+    локальные артефакты.
 """
 from __future__ import annotations
 
@@ -159,7 +165,6 @@ class MetadataDialog(QDialog):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
 
-        # --- Вкладки ---
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
 
@@ -172,7 +177,6 @@ class MetadataDialog(QDialog):
             self._build_attachments_tab(), "Вложения"
         )
 
-        # --- Кнопки ---
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel,
@@ -199,7 +203,7 @@ class MetadataDialog(QDialog):
 
         info = QLabel(
             "Базовая информация о записи: проект, название, "
-            "комментарий и теги."
+            "комментарий, теги и готовность к синхронизации."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
@@ -287,6 +291,9 @@ class MetadataDialog(QDialog):
         # --- Теги ---
         layout.addWidget(self._build_tags_section())
 
+        # --- Готовность к синхронизации ---
+        layout.addWidget(self._build_sync_ready_section())
+
         layout.addStretch()
         return w
 
@@ -359,6 +366,46 @@ class MetadataDialog(QDialog):
         self._update_tags_count()
         return box
 
+    # ------------------------------------------------------------------
+    # Блок «Готовность к синхронизации»
+    # ------------------------------------------------------------------
+    def _build_sync_ready_section(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 12, 0, 0)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Синхронизация</b>"))
+        header.addStretch()
+        icon = make_info_icon("meta_sync_ready")
+        if icon is not None:
+            header.addWidget(icon)
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "<span style='color:#666'>Пока галочка не стоит — "
+            "запись считается черновиком: автопубликация на "
+            "сервер не запускается, фоновый pull не "
+            "перезаписывает локальные файлы, локальные "
+            "артефакты не удаляются. Поставьте галочку, когда "
+            "запись полностью готова — протокол, summary и "
+            "вложения на месте.</span>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.sync_ready_check = QCheckBox(
+            "Готово к синхронизации с сервером"
+        )
+        attach_tooltip(self.sync_ready_check, "meta_sync_ready")
+        layout.addWidget(self.sync_ready_check)
+
+        return box
+
+    # ------------------------------------------------------------------
+    # Теги
+    # ------------------------------------------------------------------
     def _populate_tags_list(self) -> None:
         if not hasattr(self, "tags_list"):
             return
@@ -517,7 +564,6 @@ class MetadataDialog(QDialog):
         info.setStyleSheet("QLabel { color: #666; }")
         layout.addWidget(info)
 
-        # --- Выбор промпта из библиотеки ---
         lib_row = QHBoxLayout()
         lib_row.addWidget(QLabel("Библиотека:"))
         self.prompt_combo = QComboBox()
@@ -532,7 +578,6 @@ class MetadataDialog(QDialog):
             lib_row.addWidget(prompt_icon)
         layout.addLayout(lib_row)
 
-        # --- Текст промпта ---
         self.prompt_input = QPlainTextEdit()
         self.prompt_input.setPlaceholderText(
             "Промпт для формирования краткого содержания "
@@ -541,7 +586,6 @@ class MetadataDialog(QDialog):
         self.prompt_input.setMinimumHeight(160)
         layout.addWidget(self.prompt_input, 1)
 
-        # --- Кнопки управления промптом ---
         prompt_actions = QHBoxLayout()
         self.save_to_library_btn = QPushButton(
             "Сохранить как новый промпт…"
@@ -558,7 +602,6 @@ class MetadataDialog(QDialog):
         prompt_actions.addStretch()
         layout.addLayout(prompt_actions)
 
-        # --- Контекст записи в промпте ---
         layout.addWidget(self._build_context_section())
 
         return w
@@ -673,7 +716,6 @@ class MetadataDialog(QDialog):
         info.setStyleSheet("QLabel { color: #666; }")
         layout.addWidget(info)
 
-        # --- Summary ---
         summary_header = QHBoxLayout()
         summary_header.addWidget(
             QLabel("<b>Краткое содержание (summary)</b>")
@@ -693,7 +735,6 @@ class MetadataDialog(QDialog):
         self.generate_summary_check.setChecked(False)
         layout.addWidget(self.generate_summary_check)
 
-        # --- DeepSeek ---
         deepseek_header = QHBoxLayout()
         deepseek_header.addWidget(
             QLabel("<b>Промпт для DeepSeek</b>")
@@ -724,7 +765,6 @@ class MetadataDialog(QDialog):
         deepseek_hint.setWordWrap(True)
         layout.addWidget(deepseek_hint)
 
-        # --- Скрам ---
         scrum_header = QHBoxLayout()
         scrum_header.addWidget(QLabel("<b>Скрам-митинг</b>"))
         scrum_header.addStretch()
@@ -848,7 +888,6 @@ class MetadataDialog(QDialog):
         attach_btn_row.addStretch()
         layout.addLayout(attach_btn_row)
 
-        # --- Куда передавать ---
         send_header = QHBoxLayout()
         send_header.addWidget(
             QLabel("<b>Куда передавать вложения</b>")
@@ -1259,6 +1298,11 @@ class MetadataDialog(QDialog):
         self._selected_tags = selected_tags
         self._populate_tags_list()
 
+        # --- Готовность к синхронизации ---
+        self.sync_ready_check.setChecked(
+            bool(init.get("sync_ready", False))
+        )
+
         # --- Summary / DeepSeek ---
         self.generate_summary_check.blockSignals(True)
         self.generate_summary_check.setChecked(
@@ -1273,31 +1317,24 @@ class MetadataDialog(QDialog):
         self.generate_deepseek_check.setChecked(gen)
 
         # ------------------------------------------------------------------
-        # Промпт: если явного текста нет — берём default_prompt;
-        # если он совпадает с одним из промптов библиотеки —
-        # выбираем его в комбобоксе.
+        # Промпт
         # ------------------------------------------------------------------
         prompt_text = (
             init.get("prompt", "") or self._default_prompt
         )
         prompt_name = init.get("prompt_name", "")
 
-        # 1) Если prompt_name задан явно — просто выбираем его.
         if prompt_name:
             idx = self.prompt_combo.findText(prompt_name)
             if idx >= 0:
                 self.prompt_combo.blockSignals(True)
                 self.prompt_combo.setCurrentIndex(idx)
                 self.prompt_combo.blockSignals(False)
-                # Синхронизируем текст из библиотеки, если
-                # в initial не был указан собственный prompt.
                 if not init.get("prompt", "").strip():
                     lib_text = self.prompt_combo.itemData(idx) or ""
                     if lib_text:
                         prompt_text = lib_text
         else:
-            # 2) Явного имени нет. Пробуем найти в библиотеке
-            #    промпт с текстом, равным prompt_text.
             found_idx = -1
             if prompt_text:
                 for i in range(self.prompt_combo.count()):
@@ -1314,8 +1351,6 @@ class MetadataDialog(QDialog):
                     "%r", self.prompt_combo.itemText(found_idx),
                 )
             else:
-                # Ничего не нашли — оставляем «— не выбрано —»,
-                # но текст всё равно подставим в редактор.
                 self.prompt_combo.blockSignals(True)
                 self.prompt_combo.setCurrentIndex(0)
                 self.prompt_combo.blockSignals(False)
@@ -1325,11 +1360,7 @@ class MetadataDialog(QDialog):
         self.prompt_input.blockSignals(False)
         self._prompt_edited = False
 
-        # ------------------------------------------------------------------
-        # Контекст в промпт.
-        # По умолчанию (если в initial нет соответствующих ключей)
-        # все четыре галочки включены.
-        # ------------------------------------------------------------------
+        # --- Контекст в промпт ---
         default_ctx = True
 
         if "include_name_in_prompt" in init:
@@ -1384,12 +1415,14 @@ class MetadataDialog(QDialog):
 
         log.debug(
             "Начальные значения применены: project=%r, name=%r, "
-            "template=%r, abbr=%r, tags=%s, generate_summary=%s, "
-            "prompt=%d символов (combo=%r), is_scrum=%s, "
-            "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
-            "ctx_comment=%s, ctx_tags=%s, attachments=%d",
+            "template=%r, abbr=%r, tags=%s, sync_ready=%s, "
+            "generate_summary=%s, prompt=%d символов (combo=%r), "
+            "is_scrum=%s, generate_deepseek=%s, ctx_name=%s, "
+            "ctx_project=%s, ctx_comment=%s, ctx_tags=%s, "
+            "attachments=%d",
             project, init_name, init_template, init_abbr,
             self._selected_tags,
+            self.sync_ready_check.isChecked(),
             self.generate_summary_check.isChecked(),
             len(prompt_text),
             self.prompt_combo.currentText(),
@@ -1583,7 +1616,6 @@ class MetadataDialog(QDialog):
 
         is_scrum = bool(self.is_scrum_check.isChecked())
 
-        # Собираем теги в порядке справочника.
         selected_set = set(self._selected_tags)
         ordered_tags: List[str] = []
         for tag in self._tags:
@@ -1602,6 +1634,8 @@ class MetadataDialog(QDialog):
             "name_abbr": abbr,
             "comment": comment,
             "tags": ordered_tags,
+            # --- Флаг готовности к синхронизации ---
+            "sync_ready": bool(self.sync_ready_check.isChecked()),
             "prompt": prompt,
             "prompt_name": prompt_name,
             "prompt_edited": bool(self._prompt_edited),
@@ -1641,13 +1675,14 @@ class MetadataDialog(QDialog):
         self.result_data = result
         log.info(
             "Метаданные подтверждены: project=%s, name=%s, "
-            "template=%r, abbr=%r, tags=%s, prompt=%d символов "
-            "(изменён: %s), generate_summary=%s, "
+            "template=%r, abbr=%r, tags=%s, sync_ready=%s, "
+            "prompt=%d символов (изменён: %s), generate_summary=%s, "
             "is_scrum=%s, generate_deepseek=%s, "
             "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
             "ctx_tags=%s, protocol=%s, attachments=%d, "
             "send_to_transcribe=%s, send_to_deepseek=%s",
             project, final_name, template, abbr, ordered_tags,
+            result["sync_ready"],
             len(prompt),
             result["prompt_edited"],
             result["generate_summary"],

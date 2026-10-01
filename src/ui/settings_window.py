@@ -1119,6 +1119,26 @@ class SettingsWindow(QDialog):
         )
         behavior_form.addRow("", self.sync_auto_upload_check)
 
+        self.sync_ready_only_check = QCheckBox(
+            "Автопубликовать только записи, помеченные как "
+            "«готово к синхронизации»"
+        )
+        attach_tooltip(
+            self.sync_ready_only_check,
+            "app_sync_auto_publish_ready_only",
+        )
+        behavior_form.addRow("", self.sync_ready_only_check)
+
+        self.sync_publish_on_ready_check = QCheckBox(
+            "Публиковать на сервер сразу при установке "
+            "«Готово к синхронизации»"
+        )
+        attach_tooltip(
+            self.sync_publish_on_ready_check,
+            "app_sync_publish_on_ready",
+        )
+        behavior_form.addRow("", self.sync_publish_on_ready_check)
+
         self.sync_auto_pull_check = QCheckBox(
             "Автоматически подтягивать изменения в фоне"
         )
@@ -2561,6 +2581,10 @@ class SettingsWindow(QDialog):
         cfg = self.config_manager.config
         log.debug("Загрузка настроек в окно")
 
+        # --- app (читаем заранее — используется ниже в
+        #     блоке синхронизации для флага sync_ready) ---
+        app_cfg = cfg.get("app", {}) or {}
+
         # --- Проекты ---
         projects = self.config_manager.get_projects()
         self.projects_table.setRowCount(0)
@@ -2673,6 +2697,14 @@ class SettingsWindow(QDialog):
         self.sync_read_timeout.setValue(int(sync["read_timeout"]))
         self.sync_auto_upload_check.setChecked(
             bool(sync["auto_upload_after_processing"])
+        )
+        # --- Флаг «автопубликовать только готовые записи» ---
+        # app_cfg уже определён в начале метода.
+        self.sync_ready_only_check.setChecked(
+            bool(app_cfg.get("sync_auto_publish_ready_only", True))
+        )
+        self.sync_publish_on_ready_check.setChecked(
+            bool(app_cfg.get("sync_publish_on_ready", True))
         )
         self.sync_auto_pull_check.setChecked(
             bool(sync["auto_pull_enabled"])
@@ -2838,8 +2870,7 @@ class SettingsWindow(QDialog):
             bool(rec.get("show_start_notification", True))
         )
 
-        # --- app ---
-        app_cfg = cfg.get("app", {})
+        # --- app (ffmpeg, overlay, плеер) ---
         self.ffmpeg_start_check_delay.setValue(
             float(app_cfg.get("ffmpeg_start_check_delay", 0.3))
         )
@@ -2952,6 +2983,7 @@ class SettingsWindow(QDialog):
             "default_project=%r, default_chat_id=%r, "
             "tags=%d, employees=%d, prompts=%d, "
             "sync_enabled=%s, sync_url=%r, send_media=%s, "
+            "sync_ready_only=%s, "
             "media_prefer_builtin=%s, use_hash_check=%s, "
             "compress_media=%s, max_artifact_mb=%d",
             len(projects), default_project,
@@ -2959,6 +2991,7 @@ class SettingsWindow(QDialog):
             len(tags), len(employees), len(prompts),
             sync.get("enabled"), sync.get("base_url"),
             sync.get("send_media_to_server"),
+            self.sync_ready_only_check.isChecked(),
             self.media_prefer_builtin_check.isChecked(),
             self.sync_use_hash_check_check.isChecked(),
             self.compress_enabled_check.isChecked(),
@@ -3282,6 +3315,12 @@ class SettingsWindow(QDialog):
         app_cfg = cfg.setdefault("app", {})
         app_cfg["ffmpeg_start_check_delay"] = float(
             self.ffmpeg_start_check_delay.value()
+        )
+        app_cfg["sync_auto_publish_ready_only"] = (
+            self.sync_ready_only_check.isChecked()
+        )
+        app_cfg["sync_publish_on_ready"] = (
+            self.sync_publish_on_ready_check.isChecked()
         )
         app_cfg["ffmpeg_stop_timeout"] = int(
             self.ffmpeg_stop_timeout.value()
@@ -3779,6 +3818,22 @@ class SettingsWindow(QDialog):
             "открывает полноценный менеджер: публикация выбранных "
             "записей, скачивание с сервера, дельта-синхронизация, "
             "справочники проектов и тегов и журнал операций."
+            "<br><br>"
+            "<b>Флаг «готово к синхронизации».</b> "
+            "Запись можно пометить как готовую к синхронизации — "
+            "в карточке метаданных или в окне «Записи» "
+            "(галочка / кнопка «Готово к синхронизации»). "
+            "Пока флаг не выставлен, запись считается черновиком:<br>"
+            "  • автопубликация не запускается;<br>"
+            "  • фоновый pull не перезаписывает локальные файлы;<br>"
+            "  • локальные артефакты не удаляются, даже если "
+            "их нет на сервере.<br><br>"
+            "Если включена настройка «Автопубликовать только "
+            "записи, помеченные как „готово к синхронизации“», "
+            "автопубликация работает только для готовых записей. "
+            "Это защищает от гонки publish/pull, когда фоновый "
+            "sync начинает передавать данные, пока вы ещё "
+            "дополняете запись (протокол, summary, вложения)."
         ),
         "Сжатие медиа": (
             "<b>Автосжатие медиа перед публикацией</b><br><br>"
