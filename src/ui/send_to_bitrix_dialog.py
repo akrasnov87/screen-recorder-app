@@ -8,6 +8,12 @@
   • _SendWorker принимает max_message_chars.
   • SendToBitrixDialog._on_send / _on_test читают
     max_message_chars из bitrix_cfg.
+  • Для файлов-протоколов имя в чате формируется из заголовка
+    (поле «Заголовок протокола»). Кириллица транслитерируется,
+    недопустимые символы заменяются на «_».
+  • Комментарий к сообщению с файлами формируется из заголовков
+    файлов. Bitrix24 требует непустой MESSAGE — если заголовки
+    не заданы, bitrix_client подставит имя первого файла.
 """
 from __future__ import annotations
 
@@ -17,7 +23,7 @@ import os
 import re
 import tempfile
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
@@ -101,8 +107,9 @@ class _SendWorker(QThread):
         webhook: str,
         chat_ids: List[str],
         plan: List[Dict[str, Any]],
-        build_file_cb,
-        build_text_cb,
+        build_file_cb: Callable[[Dict[str, Any]], str],
+        build_text_cb: Callable[[Dict[str, Any]], str],
+        desired_filename_cb: Callable[[Dict[str, Any], str], str],
         *,
         connect_timeout: float,
         read_timeout: float,
@@ -118,6 +125,7 @@ class _SendWorker(QThread):
         self._plan = list(plan)
         self._build_file_cb = build_file_cb
         self._build_text_cb = build_text_cb
+        self._desired_filename_cb = desired_filename_cb
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
         self._max_message_chars = max_message_chars
@@ -151,14 +159,30 @@ class _SendWorker(QThread):
 
         if file_items:
             prepared: List[str] = []
+            override_names: Dict[str, str] = {}
             cleanup_paths: List[str] = []
             try:
                 for it in file_items:
                     p = self._build_file_cb(it)
-                    if p:
-                        prepared.append(p)
-                        if it.get("_tmp"):
-                            cleanup_paths.append(p)
+                    if not p:
+                        continue
+                    prepared.append(p)
+
+                    # Имя файла в чате: для протокола — заголовок,
+                    # для остальных — basename.
+                    try:
+                        desired = self._desired_filename_cb(it, p)
+                    except Exception as exc:
+                        log.warning(
+                            "Не удалось вычислить имя файла для "
+                            "%r: %s", it.get("which"), exc
+                        )
+                        desired = ""
+                    if desired:
+                        override_names[p] = desired
+
+                    if it.get("_tmp"):
+                        cleanup_paths.append(p)
             except Exception as exc:
                 log.exception(
                     "Bitrix24: [%s] ошибка подготовки файлов: %s",
@@ -168,8 +192,13 @@ class _SendWorker(QThread):
                 prepared = []
 
             if prepared:
+                # Комментарий: заголовки файлов, если они заданы.
+                # Bitrix24 требует непустой MESSAGE — если
+                # заголовков нет, bitrix_client подставит имя
+                # первого файла.
                 headers = [
-                    it.get("header", "") for it in file_items
+                    (it.get("header") or "").strip()
+                    for it in file_items
                 ]
                 headers = [h for h in headers if h]
                 comment = " / ".join(headers) if headers else ""
@@ -177,8 +206,12 @@ class _SendWorker(QThread):
                 try:
                     log.info(
                         "Bitrix24: [%s] отправка %d файлов одним "
-                        "сообщением",
+                        "сообщением (override_names=%s, "
+                        "comment=%d символов)",
                         chat_id, len(prepared),
+                        {os.path.basename(k): v
+                         for k, v in override_names.items()},
+                        len(comment),
                     )
                     await client.send_file_message(
                         dialog_id=chat_id,
@@ -188,6 +221,7 @@ class _SendWorker(QThread):
                         system=self._system,
                         url_preview=self._url_preview,
                         prefer_chat_folder=self._prefer_chat_folder,
+                        override_filenames=override_names,
                     )
                     sent += 1
                 except Bitrix24Error as exc:
@@ -283,6 +317,11 @@ class SendToBitrixDialog(QDialog):
       • Получатели — выбор чатов и ручных ID;
       • Содержимое — материалы, заголовки, режим отправки;
       • Параметры — вебхук, таймауты, опции.
+
+    Для файлов-протоколов имя в чате формируется из поля
+    «Заголовок протокола» (если оно не пустое). Тот же заголовок
+    уходит как текст сообщения (MESSAGE) — это одно сообщение
+    с текстом и файлом, а не два отдельных.
     """
 
     def __init__(
@@ -411,10 +450,10 @@ class SendToBitrixDialog(QDialog):
 
         self.send_both_btn = QPushButton("Отправить всё")
         self.send_both_btn.setToolTip(
-            "Отправить двумя сообщениями: сначала протокол, "
-            "потом summary.\n\n"
-            "В режиме «Файлом с комментарием» оба файла уйдут "
-            "одним сообщением с двумя вложениями."
+            "Отправить протокол и summary.\n\n"
+            "Если протокол уходит файлом — его имя будет "
+            "совпадать с заголовком, а сам заголовок — текстом "
+            "в том же сообщении."
         )
         self.send_both_btn.clicked.connect(
             lambda: self._on_send(which="both")
@@ -583,18 +622,23 @@ class SendToBitrixDialog(QDialog):
             bool(self.bitrix_cfg.get("include_header", True))
         )
         self.header_check.setToolTip(
-            "Если снять — сообщения уйдут без заголовка, "
-            "только текст протокола / summary."
+            "Если снять — сообщения уйдут без заголовка.\n\n"
+            "Для файла-протокола заголовок используется как имя "
+            "файла в чате и как текст сообщения. Если галочка снята, "
+            "и то, и другое будет пустым."
         )
         header_header.addWidget(self.header_check)
         header_header.addStretch()
         layout.addLayout(header_header)
 
         headers_hint = QLabel(
-            "<span style='color:#666'>Заголовок добавляется "
-            "в начало сообщения. Пустое поле — заголовок не "
-            "добавляется. При массовой рассылке заголовок "
-            "у всех получателей одинаковый.</span>"
+            "<span style='color:#666'>Заголовок протокола "
+            "используется как ИМЯ ФАЙЛА в чате Bitrix24 "
+            "(с транслитерацией кириллицы в латиницу) и как "
+            "ТЕКСТ сообщения — это ОДНО сообщение с текстом "
+            "и файлом.<br><br>"
+            "Заголовок summary, если summary уходит текстом, "
+            "добавляется в начало сообщения.</span>"
         )
         headers_hint.setWordWrap(True)
         layout.addWidget(headers_hint)
@@ -610,7 +654,10 @@ class SendToBitrixDialog(QDialog):
             "Например: Протокол: Название встречи — 2026-09-28"
         )
         self.protocol_header_input.setToolTip(
-            "Заголовок для сообщения с протоколом."
+            "Заголовок для протокола. Используется как имя файла "
+            "и как текст сообщения в чате Bitrix24. Кириллица "
+            "транслитерируется в латиницу для имени файла, "
+            "недопустимые символы заменяются на «_»."
         )
 
         self.summary_header_input = QLineEdit()
@@ -619,7 +666,8 @@ class SendToBitrixDialog(QDialog):
             "2026-09-28"
         )
         self.summary_header_input.setToolTip(
-            "Заголовок для сообщения с кратким описанием."
+            "Заголовок для сообщения с кратким описанием. "
+            "Если summary уходит текстом — добавляется в начало."
         )
 
         headers_form.addRow(
@@ -667,7 +715,9 @@ class SendToBitrixDialog(QDialog):
             "• Автоматически — если текст длиннее порога, "
             "уйдёт файлом;\n"
             "• Текстом — всегда текстом;\n"
-            "• Файлом — всегда файлом с комментарием."
+            "• Файлом — всегда файлом.\n\n"
+            "Для файла-протокола имя файла = заголовок, "
+            "и тот же заголовок идёт в тексте сообщения."
         )
         mode_box.addRow("Режим отправки:", self.send_mode_combo)
 
@@ -1531,6 +1581,40 @@ class SendToBitrixDialog(QDialog):
         return ""
 
     # ------------------------------------------------------------------
+    # Имя файла в чате
+    # ------------------------------------------------------------------
+    def _desired_filename_for_item(
+        self,
+        item: Dict[str, Any],
+        local_path: str,
+    ) -> str:
+        """
+        Возвращает желаемое имя файла в Bitrix24.
+
+        Для протокола — заголовок из поля «Заголовок протокола»
+        (если он не пустой и включена галочка «Добавлять заголовок»).
+        Для остальных типов — пустая строка (будет использовано
+        стандартное имя).
+
+        Транслитерация кириллицы в латиницу и замена недопустимых
+        символов выполняются в Bitrix24Client.upload_file()
+        через _sanitize_display_name().
+        """
+        which = item.get("which", "")
+        if which != "protocol":
+            return ""
+
+        header = (item.get("header") or "").strip()
+        if not header:
+            return ""
+
+        # Расширение: берём из фактического файла (после конвертации).
+        ext = os.path.splitext(local_path)[1].lower() or ".docx"
+
+        # Заголовок + расширение. Санитизация и транслит — в bitrix_client.
+        return f"{header}{ext}"
+
+    # ------------------------------------------------------------------
     # Отправка
     # ------------------------------------------------------------------
     def _on_send(self, which: str) -> None:
@@ -1646,10 +1730,16 @@ class SendToBitrixDialog(QDialog):
 
         preview_lines: List[str] = []
         if file_items_preview:
-            names = ", ".join(
-                p["which"] for p in file_items_preview
+            names = []
+            for p in file_items_preview:
+                header = (p.get("header") or "").strip()
+                if p["which"] == "protocol" and header:
+                    names.append(f"протокол (имя: {header}.docx)")
+                else:
+                    names.append(p["which"])
+            preview_lines.append(
+                f"• файлом: {', '.join(names)}"
             )
-            preview_lines.append(f"• файлом: {names}")
         for p in text_items_preview:
             preview_lines.append(
                 f"• текстом: {p['which']}, "
@@ -1668,7 +1758,9 @@ class SendToBitrixDialog(QDialog):
             f"<b>Что отправить:</b><br>"
             f"{html.escape(preview_text)}<br>"
             f"<span style='color:#666'>Протокол будет отправлен "
-            f"в формате .docx.</span><br><br>"
+            f"в формате .docx. Имя файла = заголовок, "
+            f"тот же заголовок — текстом в том же сообщении."
+            f"</span><br><br>"
             f"<b>Кому:</b><br>"
             f"<pre style='font-family:monospace'>"
             f"{html.escape(recipients_text)}</pre>"
@@ -1718,6 +1810,7 @@ class SendToBitrixDialog(QDialog):
             plan=plan,
             build_file_cb=self._prepare_file_for_item,
             build_text_cb=self._build_text_message,
+            desired_filename_cb=self._desired_filename_for_item,
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             max_message_chars=max_message_chars,

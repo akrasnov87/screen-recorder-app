@@ -45,7 +45,7 @@ from ..config_manager import ConfigManager, DEFAULT_NAME_TEMPLATES
 from ..logger import get_current_log_path, get_logger
 from ..screc_client import ScrecClient, ScrecError
 from ..transcribe_client import TranscribeClient
-from ..utils import get_system_monitors
+from ..utils import get_system_monitors, safe_local_path
 from .. import __version__
 from .media_player import probe_media_support      # ui → ui
 from .sync_window import SyncWindow                # ui → ui
@@ -251,6 +251,7 @@ class SettingsWindow(QDialog):
             start,
         )
         if folder:
+            folder = safe_local_path(folder)
             self.yandex_vm_root_input.setText(folder)
 
     # ------------------------------------------------------------------
@@ -1183,6 +1184,7 @@ class SettingsWindow(QDialog):
             "копия удаляется. Ссылка file:// перестанет "
             "работать, но файл можно скачать с сервера."
         )
+        
         attach_tooltip(
             self.sync_delete_media_after_upload_check,
             "sync_delete_local_media_after_media_upload",
@@ -1203,7 +1205,84 @@ class SettingsWindow(QDialog):
         )
         behavior_form.addRow("", self.sync_delete_media_check)
 
+        # --- Автосжатие медиа ---
         layout.addLayout(behavior_form)
+
+        compress_header = QHBoxLayout()
+        compress_header.addWidget(
+            QLabel("<b>Автосжатие медиа</b>")
+        )
+        compress_header.addStretch()
+        compress_header.addWidget(
+            make_info_icon("sync_compress_media_if_too_large")
+        )
+        layout.addLayout(compress_header)
+
+        compress_form = QFormLayout()
+        compress_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.sync_compress_media_check = QCheckBox(
+            "Сжимать видео, если его размер превышает "
+            "«Макс. размер артефакта»"
+        )
+        self.sync_compress_media_check.setToolTip(
+            "Перед публикацией видео перекодируется через ffmpeg "
+            "до целевого размера. Оригинал ПЕРЕЗАПИСЫВАЕТСЯ "
+            "сжатой версией.\n\n"
+            "Если выключено — файлы сверх лимита просто "
+            "пропускаются."
+        )
+        self.sync_compress_media_check.setChecked(True)
+        attach_tooltip(
+            self.sync_compress_media_check,
+            "sync_compress_media_if_too_large",
+        )
+        compress_form.addRow("", self.sync_compress_media_check)
+
+        self.sync_compression_min_video_bitrate = QSpinBox()
+        self.sync_compression_min_video_bitrate.setRange(50, 10000)
+        self.sync_compression_min_video_bitrate.setSingleStep(50)
+        self.sync_compression_min_video_bitrate.setSuffix(" kbps")
+        self.sync_compression_min_video_bitrate.setValue(200)
+        compress_form.addRow(
+            "Мин. битрейт видео:",
+            with_info(
+                self.sync_compression_min_video_bitrate,
+                "sync_compression_min_video_bitrate_kbps",
+            ),
+        )
+
+        self.sync_compression_audio_bitrate = QSpinBox()
+        self.sync_compression_audio_bitrate.setRange(32, 320)
+        self.sync_compression_audio_bitrate.setSingleStep(16)
+        self.sync_compression_audio_bitrate.setSuffix(" kbps")
+        self.sync_compression_audio_bitrate.setValue(96)
+        compress_form.addRow(
+            "Битрейт аудио:",
+            with_info(
+                self.sync_compression_audio_bitrate,
+                "sync_compression_audio_bitrate_kbps",
+            ),
+        )
+
+        self.sync_compression_preset_combo = QComboBox()
+        self.sync_compression_preset_combo.addItems([
+            "ultrafast", "superfast", "veryfast", "faster",
+            "fast", "medium", "slow", "slower", "veryslow",
+        ])
+        self.sync_compression_preset_combo.setCurrentText("veryfast")
+        compress_form.addRow(
+            "Пресет x264:",
+            with_info(
+                self.sync_compression_preset_combo,
+                "sync_compression_preset",
+            ),
+        )
+
+        layout.addLayout(compress_form)
 
         # --- Тонкие настройки ---
         adv_header = QHBoxLayout()
@@ -2595,6 +2674,21 @@ class SettingsWindow(QDialog):
         self.sync_retry_count.setValue(int(sync["retry_count"]))
         self.sync_retry_delay.setValue(float(sync["retry_delay"]))
 
+
+        self.sync_compress_media_check.setChecked(
+            bool(sync.get("compress_media_if_too_large", True))
+        )
+        self.sync_compression_min_video_bitrate.setValue(
+            int(sync.get("compression_min_video_bitrate_kbps", 200))
+        )
+        self.sync_compression_audio_bitrate.setValue(
+            int(sync.get("compression_audio_bitrate_kbps", 96))
+        )
+        preset = str(sync.get("compression_preset", "veryfast"))
+        idx = self.sync_compression_preset_combo.findText(preset)
+        if idx >= 0:
+            self.sync_compression_preset_combo.setCurrentIndex(idx)
+
         # --- Промпты ---
         prompts = self.config_manager.get_prompts()
         self.prompts_table.setRowCount(0)
@@ -2964,6 +3058,18 @@ class SettingsWindow(QDialog):
             "sync_projects_and_tags": True,
             "retry_count": int(self.sync_retry_count.value()),
             "retry_delay": float(self.sync_retry_delay.value()),
+                        "compress_media_if_too_large": (
+                self.sync_compress_media_check.isChecked()
+            ),
+            "compression_min_video_bitrate_kbps": int(
+                self.sync_compression_min_video_bitrate.value()
+            ),
+            "compression_audio_bitrate_kbps": int(
+                self.sync_compression_audio_bitrate.value()
+            ),
+            "compression_preset": (
+                self.sync_compression_preset_combo.currentText()
+            ),
         })
 
         # --- Промпты ---
@@ -3250,6 +3356,7 @@ class SettingsWindow(QDialog):
         if not target:
             log.info("Экспорт настроек отменён пользователем")
             return
+        target = safe_local_path(target)
 
         if not target.lower().endswith(".json"):
             target += ".json"
@@ -3306,6 +3413,7 @@ class SettingsWindow(QDialog):
         if not path:
             log.info("Импорт настроек отменён пользователем")
             return
+        path = safe_local_path(path)
 
         if not os.path.isfile(path):
             QMessageBox.warning(
@@ -3447,6 +3555,7 @@ class SettingsWindow(QDialog):
             self, "Выберите папку"
         )
         if folder:
+            folder = safe_local_path(folder)
             self.temp_path_input.setText(folder)
 
     def browse_log_file(self) -> None:
@@ -3459,6 +3568,7 @@ class SettingsWindow(QDialog):
             "Log files (*.log *.txt);;All files (*)",
         )
         if filename:
+            filename = safe_local_path(filename)
             self.log_path_input.setText(filename)
 
     def open_log_file(self) -> None:

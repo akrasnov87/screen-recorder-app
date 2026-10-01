@@ -4,6 +4,10 @@
   • Добавлен блок «Теги» — можно сразу проставить метки
     на импортируемую запись. Теги попадают в session.json
     и участвуют в фильтре раздела «Библиотека».
+  • Пути из QFileDialog нормализуются через safe_local_path():
+    под Wayland/GTK Qt может вернуть percent-encoded путь
+    (например, %D0%9A%D0%A1%D0%A3%D0%9E_...), из-за чего файлы
+    сохранялись с «сырыми» именами.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..logger import get_logger
+from ..utils import safe_local_path
 from .tooltips import attach_tooltip, make_info_icon, with_info
 
 log = get_logger(__name__)
@@ -504,6 +509,7 @@ class ImportWindow(QDialog):
             _file_filter(_VIDEO_EXTS),
         )
         if path:
+            path = safe_local_path(path)
             self.video_input.setText(path)
             self.video_input.setToolTip(path)
             log.info("Импорт: выбрано видео %s", path)
@@ -516,6 +522,7 @@ class ImportWindow(QDialog):
             _file_filter(_TRANSCRIPT_EXTS),
         )
         if path:
+            path = safe_local_path(path)
             self.transcript_input.setText(path)
             self.transcript_input.setToolTip(path)
             log.info("Импорт: выбрана стенограмма %s", path)
@@ -528,6 +535,7 @@ class ImportWindow(QDialog):
             _file_filter(_PROTOCOL_EXTS),
         )
         if path:
+            path = safe_local_path(path)
             self.protocol_input.setText(path)
             self.protocol_input.setToolTip(path)
             log.info("Импорт: выбран протокол %s", path)

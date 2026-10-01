@@ -4,10 +4,21 @@
   • Лимит длины сообщения теперь настраивается через параметр
     конструктора max_message_chars (значение из config["bitrix"]).
   • _truncate — метод класса, а не модульная функция.
+  • Добавлен параметр override_filename в upload_file и
+    send_file_message: позволяет передать пользовательское имя
+    файла (например, заголовок протокола) с сохранением
+    расширения. Имя транслитерируется в латиницу и очищается
+    от недопустимых символов через _sanitize_display_name.
+  • В send_file_message добавлен fallback для пустого MESSAGE:
+    Bitrix24 не принимает пустой текст даже при наличии FILES
+    (ошибка EMPTY_MESSAGE / MESSAGE_EMPTY). Если comment пустой —
+    в MESSAGE подставляется имя первого файла (после
+    override_filename), чтобы сообщение не было пустым.
 """
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -45,6 +56,13 @@ _TRANSLIT_MAP = {
 }
 
 
+# Символы, недопустимые в именах файлов (в т.ч. Windows).
+_BAD_FILENAME_CHARS = '<>:"/\\|?*\n\r\t'
+
+# Максимальная длина имени файла в байтах UTF-8 (с запасом до 255).
+_MAX_FILENAME_BYTES = 200
+
+
 def _to_ascii_filename(name: str) -> str:
     """Приводит имя файла к ASCII-only."""
     if not name:
@@ -66,6 +84,71 @@ def _to_ascii_filename(name: str) -> str:
         result = result.replace("  ", " ")
 
     return result or "file"
+
+
+def _sanitize_display_name(name: str, ext: str) -> str:
+    """
+    Приводит пользовательское имя (например, заголовок протокола)
+    к безопасному для файловой системы виду.
+
+    Шаги:
+      1. Определяем расширение. Если в name уже есть ext в конце —
+         не дублируем. Иначе добавляем ext.
+      2. Убираем недопустимые символы (заменяем на "_").
+      3. Схлопываем пробелы, убираем ведущие/замыкающие пробелы
+         и точки.
+      4. Транслитерируем кириллицу в латиницу через
+         _to_ascii_filename.
+      5. Обрезаем по границе UTF-8 с сохранением расширения.
+
+    Args:
+        name: заголовок или имя файла (может содержать недопустимые
+              символы).
+        ext:  расширение с точкой, например ".docx".
+
+    Returns:
+        Безопасное имя файла. Если ничего не осталось — "document<ext>".
+    """
+    suffix = ext or ".bin"
+
+    if not name:
+        return f"document{suffix}"
+
+    # 1. Не дублируем расширение.
+    name_ext = os.path.splitext(name)[1].lower()
+    if name_ext and name_ext == suffix.lower():
+        stem = name[: -len(name_ext)]
+    else:
+        stem = name
+
+    # 2. Заменяем недопустимые символы.
+    cleaned = "".join(
+        ("_" if c in _BAD_FILENAME_CHARS else c) for c in stem
+    )
+
+    # 3. Схлопываем пробелы и убираем мусор по краям.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+
+    if not cleaned:
+        cleaned = "document"
+
+    # 3a. Заменяем пробелы на "_", чтобы Bitrix24 не превращал их
+    #     в "%20" в URL файла.
+    cleaned = cleaned.replace(" ", "_")
+
+    # 4. Транслитерация.
+    cleaned = _to_ascii_filename(cleaned)
+
+    # 4a. Убираем возможные двойные подчёркивания и мусор по краям
+    #     (после транслита могли появиться лишние "_").
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    cleaned = cleaned.strip(" ._-")
+
+    if not cleaned:
+        cleaned = "document"
+
+    return f"{cleaned}{suffix}"
 
 
 class Bitrix24Client:
@@ -444,9 +527,6 @@ class Bitrix24Client:
         """
         Возвращает ID подпапки `name` внутри `parent_id`.
         Создаёт, если её нет.
-
-        Полезно при создании тематических подпапок в общем диске,
-        когда папка чата недоступна.
         """
         children = await self.list_folder_children(parent_id)
         for item in children:
@@ -470,9 +550,27 @@ class Bitrix24Client:
         log.info("Bitrix24: создана папка %r id=%s", name, new_id)
         return int(new_id)
 
-    async def upload_file(self, file_path: str, folder_id: int = 0) -> int:
+    async def upload_file(
+        self,
+        file_path: str,
+        folder_id: int = 0,
+        *,
+        override_filename: Optional[str] = None,
+    ) -> int:
         """
         Загружает файл на Диск Bitrix24 (двухэтапная схема).
+
+        Args:
+            file_path:        путь к файлу на диске.
+            folder_id:        ID папки на Диске (0 — корень).
+            override_filename: если задан — используется как имя
+                              файла в Bitrix24. Кириллица
+                              транслитерируется, недопустимые
+                              символы заменяются на "_",
+                              расширение сохраняется из file_path
+                              (или добавляется, если его нет).
+                              Если None — имя формируется из
+                              basename + транслит + таймстамп.
 
         Returns:
             FILE_ID (int) — ID файла на Диске Bitrix24.
@@ -495,10 +593,21 @@ class Bitrix24Client:
 
         orig_name = os.path.basename(file_path)
         stem, ext = os.path.splitext(orig_name)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        safe_stem = _to_ascii_filename(stem)
-        unique_name = f"{safe_stem}_{stamp}{ext}"
+        if override_filename:
+            # Пользовательское имя: заголовок протокола или
+            # аналогичное. Санитизация + транслит + обрезка.
+            unique_name = _sanitize_display_name(
+                override_filename, ext
+            )
+            log.info(
+                "Bitrix24: имя файла задано вручную: %r → %r",
+                override_filename, unique_name,
+            )
+        else:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_stem = _to_ascii_filename(stem)
+            unique_name = f"{safe_stem}_{stamp}{ext}"
 
         try:
             size = os.path.getsize(file_path)
@@ -657,8 +766,22 @@ class Bitrix24Client:
         system: bool = False,
         url_preview: bool = False,
         prefer_chat_folder: bool = True,
+        override_filenames: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Отправляет один или несколько файлов в чат Bitrix24."""
+        """
+        Отправляет один или несколько файлов в чат Bitrix24.
+
+        ВАЖНО: Bitrix24 не принимает пустой MESSAGE даже при
+        наличии FILES (ошибки MESSAGE_EMPTY / EMPTY_MESSAGE).
+        Если comment пустой — в MESSAGE подставляется имя первого
+        файла (после override_filename или basename).
+
+        Args:
+            override_filenames: словарь {локальный_путь: желаемое_имя}.
+                                Для файлов, которых нет в словаре,
+                                имя формируется автоматически
+                                (basename + транслит + таймстамп).
+        """
         if not dialog_id:
             raise Bitrix24Error("Не указан dialog_id")
 
@@ -692,10 +815,16 @@ class Bitrix24Client:
                 "используем корень общего диска"
             )
 
+        override_map: Dict[str, str] = dict(override_filenames or {})
+
         disk_file_ids: List[int] = []
         for p in paths:
             try:
-                fid = await self.upload_file(p, folder_id=target_folder_id)
+                fid = await self.upload_file(
+                    p,
+                    folder_id=target_folder_id,
+                    override_filename=override_map.get(p),
+                )
                 disk_file_ids.append(int(fid))
             except Bitrix24Error as exc:
                 log.error(
@@ -717,18 +846,30 @@ class Bitrix24Client:
                 "Bitrix24: не удалось получить ID файлов для отправки"
             )
 
+        # Bitrix24 требует непустой MESSAGE даже при наличии FILES.
+        # Если comment пустой — используем имя первого файла
+        # (после override_filename или basename), чтобы сообщение
+        # не было пустым и в чате было понятно, что за файл.
+        message_text = self._truncate(comment or "")
+        if not message_text.strip():
+            first_path = paths[0]
+            fallback_name = override_map.get(first_path)
+            if not fallback_name:
+                fallback_name = os.path.basename(first_path)
+            message_text = fallback_name or "Файл"
+
         params: Dict[str, Any] = {
             "DIALOG_ID": dialog_id,
-            "MESSAGE": self._truncate(comment or ""),
+            "MESSAGE": message_text,
             "SYSTEM": "Y" if system else "N",
             "URL_PREVIEW": "Y" if url_preview else "N",
             "FILES": file_ids_for_message,
         }
         log.info(
             "Bitrix24: отправка %d файлов в чат %s "
-            "(FILE_IDs=%s, комментарий=%d символов)",
+            "(FILE_IDs=%s, MESSAGE=%d символов, comment=%d символов)",
             len(file_ids_for_message), dialog_id,
-            file_ids_for_message, len(comment or ""),
+            file_ids_for_message, len(message_text), len(comment or ""),
         )
         return await self.call("im.message.add", params)
 

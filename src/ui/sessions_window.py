@@ -19,6 +19,10 @@
         предлагается скачать его (SyncManager.download_media_only);
       – поддерживается fallback на системный плеер, если встроенный
         недоступен.
+  • Пути из QFileDialog нормализуются через safe_local_path():
+    под Wayland/GTK Qt может вернуть percent-encoded путь
+    (например, %D0%9A%D0%A1%D0%A3%D0%9E_...), из-за чего файлы
+    вложений сохранялись с «сырыми» именами.
 """
 from __future__ import annotations
 
@@ -52,12 +56,12 @@ from ..sync_manager import (
     is_record_published,
 )
 from ..task_queue import TaskQueue
+from ..utils import safe_local_path, sanitize_filename
 from .markdown_editor import MarkdownEditorDialog, MarkdownViewerDialog
 from .media_player import (
     is_builtin_player_available, open_media, probe_media_support,
 )
 from .metadata_dialog import MetadataDialog
-from ..utils import sanitize_filename
 
 log = get_logger(__name__)
 
@@ -2195,6 +2199,7 @@ class SessionsWindow(QDialog):
         )
         if not target:
             return
+        target = safe_local_path(target)
 
         if not target.lower().endswith(".docx"):
             target += ".docx"
@@ -2266,6 +2271,7 @@ class SessionsWindow(QDialog):
         )
         if not file_path:
             return
+        file_path = safe_local_path(file_path)
 
         if not os.path.isfile(file_path):
             QMessageBox.warning(
@@ -2410,6 +2416,7 @@ class SessionsWindow(QDialog):
         )
         if not target_path:
             return
+        target_path = safe_local_path(target_path)
 
         try:
             if fmt == "docx":
@@ -3265,6 +3272,7 @@ class SessionsWindow(QDialog):
         )
         if not target_path:
             return
+        target_path = safe_local_path(target_path)
 
         try:
             if target_path.endswith(".docx"):
@@ -3321,6 +3329,11 @@ class SessionsWindow(QDialog):
         )
         if not files:
             return
+
+        # Нормализуем пути: под Wayland/GTK Qt может вернуть
+        # percent-encoded строки (%D0%9A...), из-за чего файлы
+        # сохранялись с «сырыми» именами.
+        files = [safe_local_path(f) for f in files]
 
         att_dir = os.path.join(r["dir"], "attachments")
         os.makedirs(att_dir, exist_ok=True)

@@ -30,6 +30,11 @@
     трафика).
   • Управляется настройкой sync_use_hash_check (включена по
     умолчанию).
+  • Добавлено автосжатие медиа: если файл превышает лимит
+    max_artifact_mb, он перекодируется через ffmpeg до целевого
+    размера (см. video_compressor.compress_video_to_target_size).
+    Оригинал перезаписывается. Управляется настройкой
+    sync_compress_media_if_too_large.
 """
 from __future__ import annotations
 
@@ -45,6 +50,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .file_readers import read_json_file
 from .logger import get_logger
 from .screc_client import ScrecClient, ScrecError
+from .video_compressor import (
+    CompressionError,
+    DEFAULT_AUDIO_BITRATE_KBPS,
+    DEFAULT_MIN_VIDEO_BITRATE_KBPS,
+    DEFAULT_PRESET,
+    compress_video_to_target_size,
+)
 
 log = get_logger(__name__)
 
@@ -304,24 +316,34 @@ def collect_artifacts(
     *,
     include_media: bool = False,
     max_artifact_mb: int = 50,
-) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+) -> Tuple[
+    List[Tuple[str, str]],
+    List[Dict[str, Any]],
+]:
     """
     Возвращает два списка:
-      • small_artifacts — (kind, filename) для отправки в POST /records
-        (метаданные + текстовые артефакты + вложения);
-      • media_artifacts — (kind, filename) для отдельной загрузки
-        через POST /records/{id}/artifacts (видео, аудио).
+      • small_artifacts — (kind, filename) для отправки в
+        POST /records (метаданные + текстовые артефакты +
+        вложения);
+      • media_artifacts — список словарей с полями kind, filename,
+        path, size_bytes, needs_compression, target_bytes.
+        Медиа-артефакты отделены потому, что их может быть
+        много / они большие, и удобнее грузить их по одному
+        после создания записи.
 
-    Медиа-артефакты отделены потому, что их может быть много/они
-    большие, и удобнее грузить их по одному после создания записи.
+    Если медиафайл превышает max_artifact_mb и в настройках
+    включено автосжатие — в элементе media_artifacts
+    выставляется needs_compression=True. Сжатие выполняется
+    в publish_session.
 
     Args:
         include_media:    если True — в media_artifacts попадут
                           найденные видео/аудио.
-        max_artifact_mb:  ограничение на размер каждого медиафайла.
+        max_artifact_mb:  ограничение на размер каждого
+                          медиафайла (в МБ).
     """
     small: List[Tuple[str, str]] = []
-    media: List[Tuple[str, str]] = []
+    media: List[Dict[str, Any]] = []
     seen_kinds: Dict[str, bool] = {}
 
     # --- Текстовые артефакты ---
@@ -342,11 +364,6 @@ def collect_artifacts(
                 if not os.path.isfile(full):
                     continue
 
-                # Клиент санитизирует имя перед отправкой
-                # (см. utils.sanitize_filename), но если исходное
-                # имя заведомо огромное — предупредим пользователя,
-                # чтобы он понимал, что на сервере файл будет
-                # под другим именем.
                 name_bytes = len(name.encode("utf-8"))
                 if name_bytes > 200:
                     log.warning(
@@ -375,14 +392,19 @@ def collect_artifacts(
                 size = os.path.getsize(path)
             except OSError:
                 continue
-            if max_bytes > 0 and size > max_bytes:
-                log.warning(
-                    "Медиафайл %s (%s) превышает лимит %d МБ — "
-                    "не будет отправлен на сервер",
-                    os.path.basename(path), kind, max_artifact_mb,
-                )
-                continue
-            media.append((kind, os.path.basename(path)))
+
+            needs_compression = (
+                max_bytes > 0 and size > max_bytes
+            )
+
+            media.append({
+                "kind": kind,
+                "filename": os.path.basename(path),
+                "path": path,
+                "size_bytes": size,
+                "needs_compression": needs_compression,
+                "target_bytes": max_bytes if needs_compression else 0,
+            })
 
     return small, media
 
@@ -411,7 +433,8 @@ class SyncManager:
         log.debug(
             "SyncManager создан: base_url=%r, send_media=%s, "
             "auto_upload=%s, auto_pull=%s, delete_local_on_delete=%s, "
-            "force_overwrite=%s, use_hash_check=%s",
+            "force_overwrite=%s, use_hash_check=%s, "
+            "compress_media=%s",
             self.settings.get("base_url"),
             self.settings.get("send_media_to_server"),
             self.settings.get("auto_upload_after_processing"),
@@ -419,6 +442,7 @@ class SyncManager:
             self.settings.get("delete_local_on_server_delete"),
             self.settings.get("force_overwrite_on_download"),
             self.settings.get("use_hash_check"),
+            self.settings.get("compress_media_if_too_large"),
         )
 
     # ------------------------------------------------------------------
@@ -445,6 +469,12 @@ class SyncManager:
     def _use_hash_check(self) -> bool:
         """Нужно ли использовать условную загрузку (HEAD/check)."""
         return bool(self.settings.get("use_hash_check", True))
+
+    def _use_compression(self) -> bool:
+        """Нужно ли автоматически сжимать медиа при превышении лимита."""
+        return bool(
+            self.settings.get("compress_media_if_too_large", True)
+        )
 
     # ------------------------------------------------------------------
     # Локальное состояние (last_synced_revision)
@@ -489,6 +519,110 @@ class SyncManager:
         self.save_state(state)
 
     # ------------------------------------------------------------------
+    # Сжатие медиа
+    # ------------------------------------------------------------------
+    async def _compress_media_if_needed(
+        self,
+        item: Dict[str, Any],
+        *,
+        progress_cb: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> bool:
+        """
+        Сжимает медиафайл, если он помечен как needs_compression.
+
+        Возвращает True, если файл успешно сжат (или сжатие
+        не требовалось), и False, если сжатие не удалось —
+        в этом случае файл следует пропустить.
+
+        Оригинал перезаписывается по месту (см. video_compressor).
+        """
+        if not item.get("needs_compression"):
+            return True
+
+        path = item.get("path") or ""
+        target_bytes = int(item.get("target_bytes") or 0)
+        kind = item.get("kind") or ""
+
+        if not path or not os.path.isfile(path):
+            log.warning(
+                "Сжатие: файл не найден: %s", path
+            )
+            return False
+
+        if target_bytes <= 0:
+            log.warning(
+                "Сжатие: некорректный целевой размер %d "
+                "для %s", target_bytes, path,
+            )
+            return False
+
+        # Настройки сжатия.
+        min_video_kbps = int(
+            self.settings.get(
+                "compression_min_video_bitrate_kbps",
+                DEFAULT_MIN_VIDEO_BITRATE_KBPS,
+            )
+        )
+        audio_kbps = int(
+            self.settings.get(
+                "compression_audio_bitrate_kbps",
+                DEFAULT_AUDIO_BITRATE_KBPS,
+            )
+        )
+        preset = str(
+            self.settings.get("compression_preset", DEFAULT_PRESET)
+        ).strip() or DEFAULT_PRESET
+
+        if progress_cb:
+            try:
+                progress_cb(
+                    f"Сжатие {kind}: "
+                    f"{os.path.basename(path)} "
+                    f"({item.get('size_bytes', 0) // (1024 * 1024)} МБ → "
+                    f"{target_bytes // (1024 * 1024)} МБ)…"
+                )
+            except Exception:
+                pass
+
+        try:
+            await compress_video_to_target_size(
+                src_path=path,
+                target_bytes=target_bytes,
+                min_video_bitrate_kbps=min_video_kbps,
+                audio_bitrate_kbps=audio_kbps,
+                preset=preset,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+            )
+        except CompressionError as exc:
+            log.error(
+                "Сжатие %s (%s) не удалось: %s",
+                path, kind, exc,
+            )
+            return False
+        except Exception as exc:
+            log.exception(
+                "Неожиданная ошибка при сжатии %s: %s",
+                path, exc,
+            )
+            return False
+
+        # Обновляем размер в item — после сжатия файл стал меньше.
+        try:
+            new_size = os.path.getsize(path)
+            item["size_bytes"] = new_size
+            item["needs_compression"] = False
+            log.info(
+                "Сжатие %s завершено: новый размер %d МБ",
+                path, new_size // (1024 * 1024),
+            )
+        except OSError:
+            pass
+
+        return True
+
+    # ------------------------------------------------------------------
     # Публикация (upload)
     # ------------------------------------------------------------------
     async def publish_session(
@@ -504,15 +638,16 @@ class SyncManager:
           1. POST /records — метаданные + текстовые артефакты
              (с sha256 для каждого файла).
           2. Если send_media_to_server:
-             a. POST /records/{id}/artifacts/check — пакетная
+             a. При необходимости — сжатие медиа до max_artifact_mb.
+             b. POST /records/{id}/artifacts/check — пакетная
                 проверка хэшей всех медиафайлов.
-             b. Отправка только тех файлов, для которых сервер
+             c. Отправка только тех файлов, для которых сервер
                 ответил skip=false.
 
         Returns:
             {"action": ..., "record_id": ..., "revision": ...,
              "path": ..., "media_uploaded": [...],
-             "media_skipped": [...]}
+             "media_skipped": [...], "media_compressed": [...]}
         """
         if not self.is_configured():
             raise ScrecError(
@@ -562,17 +697,20 @@ class SyncManager:
         log.info(
             "SyncManager.publish_session: session=%s, project=%r, "
             "folder=%r, small_artifacts=%d, media_artifacts=%d "
-            "(include_media=%s, max=%d МБ, hashes=%d)",
+            "(include_media=%s, max=%d МБ, hashes=%d, compress=%s)",
             os.path.basename(session_dir),
             payload.get("project"), payload.get("folder_name"),
             len(small_artifacts), len(media_artifacts),
             include_media, max_artifact_mb,
             len(small_artifact_hashes),
+            self._use_compression(),
         )
 
         if progress_cb:
             names = ", ".join(a[0] for a in small_artifacts) or "—"
-            media_names = ", ".join(a[0] for a in media_artifacts) or "—"
+            media_names = ", ".join(
+                a["kind"] for a in media_artifacts
+            ) or "—"
             progress_cb(
                 f"Отправка метаданных: {payload['folder_name']} "
                 f"(текстовых: {len(small_artifacts)}: {names}; "
@@ -581,6 +719,52 @@ class SyncManager:
 
         media_uploaded: List[Dict[str, Any]] = []
         media_skipped: List[Dict[str, Any]] = []
+        media_compressed: List[Dict[str, Any]] = []
+
+        # --- Сжатие медиа (до обращения к серверу) ---
+        if include_media and media_artifacts and self._use_compression():
+            for idx, item in enumerate(media_artifacts, start=1):
+                if not item.get("needs_compression"):
+                    continue
+
+                kind = item["kind"]
+                filename = item["filename"]
+                size_mb = item["size_bytes"] / 1024 / 1024
+                target_mb = item["target_bytes"] / 1024 / 1024
+
+                if progress_cb:
+                    progress_cb(
+                        f"Сжатие {kind} [{idx}/{len(media_artifacts)}]: "
+                        f"{filename} ({size_mb:.1f} МБ → "
+                        f"{target_mb:.1f} МБ)…"
+                    )
+
+                log.info(
+                    "Автосжатие медиа %s (%s): %.1f МБ → %.1f МБ",
+                    filename, kind, size_mb, target_mb,
+                )
+
+                ok = await self._compress_media_if_needed(
+                    item,
+                    progress_cb=progress_cb,
+                )
+                if ok:
+                    media_compressed.append({
+                        "kind": kind,
+                        "filename": filename,
+                        "original_size_bytes": int(size_mb * 1024 * 1024),
+                        "new_size_bytes": item.get("size_bytes", 0),
+                    })
+                else:
+                    log.warning(
+                        "Сжатие %s (%s) не удалось — файл будет "
+                        "пропущен", filename, kind,
+                    )
+                    media_skipped.append({
+                        "kind": kind,
+                        "filename": filename,
+                        "reason": "compression_failed",
+                    })
 
         async with self._make_client() as client:
             # --- Шаг 1: запись с текстовыми артефактами ---
@@ -595,10 +779,21 @@ class SyncManager:
 
             # --- Шаг 2: медиа-артефакты ---
             if record_id and media_artifacts:
-                # Собираем локальные хэши для медиа
+                # Собираем локальные хэши для медиа (после сжатия).
                 media_items: List[Dict[str, Any]] = []
-                for kind, filename in media_artifacts:
-                    full_path = os.path.join(session_dir, filename)
+                for item in media_artifacts:
+                    kind = item["kind"]
+                    filename = item["filename"]
+                    full_path = item["path"]
+
+                    # Пропускаем те, что уже отмечены как failed.
+                    if any(
+                        s.get("filename") == filename
+                        and s.get("reason") == "compression_failed"
+                        for s in media_skipped
+                    ):
+                        continue
+
                     if not os.path.isfile(full_path):
                         log.warning(
                             "Медиафайл исчез: %s", full_path
@@ -609,6 +804,7 @@ class SyncManager:
                             "reason": "not found",
                         })
                         continue
+
                     try:
                         size_bytes = os.path.getsize(full_path)
                     except OSError:
@@ -623,8 +819,6 @@ class SyncManager:
                     })
 
                 # --- Пакетная проверка хэшей ---
-                # Отправляем один маленький JSON и получаем ответ,
-                # какие файлы надо загружать, а какие уже есть.
                 skip_flags: Dict[str, bool] = {}
                 if self._use_hash_check() and media_items:
                     if progress_cb:
@@ -763,12 +957,17 @@ class SyncManager:
             _write_sync_state(session_dir, state)
             log.info(
                 "SyncManager: запись опубликована, record_id=%s "
-                "(revision=%s, action=%s, media_uploaded=%d)",
+                "(revision=%s, action=%s, media_uploaded=%d, "
+                "media_compressed=%d)",
                 record_id, result.get("revision"),
                 result.get("action"), len(media_uploaded),
+                len(media_compressed),
             )
 
         # --- Опциональное удаление локальных медиа ---
+        # После сжатия оригинал уже перезаписан сжатой версией,
+        # поэтому «удаление оригинала» становится no-op.
+        # Но если сжатие было выключено — удаляем как раньше.
         if (self.settings.get("delete_local_media_after_media_upload")
                 and media_uploaded):
             self._maybe_delete_uploaded_media(
@@ -776,7 +975,6 @@ class SyncManager:
                 [m for m in media_uploaded if not m.get("skipped")],
             )
 
-        # --- Опциональное удаление локальных медиа (старое поведение) ---
         if self.settings.get("allow_delete_local_media_after_upload"):
             self._maybe_delete_local_media(session_dir, meta)
 
@@ -785,7 +983,8 @@ class SyncManager:
                 f"Готово: {result.get('action', 'ok')} "
                 f"(id={record_id or '—'}, "
                 f"медиа: {len(media_uploaded)} загружено, "
-                f"{len(media_skipped)} пропущено)"
+                f"{len(media_skipped)} пропущено, "
+                f"{len(media_compressed)} сжато)"
             )
 
         return {
@@ -795,10 +994,10 @@ class SyncManager:
             "path": result.get("path", ""),
             "media_uploaded": media_uploaded,
             "media_skipped": media_skipped,
+            "media_compressed": media_compressed,
             "skipped_artifacts": result.get("skipped_artifacts", []),
             "uploaded_artifacts": result.get("uploaded_artifacts", []),
         }
-
 
     # ------------------------------------------------------------------
     # Публикация одной записи с явными параметрами
@@ -815,26 +1014,7 @@ class SyncManager:
         """
         Синхронизирует ОДНУ запись с явными параметрами,
         переопределяя настройки из config на время операции.
-
-        Args:
-            session_dir:              папка сессии.
-            include_media:            передавать ли видео/аудио
-                                      (если None — из настроек).
-            send_video_link:          передавать ли ссылку file://
-                                      (если None — из настроек).
-            delete_media_after_upload:
-                                      удалять ли локальные медиа
-                                      после успешной загрузки
-                                      (если None — из настроек).
-            progress_cb:              колбэк для отчёта.
-
-        Returns:
-            Тот же словарь, что и publish_session, плюс поля:
-              – "include_media": фактически применённое значение;
-              – "send_video_link": фактически применённое значение;
-              – "delete_media_after_upload": применённое значение.
         """
-        # Копируем настройки и переопределяем параметры.
         old_settings = dict(self.settings)
 
         try:
@@ -872,7 +1052,6 @@ class SyncManager:
             )
             return result
         finally:
-            # Возвращаем настройки как было.
             self.settings = old_settings
 
     def _maybe_delete_uploaded_media(
@@ -934,22 +1113,6 @@ class SyncManager:
         """
         Скачивает с сервера только медиа-артефакты (video/audio)
         для конкретной записи.
-
-        Используется в окне «Записи», когда пользователь хочет
-        посмотреть/послушать запись, но локально медиафайла нет,
-        а запись уже опубликована на сервере (есть record_id).
-
-        Returns:
-            {
-              "downloaded": [{"kind": ..., "filename": ...,
-                              "local_path": ...}, ...],
-              "missing": [{"kind": ..., "filename": ...}, ...],
-              "session_dir": ...,
-              "record_id": ...,
-            }
-            Если медиа на сервере нет — returned["downloaded"] пуст,
-            returned["missing"] содержит список ожидаемых kind'ов,
-            которые на сервере отсутствуют.
         """
         if not self.is_configured():
             raise ScrecError(
@@ -980,7 +1143,6 @@ class SyncManager:
             record = await client.get_record(record_id)
             artifacts = record.get("artifacts") or []
 
-            # Ищем медиа-артефакты на сервере.
             media_items: List[Dict[str, Any]] = []
             for art in artifacts:
                 kind = str(art.get("kind") or "")
@@ -1011,7 +1173,6 @@ class SyncManager:
                 if not filename:
                     continue
 
-                # Локальный путь: video.<ext> в папке сессии.
                 target_rel = os.path.basename(filename)
                 target_path = os.path.join(session_dir, target_rel)
 
@@ -1022,7 +1183,6 @@ class SyncManager:
                         f"{filename} ({size_mb:.1f} МБ)…"
                     )
 
-                # Проверяем, не скачано ли уже.
                 if self._should_skip_download(
                     target_path, art, force_overwrite=False
                 ):
@@ -1088,18 +1248,7 @@ class SyncManager:
         force_overwrite: Optional[bool] = None,
         download_media: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Скачивает запись с сервера и раскладывает по локальной
-        папке sessions/<folder_name>.
-
-        Медиа-артефакты (kind=video / kind=audio) сохраняются как
-        video.<ext> в папке сессии.
-
-        Args:
-            download_media:  если False — медиа-артефакты не
-                             скачиваются, только текстовые.
-            force_overwrite: если None — берётся из настроек.
-        """
+        """Скачивает запись с сервера и раскладывает по локальной папке."""
         if not self.is_configured():
             raise ScrecError(
                 "Синхронизация не настроена: укажите base_url и api_key."
@@ -1123,7 +1272,6 @@ class SyncManager:
                 folder = os.path.basename(path) if path else record_id
                 session_dir = os.path.join(self.sessions_root, folder)
 
-            # --- Переименование папки при смене path ---
             existing_dir = self._find_local_session(
                 record_id, record.get("path") or ""
             )
@@ -1171,7 +1319,6 @@ class SyncManager:
                 if not filename:
                     continue
 
-                # --- Медиа ---
                 if kind in ("video", "audio"):
                     if not download_media:
                         log.info(
@@ -1182,10 +1329,6 @@ class SyncManager:
                         continue
                     server_media_kinds.add(kind)
                     target_rel = os.path.basename(filename)
-                    if not target_rel.startswith("video."):
-                        # На всякий случай — если имя не video.*,
-                        # оставляем как есть.
-                        pass
                     target_path = os.path.join(session_dir, target_rel)
 
                     if self._should_skip_download(
@@ -1226,7 +1369,6 @@ class SyncManager:
                         )
                     continue
 
-                # --- Текстовые артефакты ---
                 target_rel = self._artifact_target_relpath(
                     kind, filename
                 )
@@ -1265,14 +1407,10 @@ class SyncManager:
                         record_id, filename, exc,
                     )
 
-            # --- Удаление локальных текстовых артефактов, которых
-            #     нет на сервере (медиа не трогаем, если сервер
-            #     их не хранит) ---
             self._prune_local_artifacts(
                 session_dir, server_targets, server_media_kinds
             )
 
-            # --- video_url ---
             video = record.get("video") or {}
             if video.get("url"):
                 meta = read_json_file(
@@ -1286,7 +1424,6 @@ class SyncManager:
                     os.path.join(session_dir, "session.json"), meta
                 )
 
-            # --- Локальный маркер ---
             state = _read_sync_state(session_dir)
             state.update({
                 "record_id": record_id,
@@ -1364,20 +1501,6 @@ class SyncManager:
         server_targets: Dict[str, Dict[str, Any]],
         server_media_kinds: set,
     ) -> None:
-        """
-        Удаляет локальные текстовые артефакты, которых нет на сервере.
-
-        Медиа: если сервер НЕ хранит видео/аудио (server_media_kinds
-        пусто по соответствующему kind), локальные media НЕ
-        удаляем. Если сервер хранит — удаляем те, что не совпадают
-        с серверным списком (но это обрабатывается выше, в
-        download_record: если сервер отдал kind=video, то файл
-        сохранится под серверным именем; если сервер отдал другой
-        ext — старый video.<ext> мог остаться).
-
-        Для простоты: не удаляем media совсем — это безопасно и
-        не приводит к потере данных.
-        """
         candidates: List[str] = []
         for _kind, fname in _ARTIFACT_KINDS:
             candidates.append(fname)
@@ -1603,8 +1726,6 @@ class SyncManager:
 
         if action in ("artifact_upload", "artifact_delete",
                       "artifact_soft_delete", "artifact_delete_all"):
-            # Перезагружаем запись и приводим локальные файлы в
-            # соответствие серверному состоянию.
             session_dir = self._find_local_session(record_id, path)
             if session_dir:
                 await self.download_record(

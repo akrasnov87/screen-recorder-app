@@ -10,6 +10,10 @@
       – окно «Синхронизация» (SyncWindow);
       – автопубликация записи после успешной обработки;
       – фоновый воркер дельта-синхронизации.
+  • Пути из QFileDialog нормализуются через safe_local_path():
+    под Wayland/GTK Qt может вернуть percent-encoded путь
+    (например, %D0%9A%D0%A1%D0%A3%D0%9E_...), из-за чего файлы
+    сохранялись с «сырыми» именами.
 """
 from __future__ import annotations
 
@@ -50,7 +54,12 @@ if __package__ in (None, ""):
     from src.recorder import ScreenRecorder
     from src.sync_manager import SyncManager, is_record_published
     from src.task_queue import TaskQueue
-    from src.utils import check_ffmpeg_installed, get_system_monitors
+    from src.utils import (
+        check_ffmpeg_installed,
+        get_system_monitors,
+        safe_local_path,
+        sanitize_filename,
+    )
 else:
     from .config_manager import ConfigManager
     from .hotkeys import GlobalHotkeyManager
@@ -74,7 +83,12 @@ else:
     from .recorder import ScreenRecorder
     from .sync_manager import SyncManager, is_record_published
     from .task_queue import TaskQueue
-    from .utils import check_ffmpeg_installed, get_system_monitors
+    from .utils import (
+        check_ffmpeg_installed,
+        get_system_monitors,
+        safe_local_path,
+        sanitize_filename,
+    )
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Slot
 from PySide6.QtGui import QDesktopServices, QIcon
@@ -532,9 +546,10 @@ class ScreenRecorderApp(QObject):
         except Exception as exc:
             log.exception("Ошибка сохранения тега: %s", exc)
 
-    @staticmethod
     def _copy_attachments_to_session(
-        meta: Dict[str, Any], session_dir: str, 
+        self,
+        meta: Dict[str, Any],
+        session_dir: str,
     ) -> None:
         src_paths = list(meta.get("attachments", []) or [])
         if not src_paths:
@@ -544,8 +559,9 @@ class ScreenRecorderApp(QObject):
         os.makedirs(att_dir, exist_ok=True)
 
         log.info("Копирование вложений: %d файлов → %s",
-                 len(src_paths), att_dir)
+                len(src_paths), att_dir)
 
+        # app_cfg читается из self — метод теперь обычный.
         max_chars = int(
             self.app_cfg.get("attachment_name_max_chars", 50)
         )
@@ -578,7 +594,7 @@ class ScreenRecorderApp(QObject):
 
         meta["attachments"] = new_paths
         log.info("Вложений скопировано: %d/%d",
-                 len(new_paths), len(src_paths))
+                len(new_paths), len(src_paths))
 
     @staticmethod
     def _save_session_metadata(
@@ -691,6 +707,9 @@ class ScreenRecorderApp(QObject):
         )
         if not file_path:
             return
+        # Нормализуем путь: под Wayland/GTK Qt может вернуть
+        # percent-encoded строку.
+        file_path = safe_local_path(file_path)
 
         if not os.path.isfile(file_path):
             QMessageBox.warning(

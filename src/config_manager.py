@@ -233,18 +233,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sync_projects_and_tags": True,
         "delete_local_on_server_delete": False,
         "force_overwrite_on_download": False,
-        # NEW: передавать ли видео/аудио на сервер как артефакты
-        # kind=video / kind=audio.
         "send_media_to_server": False,
-        # NEW: удалять ли локальное медиа после успешной публикации
-        # (работает только если send_media_to_server = True и
-        # сервер подтвердил загрузку).
         "delete_local_media_after_media_upload": False,
-        # NEW: использовать условную загрузку (HEAD/POST check)
-        # перед отправкой файла. Если включено — клиент сначала
-        # спрашивает сервер, нужно ли грузить файл, и не тратит
-        # трафик зря.
         "use_hash_check": True,
+        # NEW: автоматически сжимать медиа, если оно превышает
+        # max_artifact_mb. Сжатие выполняется через ffmpeg,
+        # оригинал перезаписывается сжатой версией.
+        "compress_media_if_too_large": True,
+        # NEW: минимальный видеобитрейт (kbps) при сжатии.
+        # Ниже — картинка рассыпается на квадраты.
+        "compression_min_video_bitrate_kbps": 200,
+        # NEW: битрейт аудио (kbps) при сжатии.
+        "compression_audio_bitrate_kbps": 96,
+        # NEW: пресет x264 при сжатии. Чем быстрее — тем
+        # меньше времени на сжатие, но больше размер при том
+        # же качестве. Допустимые значения: ultrafast, superfast,
+        # veryfast, faster, fast, medium, slow, slower, veryslow.
+        "compression_preset": "veryfast",
         "retry_count": 3,
         "retry_delay": 2.0,
     },
@@ -903,6 +908,18 @@ class ConfigManager:
             "use_hash_check": bool(
                 cfg.get("use_hash_check", True)
             ),
+            "compress_media_if_too_large": bool(
+                cfg.get("compress_media_if_too_large", True)
+            ),
+            "compression_min_video_bitrate_kbps": int(
+                cfg.get("compression_min_video_bitrate_kbps", 200)
+            ),
+            "compression_audio_bitrate_kbps": int(
+                cfg.get("compression_audio_bitrate_kbps", 96)
+            ),
+            "compression_preset": str(
+                cfg.get("compression_preset", "veryfast")
+            ),
             "retry_count": int(cfg.get("retry_count", 3)),
             "retry_delay": float(cfg.get("retry_delay", 2.0)),
         }
@@ -930,6 +947,10 @@ class ConfigManager:
             "delete_local_media_after_media_upload",
             "use_hash_check",
             "retry_count", "retry_delay",
+            "compress_media_if_too_large",
+            "compression_min_video_bitrate_kbps",
+            "compression_audio_bitrate_kbps",
+            "compression_preset",
         ):
             if key in settings:
                 cfg[key] = settings[key]

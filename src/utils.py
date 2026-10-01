@@ -4,6 +4,8 @@
   • Удалены неиспользуемые функции: get_system_info(),
     format_file_size(), get_free_space(), validate_path(),
     parse_date_from_filename().
+  • Добавлена safe_local_path() — нормализует путь от QFileDialog
+    (декодирует percent-encoding, убирает \0).
 """
 from __future__ import annotations
 
@@ -14,9 +16,9 @@ import subprocess
 import uuid
 from datetime import datetime
 from typing import Dict, List
+from urllib.parse import unquote
 
 from .logger import get_logger
-from urllib.parse import unquote
 
 log = get_logger(__name__)
 
@@ -108,6 +110,52 @@ def find_drm_card() -> str | None:
             return c
     log.warning("DRM-узлы найдены, но ни один не доступен: %s", cards)
     return cards[0]
+
+
+# ---------------------------------------------------------------------------
+# Нормализация путей от QFileDialog
+# ---------------------------------------------------------------------------
+def safe_local_path(path: str) -> str:
+    """
+    Нормализует путь, полученный от QFileDialog.
+
+    На некоторых платформах (особенно под Wayland/GTK) Qt возвращает
+    путь с percent-encoding: например, вместо
+    "/home/user/КСУО_Мобил.xlsx" приходит
+    "/home/user/%D0%9A%D0%A1%D0%A3%D0%9E_%D0%9C%D0%BE%D0%B1%D0%B8%D0%BB.xlsx".
+
+    Функция декодирует percent-encoding (до 2 раз — на случай
+    двойного кодирования) и убирает нулевые байты.
+
+    Args:
+        path: путь от QFileDialog.
+
+    Returns:
+        Нормализованный путь. Если path пустой — возвращается как есть.
+    """
+    if not path:
+        return path
+
+    decoded = path
+    for _ in range(2):
+        try:
+            new_val = unquote(decoded, errors="replace")
+        except Exception:
+            break
+        if new_val == decoded:
+            break
+        decoded = new_val
+
+    # Убираем нулевые байты — защита от «битых» имён.
+    decoded = decoded.replace("\x00", "")
+
+    if decoded != path:
+        log.debug(
+            "safe_local_path: %r → %r", path, decoded
+        )
+    return decoded
+
+
 # ---------------------------------------------------------------------------
 # Санитизация имён файлов
 # ---------------------------------------------------------------------------
