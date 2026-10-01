@@ -29,6 +29,14 @@
       – пункт контекстного меню «Просмотреть стенограмму»;
       – открывается во встроенном TextViewDialog (read-only,
         поиск с подсветкой, Ctrl+F, F3 / Shift+F3).
+  • Добавлен просмотр протокола (.docx) во встроенном просмотрщике:
+      – пункт меню «Файл → Просмотреть протокол»;
+      – кнопка «Протокол» на нижней панели;
+      – пункт контекстного меню «Просмотреть протокол»;
+      – поиск файла в корне папки записи и в attachments;
+      – открывается в DocxViewerDialog (read-only, поиск с
+        подсветкой, Ctrl+F, F3 / Shift+F3, сохранение копии,
+        открытие внешним приложением).
 """
 from __future__ import annotations
 
@@ -63,6 +71,7 @@ from ..sync_manager import (
 )
 from ..task_queue import TaskQueue
 from ..utils import safe_local_path, sanitize_filename
+from .docx_viewer import DocxViewerDialog
 from .markdown_editor import MarkdownEditorDialog, MarkdownViewerDialog
 from .media_player import (
     is_builtin_player_available, open_media, probe_media_support,
@@ -818,6 +827,15 @@ class SessionsWindow(QDialog):
         )
         bottom.addWidget(self.open_transcript_btn)
 
+        self.open_protocol_btn = QPushButton("Протокол")
+        attach_tooltip(
+            self.open_protocol_btn, "sess_protocol_button"
+        )
+        self.open_protocol_btn.clicked.connect(
+            self._view_manual_protocol
+        )
+        bottom.addWidget(self.open_protocol_btn)
+
         self.sync_btn = QPushButton("Синхронизировать…")
         self.sync_btn.setToolTip(
             "Опубликовать выбранную запись на сервер "
@@ -966,6 +984,19 @@ class SessionsWindow(QDialog):
         act_open_transcript.triggered.connect(self._open_transcript)
         m_file.addAction(act_open_transcript)
 
+        act_view_protocol = QAction("Просмотреть протокол", self)
+        act_view_protocol.setShortcut(QKeySequence("Ctrl+Shift+R"))
+        act_view_protocol.setToolTip(
+            "Открыть прикреплённый протокол (.docx) во встроенном "
+            "просмотрщике с поиском.\n\n"
+            "Поиск файла выполняется в корне папки записи и в "
+            "подпапке attachments."
+        )
+        act_view_protocol.triggered.connect(
+            self._view_manual_protocol
+        )
+        m_file.addAction(act_view_protocol)
+
         m_file.addSeparator()
 
         act_delete = QAction("Удалить запись…", self)
@@ -1060,6 +1091,20 @@ class SessionsWindow(QDialog):
 
         m_protocol.addSeparator()
 
+        act_view_protocol_menu = QAction(
+            "Просмотреть прикреплённый протокол", self
+        )
+        act_view_protocol_menu.setToolTip(
+            "Открыть протокол (.docx) во встроенном просмотрщике "
+            "с поиском.\n\n"
+            "Поиск файла выполняется в корне папки записи и в "
+            "подпапке attachments."
+        )
+        act_view_protocol_menu.triggered.connect(
+            self._view_manual_protocol
+        )
+        m_protocol.addAction(act_view_protocol_menu)
+
         act_attach_protocol = QAction(
             "Прикрепить файл протокола…", self
         )
@@ -1069,7 +1114,7 @@ class SessionsWindow(QDialog):
         m_protocol.addAction(act_attach_protocol)
 
         act_open_protocol = QAction(
-            "Открыть прикреплённый протокол", self
+            "Открыть прикреплённый протокол (внешне)", self
         )
         act_open_protocol.triggered.connect(
             self._open_manual_protocol
@@ -1264,6 +1309,7 @@ class SessionsWindow(QDialog):
             self.play_video_btn.setEnabled(False)
             self.play_audio_btn.setEnabled(False)
             self.open_transcript_btn.setEnabled(False)
+            self.open_protocol_btn.setEnabled(False)
             return
 
         parts = [f"<b>{r['name']}</b>"]
@@ -1303,6 +1349,11 @@ class SessionsWindow(QDialog):
         self.open_transcript_btn.setEnabled(
             bool(r.get("has_transcript"))
         )
+
+        # Протокол: кнопка активна, если файл найден в корне
+        # папки записи или в attachments.
+        protocol_path = self._find_manual_protocol_path(r)
+        self.open_protocol_btn.setEnabled(bool(protocol_path))
 
     # ------------------------------------------------------------------
     # Обновление
@@ -1830,6 +1881,98 @@ class SessionsWindow(QDialog):
             "Записи: просмотр стенограммы для «%s» (%d символов, файл=%s)",
             r["name"], len(text), transcript_path,
         )
+
+    # ------------------------------------------------------------------
+    # Просмотр протокола
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_manual_protocol_path(r: Dict[str, Any]) -> str:
+        """
+        Ищет файл протокола (.docx) для записи.
+
+        Порядок поиска:
+          1. Путь из session.json → manual_protocol_path.
+          2. Корень папки записи: manual_protocol.docx,
+             protocol.docx.
+          3. Подпапка attachments: manual_protocol.docx,
+             protocol.docx.
+
+        Возвращает путь к найденному файлу или "".
+        """
+        session_dir = r.get("dir") or ""
+        if not session_dir:
+            return ""
+
+        # 1. Из session.json
+        meta_path = r.get("manual_protocol_path") or ""
+        if meta_path and os.path.isfile(meta_path):
+            return meta_path
+
+        # 2. В корне папки записи
+        for name in ("manual_protocol.docx", "protocol.docx"):
+            candidate = os.path.join(session_dir, name)
+            if os.path.isfile(candidate):
+                return candidate
+
+        # 3. В подпапке attachments
+        att_dir = os.path.join(session_dir, "attachments")
+        if os.path.isdir(att_dir):
+            for name in ("manual_protocol.docx", "protocol.docx"):
+                candidate = os.path.join(att_dir, name)
+                if os.path.isfile(candidate):
+                    return candidate
+
+        return ""
+
+    def _view_manual_protocol(self) -> None:
+        """
+        Открывает прикреплённый протокол (.docx) во встроенном
+        read-only просмотрщике с поиском.
+
+        Поиск файла выполняется:
+          1. По пути из session.json → manual_protocol_path.
+          2. В корне папки записи (manual_protocol.docx,
+             protocol.docx).
+          3. В подпапке attachments.
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        protocol_path = self._find_manual_protocol_path(r)
+        if not protocol_path:
+            QMessageBox.information(
+                self, "Записи",
+                "У этой записи нет протокола (.docx) ни по пути из "
+                "session.json, ни в корне папки, ни в папке "
+                "attachments.\n\n"
+                "Протокол можно:\n"
+                "  • сформировать автоматически при обработке "
+                "(если включена суммаризация);\n"
+                "  • создать вручную: «Протокол → "
+                "Создать/редактировать протокол (Markdown)…»;\n"
+                "  • прикрепить готовый файл: «Протокол → "
+                "Прикрепить файл протокола…».",
+            )
+            return
+
+        try:
+            size_bytes = os.path.getsize(protocol_path)
+        except OSError:
+            size_bytes = 0
+
+        log.info(
+            "Записи: просмотр протокола для «%s» (%s, %.1f КБ)",
+            r["name"], protocol_path, size_bytes / 1024,
+        )
+
+        dlg = DocxViewerDialog(
+            docx_path=protocol_path,
+            title=f"Протокол — {r['name']}",
+            parent=self,
+        )
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # Синхронизация одной записи
@@ -2415,8 +2558,8 @@ class SessionsWindow(QDialog):
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
-        path = r.get("manual_protocol_path") or ""
-        if not path or not os.path.exists(path):
+        path = self._find_manual_protocol_path(r)
+        if not path:
             QMessageBox.information(
                 self, "Протокол",
                 "К этой записи не прикреплён ручной протокол.",
@@ -3268,7 +3411,21 @@ class SessionsWindow(QDialog):
         )
         act_open_transcript.setToolTip(
             "Открыть стенограмму (video.txt) во встроенном "
-            "просмотрщике с поиском (Ctrl+F, F3 / Shift+F3)."
+            "просмотрщике с поиском (Ctrl+F, F3 / Shift+F3).\n\n"
+            "Поиск файла выполняется в корне папки записи и в "
+            "подпапке attachments."
+        )
+
+        act_view_protocol = menu.addAction(
+            "Просмотреть протокол", self._view_manual_protocol
+        )
+        protocol_path = self._find_manual_protocol_path(r)
+        act_view_protocol.setEnabled(bool(protocol_path))
+        act_view_protocol.setToolTip(
+            "Открыть прикреплённый протокол (.docx) во встроенном "
+            "просмотрщике с поиском (Ctrl+F, F3 / Shift+F3).\n\n"
+            "Поиск файла выполняется в корне папки записи и в "
+            "подпапке attachments."
         )
 
         menu.addSeparator()
@@ -3307,6 +3464,10 @@ class SessionsWindow(QDialog):
         menu.addAction(
             "Создать/редактировать протокол (Markdown)…",
             self._edit_manual_protocol_md,
+        )
+        menu.addAction(
+            "Просмотреть протокол (.docx)…",
+            self._view_manual_protocol,
         )
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
@@ -3557,6 +3718,7 @@ class SessionsWindow(QDialog):
             "Ctrl+Shift+V  — смотреть видео\n"
             "Ctrl+Shift+A  — прослушать аудио\n"
             "Ctrl+Shift+T  — просмотреть стенограмму\n"
+            "Ctrl+Shift+R  — просмотреть протокол (.docx)\n"
             "Ctrl+M        — создать/редактировать протокол\n"
             "Ctrl+Shift+M  — экспорт протокола в DOCX\n"
             "Ctrl+B        — отправить протокол/summary в Bitrix24\n"
