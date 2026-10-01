@@ -21,6 +21,7 @@ from .logger import get_logger
 from .markdown_to_bitrix import markdown_to_plain_with_bb
 from .task_queue import TaskQueue
 from .transcribe_client import TranscribeClient
+from .platform_utils import ffmpeg_binary_name
 
 log = get_logger(__name__)
 
@@ -446,7 +447,7 @@ class VideoProcessor(QObject):
         out = str(Path(video_path).with_suffix(f".{fmt}"))
         codec = "libmp3lame" if fmt == "mp3" else "aac"
         cmd = [
-            "ffmpeg", "-y", "-i", video_path, "-vn",
+            ffmpeg_binary_name(), "-y", "-i", video_path, "-vn",
             "-acodec", codec, "-b:a", f"{bitrate}k", out,
         ]
         log.debug("ffmpeg конвертация: %s", " ".join(cmd))

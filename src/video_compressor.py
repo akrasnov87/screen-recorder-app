@@ -31,6 +31,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .logger import get_logger
+from .platform_utils import (
+    ffmpeg_binary_name,
+    ffprobe_binary_name,
+)
 
 log = get_logger(__name__)
 
@@ -86,7 +90,7 @@ async def _get_duration_seconds(path: str) -> float:
     Если ffprobe недоступен — 0.
     """
     cmd = [
-        "ffprobe", "-v", "error",
+        ffprobe_binary_name(), "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         path,
@@ -272,7 +276,7 @@ async def compress_video_to_target_size(
     # -maxrate/-bufsize: ограничивают пиковый битрейт, чтобы
     #                     не вылететь за target_bytes раньше времени.
     cmd = [
-        "ffmpeg", "-y",
+        ffmpeg_binary_name(), "-y",
         "-i", src_path,
         "-c:v", "libx264",
         "-preset", preset,

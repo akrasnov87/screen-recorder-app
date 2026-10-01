@@ -19,56 +19,103 @@ from typing import Dict, List
 from urllib.parse import unquote
 
 from .logger import get_logger
+from .platform_utils import (
+    IS_LINUX,
+    IS_WINDOWS,
+    ffmpeg_binary_name,
+    ffprobe_binary_name,
+    is_screen_recording_available,
+    screen_recording_unavailable_reason,
+)
 
 log = get_logger(__name__)
 
 
 def check_ffmpeg_installed() -> bool:
-    """Проверяет наличие ffmpeg в PATH."""
-    path = shutil.which("ffmpeg")
+    """Проверяет наличие ffmpeg в PATH (кроссплатформенно)."""
+    binary = ffmpeg_binary_name()
+    path = shutil.which(binary)
     found = path is not None
-    log.debug("Проверка ffmpeg: %s (%s)", found, path or "не найден")
+    log.debug(
+        "Проверка %s: %s (%s)",
+        binary, found, path or "не найден",
+    )
     return found
 
 
 def get_system_monitors() -> List[Dict[str, str]]:
-    """Возвращает список мониторов через xrandr (X11)."""
-    log.debug("Запрос списка мониторов через xrandr --listmonitors")
+    """
+    Возвращает список мониторов.
+
+    Кроссплатформенно через Qt (QGuiApplication.screens()).
+    На Linux формат `display` совместим с x11grab
+    (":0.0+X,Y"); на Windows `display` — имя монитора.
+
+    Если Qt ещё не инициализирован — возвращает fallback
+    1920x1080 (для ранних вызовов из config_manager).
+    """
+    from PySide6.QtGui import QGuiApplication
+
     monitors: List[Dict[str, str]] = []
-    try:
-        out = subprocess.check_output(
-            ["xrandr", "--listmonitors"], text=True
-        )
-        for line in out.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) >= 4:
-                index = parts[0].rstrip(":")
-                name = parts[-1]
-                geometry = parts[2]
-                m = re.match(
-                    r"(\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)", geometry
-                )
-                if m:
-                    w, h, x, y = m.groups()
-                    monitors.append({
-                        "index": index,
-                        "name": name,
-                        "width": w,
-                        "height": h,
-                        "x": x,
-                        "y": y,
-                        "display": f":0.0+{x},{y}",
-                    })
-                    log.debug("Найден монитор: %s %sx%s @ (%s,%s) → %s",
-                              name, w, h, x, y, f":0.0+{x},{y}")
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+
+    app = QGuiApplication.instance()
+    if app is None:
         log.warning(
-            "xrandr недоступен (%s), используется монитор по умолчанию",
-            exc,
+            "QGuiApplication не инициализирован — "
+            "используется fallback-монитор 1920x1080"
+        )
+        return [{
+            "index": "0",
+            "name": "default",
+            "width": "1920",
+            "height": "1080",
+            "x": "0",
+            "y": "0",
+            "display": ":0.0+0,0" if IS_LINUX else "default",
+        }]
+
+    try:
+        screens = app.screens()
+    except Exception as exc:
+        log.warning(
+            "Не удалось получить список экранов: %s", exc
+        )
+        screens = []
+
+    for i, screen in enumerate(screens):
+        try:
+            geo = screen.geometry()
+        except Exception:
+            continue
+
+        name = screen.name() or f"screen{i}"
+
+        # На Linux оставляем формат x11grab для совместимости
+        # с recorder.py. На Windows/macOS — просто имя экрана.
+        if IS_LINUX:
+            display = f":0.0+{geo.x()},{geo.y()}"
+        else:
+            display = name
+
+        monitors.append({
+            "index": str(i),
+            "name": name,
+            "width": str(geo.width()),
+            "height": str(geo.height()),
+            "x": str(geo.x()),
+            "y": str(geo.y()),
+            "display": display,
+        })
+        log.debug(
+            "Найден монитор: %s %sx%s @ (%s,%s) → %s",
+            name, geo.width(), geo.height(),
+            geo.x(), geo.y(), display,
         )
 
     if not monitors:
-        log.warning("Список мониторов пуст, добавляем fallback 1920x1080")
+        log.warning(
+            "Список мониторов пуст, fallback 1920x1080"
+        )
         monitors.append({
             "index": "0",
             "name": "default",
@@ -76,8 +123,9 @@ def get_system_monitors() -> List[Dict[str, str]]:
             "height": "1080",
             "x": "0",
             "y": "0",
-            "display": ":0.0+0,0",
+            "display": ":0.0+0,0" if IS_LINUX else "default",
         })
+
     log.info("Итого мониторов: %d", len(monitors))
     return monitors
 
@@ -95,10 +143,15 @@ def find_drm_card() -> str | None:
     """
     Возвращает путь к первому доступному /dev/dri/cardN.
 
-    kmsgrab по умолчанию ищет card0, но в некоторых системах
-    основной DRM-узел может быть card1 (например, при наличии
-    нескольких GPU или виртуального дисплея).
+    Только для Linux (kmsgrab). На других ОС — None.
     """
+    if not IS_LINUX:
+        log.debug(
+            "find_drm_card: не Linux (%s) — возвращаем None",
+            "Windows" if IS_WINDOWS else "другая ОС",
+        )
+        return None
+
     import glob
     cards = sorted(glob.glob("/dev/dri/card[0-9]*"))
     if not cards:
@@ -108,7 +161,9 @@ def find_drm_card() -> str | None:
         if os.access(c, os.R_OK):
             log.debug("Найден доступный DRM-узел: %s", c)
             return c
-    log.warning("DRM-узлы найдены, но ни один не доступен: %s", cards)
+    log.warning(
+        "DRM-узлы найдены, но ни один не доступен: %s", cards
+    )
     return cards[0]
 
 
@@ -251,3 +306,15 @@ def sanitize_filename(
         name, result, len(cleaned), len(result),
     )
     return result
+
+# ---------------------------------------------------------------------------
+# Доступность записи экрана
+# ---------------------------------------------------------------------------
+def is_recording_supported() -> bool:
+    """Доступна ли запись экрана на текущей платформе."""
+    return is_screen_recording_available()
+
+
+def recording_unavailable_message() -> str:
+    """Возвращает сообщение о недоступности записи."""
+    return screen_recording_unavailable_reason()

@@ -17,6 +17,12 @@ from typing import Dict, List, Optional
 from PySide6.QtCore import QObject, Signal
 
 from .logger import get_logger
+from .platform_utils import (
+    IS_LINUX,
+    IS_WINDOWS,
+    is_screen_recording_available,
+    screen_recording_unavailable_reason,
+)
 from .utils import find_drm_card, get_system_monitors
 
 log = get_logger(__name__)
@@ -108,8 +114,9 @@ class ScreenRecorder(QObject):
             else:
                 vf = "hwmap=derive_device=vaapi,scale_vaapi=format=nv12"
 
+            from .platform_utils import ffmpeg_binary_name
             cmd = [
-                "ffmpeg", "-y",
+                ffmpeg_binary_name(), "-y",
                 "-f", "kmsgrab", "-device", card, "-i", "-",
             ]
             if with_microphone:
@@ -134,8 +141,9 @@ class ScreenRecorder(QObject):
                     size = f"{m['width']}x{m['height']}"
                     break
 
+            from .platform_utils import ffmpeg_binary_name
             cmd = [
-                "ffmpeg", "-y",
+                ffmpeg_binary_name(), "-y",
                 "-f", "x11grab",
                 "-video_size", size,
                 "-framerate", "30",
@@ -169,6 +177,16 @@ class ScreenRecorder(QObject):
     async def start_recording(
         self, monitor: str, with_microphone: bool,
     ) -> bool:
+        # --- Проверка доступности записи на текущей платформе ---
+        if not is_screen_recording_available():
+            reason = screen_recording_unavailable_reason()
+            log.warning(
+                "Запись экрана недоступна на этой платформе: %s",
+                reason,
+            )
+            self.recording_error.emit(reason)
+            return False
+
         if self._process is not None:
             log.warning("Попытка начать запись, но запись уже идёт")
             return False

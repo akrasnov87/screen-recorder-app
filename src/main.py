@@ -54,11 +54,20 @@ if __package__ in (None, ""):
     from src.recorder import ScreenRecorder
     from src.sync_manager import SyncManager, is_record_published
     from src.task_queue import TaskQueue
+    from src.platform_utils import (
+        IS_LINUX,
+        IS_WINDOWS,
+        is_screen_recording_available,
+        is_hotkey_recording_available,
+        screen_recording_unavailable_reason,
+    )
     from src.utils import (
         check_ffmpeg_installed,
         get_system_monitors,
         safe_local_path,
         sanitize_filename,
+        is_recording_supported,
+        recording_unavailable_message,
     )
 else:
     from .config_manager import ConfigManager
@@ -83,11 +92,20 @@ else:
     from .recorder import ScreenRecorder
     from .sync_manager import SyncManager, is_record_published
     from .task_queue import TaskQueue
-    from .utils import (
+    from src.platform_utils import (
+        IS_LINUX,
+        IS_WINDOWS,
+        is_screen_recording_available,
+        is_hotkey_recording_available,
+        screen_recording_unavailable_reason,
+    )
+    from src.utils import (
         check_ffmpeg_installed,
         get_system_monitors,
         safe_local_path,
         sanitize_filename,
+        is_recording_supported,
+        recording_unavailable_message,
     )
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Slot
@@ -646,6 +664,21 @@ class ScreenRecorderApp(QObject):
     @Slot()
     def _start_recording(self) -> None:
         log.info("Запрос на старт записи (UI)")
+
+        # --- Проверка доступности записи ---
+        if not is_screen_recording_available():
+            reason = screen_recording_unavailable_reason()
+            log.warning(
+                "Запись недоступна на платформе %s",
+                "Windows" if IS_WINDOWS else "не Linux",
+            )
+            QMessageBox.warning(
+                None,
+                "Запись экрана недоступна",
+                reason,
+            )
+            return
+
         rec = self._rec_cfg()
 
         if rec.get("show_metadata_on_start", True):
@@ -676,6 +709,15 @@ class ScreenRecorderApp(QObject):
         asyncio.run_coroutine_threadsafe(_run(), self._loop)
 
     def _toggle_recording(self) -> None:
+        if not is_screen_recording_available():
+            reason = screen_recording_unavailable_reason()
+            QMessageBox.warning(
+                None,
+                "Запись экрана недоступна",
+                reason,
+            )
+            return
+
         status = self.recorder.get_recording_status()
         if status["recording"]:
             self._stop_recording()
@@ -1008,6 +1050,11 @@ class ScreenRecorderApp(QObject):
     # Хоткеи
     # ------------------------------------------------------------------
     def _hotkey_start_recording(self) -> None:
+        if not is_hotkey_recording_available():
+            log.debug(
+                "Хоткей старта записи недоступен на этой платформе"
+            )
+            return
         status = self.recorder.get_recording_status()
         if status["recording"]:
             if status["paused"]:
@@ -1026,6 +1073,11 @@ class ScreenRecorderApp(QObject):
             QTimer.singleShot(0, self._start_recording)
 
     def _hotkey_stop_recording(self) -> None:
+        if not is_hotkey_recording_available():
+            log.debug(
+                "Хоткей остановки записи недоступен на этой платформе"
+            )
+            return
         QTimer.singleShot(0, self._stop_recording)
 
     # ------------------------------------------------------------------
@@ -1375,10 +1427,19 @@ class ScreenRecorderApp(QObject):
     def startup(self) -> None:
         self.tray_manager.create_tray_icon()
         self.hotkey_manager.register_hotkeys()
-        self._notify(
-            "Screen Recorder",
-            "Приложение запущено (локальный режим)",
-        )
+
+        if is_screen_recording_available():
+            self._notify(
+                "Screen Recorder",
+                "Приложение запущено (локальный режим)",
+            )
+        else:
+            self._notify(
+                "Screen Recorder",
+                "Запись экрана недоступна на этой платформе. "
+                "Доступны транскрибация, синхронизация и другие "
+                "функции.",
+            )
 
 
 def main() -> int:
@@ -1409,12 +1470,28 @@ def main() -> int:
     log.info("=" * 60)
 
     if not check_ffmpeg_installed():
-        log.critical("ffmpeg не установлен")
-        print("ОШИБКА: ffmpeg не установлен. "
-              "Установите: sudo apt install ffmpeg")
-        return 1
-
-    log.info("ffmpeg найден: OK")
+        if IS_LINUX:
+            log.critical("ffmpeg не установлен")
+            print(
+                "ОШИБКА: ffmpeg не установлен.\n"
+                "Установите: sudo apt install ffmpeg"
+            )
+            return 1
+        else:
+            # На Windows ffmpeg нужен только для конвертации
+            # и автосжатия медиа. Продолжаем работу.
+            log.warning(
+                "ffmpeg не найден в PATH — конвертация видео и "
+                "автосжатие медиа будут недоступны"
+            )
+            print(
+                "ПРЕДУПРЕЖДЕНИЕ: ffmpeg не найден в PATH.\n"
+                "Конвертация видео и автосжатие медиа будут "
+                "недоступны.\n"
+                "Скачайте: https://ffmpeg.org/download.html"
+            )
+    else:
+        log.info("ffmpeg найден: OK")
 
     app = QApplication(sys.argv)
     app.setApplicationName("Screen Recorder")
@@ -1454,10 +1531,20 @@ def main() -> int:
     controller = ScreenRecorderApp(app)
     controller.startup()
 
-    signal.signal(signal.SIGINT, lambda *_: controller._quit())
-    timer = QTimer()
-    timer.start(500)
-    timer.timeout.connect(lambda: None)
+    if IS_LINUX:
+        # На Linux этот хак нужен, чтобы Ctrl+C в консоли
+        # корректно останавливал Qt-приложение.
+        signal.signal(
+            signal.SIGINT, lambda *_: controller._quit()
+        )
+        timer = QTimer()
+        timer.start(500)
+        timer.timeout.connect(lambda: None)
+    else:
+        log.info(
+            "SIGINT-хак отключён (не Linux): приложение "
+            "останавливается через трей → «Выход»"
+        )
 
     log.info("Вход в главный цикл приложения")
     return app.exec()

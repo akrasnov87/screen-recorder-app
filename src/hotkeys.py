@@ -9,6 +9,7 @@ from pynput import keyboard
 from .config_manager import ConfigManager
 from .logger import get_logger
 from .utils import get_system_monitors
+from .platform_utils import is_hotkey_recording_available
 
 log = get_logger(__name__)
 
@@ -89,6 +90,13 @@ class GlobalHotkeyManager:
         log.debug("Установлен asyncio-loop для горячих клавиш")
 
     def register_hotkeys(self) -> None:
+        if not is_hotkey_recording_available():
+            log.info(
+                "Горячие клавиши записи недоступны на этой "
+                "платформе — пропускаем регистрацию"
+            )
+            return
+
         rec = self.config.config.get("recording", {})
         self._hotkeys = {
             _parse_hotkey(rec.get("hotkey_start", "Ctrl+Shift+R")): self.on_start_stop,

@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..logger import get_logger
+from ..platform_utils import is_screen_recording_available
 
 log = get_logger(__name__)
 
@@ -224,6 +225,9 @@ class TrayManager(QObject):
         )
 
     def set_recording_state(self, state: str) -> None:
+        if not is_screen_recording_available():
+            # На Windows запись недоступна — трей всегда "idle".
+            return
         log.info("Состояние трея: %s → %s", self._state, state)
         self._state = state
         if self._tray is None:

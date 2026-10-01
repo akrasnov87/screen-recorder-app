@@ -56,6 +56,12 @@ from .. import __version__
 from .media_player import probe_media_support      # ui → ui
 from .sync_window import SyncWindow                # ui → ui
 from .tooltips import attach_tooltip, make_info_icon, with_info  # ui → ui
+from ..platform_utils import (
+    IS_LINUX,
+    IS_WINDOWS,
+    is_screen_recording_available,
+    screen_recording_unavailable_reason,
+)
 
 log = get_logger(__name__)
 
@@ -2422,6 +2428,40 @@ class SettingsWindow(QDialog):
         layout.addWidget(self.player_status_label)
 
         layout.addStretch()
+        # --- Если запись экрана недоступна, отключаем поля ---
+        if not is_screen_recording_available():
+            reason = screen_recording_unavailable_reason()
+
+            warning = QLabel(
+                f"<span style='color:#c62828'><b>Запись экрана "
+                f"недоступна на этой платформе.</b></span><br>"
+                f"<span style='color:#666'>"
+                f"{reason.replace(chr(10), '<br>')}"
+                f"</span>"
+            )
+            warning.setWordWrap(True)
+            warning.setStyleSheet(
+                "QLabel { padding: 8px; border: 1px solid #c62828; "
+                "border-radius: 4px; background-color: #fff5f5; }"
+            )
+            layout.insertWidget(0, warning)
+
+            # Отключаем элементы, связанные с записью.
+            for w in (
+                self.monitor_combo,
+                self.mic_check,
+                self.watermark_check,
+                self.hotkey_start_input,
+                self.hotkey_stop_input,
+                self.metadata_on_start_check,
+                self.metadata_on_stop_check,
+                self.overlay_panel_check,
+                self.start_notification_check,
+            ):
+                try:
+                    w.setEnabled(False)
+                except Exception:
+                    pass
         return w
 
     # ------------------------------------------------------------------

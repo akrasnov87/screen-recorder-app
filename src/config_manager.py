@@ -36,6 +36,11 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from .logger import get_logger
+from .platform_utils import (
+    default_config_path,
+    default_log_path,
+    default_temp_dir,
+)
 
 log = get_logger(__name__)
 
@@ -162,11 +167,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "compression_level": 5,
     },
     "storage": {
-        "temp_path": "/tmp/screen-recorder",
+        "temp_path": default_temp_dir(),
         "retention_hours": 24,
     },
     "logging": {
-        "log_path": "/tmp/screen-recorder/app.log",
+        "log_path": default_log_path(),
         "level": "DEBUG",
         "max_bytes_mb": 10,
         "backup_count": 5,
@@ -303,10 +308,7 @@ class ConfigManager:
 
     def __init__(self, config_path: str | None = None) -> None:
         if config_path is None:
-            config_path = os.path.join(
-                os.path.expanduser("~"), ".config",
-                "screen-recorder", "config.json"
-            )
+            config_path = default_config_path()
         self.config_path = Path(config_path)
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -559,7 +561,7 @@ class ConfigManager:
     def get_log_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("logging", {})
         return {
-            "log_path": cfg.get("log_path", "/tmp/screen-recorder/app.log"),
+            "log_path": cfg.get("log_path", default_log_path()),
             "level": cfg.get("level", "DEBUG"),
             "max_bytes_mb": int(cfg.get("max_bytes_mb", 10)),
             "backup_count": int(cfg.get("backup_count", 5)),

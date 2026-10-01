@@ -14,13 +14,15 @@ import sys
 from logging.handlers import RotatingFileHandler
 from typing import Callable, List, Optional
 
+from .platform_utils import default_log_path
+
 # ---------------------------------------------------------------------------
 # Глобальное состояние
 # ---------------------------------------------------------------------------
 
 _gui_handlers: List[Callable[[str, str], None]] = []
 _root_logger: Optional[logging.Logger] = None
-_DEFAULT_LOG_PATH = "/tmp/screen-recorder/app.log"
+_DEFAULT_LOG_PATH = default_log_path()
 _active_log_path: str = _DEFAULT_LOG_PATH
 
 
