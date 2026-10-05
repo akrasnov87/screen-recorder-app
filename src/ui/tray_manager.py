@@ -105,6 +105,8 @@ class TrayManager(QObject):
     import_requested = Signal()
     upload_video_requested = Signal()
     quit_requested = Signal()
+    open_tasks_requested = Signal()
+    open_tasks_editor_requested = Signal()   # если нужно открыть сразу редактор
 
     def __init__(
         self,
@@ -186,6 +188,14 @@ class TrayManager(QObject):
         library_action.triggered.connect(self.open_library)
         menu.addAction(library_action)
 
+        tasks_action = QAction("Поручения", menu)
+        tasks_action.setToolTip(
+            "Сводное окно поручений по всем записям: фильтры "
+            "по статусу, исполнителю и контексту, отправка в Bitrix24"
+        )
+        tasks_action.triggered.connect(self.open_tasks)
+        menu.addAction(tasks_action)
+
         yandex_vm_action = QAction("ВМ Yandex", menu)
         yandex_vm_action.setToolTip(
             "Просмотр и редактирование конфигураций виртуальных "
@@ -223,6 +233,10 @@ class TrayManager(QObject):
             "Контекстное меню создано: %d действий",
             len(menu.actions()),
         )
+
+    def open_tasks(self) -> None:
+        log.debug("Клик: открыть окно «Поручения»")
+        self.open_tasks_requested.emit()
 
     def set_recording_state(self, state: str) -> None:
         if not is_screen_recording_available():

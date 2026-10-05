@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 from typing import List
+from typing import Any, Dict
 
 from .logger import get_logger
 
@@ -270,3 +271,86 @@ def markdown_to_plain_with_bb(text: str) -> str:
     from .bbcode_editor import bbcode_to_plain
 
     return bbcode_to_plain(markdown_to_plain(text))
+
+# ---------------------------------------------------------------------------
+# Форматирование поручений для Bitrix24
+# ---------------------------------------------------------------------------
+def format_action_items_to_bitrix(
+    items: List[Dict[str, Any]],
+    *,
+    title: str = "Поручения",
+    group_by_assignee: bool = True,
+    include_status: bool = True,
+    include_due_date: bool = True,
+) -> str:
+    """
+    Форматирует список поручений в BB-код Bitrix24.
+
+    Args:
+        items:              список словарей с ключами
+                            text, assignee, status, due_date.
+        title:              заголовок сообщения.
+        group_by_assignee:  группировать по исполнителю.
+        include_status:     добавлять ли статус в скобках.
+        include_due_date:   добавлять ли срок.
+
+    Returns:
+        Строка в BB-коде, готовая для im.message.add.
+    """
+    # Импорт здесь, чтобы не тянуть лишние зависимости в начало.
+    from .logger import get_logger as _get_logger
+    _log = _get_logger(__name__)
+
+    if not items:
+        return ""
+
+    _STATUS_LABELS = {
+        "created": "создан",
+        "in_progress": "в работе",
+        "waiting": "ожидание",
+        "done": "выполнен",
+    }
+
+    def _format_one(it: Dict[str, Any]) -> str:
+        text = (it.get("text") or "").strip() or "—"
+        parts: List[str] = [text]
+
+        meta: List[str] = []
+        if include_status:
+            st = it.get("status") or "created"
+            meta.append(_STATUS_LABELS.get(st, st))
+        if include_due_date and it.get("due_date"):
+            meta.append(f"срок: {it['due_date']}")
+
+        if meta:
+            parts.append(f" [{' · '.join(meta)}]")
+        return "".join(parts)
+
+    out: List[str] = []
+    if title:
+        out.append(f"[B]{title}[/B] ({len(items)} шт.)")
+        out.append("")
+
+    if group_by_assignee:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for it in items:
+            key = (it.get("assignee") or "").strip() or "(без исполнителя)"
+            grouped.setdefault(key, []).append(it)
+
+        for assignee, group in sorted(grouped.items()):
+            out.append(f"[B]{assignee}[/B]")
+            for it in group:
+                out.append(f"• {_format_one(it)}")
+            out.append("")
+    else:
+        for it in items:
+            assignee = (it.get("assignee") or "").strip()
+            prefix = f"[B]{assignee}[/B]: " if assignee else ""
+            out.append(f"• {prefix}{_format_one(it)}")
+
+    result = "\n".join(out).strip()
+    _log.debug(
+        "format_action_items_to_bitrix: %d элементов → %d символов",
+        len(items), len(result),
+    )
+    return result

@@ -74,6 +74,7 @@ _CONFIG_JSON_PREFIX = "§CONFIG_JSON§\n"
 
 
 # Соответствие локальных файлов и kind на сервере.
+# Соответствие локальных файлов и kind на сервере.
 _ARTIFACT_KINDS: List[Tuple[str, str]] = [
     ("transcript", "video.txt"),
     ("summary", "video_summary.md"),
@@ -88,6 +89,8 @@ _ARTIFACT_KINDS: List[Tuple[str, str]] = [
     ("deepseek_prompt", "deepseek_prompt.docx"),
     ("deepseek_prompt", "deepseek_prompt.md"),
     ("deepseek_prompt", "deepseek_prompt.txt"),
+    # --- Поручения (action items) ---
+    ("action_items", "action_items.json"),
 ]
 
 
@@ -1691,6 +1694,8 @@ class SyncManager:
             return f"manual_protocol{ext or '.txt'}"
         if kind == "deepseek_prompt":
             return f"deepseek_prompt{ext or '.txt'}"
+        if kind == "action_items":
+            return "action_items.json"
         return os.path.join("attachments", base)
 
     def _prune_local_artifacts(

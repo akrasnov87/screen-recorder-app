@@ -68,6 +68,7 @@ from ..platform_utils import (
     is_screen_recording_available,
     screen_recording_unavailable_reason,
 )
+from .tasks_editor_dialog import TasksEditorDialog
 
 log = get_logger(__name__)
 
@@ -868,6 +869,15 @@ class SessionsWindow(QDialog):
         self.close_btn.clicked.connect(self.close)
         bottom.addWidget(self.close_btn)
 
+        self.tasks_btn = QPushButton("Поручения")
+        self.tasks_btn.setToolTip(
+            "Открыть редактор поручений выбранной записи.\n\n"
+            "Поручения хранятся в action_items.json и передаются "
+            "на сервер синхронизации."
+        )
+        self.tasks_btn.clicked.connect(self._open_tasks_editor)
+        bottom.addWidget(self.tasks_btn)
+
         root.addLayout(bottom)
 
     def _build_menu_bar(self) -> None:
@@ -1185,6 +1195,30 @@ class SessionsWindow(QDialog):
         m_deepseek.addAction(act_save_downloads)
 
         m_bitrix = bar.addMenu("Bitrix24")
+
+        m_tasks = bar.addMenu("Поручения")
+
+        act_tasks_editor = QAction(
+            "Редактор поручений текущей записи…", self
+        )
+        act_tasks_editor.setShortcut(QKeySequence("Ctrl+Shift+K"))
+        act_tasks_editor.setToolTip(
+            "Открыть редактор поручений (action_items.json) для "
+            "выбранной записи.\n\n"
+            "В редакторе можно создавать, редактировать, удалять "
+            "поручения, импортировать и экспортировать JSON."
+        )
+        act_tasks_editor.triggered.connect(self._open_tasks_editor)
+        m_tasks.addAction(act_tasks_editor)
+
+        act_view_tasks = QAction("Сводное окно «Поручения»…", self)
+        act_view_tasks.setToolTip(
+            "Открыть сводную таблицу всех поручений по всем записям.\n"
+            "Горячая клавиша: Ctrl+Shift+L"
+        )
+        act_view_tasks.setShortcut(QKeySequence("Ctrl+Shift+L"))
+        act_view_tasks.triggered.connect(self._open_tasks_window)
+        m_tasks.addAction(act_view_tasks)
 
         act_send = QAction("Отправить в чат…", self)
         act_send.setShortcut(QKeySequence("Ctrl+B"))
@@ -3770,6 +3804,12 @@ class SessionsWindow(QDialog):
             "Просмотреть протокол (.docx)…",
             self._view_manual_protocol,
         )
+
+        menu.addSeparator()
+        menu.addAction(
+            "Редактор поручений", self._open_tasks_editor
+        )
+
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     # ------------------------------------------------------------------
@@ -4006,6 +4046,116 @@ class SessionsWindow(QDialog):
                 f"Не удалось удалить: {exc}",
             )
 
+    def _open_tasks_editor(self) -> None:
+        """Открывает редактор поручений для выбранной записи."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Поручения", "Выберите запись")
+            return
+
+        session_dir = r.get("dir") or ""
+        if not session_dir or not os.path.isdir(session_dir):
+            QMessageBox.warning(
+                self, "Поручения",
+                "Папка записи не найдена.",
+            )
+            return
+
+        dlg = TasksEditorDialog(
+            session_dir=session_dir,
+            session_name=r.get("name") or "",
+            parent=self,
+        )
+        dlg.exec()
+
+    def _open_tasks_window(self) -> None:
+        """Открывает сводное окно «Поручения»."""
+        try:
+            from .tasks_window import TasksWindow
+            dlg = TasksWindow(
+                sessions_root=self.sessions_root,
+                config_manager=self.config_manager,
+                parent=self,
+            )
+            dlg.show()
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть окно «Поручения»: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Поручения",
+                f"Ошибка открытия окна:\n{exc}",
+            )
+
+    # ------------------------------------------------------------------
+    # Поручения (action items)
+    # ------------------------------------------------------------------
+    def _open_tasks_editor(self) -> None:
+        """Открывает редактор поручений для выбранной записи."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Поручения", "Выберите запись")
+            return
+
+        session_dir = r.get("dir") or ""
+        if not session_dir or not os.path.isdir(session_dir):
+            QMessageBox.warning(
+                self, "Поручения",
+                "Папка записи не найдена.",
+            )
+            return
+
+        try:
+            from .tasks_editor_dialog import TasksEditorDialog
+        except ImportError as exc:
+            log.exception(
+                "Не удалось импортировать редактор поручений: %s",
+                exc,
+            )
+            QMessageBox.critical(
+                self, "Поручения",
+                f"Модуль редактора поручений недоступен:\n{exc}",
+            )
+            return
+
+        dlg = TasksEditorDialog(
+            session_dir=session_dir,
+            session_name=r.get("name") or "",
+            parent=self,
+        )
+        dlg.exec()
+
+    def _open_tasks_window(self) -> None:
+        """Открывает сводное окно «Поручения» по всем записям."""
+        try:
+            from .tasks_window import TasksWindow
+        except ImportError as exc:
+            log.exception(
+                "Не удалось импортировать окно «Поручения»: %s",
+                exc,
+            )
+            QMessageBox.critical(
+                self, "Поручения",
+                f"Модуль окна «Поручения» недоступен:\n{exc}",
+            )
+            return
+
+        try:
+            dlg = TasksWindow(
+                sessions_root=self.sessions_root,
+                config_manager=self.config_manager,
+                parent=self,
+            )
+            dlg.show()
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть окно «Поручения»: %s", exc,
+            )
+            QMessageBox.critical(
+                self, "Поручения",
+                f"Ошибка открытия окна:\n{exc}",
+            )
+
     # ------------------------------------------------------------------
     # Справка
     # ------------------------------------------------------------------
@@ -4035,5 +4185,7 @@ class SessionsWindow(QDialog):
             "Ctrl+R        — перезапустить обработку\n"
             "F5            — обновить список\n"
             "Ctrl+Delete   — удалить запись\n"
+            "Ctrl+Shift+K  — редактор поручений записи\n"
+            "Ctrl+Shift+L  — сводное окно «Поручения»\n"
             "Ctrl+W        — закрыть окно",
         )

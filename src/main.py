@@ -49,6 +49,7 @@ if __package__ in (None, ""):
     from src.ui.sync_window import SyncWindow
     from src.ui.tray_manager import TrayManager
     from src.ui.yandex_vm_window import YandexVMDialog
+    from src.ui.tasks_window import TasksWindow
     from src.logger import (
         get_logger,
         register_gui_handler,
@@ -88,6 +89,7 @@ else:
     from .ui.sync_window import SyncWindow
     from .ui.tray_manager import TrayManager
     from .ui.yandex_vm_window import YandexVMDialog
+    from .ui.tasks_window import TasksWindow
     from .logger import (
         get_logger,
         register_gui_handler,
@@ -170,6 +172,7 @@ class ScreenRecorderApp(QObject):
         self.sessions_window: Optional[SessionsWindow] = None
         self.library_window: Optional[LibraryWindow] = None
         self.sync_window: Optional[SyncWindow] = None
+        self.tasks_window: Optional[TasksWindow] = None
 
         self.hotkey_manager = GlobalHotkeyManager(
             self.recorder,
@@ -238,6 +241,9 @@ class ScreenRecorderApp(QObject):
         )
         self.tray_manager.open_library_requested.connect(
             self._open_library
+        )
+        self.tray_manager.open_tasks_requested.connect(
+            self._open_tasks_window
         )
         self.tray_manager.open_sync_requested.connect(
             self._open_sync
@@ -1458,6 +1464,24 @@ class ScreenRecorderApp(QObject):
             QMessageBox.critical(
                 None, "Синхронизация",
                 f"Не удалось открыть окно синхронизации:\n{exc}",
+            )
+            
+    def _open_tasks_window(self) -> None:
+        """Открывает сводное окно «Поручения»."""
+        try:
+            self.tasks_window = TasksWindow(
+                sessions_root=self._sessions_root(),
+                config_manager=self.config_manager,
+                parent=None,
+            )
+            self.tasks_window.show()
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть окно «Поручения»: %s", exc
+            )
+            QMessageBox.critical(
+                None, "Поручения",
+                f"Не удалось открыть окно поручений:\n{exc}",
             )
 
     def _open_yandex_vm(self) -> None:
