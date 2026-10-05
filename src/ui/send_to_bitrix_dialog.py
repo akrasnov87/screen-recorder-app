@@ -1229,12 +1229,56 @@ class SendToBitrixDialog(QDialog):
         self.auto_file_threshold.setEnabled(mode == "auto")
 
     def _is_file_mode(self, which: str, body_len: int) -> bool:
+        """
+        Решает, отправлять материал файлом или текстом.
+
+        Правило по расширению исходного файла (для протокола):
+          • .docx / .pdf  → всегда файлом (вложением);
+          • .md / .txt    → всегда текстом.
+
+        Если у протокола нет исходного файла — смотрим на
+        выбранный режим отправки и порог длины (как раньше).
+
+        Для summary исходного файла обычно нет — сработает
+        правило по режиму/порогу.
+        """
+        # --- Особое правило для протокола: смотрим на расширение ---
+        if which == "protocol":
+            path = self._protocol_path or ""
+            if path and os.path.exists(path):
+                ext = os.path.splitext(path)[1].lower()
+                if ext in (".docx", ".pdf"):
+                    return True
+                if ext in (".md", ".txt"):
+                    return False
+                # Неизвестное расширение — падаем в общую логику.
+
+        # --- Общая логика: режим + порог длины ---
         mode = self.send_mode_combo.currentData() or "auto"
         if mode == "file":
             return True
         if mode == "text":
             return False
         return body_len > self.auto_file_threshold.value()
+
+    def _has_file_for(self, which: str) -> bool:
+        """
+        Есть ли у материала готовый файл для отправки.
+
+        Для протокола — это .docx/.pdf/.md/.txt в папке записи.
+        Для summary — временный .md формируется на лету, поэтому
+        всегда есть возможность отправить файлом, если нужно.
+        """
+        if which == "protocol":
+            path = self._protocol_path or ""
+            return bool(path and os.path.exists(path))
+        if which == "summary":
+            return bool(
+                (self._summary_file_path
+                 and os.path.exists(self._summary_file_path))
+                or self._summary_md.strip()
+            )
+        return False
 
     # ------------------------------------------------------------------
     # Ссылки на материалы
@@ -1697,9 +1741,7 @@ class SendToBitrixDialog(QDialog):
                     "header": header,
                     "body": body,
                     "src_file": src_file,
-                    "is_file": self._is_file_mode(
-                        "protocol", len(body)
-                    ),
+                    "is_file": self._is_file_mode("protocol", len(body)),
                 })
             elif t == "summary":
                 header = (
