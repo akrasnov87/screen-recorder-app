@@ -4,26 +4,23 @@
 папки сессии. Структура файла:
 
     {
-      "version": 1,
+      "version": 2,
       "session_id": "2026-10-05_08-30-00",   # имя папки сессии
       "session_name": "ПРОТОКОЛ СОВЕЩАНИЯ...",
       "updated_at": "2026-10-05T09:15:00",
       "items": [
         {
           "id": "uuid4-hex",
+          "number": 42,
           "text": "Подготовить макет",
           "assignee": "Иванов И.И.",
-          "status": "created",         # created|in_progress|waiting|done
-          "due_date": "2026-10-10",
-          "created_at": "2026-10-05T09:00:00",
-          "updated_at": "2026-10-05T09:15:00",
-          "context": "ПРОТОКОЛ СОВЕЩАНИЯ ЕЖД-2026-10-05",
-          "source": "manual",          # manual|import|auto
-          "comment": ""
-        },
-        ...
+          ...
+        }
       ]
     }
+
+`number` — сквозной числовой номер поручения по всем записям.
+Счётчик хранится в <sessions_root>/action_items_counter.json.
 
 Статусы:
   • created     — создан (по умолчанию)
@@ -48,8 +45,11 @@ log = get_logger(__name__)
 # Имя файла поручений внутри папки сессии.
 ACTION_ITEMS_FILE = "action_items.json"
 
+# Имя файла-счётчика сквозных номеров в корне сессий.
+COUNTER_FILE = "action_items_counter.json"
+
 # Текущая версия формата.
-ACTION_ITEMS_VERSION = 1
+ACTION_ITEMS_VERSION = 2
 
 # Возможные статусы и их человекочитаемые названия.
 STATUS_LABELS: Dict[str, str] = {
@@ -87,6 +87,79 @@ def _path_for(session_dir: str) -> str:
     return os.path.join(session_dir, ACTION_ITEMS_FILE)
 
 
+def _sessions_root_from_session_dir(session_dir: str) -> str:
+    """
+    Возвращает корень sessions/ по папке конкретной сессии.
+
+    Папка сессии обычно лежит как <sessions_root>/<session_name>,
+    поэтому родительская папка и есть sessions_root.
+    """
+    return os.path.dirname(os.path.abspath(session_dir.rstrip("/")))
+
+
+def _counter_path(sessions_root: str) -> str:
+    return os.path.join(sessions_root, COUNTER_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Счётчик сквозных номеров
+# ---------------------------------------------------------------------------
+def _load_counter(sessions_root: str) -> int:
+    """
+    Читает текущее значение счётчика из <sessions_root>/action_items_counter.json.
+
+    Если файла нет или он битый — возвращает 0.
+    """
+    path = _counter_path(sessions_root)
+    data = read_json_file(path)
+    if not isinstance(data, dict):
+        return 0
+    try:
+        return max(0, int(data.get("last_number", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _save_counter(sessions_root: str, value: int) -> None:
+    """Атомарно сохраняет значение счётчика."""
+    try:
+        os.makedirs(sessions_root, exist_ok=True)
+        path = _counter_path(sessions_root)
+        tmp = path + ".tmp"
+        payload = {
+            "last_number": int(value),
+            "updated_at": _iso_now(),
+        }
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        log.error(
+            "Не удалось сохранить счётчик поручений %s: %s",
+            sessions_root, exc,
+        )
+
+
+def get_next_item_number(session_dir: str) -> int:
+    """
+    Возвращает следующий сквозной номер поручения и увеличивает
+    счётчик в <sessions_root>/action_items_counter.json.
+
+    Атомарность на уровне процесса: критической гонки нет,
+    так как все операции выполняются в одном потоке
+    (Qt GUI / процессор).
+    """
+    sessions_root = _sessions_root_from_session_dir(session_dir)
+    current = _load_counter(sessions_root)
+    next_number = current + 1
+    _save_counter(sessions_root, next_number)
+    log.debug(
+        "Выдан номер поручения: %d (sessions_root=%s)",
+        next_number, sessions_root,
+    )
+    return next_number
+
+
 # ---------------------------------------------------------------------------
 # Чтение / запись
 # ---------------------------------------------------------------------------
@@ -96,6 +169,9 @@ def load_action_items(session_dir: str) -> Dict[str, Any]:
 
     Если файла нет — возвращает пустую структуру, привязанную
     к этой сессии.
+
+    ВАЖНО: при загрузке элементов, у которых нет поля `number`,
+    присваивает им номер из счётчика (ленивая миграция).
     """
     path = _path_for(session_dir)
     data = read_json_file(path)
@@ -109,10 +185,36 @@ def load_action_items(session_dir: str) -> Dict[str, Any]:
 
     # Нормализуем элементы — на случай ручной правки JSON.
     normalized: List[Dict[str, Any]] = []
+    needs_migration = False
     for raw in items:
         if not isinstance(raw, dict):
             continue
-        normalized.append(_normalize_item(raw))
+        item = _normalize_item(raw)
+        if not item.get("number"):
+            needs_migration = True
+        normalized.append(item)
+
+    # Если есть элементы без номера — присваиваем и сохраняем.
+    if needs_migration and normalized:
+        for item in normalized:
+            if not item.get("number"):
+                item["number"] = get_next_item_number(session_dir)
+        log.info(
+            "Ленивая миграция номеров: %d элементов в %s",
+            len(normalized), session_dir,
+        )
+        result = {
+            "version": ACTION_ITEMS_VERSION,
+            "session_id": str(
+                data.get("session_id")
+                or os.path.basename(session_dir.rstrip("/"))
+            ),
+            "session_name": str(data.get("session_name") or ""),
+            "updated_at": _iso_now(),
+            "items": normalized,
+        }
+        save_action_items(session_dir, result, skip_normalize=True)
+        return result
 
     result: Dict[str, Any] = {
         "version": int(data.get("version", ACTION_ITEMS_VERSION)),
@@ -129,25 +231,40 @@ def load_action_items(session_dir: str) -> Dict[str, Any]:
 
 def save_action_items(
     session_dir: str, data: Dict[str, Any],
+    *,
+    skip_normalize: bool = False,
 ) -> bool:
     """
     Атомарно сохраняет action_items.json.
 
     Возвращает True при успехе.
+
+    Args:
+        session_dir:    папка сессии.
+        data:           словарь с items.
+        skip_normalize: если True — элементы не проходят
+                        _normalize_item повторно (используется
+                        при ленивой миграции, чтобы не сбить
+                        только что присвоенные номера).
     """
     try:
         os.makedirs(session_dir, exist_ok=True)
+
+        if skip_normalize:
+            items_out = list(data.get("items") or [])
+        else:
+            items_out = [
+                _normalize_item(it)
+                for it in (data.get("items") or [])
+                if isinstance(it, dict)
+            ]
 
         payload = {
             "version": ACTION_ITEMS_VERSION,
             "session_id": str(data.get("session_id") or ""),
             "session_name": str(data.get("session_name") or ""),
             "updated_at": _iso_now(),
-            "items": [
-                _normalize_item(it)
-                for it in (data.get("items") or [])
-                if isinstance(it, dict)
-            ],
+            "items": items_out,
         }
 
         path = _path_for(session_dir)
@@ -180,8 +297,18 @@ def _normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     item_id = str(raw.get("id") or "").strip() or _new_id()
 
+    # Номер: int или 0 (0 = «ещё не присвоен»).
+    number_raw = raw.get("number")
+    number = 0
+    if number_raw is not None:
+        try:
+            number = int(number_raw)
+        except (TypeError, ValueError):
+            number = 0
+
     return {
         "id": item_id,
+        "number": number,
         "text": str(raw.get("text") or "").strip(),
         "assignee": str(raw.get("assignee") or "").strip(),
         "status": status,
@@ -197,17 +324,32 @@ def _normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
 def make_item(
     text: str,
     *,
+    session_dir: str = "",
     assignee: str = "",
     status: str = "created",
     due_date: str = "",
     context: str = "",
     source: str = "manual",
     comment: str = "",
+    number: int = 0,
 ) -> Dict[str, Any]:
-    """Создаёт новый элемент поручения."""
+    """
+    Создаёт новый элемент поручения.
+
+    Args:
+        session_dir: если задан и number==0 — номер берётся
+                     из сквозного счётчика.
+        number:      если > 0 — используется как есть
+                     (например, при импорте с сохранением номеров).
+    """
+    # Если номер не задан — берём из счётчика.
+    if number <= 0 and session_dir:
+        number = get_next_item_number(session_dir)
+
     now = _iso_now()
     return _normalize_item({
         "id": _new_id(),
+        "number": number,
         "text": text,
         "assignee": assignee,
         "status": status,
@@ -229,15 +371,18 @@ def add_item(
     *,
     session_name: str = "",
 ) -> Dict[str, Any]:
-    """Добавляет поручение и сохраняет файл. Возвращает добавленный элемент."""
+    """Добавляет поручение и сохраняет файл."""
     data = load_action_items(session_dir)
     if session_name:
         data["session_name"] = session_name
 
     item = _normalize_item(item)
+    # Если у элемента нет номера — присваиваем.
+    if not item.get("number"):
+        item["number"] = get_next_item_number(session_dir)
     item["updated_at"] = _iso_now()
     data["items"].append(item)
-    save_action_items(session_dir, data)
+    save_action_items(session_dir, data, skip_normalize=True)
     return item
 
 
@@ -256,6 +401,8 @@ def update_item(
         merged = dict(item)
         merged.update(patch)
         merged["id"] = item_id  # id менять нельзя
+        # number тоже менять нельзя через patch.
+        merged["number"] = item.get("number") or 0
         merged["updated_at"] = _iso_now()
         data["items"][i] = _normalize_item(merged)
         updated = data["items"][i]
@@ -290,9 +437,7 @@ def delete_item(session_dir: str, item_id: str) -> bool:
 def export_items(
     session_dir: str, target_path: str,
 ) -> bool:
-    """
-    Сохраняет копию action_items.json в произвольное место.
-    """
+    """Сохраняет копию action_items.json в произвольное место."""
     data = load_action_items(session_dir)
     try:
         with open(target_path, "w", encoding="utf-8") as f:
@@ -312,16 +457,21 @@ def import_items(
     *,
     merge: bool = True,
     session_name: str = "",
+    preserve_numbers: bool = False,
 ) -> int:
     """
     Импортирует поручения из JSON-файла.
 
     Args:
-        session_dir:  папка сессии, в которую импортируем.
-        source_path:  путь к JSON-файлу.
-        merge:        True — добавить к существующим;
-                      False — заменить полностью.
-        session_name: обновить имя сессии.
+        session_dir:      папка сессии, в которую импортируем.
+        source_path:      путь к JSON-файлу.
+        merge:            True — добавить к существующим;
+                          False — заменить полностью.
+        session_name:     обновить имя сессии.
+        preserve_numbers: если True — сохранять номера из файла
+                          (если они там есть). По умолчанию
+                          номера выдаются заново, чтобы не
+                          было коллизий со сквозной нумерацией.
 
     Returns:
         Количество добавленных элементов.
@@ -358,13 +508,20 @@ def import_items(
         # Если id уже есть — генерируем новый, чтобы не перетирать.
         if item["id"] in existing_ids:
             item["id"] = _new_id()
+
+        # Номер: либо сохраняем из файла, либо выдаём новый.
+        if preserve_numbers and item.get("number"):
+            pass  # оставляем как есть
+        else:
+            item["number"] = get_next_item_number(session_dir)
+
         item["source"] = "import"
         item["updated_at"] = _iso_now()
         current["items"].append(item)
         existing_ids.add(item["id"])
         added += 1
 
-    save_action_items(session_dir, current)
+    save_action_items(session_dir, current, skip_normalize=True)
     log.info(
         "Импортировано поручений: %d (в %s)", added, session_dir
     )

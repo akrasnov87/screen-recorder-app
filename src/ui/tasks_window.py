@@ -2,19 +2,34 @@
 
 Возможности:
   • таблица всех поручений из sessions/;
-  • фильтры: статус, исполнитель, проект, контекст (сессия);
-  • сортировка по колонке;
+  • фильтры: статус, исполнитель, проект, поиск по номеру
+    поручения, поиск по контексту (названию записи) и по
+    дате создания;
+  • сортировка по сроку;
   • мультивыбор → отправка в Bitrix24 с форматированием;
   • быстрое редактирование статуса;
   • открытие редактора поручений конкретной записи.
+
+Изменения:
+  • Добавлена колонка «№» — сквозной числовой номер поручения.
+  • Убраны колонки «Срок» и «ID» из основной таблицы.
+  • Панель фильтров переработана:
+      – вместо диапазона дат «с/по» — одно поле «Дата создания»;
+      – вместо выпадающего списка «Контекст» — поле поиска
+        по названию записи (частичное совпадение);
+      – по умолчанию показываются поручения за сегодня.
+  • НОВОЕ: добавлено поле «№ поручения» — поиск по номеру.
+    Поддерживаются: одно число, список через запятую, диапазон.
+  • В сообщения Bitrix24 номер поручения выводится текстом.
 """
 from __future__ import annotations
 
 import asyncio
 import html
 import os
+import re
 import threading
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QDate, Qt, QUrl
@@ -201,6 +216,14 @@ class _SendTasksDialog(QDialog):
         group = self.group_by_assignee_check.isChecked()
         header = self.header_check.isChecked()
 
+        def _num_prefix(it: Dict[str, Any]) -> str:
+            n = it.get("number") or 0
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                n = 0
+            return f"№{n}: " if n > 0 else ""
+
         parts: List[str] = []
 
         if header:
@@ -208,9 +231,17 @@ class _SendTasksDialog(QDialog):
             parts.append("")
 
         if fmt == "table":
-            parts.append("| Исполнитель | Поручение | Срок | Статус |")
-            parts.append("| --- | --- | --- | --- |")
+            parts.append(
+                "| № | Исполнитель | Поручение | Срок | Статус |"
+            )
+            parts.append("| --- | --- | --- | --- | --- |")
             for it in self._items:
+                number = it.get("number") or 0
+                try:
+                    number = int(number)
+                except (TypeError, ValueError):
+                    number = 0
+                num_str = str(number) if number > 0 else "—"
                 assignee = it.get("assignee") or "—"
                 text = (it.get("text") or "").replace("|", "/")
                 due = it.get("due_date") or "—"
@@ -218,7 +249,8 @@ class _SendTasksDialog(QDialog):
                     it.get("status") or "created", "—"
                 )
                 parts.append(
-                    f"| {assignee} | {text} | {due} | {status} |"
+                    f"| {num_str} | {assignee} | {text} | "
+                    f"{due} | {status} |"
                 )
         else:
             # Список
@@ -238,7 +270,8 @@ class _SendTasksDialog(QDialog):
                             if it.get("due_date") else ""
                         )
                         parts.append(
-                            f"- {it.get('text') or ''} "
+                            f"- {_num_prefix(it)}"
+                            f"{it.get('text') or ''} "
                             f"[{status}]{due}"
                         )
                     parts.append("")
@@ -256,7 +289,8 @@ class _SendTasksDialog(QDialog):
                         if it.get("due_date") else ""
                     )
                     parts.append(
-                        f"- {assignee}{it.get('text') or ''} "
+                        f"- {assignee}{_num_prefix(it)}"
+                        f"{it.get('text') or ''} "
                         f"[{status}]{due}"
                     )
 
@@ -264,7 +298,6 @@ class _SendTasksDialog(QDialog):
 
     def _refresh_preview(self) -> None:
         md = self._build_text()
-        # Преобразуем в BB-код для предпросмотра как Bitrix24.
         try:
             self.preview.setPlainText(markdown_to_bitrix(md))
         except Exception:
@@ -320,8 +353,6 @@ class _SendTasksDialog(QDialog):
             self._bitrix_cfg.get("disable_url_preview", False)
         )
 
-        # Простая синхронная отправка в отдельном потоке,
-        # чтобы UI не подвис.
         dlg = QProgressDialog(
             "Отправка в Bitrix24…", None, 0, 0, self
         )
@@ -395,7 +426,7 @@ class TasksWindow(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Поручения")
-        self.setMinimumSize(1280, 760)
+        self.setMinimumSize(1400, 760)
         self.setModal(False)
 
         self._sessions_root = sessions_root
@@ -417,9 +448,10 @@ class TasksWindow(QDialog):
         info_row = QHBoxLayout()
         info = QLabel(
             "Сводная таблица поручений по всем записям. "
-            "Можно фильтровать по статусу, исполнителю и "
-            "проекту, выбирать несколько строк и отправлять "
-            "их в Bitrix24 одним сообщением."
+            "Можно фильтровать по статусу, исполнителю, "
+            "проекту, номеру поручения и дате создания, "
+            "выбирать несколько строк и отправлять их "
+            "в Bitrix24 одним сообщением."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
@@ -429,7 +461,7 @@ class TasksWindow(QDialog):
             info_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
         root.addLayout(info_row)
 
-        # --- Фильтры ---
+        # --- Фильтры (верхний ряд) ---
         filters = QHBoxLayout()
 
         filters.addWidget(QLabel("Статус:"))
@@ -462,50 +494,44 @@ class TasksWindow(QDialog):
         )
         filters.addWidget(self.project_filter)
 
+        # --- НОВОЕ: поиск по номеру поручения ---
         filters.addSpacing(8)
-        filters.addWidget(QLabel("Контекст:"))
-        self.context_filter = QComboBox()
-        self.context_filter.addItem("— все —", "")
-        self.context_filter.setMinimumWidth(220)
-        self.context_filter.currentIndexChanged.connect(
+        filters.addWidget(QLabel("№ поручения:"))
+        self.number_search_input = QLineEdit()
+        self.number_search_input.setPlaceholderText(
+            "Например: 42, 43 или 40-50"
+        )
+        self.number_search_input.setMaximumWidth(180)
+        self.number_search_input.setClearButtonEnabled(True)
+        self.number_search_input.setToolTip(
+            "Поиск по номеру поручения.\n\n"
+            "Поддерживается:\n"
+            "  • одно число: 42;\n"
+            "  • несколько через запятую: 42, 43, 44;\n"
+            "  • диапазон: 40-50;\n"
+            "  • смешанное: 1, 5-7, 10.\n\n"
+            "Пробелы игнорируются. Пустое поле — фильтр выключен."
+        )
+        self.number_search_input.textChanged.connect(
             self._reload_table
         )
-        filters.addWidget(self.context_filter)
+        filters.addWidget(self.number_search_input)
 
         filters.addSpacing(8)
-
-        search_container = QWidget()
-        search_row = QHBoxLayout(search_container)
-        search_row.setContentsMargins(0, 0, 0, 0)
-        search_row.setSpacing(4)
-
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText(
-            "Поиск по тексту поручения, названию записи, "
-            "исполнителю…"
+        filters.addWidget(QLabel("Контекст:"))
+        self.context_search_input = QLineEdit()
+        self.context_search_input.setPlaceholderText(
+            "Поиск по названию записи…"
         )
-        self.search_input.setClearButtonEnabled(True)
-        self.search_input.textChanged.connect(self._reload_table)
-        self.search_input.textChanged.connect(
-            self._on_search_text_changed
+        self.context_search_input.setClearButtonEnabled(True)
+        self.context_search_input.textChanged.connect(
+            self._reload_table
         )
-        attach_tooltip(self.search_input, "tasks_search_input")
-        search_row.addWidget(self.search_input, 1)
-
-        self.search_clear_btn = QPushButton("Сбросить")
-        self.search_clear_btn.setToolTip(
-            "Очистить поле поиска"
-        )
-        self.search_clear_btn.clicked.connect(
-            self._on_clear_search
-        )
-        search_row.addWidget(self.search_clear_btn, 0)
-
-        filters.addWidget(search_container, 1)
+        filters.addWidget(self.context_search_input, 1)
 
         root.addLayout(filters)
 
-        # --- Фильтры по срокам ---
+        # --- Фильтры (нижний ряд) ---
         filters2 = QHBoxLayout()
 
         self.overdue_only_check = QCheckBox(
@@ -520,32 +546,25 @@ class TasksWindow(QDialog):
 
         filters2.addSpacing(12)
 
-        self.due_filter_enabled = QCheckBox("Срок с:")
-        self.due_filter_enabled.setToolTip(
-            "Включить фильтр по диапазону дат срока."
+        filters2.addWidget(QLabel("Дата создания:"))
+        self.created_date_filter = QDateEdit()
+        self.created_date_filter.setCalendarPopup(True)
+        self.created_date_filter.setDisplayFormat("yyyy-MM-dd")
+        # По умолчанию — сегодня.
+        self.created_date_filter.setDate(QDate.currentDate())
+        self.created_date_filter.dateChanged.connect(
+            self._reload_table
         )
-        filters2.addWidget(self.due_filter_enabled)
+        filters2.addWidget(self.created_date_filter)
 
-        self.due_from = QDateEdit()
-        self.due_from.setCalendarPopup(True)
-        self.due_from.setDisplayFormat("yyyy-MM-dd")
-        self.due_from.setDate(QDate.currentDate().addMonths(-1))
-        self.due_from.dateChanged.connect(self._reload_table)
-        filters2.addWidget(self.due_from)
-
-        filters2.addWidget(QLabel("по:"))
-
-        self.due_to = QDateEdit()
-        self.due_to.setCalendarPopup(True)
-        self.due_to.setDisplayFormat("yyyy-MM-dd")
-        self.due_to.setDate(QDate.currentDate().addMonths(1))
-        self.due_to.dateChanged.connect(self._reload_table)
-        filters2.addWidget(self.due_to)
-
-        self.due_filter_enabled.toggled.connect(
-            self._on_due_filter_toggled
+        self.clear_created_date_btn = QPushButton("Сбросить дату")
+        self.clear_created_date_btn.setToolTip(
+            "Показать поручения за все даты"
         )
-        #self._on_due_filter_toggled(False)
+        self.clear_created_date_btn.clicked.connect(
+            self._clear_created_date
+        )
+        filters2.addWidget(self.clear_created_date_btn)
 
         filters2.addSpacing(12)
 
@@ -565,10 +584,10 @@ class TasksWindow(QDialog):
         root.addLayout(filters2)
 
         # --- Таблица ---
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
-            "Статус", "Поручение", "Исполнитель",
-            "Срок", "Проект", "Контекст (запись)", "ID",
+            "№", "Статус", "Поручение", "Исполнитель",
+            "Проект", "Контекст (запись)",
         ])
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -583,13 +602,20 @@ class TasksWindow(QDialog):
             lambda _it: self._open_editor_for_current()
         )
         hv = self.table.horizontalHeader()
-        hv.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents
+        )
         hv.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        hv.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         root.addWidget(self.table, 1)
 
         # --- Действия ---
@@ -674,9 +700,16 @@ class TasksWindow(QDialog):
         bottom.addWidget(self.close_btn)
 
         root.addLayout(bottom)
-        # --- Первичная инициализация состояния фильтров ---
-        # Вызывается ОДИН раз, когда все виджеты уже созданы.
-        self._on_due_filter_toggled(False)
+
+    def _clear_created_date(self) -> None:
+        """
+        Сбрасывает фильтр по дате создания.
+
+        Устанавливаем «магическую» дату 2000-01-01, которая
+        трактуется в _filtered_items как «фильтр выключен».
+        """
+        self.created_date_filter.setDate(QDate(2000, 1, 1))
+        self._reload_table()
 
     def _send_to_employees(self) -> None:
         """Открывает диалог сопоставления и рассылки по сотрудникам."""
@@ -714,7 +747,6 @@ class TasksWindow(QDialog):
             )
             return
 
-        # Проверяем, есть ли вообще у поручений исполнители.
         has_assignees = any(
             (it.get("assignee") or "").strip()
             for it in items
@@ -737,46 +769,61 @@ class TasksWindow(QDialog):
         )
         dlg.exec()
 
-    def _on_due_filter_toggled(self, enabled: bool) -> None:
-        if not hasattr(self, "due_from"):
-            # Вызвано до _build_ui — игнорируем.
-            return
-        self.due_from.setEnabled(enabled)
-        if hasattr(self, "due_to"):
-            self.due_to.setEnabled(enabled)
-        if hasattr(self, "sort_by_due_check"):
-            self._reload_table()
-
-    def _on_search_text_changed(self, _text: str) -> None:
-        """Обновляет счётчик найденного при вводе в поле поиска."""
-        self._update_search_hint()
-
-    def _on_clear_search(self) -> None:
-        """Очищает поле поиска и перезагружает таблицу."""
-        self.search_input.clear()
-        self._reload_table()
-        self._update_search_hint()
-
-    def _update_search_hint(self) -> None:
+    # ------------------------------------------------------------------
+    # Разбор строки поиска по номеру
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_number_query(raw: str) -> Optional[set]:
         """
-        Показывает в подсказке поля поиска, сколько записей
-        найдено по текущему запросу. Полезно, когда список
-        большой и нужно быстро оценить результат.
-        """
-        query = (self.search_input.text() or "").strip()
-        if not query:
-            self.search_input.setToolTip(
-                "Поиск идёт по тексту поручения, названию "
-                "записи (контексту), исполнителю, "
-                "комментарию и проекту."
-            )
-            return
+        Разбирает строку поиска по номеру поручения.
 
-        total = len(self._items)
-        shown = self.table.rowCount()
-        self.search_input.setToolTip(
-            f"Найдено: {shown} из {total} поручений."
-        )
+        Поддерживает:
+          • пусто → None (фильтр выключен);
+          • «42» → {42};
+          • «42, 43, 44» → {42, 43, 44};
+          • «40-50» → {40, 41, ..., 50};
+          • смешанное: «1, 5-7, 10» → {1, 5, 6, 7, 10}.
+
+        Невалидные куски игнорируются.
+
+        Returns:
+            set[int] или None.
+        """
+        s = (raw or "").strip()
+        if not s:
+            return None
+
+        result: set = set()
+
+        for chunk in re.split(r"[,;]+", s):
+            chunk = chunk.strip().replace(" ", "")
+            if not chunk:
+                continue
+
+            # Диапазон вида «40-50».
+            m = re.match(r"^(\d+)\s*-\s*(\d+)$", chunk)
+            if m:
+                try:
+                    a = int(m.group(1))
+                    b = int(m.group(2))
+                except ValueError:
+                    continue
+                if a > b:
+                    a, b = b, a
+                # Защита от огромных диапазонов.
+                if b - a > 10000:
+                    b = a + 10000
+                result.update(range(a, b + 1))
+                continue
+
+            # Одиночное число.
+            if chunk.isdigit():
+                try:
+                    result.add(int(chunk))
+                except ValueError:
+                    continue
+
+        return result if result else None
 
     # ------------------------------------------------------------------
     # Данные
@@ -817,7 +864,6 @@ class TasksWindow(QDialog):
             if (it.get("project") or "").strip()
         })
         # Проект лежит не в поручении, а в session.json.
-        # Подгружаем отдельно.
         if not projects:
             projects = self._collect_projects_from_sessions()
 
@@ -830,23 +876,6 @@ class TasksWindow(QDialog):
         if idx >= 0:
             self.project_filter.setCurrentIndex(idx)
         self.project_filter.blockSignals(False)
-
-        # --- Контексты (записи) ---
-        cur_c = self.context_filter.currentData() or ""
-        contexts = sorted({
-            (it.get("session_name") or "").strip()
-            for it in self._items
-            if (it.get("session_name") or "").strip()
-        })
-        self.context_filter.blockSignals(True)
-        self.context_filter.clear()
-        self.context_filter.addItem("— все —", "")
-        for c in contexts:
-            self.context_filter.addItem(c, c)
-        idx = self.context_filter.findData(cur_c)
-        if idx >= 0:
-            self.context_filter.setCurrentIndex(idx)
-        self.context_filter.blockSignals(False)
 
     def _collect_projects_from_sessions(self) -> List[str]:
         projects = set()
@@ -875,18 +904,21 @@ class TasksWindow(QDialog):
         status_f = self.status_filter.currentData() or ""
         assignee_f = self.assignee_filter.currentData() or ""
         project_f = self.project_filter.currentData() or ""
-        context_f = self.context_filter.currentData() or ""
-        query = (self.search_input.text() or "").strip().lower()
+        context_query = (
+            self.context_search_input.text().strip().lower()
+        )
+
+        # --- Поиск по номеру ---
+        number_query_raw = (
+            self.number_search_input.text().strip()
+            if hasattr(self, "number_search_input") else ""
+        )
+        numbers_filter = self._parse_number_query(number_query_raw)
 
         overdue_only = self.overdue_only_check.isChecked()
-        due_enabled = self.due_filter_enabled.isChecked()
-        due_from = self.due_from.date()
-        due_to = self.due_to.date()
-
-        # Нормализуем запрос: схлопываем повторные пробелы и
-        # убираем пробелы по краям — чтобы «  Иванов  И.И.»
-        # совпадал так же, как «Иванов И.И.».
-        query_norm = " ".join(query.split())
+        # Дата 2000-01-01 трактуется как «фильтр выключен».
+        date_filter = self.created_date_filter.date()
+        use_date_filter = date_filter != QDate(2000, 1, 1)
 
         result: List[Dict[str, Any]] = []
         for it in self._items:
@@ -894,46 +926,47 @@ class TasksWindow(QDialog):
                 continue
             if assignee_f and (it.get("assignee") or "") != assignee_f:
                 continue
-            if context_f and (it.get("session_name") or "") != context_f:
-                continue
             if project_f and self._project_of(it) != project_f:
                 continue
 
-            # --- Поиск по свободному тексту ---
-            # ВАЖНО: ищем не только по тексту поручения, но и по
-            # названию записи (контексту), исполнителю и
-            # комментарию. Так одно поле закрывает все типовые
-            # сценарии: «найди всё про Иванова», «что было на
-            # совещании по проекту X», «все поручения с
-            # "миграцией"».
-            if query_norm:
-                haystack = " ".join([
-                    it.get("text") or "",
-                    it.get("comment") or "",
-                    it.get("assignee") or "",
-                    it.get("session_name") or "",
-                    self._project_of(it) or "",
-                ]).lower()
-                haystack_norm = " ".join(haystack.split())
-                if query_norm not in haystack_norm:
+            # --- Фильтр по номеру ---
+            if numbers_filter is not None:
+                try:
+                    n = int(it.get("number") or 0)
+                except (TypeError, ValueError):
+                    n = 0
+                if n not in numbers_filter:
+                    continue
+
+            # --- Фильтр по контексту (названию записи) ---
+            if context_query:
+                session_name = (it.get("session_name") or "").lower()
+                if context_query not in session_name:
+                    continue
+
+            # --- Фильтр по дате создания ---
+            if use_date_filter:
+                created_at_str = it.get("created_at") or ""
+                if not created_at_str:
+                    continue
+                try:
+                    created_dt = datetime.fromisoformat(
+                        created_at_str
+                    )
+                    created_date = created_dt.date()
+                    filter_date = date(
+                        date_filter.year(),
+                        date_filter.month(),
+                        date_filter.day(),
+                    )
+                    if created_date != filter_date:
+                        continue
+                except (ValueError, TypeError):
                     continue
 
             # --- Только просроченные ---
             if overdue_only and not is_overdue(it):
                 continue
-
-            # --- Фильтр по диапазону дат срока ---
-            if due_enabled:
-                raw_due = (it.get("due_date") or "").strip()
-                if not raw_due:
-                    continue
-                try:
-                    y, m, d = raw_due.split("-")
-                    item_due = QDate(int(y), int(m), int(d))
-                except Exception:
-                    continue
-                if item_due < due_from or item_due > due_to:
-                    continue
 
             result.append(it)
 
@@ -978,39 +1011,37 @@ class TasksWindow(QDialog):
                 except Exception:
                     due_is_today = False
 
+            # --- № ---
+            number = it.get("number") or 0
+            try:
+                number = int(number)
+            except (TypeError, ValueError):
+                number = 0
+            number_text = str(number) if number > 0 else "—"
+            number_item = QTableWidgetItem(number_text)
+            number_item.setForeground(QColor("#444"))
+            number_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight
+                | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.table.setItem(row, 0, number_item)
+
             # --- Статус ---
             status_item = QTableWidgetItem(label)
             status_item.setForeground(QColor(color))
-            self.table.setItem(row, 0, status_item)
+            self.table.setItem(row, 1, status_item)
 
             # --- Текст поручения ---
             text = it.get("text") or ""
             if overdue:
                 text = "⚠  " + text
             text_item = QTableWidgetItem(text)
-            self.table.setItem(row, 1, text_item)
+            self.table.setItem(row, 2, text_item)
 
             # --- Исполнитель ---
             self.table.setItem(
-                row, 2, QTableWidgetItem(it.get("assignee") or "—")
+                row, 3, QTableWidgetItem(it.get("assignee") or "—")
             )
-
-            # --- Срок ---
-            due_text = raw_due or "—"
-            if overdue:
-                days = days_until_due(it) or 0
-                due_text = (
-                    f"{raw_due}  (просрочено на {abs(days)} дн.)"
-                )
-            elif due_is_today:
-                due_text = f"{raw_due}  (сегодня)"
-
-            due_item = QTableWidgetItem(due_text)
-            if overdue:
-                due_item.setForeground(overdue_fg)
-            elif due_is_today:
-                due_item.setForeground(today_fg)
-            self.table.setItem(row, 3, due_item)
 
             # --- Проект ---
             self.table.setItem(
@@ -1024,11 +1055,6 @@ class TasksWindow(QDialog):
                 QTableWidgetItem(it.get("session_name") or "—"),
             )
 
-            # --- ID ---
-            id_item = QTableWidgetItem(it.get("id") or "")
-            id_item.setForeground(QColor("#888"))
-            self.table.setItem(row, 6, id_item)
-
             # --- Подсветка ---
             if overdue:
                 for col in range(self.table.columnCount()):
@@ -1036,7 +1062,7 @@ class TasksWindow(QDialog):
                     if cell is None:
                         continue
                     cell.setBackground(overdue_bg)
-                    if col != 0:
+                    if col not in (0, 1):
                         cell.setForeground(overdue_fg)
             elif due_is_today and status != "done":
                 for col in range(self.table.columnCount()):
@@ -1064,31 +1090,6 @@ class TasksWindow(QDialog):
         if overdue_count:
             stats += f" · просрочено: {overdue_count}"
 
-        query = (self.search_input.text() or "").strip()
-        if query:
-            stats += f" · поиск: «{query}»"
-
-        self.stats_label.setText(stats)
-        self._update_search_hint()
-
-    def _update_selection_stats(self) -> None:
-        try:
-            n_sel = len(
-                self.table.selectionModel().selectedRows()
-            )
-        except Exception:
-            n_sel = 0
-        total = len(self._items)
-        overdue_count = sum(
-            1 for x in self._items if is_overdue(x)
-        )
-        stats = (
-            f"Всего: {total} · "
-            f"показано: {self.table.rowCount()} · "
-            f"выбрано: {n_sel}"
-        )
-        if overdue_count:
-            stats += f" · просрочено: {overdue_count}"
         self.stats_label.setText(stats)
 
     # ------------------------------------------------------------------
@@ -1101,19 +1102,23 @@ class TasksWindow(QDialog):
         self.table.clearSelection()
 
     def _selected_items(self) -> List[Dict[str, Any]]:
+        """
+        Возвращает список выбранных поручений.
+
+        Сопоставляем по индексу строки с отфильтрованным списком,
+        так как ID больше не отображается в таблице.
+        """
         rows = sorted(
-            {i.row() for i in self.table.selectionModel().selectedRows()}
+            {
+                i.row()
+                for i in self.table.selectionModel().selectedRows()
+            }
         )
+        items_in_table = self._filtered_items()
         result: List[Dict[str, Any]] = []
         for r in rows:
-            id_item = self.table.item(r, 6)
-            if id_item is None:
-                continue
-            item_id = id_item.text()
-            for it in self._items:
-                if it.get("id") == item_id:
-                    result.append(it)
-                    break
+            if 0 <= r < len(items_in_table):
+                result.append(items_in_table[r])
         return result
 
     def _open_editor_for_current(self) -> None:

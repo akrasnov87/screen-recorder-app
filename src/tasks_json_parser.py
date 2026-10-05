@@ -5,10 +5,16 @@
   • объект только с items;
   • массив поручений ([{...}, {...}]);
   • одиночный объект-поручение;
-  • русские синонимы полей (текст/исполнитель/срок/...).
+  • русские синонимы полей (текст/исполнитель/срок/номер/...).
 
 Возвращает нормализованный список поручений (dict с полями
 tasks_manager) и метаинформацию о формате.
+
+Изменения:
+  • Добавлен синоним поля «number» (номер/№/num/no).
+  • При разборе номера из JSON: если он отсутствует или
+    невалиден — возвращается 0 (номер будет выдан
+    автоматически при импорте/вставке).
 """
 from __future__ import annotations
 
@@ -58,6 +64,9 @@ _FIELD_ALIASES: Dict[str, List[str]] = {
     "id": [
         "id", "идентификатор",
     ],
+    "number": [
+        "number", "номер", "№", "num", "no", "n",
+    ],
     "created_at": [
         "created_at", "создано", "created",
     ],
@@ -104,7 +113,10 @@ def parse_action_items_json(raw: str) -> ParseResult:
         return ParseResult([], warning="Буфер обмена пуст")
 
     if not raw.strip():
-        return ParseResult([], warning="Буфер обмена пуст или содержит только пробелы")
+        return ParseResult(
+            [],
+            warning="Буфер обмена пуст или содержит только пробелы",
+        )
 
     # --- 1. Убираем BOM и нормализуем переводы строк ---
     text = _strip_bom(raw)
@@ -192,7 +204,8 @@ def _normalize_parsed(data: Any) -> ParseResult:
         looks_like_item = any(
             k in keys_lower
             for k in ("text", "текст", "поручение", "задача",
-                      "assignee", "исполнитель", "due_date", "срок")
+                      "assignee", "исполнитель", "due_date", "срок",
+                      "number", "номер")
         )
         if looks_like_item:
             return ParseResult(
@@ -262,10 +275,20 @@ def _normalize_one(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     source = str(get("source", "") or "manual").strip()
     item_id = str(get("id", "") or "").strip()
 
+    # --- Номер ---
+    number_raw = get("number", 0)
+    try:
+        number = int(number_raw)
+        if number < 0:
+            number = 0
+    except (TypeError, ValueError):
+        number = 0
+
     # Передаём в _normalize_item из tasks_manager — там
     # проставляются created_at/updated_at, если их нет.
     normalized = _normalize_item({
         "id": item_id or uuid.uuid4().hex,
+        "number": number,
         "text": text,
         "assignee": assignee,
         "status": status,

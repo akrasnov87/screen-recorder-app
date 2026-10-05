@@ -10,6 +10,9 @@
   4. Пользователь проверяет/корректирует через ComboBox.
   5. Отправляем каждому сотруднику отдельное сообщение с его
      поручениями.
+
+Изменения:
+  • В сообщениях сотрудникам выводятся сквозные номера поручений.
 """
 from __future__ import annotations
 
@@ -655,6 +658,7 @@ class SendToEmployeesDialog(QDialog):
                 group_by_assignee=False,
                 include_status=True,
                 include_due_date=True,
+                include_number=True,   # ← сквозные номера в сообщении
             )
 
             result.append({

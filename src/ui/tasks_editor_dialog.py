@@ -5,20 +5,31 @@
   • создавать, редактировать, удалять элементы;
   • импортировать/экспортировать JSON;
   • сохранять изменения в action_items.json внутри папки сессии.
+
+Изменения:
+  • Добавлена колонка «№» — сквозной числовой номер поручения.
+  • При создании/дублировании номера выдаются из общего
+    счётчика (action_items_counter.json в корне sessions/).
+  • _selected_item ищет элемент по ID в колонке «ID» (последней).
+  • НОВОЕ: добавлено поле «№ поручения» для поиска по номеру.
+    Поддерживаются: одно число, список через запятую, диапазон.
 """
 from __future__ import annotations
 
 import html
 import os
+import re
 from datetime import date
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QDate, Qt
-from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QKeySequence, QShortcut,
+)
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
-    QApplication, QAbstractItemView, QComboBox, QCheckBox, QDateEdit, QDialog,
-    QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QApplication, QAbstractItemView, QComboBox, QCheckBox, QDateEdit,
+    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox,
     QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
@@ -198,10 +209,11 @@ class TasksEditorDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(
-            f"Поручения — {session_name or os.path.basename(session_dir)}"
+            f"Поручения — "
+            f"{session_name or os.path.basename(session_dir)}"
         )
         self.setModal(True)
-        self.setMinimumSize(1000, 640)
+        self.setMinimumSize(1120, 640)
 
         self._session_dir = session_dir
         self._session_name = session_name
@@ -221,9 +233,13 @@ class TasksEditorDialog(QDialog):
         # --- Инфо-плашка ---
         info_row = QHBoxLayout()
         info = QLabel(
-            "Поручения сохраняются в файл <code>action_items.json</code> "
-            "внутри папки записи и передаются на сервер синхронизации "
-            "вместе с остальными артефактами."
+            "Поручения сохраняются в файл "
+            "<code>action_items.json</code> внутри папки записи "
+            "и передаются на сервер синхронизации вместе с "
+            "остальными артефактами.<br><br>"
+            "Каждому поручению присваивается сквозной числовой "
+            "номер (№) — он отображается в таблицах и "
+            "передаётся в чат Bitrix24."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
@@ -256,6 +272,29 @@ class TasksEditorDialog(QDialog):
         )
         filters.addWidget(self.assignee_filter)
 
+        # --- НОВОЕ: поиск по номеру поручения ---
+        filters.addSpacing(12)
+        filters.addWidget(QLabel("№ поручения:"))
+        self.number_search_input = QLineEdit()
+        self.number_search_input.setPlaceholderText(
+            "42, 43 или 40-50"
+        )
+        self.number_search_input.setMaximumWidth(160)
+        self.number_search_input.setClearButtonEnabled(True)
+        self.number_search_input.setToolTip(
+            "Поиск по номеру поручения.\n\n"
+            "Поддерживается:\n"
+            "  • одно число: 42;\n"
+            "  • несколько через запятую: 42, 43, 44;\n"
+            "  • диапазон: 40-50;\n"
+            "  • смешанное: 1, 5-7, 10.\n\n"
+            "Пробелы игнорируются. Пустое поле — фильтр выключен."
+        )
+        self.number_search_input.textChanged.connect(
+            self._reload_table
+        )
+        filters.addWidget(self.number_search_input)
+
         filters.addSpacing(12)
         filters.addWidget(QLabel("Поиск:"))
         self.search_input = QLineEdit()
@@ -267,7 +306,7 @@ class TasksEditorDialog(QDialog):
 
         root.addLayout(filters)
 
-        # --- Дополнительные фильтры (просроченные + даты) ---
+        # --- Дополнительные фильтры ---
         filters2 = QHBoxLayout()
 
         self.overdue_only_check = QCheckBox(
@@ -307,7 +346,6 @@ class TasksEditorDialog(QDialog):
         self.due_filter_enabled.toggled.connect(
             self._on_due_filter_toggled
         )
-        #self._on_due_filter_toggled(False)
 
         filters2.addSpacing(12)
 
@@ -327,9 +365,9 @@ class TasksEditorDialog(QDialog):
         root.addLayout(filters2)
 
         # --- Таблица ---
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels([
-            "Статус", "Текст", "Исполнитель",
+            "№", "Статус", "Текст", "Исполнитель",
             "Срок", "Комментарий", "ID",
         ])
         self.table.setSelectionBehavior(
@@ -345,12 +383,23 @@ class TasksEditorDialog(QDialog):
             lambda _it: self._edit_selected()
         )
         hv = self.table.horizontalHeader()
-        hv.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        hv.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            6, QHeaderView.ResizeMode.ResizeToContents
+        )
         root.addWidget(self.table, 1)
 
         # --- Кнопки действий ---
@@ -370,7 +419,7 @@ class TasksEditorDialog(QDialog):
 
         self.duplicate_btn = QPushButton("Дублировать")
         self.duplicate_btn.setToolTip(
-            "Создать копию выбранного поручения."
+            "Создать копию выбранного поручения (с новым номером)."
         )
         self.duplicate_btn.clicked.connect(self._duplicate_selected)
         actions.addWidget(self.duplicate_btn)
@@ -400,7 +449,7 @@ class TasksEditorDialog(QDialog):
             "  • массив поручений;\n"
             "  • один объект-поручение;\n"
             "  • русские синонимы полей (текст/исполнитель/"
-            "срок/статус).\n\n"
+            "срок/статус/номер).\n\n"
             "Горячая клавиша: Ctrl+Shift+V"
         )
         self.paste_btn.clicked.connect(self._paste_json)
@@ -440,7 +489,6 @@ class TasksEditorDialog(QDialog):
         ).activated.connect(self._paste_json)
 
         # --- Первичная инициализация состояния фильтров ---
-        # Вызывается ОДИН раз, когда все виджеты уже созданы.
         self._on_due_filter_toggled(False)
 
     def _on_due_filter_toggled(self, enabled: bool) -> None:
@@ -451,6 +499,62 @@ class TasksEditorDialog(QDialog):
             self.due_to.setEnabled(enabled)
         if hasattr(self, "sort_by_due_check"):
             self._reload_table()
+
+    # ------------------------------------------------------------------
+    # Разбор строки поиска по номеру
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_number_query(raw: str) -> Optional[set]:
+        """
+        Разбирает строку поиска по номеру поручения.
+
+        Поддерживает:
+          • пусто → None (фильтр выключен);
+          • «42» → {42};
+          • «42, 43, 44» → {42, 43, 44};
+          • «40-50» → {40, 41, ..., 50};
+          • смешанное: «1, 5-7, 10» → {1, 5, 6, 7, 10}.
+
+        Невалидные куски игнорируются.
+
+        Returns:
+            set[int] или None.
+        """
+        s = (raw or "").strip()
+        if not s:
+            return None
+
+        result: set = set()
+
+        for chunk in re.split(r"[,;]+", s):
+            chunk = chunk.strip().replace(" ", "")
+            if not chunk:
+                continue
+
+            # Диапазон вида «40-50».
+            m = re.match(r"^(\d+)\s*-\s*(\d+)$", chunk)
+            if m:
+                try:
+                    a = int(m.group(1))
+                    b = int(m.group(2))
+                except ValueError:
+                    continue
+                if a > b:
+                    a, b = b, a
+                # Защита от огромных диапазонов.
+                if b - a > 10000:
+                    b = a + 10000
+                result.update(range(a, b + 1))
+                continue
+
+            # Одиночное число.
+            if chunk.isdigit():
+                try:
+                    result.add(int(chunk))
+                except ValueError:
+                    continue
+
+        return result if result else None
 
     # ------------------------------------------------------------------
     # Данные
@@ -491,6 +595,13 @@ class TasksEditorDialog(QDialog):
         assignee_filter = self.assignee_filter.currentData() or ""
         query = (self.search_input.text() or "").strip().lower()
 
+        # --- Поиск по номеру ---
+        number_query_raw = (
+            self.number_search_input.text().strip()
+            if hasattr(self, "number_search_input") else ""
+        )
+        numbers_filter = self._parse_number_query(number_query_raw)
+
         overdue_only = self.overdue_only_check.isChecked()
         due_enabled = self.due_filter_enabled.isChecked()
         due_from = self.due_from.date()
@@ -502,11 +613,22 @@ class TasksEditorDialog(QDialog):
                 continue
             if assignee_filter and it.get("assignee") != assignee_filter:
                 continue
+
+            # --- Фильтр по номеру ---
+            if numbers_filter is not None:
+                try:
+                    n = int(it.get("number") or 0)
+                except (TypeError, ValueError):
+                    n = 0
+                if n not in numbers_filter:
+                    continue
+
             if query:
                 haystack = (
                     (it.get("text") or "") + " " +
                     (it.get("comment") or "") + " " +
-                    (it.get("assignee") or "")
+                    (it.get("assignee") or "") + " " +
+                    str(it.get("number") or "")
                 ).lower()
                 if query not in haystack:
                     continue
@@ -519,9 +641,6 @@ class TasksEditorDialog(QDialog):
             if due_enabled:
                 raw_due = (it.get("due_date") or "").strip()
                 if not raw_due:
-                    # Без срока — при включённом фильтре
-                    # показываем, только если это явно
-                    # интересно. По умолчанию скрываем.
                     continue
                 try:
                     y, m, d = raw_due.split("-")
@@ -548,10 +667,10 @@ class TasksEditorDialog(QDialog):
         self.table.setRowCount(0)
 
         # Цвета для просроченных строк.
-        overdue_bg = QColor("#FFEBEE")     # светло-красный фон
-        overdue_fg = QColor("#B71C1C")     # тёмно-красный текст
-        today_bg = QColor("#FFF8E1")       # светло-жёлтый
-        today_fg = QColor("#B8860B")       # тёмно-жёлтый
+        overdue_bg = QColor("#FFEBEE")
+        overdue_fg = QColor("#B71C1C")
+        today_bg = QColor("#FFF8E1")
+        today_fg = QColor("#B8860B")
 
         today = QDate.currentDate()
 
@@ -576,20 +695,35 @@ class TasksEditorDialog(QDialog):
                 except Exception:
                     due_is_today = False
 
+            # --- № ---
+            number = it.get("number") or 0
+            try:
+                number = int(number)
+            except (TypeError, ValueError):
+                number = 0
+            number_text = str(number) if number > 0 else "—"
+            number_item = QTableWidgetItem(number_text)
+            number_item.setForeground(QColor("#444"))
+            number_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight
+                | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.table.setItem(row, 0, number_item)
+
             # --- Статус ---
             status_item = QTableWidgetItem(label)
             status_item.setForeground(QColor(status_color))
-            self.table.setItem(row, 0, status_item)
+            self.table.setItem(row, 1, status_item)
 
             # --- Текст ---
             text_item = QTableWidgetItem(it.get("text") or "")
-            self.table.setItem(row, 1, text_item)
+            self.table.setItem(row, 2, text_item)
 
             # --- Исполнитель ---
             assignee_item = QTableWidgetItem(
                 it.get("assignee") or "—"
             )
-            self.table.setItem(row, 2, assignee_item)
+            self.table.setItem(row, 3, assignee_item)
 
             # --- Срок ---
             due_text = raw_due or "—"
@@ -611,21 +745,22 @@ class TasksEditorDialog(QDialog):
             if overdue:
                 due_item.setForeground(overdue_fg)
                 due_item.setToolTip(
-                    f"Просрочено на {abs(days_until_due(it) or 0)} дн."
+                    f"Просрочено на "
+                    f"{abs(days_until_due(it) or 0)} дн."
                 )
             elif due_is_today:
                 due_item.setForeground(today_fg)
-            self.table.setItem(row, 3, due_item)
+            self.table.setItem(row, 4, due_item)
 
             # --- Комментарий ---
             self.table.setItem(
-                row, 4, QTableWidgetItem(it.get("comment") or "")
+                row, 5, QTableWidgetItem(it.get("comment") or "")
             )
 
             # --- ID ---
             id_item = QTableWidgetItem(it.get("id") or "")
             id_item.setForeground(QColor("#888"))
-            self.table.setItem(row, 5, id_item)
+            self.table.setItem(row, 6, id_item)
 
             # --- Подсветка строки ---
             if overdue:
@@ -634,11 +769,10 @@ class TasksEditorDialog(QDialog):
                     if cell is None:
                         continue
                     cell.setBackground(overdue_bg)
-                    # Статус — оставляем его цвет, остальное — красным.
-                    if col != 0:
+                    if col != 1:
                         cell.setForeground(overdue_fg)
                 # Дополнительный визуальный маркер — «⚠»
-                first_cell = self.table.item(row, 1)
+                first_cell = self.table.item(row, 2)
                 if first_cell is not None:
                     first_cell.setText(
                         "⚠  " + (first_cell.text() or "")
@@ -671,7 +805,7 @@ class TasksEditorDialog(QDialog):
         row = self.table.currentRow()
         if row < 0:
             return None
-        id_item = self.table.item(row, 5)
+        id_item = self.table.item(row, 6)
         if id_item is None:
             return None
         item_id = id_item.text()
@@ -687,6 +821,7 @@ class TasksEditorDialog(QDialog):
         patch = dlg.result_data()
         item = make_item(
             patch["text"],
+            session_dir=self._session_dir,   # ← сквозной номер
             assignee=patch["assignee"],
             status=patch["status"],
             due_date=patch["due_date"],
@@ -699,7 +834,8 @@ class TasksEditorDialog(QDialog):
         self._rebuild_assignees()
         self._reload_table()
         log.info(
-            "Создано поручение: %s", item.get("text", "")[:60]
+            "Создано поручение №%s: %s",
+            item.get("number"), (item.get("text") or "")[:60],
         )
 
     def _edit_selected(self) -> None:
@@ -734,9 +870,11 @@ class TasksEditorDialog(QDialog):
                 self, "Поручения", "Выберите поручение."
             )
             return
+        number = item.get("number") or 0
+        num_prefix = f"№{number} " if number else ""
         reply = QMessageBox.question(
             self, "Удаление",
-            f"Удалить поручение?\n\n"
+            f"Удалить поручение {num_prefix}?\n\n"
             f"«{(item.get('text') or '')[:120]}»",
             QMessageBox.StandardButton.Yes
             | QMessageBox.StandardButton.No,
@@ -753,9 +891,11 @@ class TasksEditorDialog(QDialog):
             return
         copy = dict(item)
         copy.pop("id", None)
+        copy.pop("number", None)  # копия получит новый номер
         copy["text"] = (copy.get("text") or "") + " (копия)"
         new_item = make_item(
             copy["text"],
+            session_dir=self._session_dir,
             assignee=copy.get("assignee") or "",
             status=copy.get("status") or "created",
             due_date=copy.get("due_date") or "",
@@ -811,7 +951,7 @@ class TasksEditorDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(
             self, "Экспорт поручений",
             default_path,
-            "JSON (*.json);;Все файлы (*)",
+            "JSON (*.json);;;Все файлы (*)",
         )
         if not path:
             return
@@ -862,14 +1002,10 @@ class TasksEditorDialog(QDialog):
 
     def _show_paste_error(self, raw: str, warning: str) -> None:
         """Показывает подробную ошибку парсинга JSON."""
-        # Показываем первые символы буфера с их кодами —
-        # чтобы пользователь видел, что именно вставилось.
         preview = raw.strip()
         if len(preview) > 300:
             preview = preview[:300] + "…"
 
-        # Первые 60 символов с кодами — помогает ловить BOM,
-        # HTML, «умные кавычки» и прочий мусор.
         head = preview[:60]
         head_codes = " ".join(f"{ord(c):04x}" for c in head)
 
@@ -929,8 +1065,11 @@ class TasksEditorDialog(QDialog):
                 it.get("status") or "created", "—"
             )
             due = (it.get("due_date") or "").strip() or "—"
+            number = it.get("number") or 0
+            num_prefix = f"№{number} " if number else ""
             preview_lines.append(
-                f"{i}. [{status}] {assignee} · до {due}\n   {text}"
+                f"{i}. [{status}] {num_prefix}{assignee} · до {due}\n"
+                f"   {text}"
             )
         if len(items) > 10:
             preview_lines.append(
@@ -1043,6 +1182,14 @@ class TasksEditorDialog(QDialog):
                 # не перетирать существующее.
                 if it.get("id") in existing_ids:
                     it["id"] = _new_uuid_hex()
+                # Если у элемента нет номера — выдаём новый.
+                if not it.get("number"):
+                    from ..tasks_manager import (
+                        get_next_item_number,
+                    )
+                    it["number"] = get_next_item_number(
+                        self._session_dir
+                    )
                 it["source"] = "import"
                 it["updated_at"] = _iso_now()
                 existing.append(it)
@@ -1053,6 +1200,15 @@ class TasksEditorDialog(QDialog):
                 added, len(existing),
             )
         else:
+            # При полной замене тоже выдаём номера, если их нет.
+            for it in items:
+                if not it.get("number"):
+                    from ..tasks_manager import (
+                        get_next_item_number,
+                    )
+                    it["number"] = get_next_item_number(
+                        self._session_dir
+                    )
             existing = list(items)
             log.info(
                 "Вставка JSON: заменено всё, элементов=%d",

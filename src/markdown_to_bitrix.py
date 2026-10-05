@@ -20,6 +20,10 @@
   • [LIST]...[/LIST]
   • [LIST=1]...[/LIST]
   • [*]...[/LIST]
+
+Изменения:
+  • format_action_items_to_bitrix теперь выводит сквозной
+    числовой номер поручения (№N — текст).
 """
 from __future__ import annotations
 
@@ -282,22 +286,23 @@ def format_action_items_to_bitrix(
     group_by_assignee: bool = True,
     include_status: bool = True,
     include_due_date: bool = True,
+    include_number: bool = True,
 ) -> str:
     """
     Форматирует список поручений в BB-код Bitrix24.
 
     Args:
         items:              список словарей с ключами
-                            text, assignee, status, due_date.
+                            number, text, assignee, status, due_date.
         title:              заголовок сообщения.
         group_by_assignee:  группировать по исполнителю.
         include_status:     добавлять ли статус в скобках.
         include_due_date:   добавлять ли срок.
+        include_number:     добавлять ли номер поручения (№N — ).
 
     Returns:
         Строка в BB-коде, готовая для im.message.add.
     """
-    # Импорт здесь, чтобы не тянуть лишние зависимости в начало.
     from .logger import get_logger as _get_logger
     _log = _get_logger(__name__)
 
@@ -311,9 +316,19 @@ def format_action_items_to_bitrix(
         "done": "выполнен",
     }
 
+    def _num_prefix(it: Dict[str, Any]) -> str:
+        if not include_number:
+            return ""
+        n = it.get("number") or 0
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = 0
+        return f"№{n} — " if n > 0 else ""
+
     def _format_one(it: Dict[str, Any]) -> str:
         text = (it.get("text") or "").strip() or "—"
-        parts: List[str] = [text]
+        parts: List[str] = [f"{_num_prefix(it)}{text}"]
 
         meta: List[str] = []
         if include_status:
