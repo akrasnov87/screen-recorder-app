@@ -59,9 +59,6 @@ _TRANSLIT_MAP = {
 # Символы, недопустимые в именах файлов (в т.ч. Windows).
 _BAD_FILENAME_CHARS = '<>:"/\\|?*\n\r\t'
 
-# Максимальная длина имени файла в байтах UTF-8 (с запасом до 255).
-_MAX_FILENAME_BYTES = 200
-
 
 def _to_ascii_filename(name: str) -> str:
     """Приводит имя файла к ASCII-only."""
@@ -857,6 +854,10 @@ class Bitrix24Client:
             if not fallback_name:
                 fallback_name = os.path.basename(first_path)
             message_text = fallback_name or "Файл"
+            log.info(
+                "Bitrix24: MESSAGE был пуст — подставлено имя "
+                "первого файла: %r", message_text,
+            )
 
         params: Dict[str, Any] = {
             "DIALOG_ID": dialog_id,

@@ -657,6 +657,20 @@ class ConfigManager:
         d = DEFAULT_CONFIG["app"]
         return {k: a.get(k, v) for k, v in d.items()}
 
+    def get_sessions_root(self) -> str:
+        """
+        Возвращает корневую папку всех сессий (sessions/).
+
+        Единая точка для всех модулей — чтобы путь не собирался
+        вручную в разных местах.
+        """
+        temp_path = (
+            self.config.get("storage", {}).get(
+                "temp_path", default_temp_dir()
+            )
+        )
+        return os.path.join(temp_path, "sessions")
+
     # ------------------------------------------------------------------
     # Проекты
     # ------------------------------------------------------------------

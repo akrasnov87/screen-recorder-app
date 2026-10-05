@@ -46,7 +46,7 @@ class VideoProcessor(QObject):
         self.config = config or {}
         self.task_queue = task_queue
         self._is_recording_cb = is_recording_cb
-        self._config_manager = config_manager   # ← добавить
+        self.config_manager = config_manager
         self._cancel_events: Dict[str, asyncio.Event] = {}
         self._running = False
         self._last_retry_check = 0.0
@@ -139,13 +139,13 @@ class VideoProcessor(QObject):
             vm_session = None
 
             # --- Проверка доступности транскрибации и ВМ ---
-            if transcribe_url and self._config_manager is not None:
+            if transcribe_url and self.config_manager is not None:
                 from .transcribe_vm_controller import (
                     TranscribeVMController,
                 )
 
                 controller = TranscribeVMController(
-                    self._config_manager
+                    self.config_manager
                 )
 
                 self.task_progress.emit(
@@ -1019,7 +1019,7 @@ class VideoProcessor(QObject):
                 форматирование).
         """
         from docx import Document  # type: ignore
-        from docx.shared import Pt  # type: ignore
+        from docx.shared import Pt, RGBColor  # type: ignore
         from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
 
         for idx, b in enumerate(blocks):
@@ -1031,7 +1031,7 @@ class VideoProcessor(QObject):
                 sep = doc.add_paragraph()
                 run = sep.add_run("─" * 60)
                 run.font.size = Pt(9)
-                run.font.color.rgb = None
+                run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
                 sep.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
             # --- Заголовок блока ---
@@ -1075,14 +1075,12 @@ class VideoProcessor(QObject):
                                 except Exception:
                                     pass
                         else:
-                            # Fallback: как plain text
                             plain = read_any_text(
                                 path, self._max_file_read_chars
                             )
                             for line in plain.splitlines():
                                 doc.add_paragraph(line)
                     else:
-                        # .txt, .json, .pdf, прочее — как plain
                         plain = read_any_text(
                             path, self._max_file_read_chars
                         )
@@ -1634,7 +1632,7 @@ class VideoProcessor(QObject):
             log.warning(
                 "python-docx не установлен. Сохраняю .txt вместо .docx"
             )
-            path_txt = os.path.join(session_dir, f"{base_name}.txt")
+            #path_txt = os.path.join(session_dir, f"{base_name}.txt")
             # Рекурсивно вызываем себя с fmt=txt
             return self._export_prompt_file(
                 session_dir=session_dir,
@@ -1660,7 +1658,9 @@ class VideoProcessor(QObject):
         """
         Простейшая конвертация .docx → Markdown.
 
-        Сохраняет заголовки (Heading N), списки, жирный/курсив.
+        Сохраняет заголовки (Heading N), списки, жирный/курсив,
+        таблицы (в виде pipe-таблиц).
+
         Используется, когда DeepSeek-промпт сохраняется в .md,
         но содержит .docx-вложение/протокол.
         """
@@ -1678,6 +1678,10 @@ class VideoProcessor(QObject):
             return ""
 
         lines: List[str] = []
+
+        # Абзацы + таблицы в исходном порядке сложно восстановить
+        # без обхода XML. Идём простым путём: сначала все абзацы,
+        # потом все таблицы. Для протоколов это обычно приемлемо.
         for para in doc.paragraphs:
             text = para.text or ""
             style = (para.style.name if para.style else "") or ""
@@ -1701,7 +1705,6 @@ class VideoProcessor(QObject):
                 lines.append(f"> {text}")
                 continue
 
-            # Инлайн-форматирование — грубо, по runs.
             if para.runs:
                 parts: List[str] = []
                 for run in para.runs:
@@ -1718,6 +1721,34 @@ class VideoProcessor(QObject):
                 lines.append("".join(parts))
             else:
                 lines.append(text)
+
+        # --- Таблицы ---
+        for table in doc.tables:
+            try:
+                n_cols = len(table.columns)
+                if n_cols == 0:
+                    continue
+                rows_md: List[str] = []
+                for row in table.rows:
+                    cells = [
+                        (cell.text or "").strip().replace("\n", " ")
+                        for cell in row.cells
+                    ]
+                    rows_md.append("| " + " | ".join(cells) + " |")
+
+                if rows_md:
+                    lines.append("")
+                    lines.append(rows_md[0])
+                    lines.append(
+                        "| " + " | ".join(["---"] * n_cols) + " |"
+                    )
+                    lines.extend(rows_md[1:])
+                    lines.append("")
+            except Exception as exc:
+                log.warning(
+                    "Не удалось сконвертировать таблицу из %s: %s",
+                    docx_path, exc,
+                )
 
         return "\n".join(lines)
 

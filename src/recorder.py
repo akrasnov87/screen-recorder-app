@@ -20,6 +20,7 @@ from .logger import get_logger
 from .platform_utils import (
     IS_LINUX,
     IS_WINDOWS,
+    ffmpeg_binary_name,
     is_screen_recording_available,
     screen_recording_unavailable_reason,
 )
@@ -114,7 +115,6 @@ class ScreenRecorder(QObject):
             else:
                 vf = "hwmap=derive_device=vaapi,scale_vaapi=format=nv12"
 
-            from .platform_utils import ffmpeg_binary_name
             cmd = [
                 ffmpeg_binary_name(), "-y",
                 "-f", "kmsgrab", "-device", card, "-i", "-",
@@ -141,7 +141,6 @@ class ScreenRecorder(QObject):
                     size = f"{m['width']}x{m['height']}"
                     break
 
-            from .platform_utils import ffmpeg_binary_name
             cmd = [
                 ffmpeg_binary_name(), "-y",
                 "-f", "x11grab",

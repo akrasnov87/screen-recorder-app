@@ -50,6 +50,8 @@ class MarkdownEditorDialog(QDialog):
         title: str = "Редактор Markdown",
         parent: Optional[QWidget] = None,
         default_docx_path: str = "",
+        threshold_chars: int = 0,
+        threshold_label: str = "",
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -61,9 +63,16 @@ class MarkdownEditorDialog(QDialog):
         # <session_dir>/manual_protocol.docx.
         self._default_docx_path: str = default_docx_path or ""
 
+        # Порог длины текста, после которого в Bitrix24 текст
+        # уходит файлом, а не сообщением. 0 — предупреждение
+        # не показывается.
+        self._threshold_chars: int = max(0, int(threshold_chars or 0))
+        self._threshold_label: str = threshold_label or ""
+
         self._build_ui()
         self._apply_initial(text)
         self._refresh_preview()
+        self._refresh_counter()
 
     # ------------------------------------------------------------------
     # UI
@@ -156,6 +165,9 @@ class MarkdownEditorDialog(QDialog):
         splitter.setSizes([560, 540])
         root.addWidget(splitter, 1)
 
+        # --- Счётчик символов + предупреждение о длине ---
+        root.addWidget(self._build_counter_bar())
+
         # --- Кнопки ---
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -168,11 +180,52 @@ class MarkdownEditorDialog(QDialog):
         buttons.rejected.connect(self._on_reject)
         root.addWidget(buttons)
 
+    def _build_counter_bar(self) -> QWidget:
+        """
+        Нижняя панель: счётчик символов и предупреждение,
+        если текст превышает порог «текст → файл» для Bitrix24.
+        """
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(12)
+
+        self.counter_label = QLabel("")
+        self.counter_label.setStyleSheet(
+            "QLabel { color: #666; }"
+        )
+        layout.addWidget(self.counter_label)
+
+        self.limit_label = QLabel("")
+        self.limit_label.setStyleSheet(
+            "QLabel { color: #666; }"
+        )
+        layout.addWidget(self.limit_label)
+
+        layout.addStretch()
+
+        self.warning_label = QLabel("")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setStyleSheet(
+            "QLabel {"
+            "  color: #B8860B;"
+            "  background-color: #FFF8E1;"
+            "  border: 1px solid #FFE082;"
+            "  border-radius: 4px;"
+            "  padding: 4px 8px;"
+            "}"
+        )
+        self.warning_label.setVisible(False)
+        layout.addWidget(self.warning_label, 1)
+
+        return box    
+
     def _apply_initial(self, text: str) -> None:
         self.editor.blockSignals(True)
         self.editor.setPlainText(text or "")
         self.editor.blockSignals(False)
         self.editor.textChanged.connect(self._refresh_preview)
+        self.editor.textChanged.connect(self._refresh_counter)
 
     # ------------------------------------------------------------------
     # Вставка разметки
@@ -248,6 +301,56 @@ class MarkdownEditorDialog(QDialog):
         except Exception as exc:
             log.exception("Ошибка предпросмотра Markdown: %s", exc)
             self.preview.setPlainText(f"Ошибка предпросмотра: {exc}")
+
+    def _refresh_counter(self) -> None:
+        """
+        Обновляет счётчик символов и показывает предупреждение,
+        если текст превышает порог «текст → файл» Bitrix24.
+        """
+        text = self.editor.toPlainText()
+        chars = len(text)
+        lines = text.count("\n") + 1 if text else 0
+        size_bytes = len(text.encode("utf-8"))
+
+        self.counter_label.setText(
+            f"Символов: {chars} · строк: {lines} · "
+            f"UTF-8: {size_bytes / 1024:.1f} КБ"
+        )
+
+        if self._threshold_chars > 0:
+            self.limit_label.setText(
+                f"Порог «текст → файл»: {self._threshold_chars} символов"
+            )
+        else:
+            self.limit_label.setText("")
+
+        # --- Предупреждение о превышении ---
+        if self._threshold_chars <= 0:
+            self.warning_label.setVisible(False)
+            self.warning_label.setText("")
+            return
+
+        if chars <= self._threshold_chars:
+            self.warning_label.setVisible(False)
+            self.warning_label.setText("")
+            return
+
+        # Предупреждение активно.
+        excess = chars - self._threshold_chars
+        if self._threshold_label:
+            context = f" в {self._threshold_label}"
+        else:
+            context = ""
+
+        self.warning_label.setText(
+            f"⚠ Текст ({chars} символов) превышает порог "
+            f"«текст → файл»{context} на {excess} символов.\n"
+            f"При отправке в Bitrix24 сообщение может уйти "
+            f"файлом, а не текстом. Уменьшите объём текста "
+            f"или проверьте настройку «Порог „текст → файл“» "
+            f"в Настройках → Bitrix24."
+        )
+        self.warning_label.setVisible(True)
 
     # ------------------------------------------------------------------
     # Экспорт в DOCX

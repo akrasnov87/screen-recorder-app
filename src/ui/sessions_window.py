@@ -89,10 +89,8 @@ STATUS_COLORS = {
 }
 
 
-_VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv",
-               ".mp3", ".wav", ".m4a", ".aac", ".opus", ".ogg")
-
-_AUDIO_EXTS = (".mp3", ".aac", ".wav", ".opus", ".ogg", ".m4a")
+_VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv")
+_AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".opus", ".ogg")
 
 
 # ---------------------------------------------------------------------------
@@ -1628,7 +1626,7 @@ class SessionsWindow(QDialog):
             # Обновляем запись в self._rows, чтобы _publish_after_ready
             # видела свежие данные.
             r["sync_ready"] = True
-            self._publish_after_ready(r)
+            self._maybe_publish_after_sync_ready(r, was_ready=current)
         else:
             self._notify_sync_ready(r, False)
 
@@ -2262,6 +2260,22 @@ class SessionsWindow(QDialog):
         )
         self._sync_worker.start()
 
+    def _maybe_publish_after_sync_ready(
+        self,
+        row: Dict[str, Any],
+        was_ready: bool,
+    ) -> None:
+        """
+        Публикует запись, если флаг sync_ready только что
+        установлен (был False, стал True) и включена настройка
+        app.sync_publish_on_ready.
+        """
+        if was_ready or not row.get("sync_ready"):
+            return
+        if not self._app_cfg.get("sync_publish_on_ready", True):
+            return
+        self._publish_after_ready(row)
+
     def _notify_ready_no_publish(
         self, r: Dict[str, Any], reason: str = "",
     ) -> None:
@@ -2816,10 +2830,28 @@ class SessionsWindow(QDialog):
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
 
+        threshold_chars = 0
+        threshold_label = ""
+        if self.config_manager is not None:
+            try:
+                bitrix_cfg = self.config_manager.get_bitrix_settings()
+                threshold_chars = int(
+                    bitrix_cfg.get("file_message_max_chars", 0) or 0
+                )
+                if threshold_chars > 0:
+                    threshold_label = "Bitrix24"
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать настройки Bitrix24 "
+                    "для порога: %s", exc,
+                )
+
         dlg = MarkdownEditorDialog(
             text=r.get("summary_bb") or "",
             title=f"Краткое описание — {r['name']}",
             parent=self,
+            threshold_chars=threshold_chars,
+            threshold_label=threshold_label,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3501,13 +3533,13 @@ class SessionsWindow(QDialog):
         self.refresh()
 
         # --- Авто-публикация, если флаг только что установлен ---
-        if (not old_sync_ready and new_sync_ready
-                and self._app_cfg.get("sync_publish_on_ready", True)):
-            # Ищем актуальную строку в self._rows
+        if not old_sync_ready and new_sync_ready:
             for row in self._rows:
                 if row["dir"] == r["dir"]:
                     row["sync_ready"] = True
-                    self._publish_after_ready(row)
+                    self._maybe_publish_after_sync_ready(
+                        row, was_ready=old_sync_ready,
+                    )
                     break
 
     # ------------------------------------------------------------------

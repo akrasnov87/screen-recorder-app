@@ -406,11 +406,10 @@ class TranscribeClient:
                     await asyncio.wait_for(
                         cancel_event.wait(), timeout=interval
                     )
-                    # event выставлен — выходим на следующей итерации
-                    continue
                 except asyncio.TimeoutError:
-                    # интервал истёк, event не выставлен — идём на новый poll
-                    continue
+                    pass
+                # event выставлен или таймаут истёк — идём
+                # на следующую итерацию (там проверим is_set).
             else:
                 await asyncio.sleep(interval)
 

@@ -288,6 +288,9 @@ def extend_schedule_for_now(
          <сегодняшний_день> <сейчас> <сейчас + extension_minutes>
       3. Если новая строка пересекается с существующей для того же
          дня — расширяем существующую (меняем end_min).
+      4. Если end_min переходит за полночь — добавляем два правила:
+         одно на сегодня [now_min, 24*60), второе на завтра
+         [0, end_min % (24*60)).
     """
     now = now or datetime.now()
     weekday = _iso_weekday_to_cron(now.isoweekday())
@@ -297,58 +300,123 @@ def extend_schedule_for_now(
     rules = parse_schedule_lines(schedule_content)
 
     # Ищем правило, которое покрывает [now_min, end_min)
-    for rule in rules:
-        if weekday not in rule["days"]:
-            continue
-        s, e = rule["start_min"], rule["end_min"]
-        if s == e:
-            continue
-        if s < e:
-            # Дневной интервал
-            if s <= now_min and end_min <= e:
-                return schedule_content, (
-                    f"Расписание уже покрывает текущее время "
-                    f"(правило {rule['raw']})"
-                )
-        else:
-            # Ночной интервал
-            if (now_min >= s or now_min < e):
-                # Проверяем, что end_min тоже в интервале
-                if end_min >= s or end_min < e:
+    # для случая, когда end_min не переходит за полночь.
+    if end_min <= 24 * 60:
+        for rule in rules:
+            if weekday not in rule["days"]:
+                continue
+            s, e = rule["start_min"], rule["end_min"]
+            if s == e:
+                continue
+            if s < e:
+                # Дневной интервал
+                if s <= now_min and end_min <= e:
                     return schedule_content, (
                         f"Расписание уже покрывает текущее время "
                         f"(правило {rule['raw']})"
                     )
+            else:
+                # Ночной интервал (правило уже пересекает полночь)
+                # Проверяем, что now_min и end_min оба попадают
+                # в [s, 24*60) ∪ [0, e).
+                def _in_night(x: int, s_: int, e_: int) -> bool:
+                    return x >= s_ or x < e_
+
+                if _in_night(now_min, s, e) and _in_night(end_min, s, e):
+                    return schedule_content, (
+                        f"Расписание уже покрывает текущее время "
+                        f"(правило {rule['raw']})"
+                    )
+    else:
+        # end_min переходит за полночь. Проверяем, что есть
+        # правило, покрывающее и [now_min, 24*60), и [0, end_min%1440).
+        end_next_day = end_min % (24 * 60)
+        next_weekday = _iso_weekday_to_cron(
+            (now + timedelta(days=1)).isoweekday()
+        )
+
+        covered_today = False
+        covered_tomorrow = False
+        for rule in rules:
+            s, e = rule["start_min"], rule["end_min"]
+            if s == e:
+                continue
+            if s < e:
+                # Дневной: [s, e)
+                if weekday in rule["days"]:
+                    if s <= now_min < e:
+                        covered_today = True
+                    # Хвост до полуночи от today
+                    if s <= now_min and e >= 24 * 60:
+                        covered_today = True
+                if next_weekday in rule["days"]:
+                    if s <= 0 and e >= end_next_day:
+                        covered_tomorrow = True
+            else:
+                # Ночной: [s, 24*60) ∪ [0, e)
+                if weekday in rule["days"] and now_min >= s:
+                    covered_today = True
+                if next_weekday in rule["days"] and end_next_day < e:
+                    covered_tomorrow = True
+
+        if covered_today and covered_tomorrow:
+            return schedule_content, (
+                "Расписание уже покрывает текущее время и "
+                "переход через полночь"
+            )
 
     # Ищем правило для сегодняшнего дня, которое заканчивается
-    # до end_min — его можно расширить.
-    for rule in rules:
-        if weekday not in rule["days"]:
-            continue
-        s, e = rule["start_min"], rule["end_min"]
-        if s < e and e > now_min and e < end_min:
-            # Расширяем это правило
-            old_line = rule["raw"]
-            new_line = (
-                f"{_format_days(rule['days'])} "
-                f"{_minutes_to_time(s)} {_minutes_to_time(end_min)}"
-            )
-            new_content = schedule_content.replace(
-                old_line, new_line, 1
-            )
-            return new_content, (
-                f"Расширено правило «{old_line}» → «{new_line}»"
-            )
+    # до end_min — его можно расширить (только если end_min
+    # не переходит за полночь).
+    if end_min <= 24 * 60:
+        for rule in rules:
+            if weekday not in rule["days"]:
+                continue
+            s, e = rule["start_min"], rule["end_min"]
+            if s < e and e > now_min and e < end_min:
+                old_line = rule["raw"]
+                new_line = (
+                    f"{_format_days(rule['days'])} "
+                    f"{_minutes_to_time(s)} {_minutes_to_time(end_min)}"
+                )
+                new_content = schedule_content.replace(
+                    old_line, new_line, 1
+                )
+                return new_content, (
+                    f"Расширено правило «{old_line}» → «{new_line}»"
+                )
 
-    # Иначе добавляем новую строку
-    new_line = (
-        f"{weekday} {_minutes_to_time(now_min)} "
-        f"{_minutes_to_time(end_min)}"
+    # Иначе добавляем новую строку (или две, если переход
+    # через полночь).
+    if end_min <= 24 * 60:
+        new_line = (
+            f"{weekday} {_minutes_to_time(now_min)} "
+            f"{_minutes_to_time(end_min)}"
+        )
+        new_content = (
+            schedule_content.rstrip() + "\n" + new_line + "\n"
+        )
+        return new_content, f"Добавлено правило «{new_line}»"
+
+    # Переход через полночь: два правила.
+    end_next_day = end_min % (24 * 60)
+    next_weekday = _iso_weekday_to_cron(
+        (now + timedelta(days=1)).isoweekday()
     )
-    # Если end_min < now_min (пересечение полуночи) — оставляем
-    # как есть, парсер расписания обработает.
-    new_content = schedule_content.rstrip() + "\n" + new_line + "\n"
-    return new_content, f"Добавлено правило «{new_line}»"
+    line_today = (
+        f"{weekday} {_minutes_to_time(now_min)} 23:59"
+    )
+    line_tomorrow = (
+        f"{next_weekday} 00:00 {_minutes_to_time(end_next_day)}"
+    )
+    new_content = (
+        schedule_content.rstrip()
+        + "\n" + line_today + "\n" + line_tomorrow + "\n"
+    )
+    return new_content, (
+        f"Добавлены правила «{line_today}» и «{line_tomorrow}» "
+        f"(переход через полночь)"
+    )
 
 
 def _format_days(days: List[int]) -> str:

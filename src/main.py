@@ -367,12 +367,7 @@ class ScreenRecorderApp(QObject):
         )
 
     def _sessions_root(self) -> str:
-        return os.path.join(
-            self.config_manager.config["storage"].get(
-                "temp_path", "/tmp/screen-recorder"
-            ),
-            "sessions",
-        )
+        return self.config_manager.get_sessions_root()
 
     # ------------------------------------------------------------------
     # Метаданные
@@ -1408,7 +1403,7 @@ class ScreenRecorderApp(QObject):
             self.processor.config = self.config_manager.config
             # Обновляем ссылку на ConfigManager в процессоре —
             # на случай, если он был пересоздан.
-            self.processor._config_manager = self.config_manager
+            self.processor.config_manager = self.config_manager
             self.hotkey_manager.update_hotkeys(
                 self.config_manager.config
             )

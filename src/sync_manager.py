@@ -796,6 +796,15 @@ class SyncManager:
         media_skipped: List[Dict[str, Any]] = []
         media_compressed: List[Dict[str, Any]] = []
 
+        # Сохраняем исходные размеры ДО сжатия — иначе
+        # int(size_mb * 1024 * 1024) даст потерю точности.
+        original_sizes: Dict[str, int] = {}
+        for item in media_artifacts:
+            if item.get("needs_compression"):
+                original_sizes[item["filename"]] = int(
+                    item.get("size_bytes") or 0
+                )
+
         if include_media and media_artifacts and self._use_compression():
             for idx, item in enumerate(media_artifacts, start=1):
                 if not item.get("needs_compression"):
@@ -826,7 +835,9 @@ class SyncManager:
                     media_compressed.append({
                         "kind": kind,
                         "filename": filename,
-                        "original_size_bytes": int(size_mb * 1024 * 1024),
+                        "original_size_bytes": original_sizes.get(
+                            filename, 0
+                        ),
                         "new_size_bytes": item.get("size_bytes", 0),
                     })
                 else:

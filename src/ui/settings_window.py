@@ -1674,12 +1674,7 @@ class SettingsWindow(QDialog):
 
     def _open_sync_window(self) -> None:
         try:
-            sessions_root = os.path.join(
-                self.config_manager.config.get(
-                    "storage", {}
-                ).get("temp_path", "/tmp/screen-recorder"),
-                "sessions",
-            )
+            sessions_root = self.config_manager.get_sessions_root()
             dlg = SyncWindow(
                 sessions_root=sessions_root,
                 config_manager=self.config_manager,
@@ -3862,9 +3857,30 @@ class SettingsWindow(QDialog):
     # ------------------------------------------------------------------
     def reset_to_defaults(self) -> None:
         log.warning("Сброс настроек к значениям по умолчанию")
-        self.config_manager.config = (
-            self.config_manager.get_defaults()
+        reply = QMessageBox.question(
+            self, "Сброс настроек",
+            "Сбросить все настройки к значениям по умолчанию?\n\n"
+            "Изменения будут сохранены на диск немедленно.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
+        if reply != QMessageBox.StandardButton.Yes:
+            log.info("Сброс настроек отменён пользователем")
+            return
+
+        self.config_manager.config = self.config_manager.get_defaults()
+        try:
+            self.config_manager.save()
+        except Exception as exc:
+            log.exception(
+                "Не удалось сохранить сброшенные настройки: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Ошибка",
+                f"Не удалось сохранить настройки:\n{exc}",
+            )
+            return
         self.load_settings()
 
     def toggle_password_visibility(

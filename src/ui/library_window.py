@@ -15,7 +15,7 @@ import shutil
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtCore import Qt, QDate, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
@@ -807,12 +807,10 @@ class LibraryWindow(QDialog):
     # ------------------------------------------------------------------
     @staticmethod
     def _default_from_date():
-        from PySide6.QtCore import QDate
         return QDate.currentDate().addMonths(-1)
 
     @staticmethod
     def _default_to_date():
-        from PySide6.QtCore import QDate
         return QDate.currentDate()
 
     # ------------------------------------------------------------------

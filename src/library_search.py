@@ -55,7 +55,10 @@ class SearchFilters:
     date_to: Optional[datetime] = None
     fuzzy_threshold: float = 0.82
     max_results: int = 500
-    context_chars: int = 120
+    # Контекст вокруг совпадения для сниппета в результатах
+    # поиска. Не путать с before_chars/after_chars в
+    # build_prompt_from_hits — это разные вещи.
+    snippet_context_chars: int = 120
     fuzzy_max_word_distance: int = 200
     # --- Новый фильтр по тегу ---
     # Если пусто — фильтр не применяется.
@@ -417,7 +420,7 @@ def search(
                     continue
                 for score, snippet, kind in _search_in_text(
                     text, query, filters.fuzzy_threshold,
-                    filters.context_chars, mwd,
+                    filters.snippet_context_chars, mwd,
                 ):
                     hits.append(SearchHit(
                         session_dir=session_dir,
@@ -445,7 +448,7 @@ def search(
                     continue
                 for score, snippet, kind in _search_in_text(
                     text, query, filters.fuzzy_threshold,
-                    filters.context_chars, mwd,
+                    filters.snippet_context_chars, mwd,
                 ):
                     hits.append(SearchHit(
                         session_dir=session_dir,
@@ -474,7 +477,7 @@ def search(
                 plain = markdown_to_plain_with_bb(summary_bb)
                 for score, snippet, kind in _search_in_text(
                     plain, query, filters.fuzzy_threshold,
-                    filters.context_chars, mwd,
+                    filters.snippet_context_chars, mwd,
                 ):
                     hits.append(SearchHit(
                         session_dir=session_dir,
@@ -508,7 +511,7 @@ def search(
                         continue
                     for score, snippet, kind in _search_in_text(
                         text, query, filters.fuzzy_threshold,
-                        filters.context_chars, mwd,
+                        filters.snippet_context_chars, mwd,
                     ):
                         hits.append(SearchHit(
                             session_dir=session_dir,
