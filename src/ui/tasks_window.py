@@ -46,6 +46,7 @@ from ..tasks_manager import (
 )
 from .tasks_editor_dialog import TasksEditorDialog
 from .tooltips import attach_tooltip, make_info_icon, with_info
+from .send_to_employees_dialog import SendToEmployeesDialog
 
 log = get_logger(__name__)
 
@@ -472,12 +473,35 @@ class TasksWindow(QDialog):
         filters.addWidget(self.context_filter)
 
         filters.addSpacing(8)
+
+        search_container = QWidget()
+        search_row = QHBoxLayout(search_container)
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(4)
+
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText(
-            "Поиск по тексту поручения…"
+            "Поиск по тексту поручения, названию записи, "
+            "исполнителю…"
         )
+        self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self._reload_table)
-        filters.addWidget(self.search_input, 1)
+        self.search_input.textChanged.connect(
+            self._on_search_text_changed
+        )
+        attach_tooltip(self.search_input, "tasks_search_input")
+        search_row.addWidget(self.search_input, 1)
+
+        self.search_clear_btn = QPushButton("Сбросить")
+        self.search_clear_btn.setToolTip(
+            "Очистить поле поиска"
+        )
+        self.search_clear_btn.clicked.connect(
+            self._on_clear_search
+        )
+        search_row.addWidget(self.search_clear_btn, 0)
+
+        filters.addWidget(search_container, 1)
 
         root.addLayout(filters)
 
@@ -632,6 +656,19 @@ class TasksWindow(QDialog):
         self.send_bitrix_btn.clicked.connect(self._send_to_bitrix)
         bottom.addWidget(self.send_bitrix_btn)
 
+        self.send_employees_btn = QPushButton(
+            "Отправить сотрудникам…"
+        )
+        self.send_employees_btn.setToolTip(
+            "Сопоставить исполнителей из поручений с сотрудниками "
+            "из справочника и отправить каждому его поручения "
+            "отдельным сообщением."
+        )
+        self.send_employees_btn.clicked.connect(
+            self._send_to_employees
+        )
+        bottom.addWidget(self.send_employees_btn)
+
         self.close_btn = QPushButton("Закрыть")
         self.close_btn.clicked.connect(self.close)
         bottom.addWidget(self.close_btn)
@@ -640,6 +677,65 @@ class TasksWindow(QDialog):
         # --- Первичная инициализация состояния фильтров ---
         # Вызывается ОДИН раз, когда все виджеты уже созданы.
         self._on_due_filter_toggled(False)
+
+    def _send_to_employees(self) -> None:
+        """Открывает диалог сопоставления и рассылки по сотрудникам."""
+        items = self._selected_items()
+        if not items:
+            QMessageBox.information(
+                self, "Поручения",
+                "Выберите поручения для отправки.",
+            )
+            return
+
+        if self._config_manager is None:
+            QMessageBox.warning(
+                self, "Поручения",
+                "Нет доступа к настройкам (ConfigManager).",
+            )
+            return
+
+        bitrix_cfg = self._config_manager.get_bitrix_settings()
+        if not bitrix_cfg.get("enabled"):
+            QMessageBox.information(
+                self, "Bitrix24",
+                "Интеграция с Bitrix24 отключена.\n\n"
+                "Включите её в Настройки → Bitrix24.",
+            )
+            return
+
+        employees = self._config_manager.get_employees()
+        if not employees:
+            QMessageBox.information(
+                self, "Поручения",
+                "Справочник сотрудников пуст.\n\n"
+                "Добавьте сотрудников в Настройки → Сотрудники, "
+                "чтобы использовать этот способ отправки.",
+            )
+            return
+
+        # Проверяем, есть ли вообще у поручений исполнители.
+        has_assignees = any(
+            (it.get("assignee") or "").strip()
+            for it in items
+        )
+        if not has_assignees:
+            QMessageBox.information(
+                self, "Поручения",
+                "У выбранных поручений не заполнено поле "
+                "«Исполнитель».\n\n"
+                "Отправка сотрудникам невозможна — не с чем "
+                "сопоставлять.",
+            )
+            return
+
+        dlg = SendToEmployeesDialog(
+            items=items,
+            employees=employees,
+            bitrix_cfg=bitrix_cfg,
+            parent=self,
+        )
+        dlg.exec()
 
     def _on_due_filter_toggled(self, enabled: bool) -> None:
         if not hasattr(self, "due_from"):
@@ -650,6 +746,37 @@ class TasksWindow(QDialog):
             self.due_to.setEnabled(enabled)
         if hasattr(self, "sort_by_due_check"):
             self._reload_table()
+
+    def _on_search_text_changed(self, _text: str) -> None:
+        """Обновляет счётчик найденного при вводе в поле поиска."""
+        self._update_search_hint()
+
+    def _on_clear_search(self) -> None:
+        """Очищает поле поиска и перезагружает таблицу."""
+        self.search_input.clear()
+        self._reload_table()
+        self._update_search_hint()
+
+    def _update_search_hint(self) -> None:
+        """
+        Показывает в подсказке поля поиска, сколько записей
+        найдено по текущему запросу. Полезно, когда список
+        большой и нужно быстро оценить результат.
+        """
+        query = (self.search_input.text() or "").strip()
+        if not query:
+            self.search_input.setToolTip(
+                "Поиск идёт по тексту поручения, названию "
+                "записи (контексту), исполнителю, "
+                "комментарию и проекту."
+            )
+            return
+
+        total = len(self._items)
+        shown = self.table.rowCount()
+        self.search_input.setToolTip(
+            f"Найдено: {shown} из {total} поручений."
+        )
 
     # ------------------------------------------------------------------
     # Данные
@@ -756,6 +883,11 @@ class TasksWindow(QDialog):
         due_from = self.due_from.date()
         due_to = self.due_to.date()
 
+        # Нормализуем запрос: схлопываем повторные пробелы и
+        # убираем пробелы по краям — чтобы «  Иванов  И.И.»
+        # совпадал так же, как «Иванов И.И.».
+        query_norm = " ".join(query.split())
+
         result: List[Dict[str, Any]] = []
         for it in self._items:
             if status_f and it.get("status") != status_f:
@@ -766,13 +898,24 @@ class TasksWindow(QDialog):
                 continue
             if project_f and self._project_of(it) != project_f:
                 continue
-            if query:
-                haystack = (
-                    (it.get("text") or "") + " " +
-                    (it.get("comment") or "") + " " +
-                    (it.get("assignee") or "")
-                ).lower()
-                if query not in haystack:
+
+            # --- Поиск по свободному тексту ---
+            # ВАЖНО: ищем не только по тексту поручения, но и по
+            # названию записи (контексту), исполнителю и
+            # комментарию. Так одно поле закрывает все типовые
+            # сценарии: «найди всё про Иванова», «что было на
+            # совещании по проекту X», «все поручения с
+            # "миграцией"».
+            if query_norm:
+                haystack = " ".join([
+                    it.get("text") or "",
+                    it.get("comment") or "",
+                    it.get("assignee") or "",
+                    it.get("session_name") or "",
+                    self._project_of(it) or "",
+                ]).lower()
+                haystack_norm = " ".join(haystack.split())
+                if query_norm not in haystack_norm:
                     continue
 
             # --- Только просроченные ---
@@ -920,7 +1063,13 @@ class TasksWindow(QDialog):
         )
         if overdue_count:
             stats += f" · просрочено: {overdue_count}"
+
+        query = (self.search_input.text() or "").strip()
+        if query:
+            stats += f" · поиск: «{query}»"
+
         self.stats_label.setText(stats)
+        self._update_search_hint()
 
     def _update_selection_stats(self) -> None:
         try:

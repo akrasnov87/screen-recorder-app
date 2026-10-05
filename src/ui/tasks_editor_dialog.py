@@ -14,16 +14,19 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QDate, Qt
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QCheckBox, QDateEdit, QDialog,
+    QApplication, QAbstractItemView, QComboBox, QCheckBox, QDateEdit, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox,
     QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
-
+from ..tasks_json_parser import (
+    ParseResult,
+    parse_action_items_json,
+)
 from ..file_readers import read_json_file
 from ..logger import get_logger
 from ..tasks_manager import (
@@ -44,6 +47,15 @@ from ..tasks_manager import (
 )
 from ..utils import safe_local_path
 from .tooltips import attach_tooltip, make_info_icon, with_info
+
+import uuid
+from datetime import datetime
+
+def _new_uuid_hex() -> str:
+    return uuid.uuid4().hex
+
+def _iso_now() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()
 
 log = get_logger(__name__)
 
@@ -380,6 +392,20 @@ class TasksEditorDialog(QDialog):
         self.export_btn.clicked.connect(self._export_json)
         actions.addWidget(self.export_btn)
 
+        self.paste_btn = QPushButton("Вставить JSON…")
+        self.paste_btn.setToolTip(
+            "Вставить поручения из буфера обмена.\n\n"
+            "Поддерживаются:\n"
+            "  • полный JSON action_items.json;\n"
+            "  • массив поручений;\n"
+            "  • один объект-поручение;\n"
+            "  • русские синонимы полей (текст/исполнитель/"
+            "срок/статус).\n\n"
+            "Горячая клавиша: Ctrl+Shift+V"
+        )
+        self.paste_btn.clicked.connect(self._paste_json)
+        actions.addWidget(self.paste_btn)
+
         actions.addStretch()
 
         self.stats_label = QLabel("")
@@ -407,6 +433,11 @@ class TasksEditorDialog(QDialog):
         bottom.addWidget(self.cancel_btn)
 
         root.addLayout(bottom)
+
+        # --- Горячие клавиши ---
+        QShortcut(
+            QKeySequence("Ctrl+Shift+V"), self
+        ).activated.connect(self._paste_json)
 
         # --- Первичная инициализация состояния фильтров ---
         # Вызывается ОДИН раз, когда все виджеты уже созданы.
@@ -798,6 +829,246 @@ class TasksEditorDialog(QDialog):
                 self, "Экспорт поручений",
                 "Не удалось сохранить файл.",
             )
+
+    def _paste_json(self) -> None:
+        """Вставляет поручения из буфера обмена."""
+        try:
+            clipboard = QApplication.clipboard()
+            raw = clipboard.text()
+        except Exception as exc:
+            log.exception(
+                "Не удалось прочитать буфер обмена: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Вставка JSON",
+                f"Не удалось прочитать буфер обмена:\n{exc}",
+            )
+            return
+
+        if not raw or not raw.strip():
+            QMessageBox.information(
+                self, "Вставка JSON",
+                "Буфер обмена пуст.",
+            )
+            return
+
+        result = parse_action_items_json(raw)
+
+        if not result:
+            self._show_paste_error(raw, result.warning)
+            return
+
+        self._show_paste_preview(result)
+
+    def _show_paste_error(self, raw: str, warning: str) -> None:
+        """Показывает подробную ошибку парсинга JSON."""
+        # Показываем первые символы буфера с их кодами —
+        # чтобы пользователь видел, что именно вставилось.
+        preview = raw.strip()
+        if len(preview) > 300:
+            preview = preview[:300] + "…"
+
+        # Первые 60 символов с кодами — помогает ловить BOM,
+        # HTML, «умные кавычки» и прочий мусор.
+        head = preview[:60]
+        head_codes = " ".join(f"{ord(c):04x}" for c in head)
+
+        QMessageBox.warning(
+            self, "Вставка JSON — ошибка",
+            f"<b>Не удалось разобрать JSON из буфера обмена.</b>"
+            f"<br><br>"
+            f"<b>Причина:</b><br>"
+            f"<span style='color:#B8860B'>"
+            f"{html.escape(warning or 'Неизвестная ошибка.')}"
+            f"</span>"
+            f"<br><br>"
+            f"<b>Начало буфера (первые 300 символов):</b>"
+            f"<pre style='font-family:monospace; font-size:9pt; "
+            f"background:#f5f5f5; padding:6px; "
+            f"border:1px solid #ddd;'>"
+            f"{html.escape(preview)}"
+            f"</pre>"
+            f"<b>Коды первых 60 символов (hex):</b>"
+            f"<pre style='font-family:monospace; font-size:8pt; "
+            f"background:#f5f5f5; padding:6px; "
+            f"border:1px solid #ddd;'>"
+            f"{html.escape(head_codes)}"
+            f"</pre>"
+            f"<b>Что можно сделать:</b><br>"
+            f"• Скопируйте JSON из <i>текстового</i> редактора "
+            f"(не из браузера — он может добавить HTML/RTF).<br>"
+            f"• Убедитесь, что текст начинается с <code>{{</code> "
+            f"или <code>[</code>.<br>"
+            f"• Проверьте, что нет «умных кавычек» "
+            f"(<code>“ ” ‘ ’</code>) — нужны обычные "
+            f"<code>\"</code>.<br>"
+            f"• При вставке из чата уберите лишний текст "
+            f"(приветствия, подписи).",
+        )
+
+    def _show_paste_preview(self, result: ParseResult) -> None:
+        """Показывает диалог предпросмотра перед импортом."""
+        items = result.items
+        format_labels = {
+            "object_with_items": "полный объект action_items.json",
+            "array": "массив поручений",
+            "single_item": "одиночное поручение",
+        }
+        fmt = format_labels.get(
+            result.format_kind, result.format_kind or "неизвестный",
+        )
+
+        # --- Превью первых элементов ---
+        preview_lines: List[str] = []
+        for i, it in enumerate(items[:10], start=1):
+            text = (it.get("text") or "").strip()
+            if len(text) > 80:
+                text = text[:77] + "…"
+            assignee = (it.get("assignee") or "").strip() or "—"
+            status = STATUS_LABELS.get(
+                it.get("status") or "created", "—"
+            )
+            due = (it.get("due_date") or "").strip() or "—"
+            preview_lines.append(
+                f"{i}. [{status}] {assignee} · до {due}\n   {text}"
+            )
+        if len(items) > 10:
+            preview_lines.append(
+                f"… и ещё {len(items) - 10}"
+            )
+        preview_text = "\n".join(preview_lines) or "(нет элементов)"
+
+        # --- Диалог ---
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Вставка JSON — предпросмотр")
+        dlg.setModal(True)
+        dlg.setMinimumSize(720, 560)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        info = QLabel(
+            f"<b>Формат:</b> {html.escape(fmt)}<br>"
+            f"<b>Поручений:</b> {len(items)}"
+            + (
+                f"<br><b>Имя сессии:</b> "
+                f"{html.escape(result.session_name)}"
+                if result.session_name else ""
+            )
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        if result.warning:
+            warn = QLabel(
+                f"<span style='color:#B8860B'>"
+                f"⚠ {html.escape(result.warning)}</span>"
+            )
+            warn.setWordWrap(True)
+            layout.addWidget(warn)
+
+        layout.addWidget(QLabel("<b>Предпросмотр:</b>"))
+
+        preview_label = QLabel(preview_text)
+        preview_label.setWordWrap(True)
+        preview_label.setTextFormat(Qt.TextFormat.PlainText)
+        preview_label.setStyleSheet(
+            "QLabel {"
+            "  background-color: #f5f5f5;"
+            "  border: 1px solid #ddd;"
+            "  border-radius: 4px;"
+            "  padding: 8px;"
+            "  font-family: monospace;"
+            "  color: #333;"
+            "}"
+        )
+        preview_label.setMinimumHeight(200)
+        layout.addWidget(preview_label, 1)
+
+        # --- Режим импорта ---
+        mode_label = QLabel(
+            "<b>Что делать с текущими поручениями?</b>"
+        )
+        layout.addWidget(mode_label)
+
+        merge_check = QCheckBox(
+            "Добавить к существующим (иначе — заменить все)"
+        )
+        merge_check.setChecked(True)
+        merge_check.setToolTip(
+            "• Включено — новые поручения добавятся к тем, "
+            "что уже есть в записи.\n"
+            "• Выключено — все текущие поручения будут удалены, "
+            "останутся только вставленные."
+        )
+        layout.addWidget(merge_check)
+
+        # --- Кнопки ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=dlg,
+        )
+        buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        ).setText("Вставить")
+        buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        ).setText("Отмена")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        merge = merge_check.isChecked()
+        self._apply_pasted_items(items, merge=merge)
+
+    def _apply_pasted_items(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        merge: bool,
+    ) -> None:
+        """Применяет вставленные поручения к текущим данным."""
+        existing = self._data.get("items", []) or []
+
+        if merge:
+            existing_ids = {it.get("id") for it in existing}
+            added = 0
+            for it in items:
+                # Если id уже есть — генерируем новый, чтобы
+                # не перетирать существующее.
+                if it.get("id") in existing_ids:
+                    it["id"] = _new_uuid_hex()
+                it["source"] = "import"
+                it["updated_at"] = _iso_now()
+                existing.append(it)
+                existing_ids.add(it["id"])
+                added += 1
+            log.info(
+                "Вставка JSON: добавлено %d (всего %d)",
+                added, len(existing),
+            )
+        else:
+            existing = list(items)
+            log.info(
+                "Вставка JSON: заменено всё, элементов=%d",
+                len(existing),
+            )
+
+        self._data["items"] = existing
+        self._save()
+        self._rebuild_assignees()
+        self._reload_table()
+
+        QMessageBox.information(
+            self, "Вставка JSON",
+            f"Применено поручений: {len(items)}\n"
+            f"Всего в записи: {len(existing)}",
+        )
 
     # ------------------------------------------------------------------
     # Служебное

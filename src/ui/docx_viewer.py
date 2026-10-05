@@ -24,6 +24,12 @@ import os
 import shutil
 from typing import List, Optional, Tuple
 
+import html as _html
+from PySide6.QtWidgets import QApplication
+from ..action_items_prompt_builder import (
+    regenerate_action_items_prompt,
+)
+
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import (
     QDesktopServices, QFont, QKeySequence, QShortcut,
@@ -161,6 +167,21 @@ class DocxViewerDialog(QDialog):
         )
         self.open_external_btn.clicked.connect(self._open_external)
         bottom.addWidget(self.open_external_btn)
+
+        self.regen_prompt_btn = QPushButton(
+            "Обновить промпт поручений"
+        )
+        self.regen_prompt_btn.setToolTip(
+            "Пересобрать файл action_items_prompt.<ext> на основе "
+            "текущего протокола в папке записи.\n\n"
+            "Полезно после ручной правки протокола.\n\n"
+            "Промпт формируется отдельно от обработки записи "
+            "и перезаписывает существующий файл."
+        )
+        self.regen_prompt_btn.clicked.connect(
+            self._regenerate_action_items_prompt
+        )
+        bottom.addWidget(self.regen_prompt_btn)
 
         self.close_btn = QPushButton("Закрыть")
         self.close_btn.setToolTip("Закрыть окно (Esc).")
@@ -302,9 +323,15 @@ class DocxViewerDialog(QDialog):
         has_file = bool(
             self._docx_path and os.path.isfile(self._docx_path)
         )
+        has_dir = bool(
+            self._docx_path
+            and os.path.isdir(os.path.dirname(self._docx_path))
+        )
         self.copy_all_btn.setEnabled(has_text)
         self.save_as_btn.setEnabled(has_file)
         self.open_external_btn.setEnabled(has_file)
+        if hasattr(self, "regen_prompt_btn"):
+            self.regen_prompt_btn.setEnabled(has_dir)
 
     # ------------------------------------------------------------------
     # Поиск
@@ -490,6 +517,119 @@ class DocxViewerDialog(QDialog):
         QDesktopServices.openUrl(
             QUrl.fromLocalFile(self._docx_path)
         )
+
+    def _regenerate_action_items_prompt(self) -> None:
+        """
+        Пересобирает action_items_prompt.<ext> на основе
+        протокола в папке записи.
+        """
+        session_dir = os.path.dirname(self._docx_path or "")
+        if not session_dir or not os.path.isdir(session_dir):
+            QMessageBox.warning(
+                self, "Промпт поручений",
+                f"Папка записи не найдена:\n{session_dir}",
+            )
+            return
+
+        # --- Спрашиваем про перезапись (RichText!) ---
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Обновление промпта поручений")
+        msg_box.setIcon(QMessageBox.Icon.Question)
+        msg_box.setTextFormat(Qt.TextFormat.RichText)
+        msg_box.setText(
+            f"Пересобрать <code>action_items_prompt</code> "
+            f"на основе протокола:<br>"
+            f"<code>{_html.escape(os.path.basename(self._docx_path or ''))}</code>"
+            f"<br><br>"
+            f"Папка записи:<br>"
+            f"<code>{_html.escape(session_dir)}</code><br><br>"
+            f"Существующий файл промпта (если есть) будет "
+            f"перезаписан.<br><br>"
+            f"Продолжить?"
+        )
+        msg_box.setStandardButtons(
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+        )
+        msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
+
+        reply = msg_box.exec()
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # --- Конфиг: формат и шаблон ---
+        fmt = "docx"
+        template = ""
+        session_name = ""
+        session_date = ""
+
+        try:
+            # Имя записи и дата — из session.json, если есть.
+            from ..file_readers import read_json_file
+            meta = read_json_file(
+                os.path.join(session_dir, "session.json")
+            ) or {}
+            session_name = str(meta.get("name") or "")
+            session_date = str(meta.get("date") or "")
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать session.json: %s", exc
+            )
+
+        # Формат и шаблон берём из конфига.
+        try:
+            from ..config_manager import ConfigManager
+            cm = ConfigManager()
+            scrum = cm.config.get("scrum", {}) or {}
+            fmt = str(
+                scrum.get("export_format") or "docx"
+            ).lower()
+            template = str(
+                scrum.get("action_items_prompt_template") or ""
+            )
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать настройки: %s", exc
+            )
+
+        # --- Запускаем ---
+        QApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
+        try:
+            res = regenerate_action_items_prompt(
+                session_dir=session_dir,
+                fmt=fmt,
+                template=template,
+                session_name=session_name,
+                session_date=session_date,
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # --- Итог ---
+        if res.get("ok"):
+            log.info(
+                "Промпт поручений пересобран из UI: %s",
+                res["path"],
+            )
+            QMessageBox.information(
+                self, "Промпт поручений",
+                f"Файл обновлён:\n{res['path']}\n\n"
+                f"Источник протокола:\n"
+                f"{res.get('protocol_path') or '—'}\n\n"
+                f"Символов протокола: "
+                f"{res.get('protocol_chars', 0)}",
+            )
+        else:
+            warn = res.get("warning") or "Неизвестная ошибка"
+            log.warning(
+                "Не удалось пересобрать промпт: %s", warn
+            )
+            QMessageBox.warning(
+                self, "Промпт поручений",
+                f"Не удалось сформировать файл:\n\n{warn}",
+            )
 
 
 # ---------------------------------------------------------------------------

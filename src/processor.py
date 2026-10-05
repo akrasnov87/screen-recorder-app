@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -464,6 +465,95 @@ class VideoProcessor(QObject):
                     transcript_path,
                 )
 
+            # ============================================================
+            # Шаг 4: формирование файла-промпта для поручений
+            # ============================================================
+            scrum_cfg = self.config.get("scrum", {}) or {}
+            generate_action_items = bool(
+                scrum_cfg.get("generate_action_items", True)
+            )
+
+            if generate_action_items:
+                self.task_progress.emit(
+                    task_id, 85, "Формирование промпта поручений…"
+                )
+
+                from .action_items_prompt_builder import (
+                    read_protocol_text,
+                    regenerate_action_items_prompt,
+                )
+
+                session_dir = os.path.dirname(video_path)
+
+                # --- Читаем протокол ---
+                protocol_text, protocol_source = read_protocol_text(
+                    session_dir, max_chars=self._max_file_read_chars
+                )
+                if protocol_source and protocol_text:
+                    log.info(
+                        "[%s] Протокол прочитан для промпта поручений: "
+                        "%s (%d символов)",
+                        task_id, protocol_source, len(protocol_text),
+                    )
+                elif protocol_source:
+                    log.warning(
+                        "[%s] Протокол %s найден, но пустой/нечитаемый",
+                        task_id, protocol_source,
+                    )
+                else:
+                    log.warning(
+                        "[%s] Промпт поручений: протокол не найден "
+                        "в папке %s — файл будет содержать только "
+                        "инструкцию",
+                        task_id, session_dir,
+                    )
+
+                # --- Сохраняем файл-промпт ---
+                try:
+                    res = await asyncio.to_thread(
+                        regenerate_action_items_prompt,
+                        session_dir=session_dir,
+                        fmt=str(
+                            scrum_cfg.get("export_format") or "docx"
+                        ),
+                        template=str(
+                            scrum_cfg.get(
+                                "action_items_prompt_template"
+                            ) or ""
+                        ),
+                        session_name=str(
+                            metadata.get("name") or ""
+                        ),
+                        session_date=str(
+                            metadata.get("date") or ""
+                        ),
+                        max_chars=self._max_file_read_chars,
+                    )
+                    if res.get("ok"):
+                        log.info(
+                            "[%s] Промпт поручений готов: %s "
+                            "(источник протокола: %s)",
+                            task_id, res["path"],
+                            res.get("protocol_path") or "—",
+                        )
+                    else:
+                        log.warning(
+                            "[%s] Не удалось сформировать промпт "
+                            "поручений: %s",
+                            task_id, res.get("warning"),
+                        )
+                except Exception as exc:
+                    log.exception(
+                        "[%s] Не удалось собрать промпт поручений: %s",
+                        task_id, exc,
+                    )
+            else:
+                log.info(
+                    "[%s] Формирование промпта поручений отключено "
+                    "(scrum.generate_action_items=false)",
+                    task_id,
+                )
+
             # --- Завершение ---
             self.task_queue.update_task_status(task_id, "completed", 100)
             self.task_progress.emit(task_id, 100, "completed")
@@ -754,6 +844,132 @@ class VideoProcessor(QObject):
         )
 
     # ------------------------------------------------------------------
+    # Сохранение промпта и ответа для поручений
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _save_action_items_prompt(
+        *,
+        session_dir: str,
+        system_prompt: str,
+        user_prompt: str,
+        model: str,
+        task_id: str,
+    ) -> Optional[str]:
+        """
+        Сохраняет промпт поручений в файл внутри папки сессии.
+
+        Создаёт два файла:
+          • action_items_prompt.txt — только system-промпт
+            (то, что реально «инструктирует» модель);
+          • action_items_request.txt — полный запрос
+            (system + входные данные), для отладки.
+
+        Возвращает путь к основному файлу или None.
+        """
+        if not session_dir or not os.path.isdir(session_dir):
+            log.warning(
+                "[%s] _save_action_items_prompt: папка сессии "
+                "не найдена: %s", task_id, session_dir,
+            )
+            return None
+
+        # --- Основной файл: только промпт ---
+        prompt_path = os.path.join(
+            session_dir, "action_items_prompt.txt"
+        )
+        try:
+            with open(prompt_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "===== ACTION ITEMS PROMPT =====\n"
+                    f"Модель: {model}\n"
+                    f"Сформирован: {datetime.now().isoformat()}\n"
+                    "\n"
+                    "----- SYSTEM PROMPT -----\n"
+                    f"{system_prompt}\n"
+                )
+            log.info(
+                "[%s] Промпт поручений сохранён: %s (%d симв)",
+                task_id, prompt_path, len(system_prompt),
+            )
+        except Exception as exc:
+            log.warning(
+                "[%s] Не удалось сохранить %s: %s",
+                task_id, prompt_path, exc,
+            )
+            return None
+
+        # --- Дополнительный файл: полный запрос ---
+        request_path = os.path.join(
+            session_dir, "action_items_request.txt"
+        )
+        try:
+            with open(request_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "===== ACTION ITEMS REQUEST =====\n"
+                    f"Модель: {model}\n"
+                    f"Сформирован: {datetime.now().isoformat()}\n"
+                    f"Символов: system={len(system_prompt)}, "
+                    f"user={len(user_prompt)}\n"
+                    "\n"
+                    "----- SYSTEM PROMPT -----\n"
+                    f"{system_prompt}\n"
+                    "\n"
+                    "----- USER MESSAGE -----\n"
+                    f"{user_prompt}\n"
+                )
+            log.debug(
+                "[%s] Полный запрос поручений сохранён: %s",
+                task_id, request_path,
+            )
+        except Exception as exc:
+            log.warning(
+                "[%s] Не удалось сохранить %s: %s",
+                task_id, request_path, exc,
+            )
+
+        return prompt_path
+
+    @staticmethod
+    def _save_action_items_raw_response(
+        *,
+        session_dir: str,
+        raw: str,
+        task_id: str,
+    ) -> Optional[str]:
+        """
+        Сохраняет сырой ответ LLM в action_items_response_raw.txt.
+
+        Полезно при отладке: если парсер не смог разобрать JSON,
+        видно, что именно вернула модель.
+        """
+        if not session_dir or not os.path.isdir(session_dir):
+            return None
+
+        path = os.path.join(
+            session_dir, "action_items_response_raw.txt"
+        )
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(
+                    "===== ACTION ITEMS RAW RESPONSE =====\n"
+                    f"Сформирован: {datetime.now().isoformat()}\n"
+                    f"Символов: {len(raw)}\n"
+                    "\n"
+                    f"{raw}\n"
+                )
+            log.debug(
+                "[%s] Сырой ответ LLM сохранён: %s (%d симв)",
+                task_id, path, len(raw),
+            )
+            return path
+        except Exception as exc:
+            log.warning(
+                "[%s] Не удалось сохранить сырой ответ %s: %s",
+                task_id, path, exc,
+            )
+            return None
+
+    # ------------------------------------------------------------------
     # Вложения
     # ------------------------------------------------------------------
     def _read_attachments_text(self, paths: List[str]) -> str:
@@ -993,6 +1209,7 @@ class VideoProcessor(QObject):
             fmt=export_format,
         )
 
+    
     # ------------------------------------------------------------------
     # Рендеринг блоков промпта в DOCX / MD / TXT
     # ------------------------------------------------------------------
@@ -1752,6 +1969,58 @@ class VideoProcessor(QObject):
 
         return "\n".join(lines)
 
+    def _build_action_items_prompt_file(
+        self,
+        *,
+        session_dir: str,
+        protocol_text: str,
+        session_name: str = "",
+        session_date: str = "",
+        task_id: str = "",
+    ) -> str:
+        """
+        Формирует action_items_prompt.<ext> через общий модуль.
+
+        Обёртка над action_items_prompt_builder, чтобы processor
+        мог передать свой конфиг (шаблон, формат).
+        """
+        from .action_items_prompt_builder import (
+            build_prompt_blocks,
+            write_prompt_file,
+        )
+
+        scrum_cfg = self.config.get("scrum", {}) or {}
+        template = str(
+            scrum_cfg.get("action_items_prompt_template")
+            or ""
+        ).strip()
+        fmt = str(
+            scrum_cfg.get("export_format") or "docx"
+        ).lower()
+        if fmt not in ("docx", "md", "txt"):
+            fmt = "docx"
+
+        blocks = build_prompt_blocks(
+            protocol_text=protocol_text,
+            session_name=session_name,
+            session_date=session_date,
+            template=template,
+        )
+
+        log.info(
+            "[%s] Сборка промпта поручений: формат=%s, "
+            "протокол=%d символов, шаблон=%d символов",
+            task_id, fmt,
+            len(protocol_text or ""), len(template),
+        )
+
+        path = write_prompt_file(
+            session_dir=session_dir,
+            blocks=blocks,
+            fmt=fmt,
+        )
+        return path
+
     # ------------------------------------------------------------------
     # Управление
     # ------------------------------------------------------------------
@@ -1886,6 +2155,162 @@ class VideoProcessor(QObject):
     def stop(self) -> None:
         log.info("Остановка воркера обработки")
         self._running = False
+
+    async def _extract_action_items_via_llm(
+        self,
+        *,
+        task_id: str,
+        session_dir: str,
+        transcript: str,
+        protocol_text: str = "",
+        session_name: str = "",
+        session_date: str = "",
+    ) -> List[Dict[str, Any]]:
+        """
+        Извлекает поручения из стенограммы/протокола через LiteLLM.
+
+        Возвращает список нормализованных элементов (dict в формате
+        tasks_manager). При ошибке возвращает пустой список — общий
+        пайплайн из-за этого не должен падать.
+
+        Промпт сохраняется в файл action_items_prompt.txt внутри
+        папки сессии — по аналогии с deepseek_prompt.docx.
+        """
+        from .litellm_client import LiteLLMClient, LiteLLMError
+        from .tasks_manager import make_item
+
+        # --- Настройки суммаризатора (LiteLLM) ---
+        sum_cfg = self.config.get("summarizer", {}) or {}
+        l = sum_cfg.get("litellm", {}) or {}
+
+        base_url = str(l.get("base_url", "")).strip()
+        if not base_url:
+            log.info(
+                "[%s] Поручения: LiteLLM не настроен — пропускаем",
+                task_id,
+            )
+            return []
+
+        api_key = str(l.get("api_key", ""))
+        model = str(l.get("model", "gpt-4o-mini"))
+        max_tokens = int(l.get("max_tokens", 2200))
+        connect_timeout = float(l.get("connect_timeout", 15))
+        read_timeout = float(l.get("read_timeout", 300))
+
+        # --- Шаблон промпта ---
+        scrum_cfg = self.config.get("scrum", {}) or {}
+        from .config_manager import DEFAULT_ACTION_ITEMS_PROMPT
+        template = str(
+            scrum_cfg.get("action_items_prompt_template")
+            or DEFAULT_ACTION_ITEMS_PROMPT
+        )
+
+        # --- Формируем user-сообщение ---
+        parts: List[str] = []
+        if session_name:
+            parts.append(f"# {session_name}")
+            parts.append("")
+        if session_date:
+            parts.append(f"Дата совещания: {session_date}")
+            parts.append("")
+
+        if protocol_text.strip():
+            parts.append("=== ПРОТОКОЛ ===")
+            parts.append(protocol_text.strip())
+            parts.append("")
+
+        if transcript.strip():
+            parts.append("=== СТЕНОГРАММА ===")
+            parts.append(transcript.strip())
+
+        user_message = "\n".join(parts)
+
+        log.info(
+            "[%s] Извлечение поручений через LiteLLM: "
+            "модель=%s, промпт=%d симв, вход=%d симв",
+            task_id, model, len(template), len(user_message),
+        )
+
+        # --- НОВОЕ: сохраняем промпт в файл папки сессии ---
+        try:
+            self._save_action_items_prompt(
+                session_dir=session_dir,
+                system_prompt=template,
+                user_prompt=user_message,
+                model=model,
+                task_id=task_id,
+            )
+        except Exception as exc:
+            # Сохранение промпта — вспомогательная операция,
+            # не должна ломать пайплайн.
+            log.warning(
+                "[%s] Не удалось сохранить промпт поручений: %s",
+                task_id, exc,
+            )
+
+        try:
+            async with LiteLLMClient(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            ) as client:
+                raw = await client.chat_completion(
+                    system_prompt=template,
+                    user_prompt=user_message,
+                    model=model,
+                    # Для JSON-ответов лучше минимум температуры.
+                    temperature=0.05,
+                    max_tokens=max_tokens,
+                )
+        except LiteLLMError as exc:
+            log.error(
+                "[%s] Ошибка LiteLLM при извлечении поручений: %s",
+                task_id, exc,
+            )
+            return []
+
+        if not raw or not raw.strip():
+            log.warning("[%s] LiteLLM вернул пустой ответ", task_id)
+            return []
+
+        # --- Сохраняем сырой ответ модели (для отладки) ---
+        try:
+            self._save_action_items_raw_response(
+                session_dir=session_dir,
+                raw=raw,
+                task_id=task_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "[%s] Не удалось сохранить сырой ответ: %s",
+                task_id, exc,
+            )
+
+        # --- Парсим JSON ---
+        from .tasks_json_parser import parse_action_items_json
+        result = parse_action_items_json(raw)
+
+        if not result:
+            log.warning(
+                "[%s] Не удалось распарсить JSON поручений от LLM: %s\n"
+                "Первые 500 символов ответа: %s",
+                task_id,
+                result.warning,
+                raw[:500],
+            )
+            return []
+
+        log.info(
+            "[%s] LiteLLM вернул %d поручений "
+            "(формат: %s, session=%s)",
+            task_id, len(result.items),
+            result.format_kind,
+            result.session_name or "—",
+        )
+
+        return list(result.items)
 
 
 class _CancelledError(Exception):

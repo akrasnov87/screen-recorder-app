@@ -35,7 +35,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
+from PySide6.QtGui import QGuiApplication, QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox,
     QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog,
@@ -69,6 +69,9 @@ from ..platform_utils import (
     screen_recording_unavailable_reason,
 )
 from .tasks_editor_dialog import TasksEditorDialog
+from ..action_items_prompt_builder import (
+    regenerate_action_items_prompt,
+)
 
 log = get_logger(__name__)
 
@@ -861,6 +864,20 @@ class SessionsWindow(QDialog):
         self.sync_btn.clicked.connect(self._sync_one_record)
         bottom.addWidget(self.sync_btn)
 
+        self.regen_action_prompt_btn = QPushButton(
+            "Обновить промпт поручений"
+        )
+        self.regen_action_prompt_btn.setToolTip(
+            "Пересобрать action_items_prompt.<ext> на основе "
+            "текущего протокола записи.\n\n"
+            "Полезно после ручной правки протокола — не нужно "
+            "перезапускать всю обработку."
+        )
+        self.regen_action_prompt_btn.clicked.connect(
+            self._regenerate_action_prompt
+        )
+        bottom.addWidget(self.regen_action_prompt_btn)
+
         self.refresh_btn = QPushButton("Обновить")
         self.refresh_btn.clicked.connect(self.refresh)
         bottom.addWidget(self.refresh_btn)
@@ -1303,6 +1320,96 @@ class SessionsWindow(QDialog):
                 "sudo apt install python3-pyside6.qmultimedia "
                 "gstreamer1.0-plugins-good gstreamer1.0-plugins-bad "
                 "gstreamer1.0-libav",
+            )
+
+    def _regenerate_action_prompt(self) -> None:
+        """Пересобирает action_items_prompt для выбранной записи."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(
+                self, "Промпт поручений", "Выберите запись"
+            )
+            return
+
+        session_dir = r.get("dir") or ""
+        if not session_dir or not os.path.isdir(session_dir):
+            QMessageBox.warning(
+                self, "Промпт поручений",
+                f"Папка записи не найдена:\n{session_dir}",
+            )
+            return
+
+        # --- Формат и шаблон из конфига ---
+        fmt = "docx"
+        template = ""
+        if self.config_manager is not None:
+            try:
+                scrum = (
+                    self.config_manager.config
+                    .get("scrum", {}) or {}
+                )
+                fmt = str(
+                    scrum.get("export_format") or "docx"
+                ).lower()
+                template = str(
+                    scrum.get("action_items_prompt_template")
+                    or ""
+                )
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать настройки скрама: %s",
+                    exc,
+                )
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Обновление промпта поручений")
+        msg_box.setIcon(QMessageBox.Icon.Question)
+        msg_box.setTextFormat(Qt.TextFormat.RichText)   # ← ключевая строка
+        msg_box.setText(
+            f"Пересобрать <code>action_items_prompt</code> "
+            f"на основе протокола записи:<br><br>"
+            f"<b>{html.escape(r.get('name') or '')}</b><br>"
+            f"<code>{html.escape(session_dir)}</code><br><br>"
+            f"Существующий файл будет перезаписан.<br><br>"
+            f"Продолжить?"
+        )
+        msg_box.setStandardButtons(
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+        )
+        msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
+
+        reply = msg_box.exec()
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        QGuiApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
+        try:
+            res = regenerate_action_items_prompt(
+                session_dir=session_dir,
+                fmt=fmt,
+                template=template,
+                session_name=r.get("name") or "",
+                session_date=r.get("datetime") or "",
+            )
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+
+        if res.get("ok"):
+            QMessageBox.information(
+                self, "Промпт поручений",
+                f"Файл обновлён:\n{res['path']}\n\n"
+                f"Источник протокола:\n"
+                f"{res.get('protocol_path') or '—'}\n"
+                f"Символов: {res.get('protocol_chars', 0)}",
+            )
+        else:
+            QMessageBox.warning(
+                self, "Промпт поручений",
+                f"Не удалось сформировать файл:\n\n"
+                f"{res.get('warning') or 'Неизвестная ошибка'}",
             )
 
     # ------------------------------------------------------------------

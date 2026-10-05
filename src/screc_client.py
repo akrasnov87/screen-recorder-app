@@ -119,10 +119,8 @@ class ScrecClient:
         self._session: Optional[aiohttp.ClientSession] = None
 
         log.debug(
-            "ScrecClient создан: base_url=%s, connect=%.1f, read=%.1f, "
-            "delete_allowed=%s",
+            "ScrecClient создан: base_url=%s, connect=%.1f, read=%.1f",
             self.base_url, self._connect_timeout, self._read_timeout,
-            _DELETE_ALLOWED_ON_SERVER,
         )
 
     # ------------------------------------------------------------------

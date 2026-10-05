@@ -2612,28 +2612,95 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Шаблон промпта для DeepSeek и формат файла."
+            "Шаблоны промптов для DeepSeek: основной протокол "
+            "и извлечение поручений. Здесь же — формат экспорта "
+            "и опции автогенерации."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
+        # ==============================================================
+        # Блок 1: шаблон промпта для протокола (был раньше)
+        # ==============================================================
         scrum_header = QHBoxLayout()
-        scrum_header.addWidget(QLabel("<b>Шаблон промпта</b>"))
+        scrum_header.addWidget(
+            QLabel("<b>Шаблон промпта — протокол</b>")
+        )
         scrum_header.addStretch()
         scrum_header.addWidget(make_info_icon("scrum_template"))
         layout.addLayout(scrum_header)
 
         self.scrum_template_edit = QPlainTextEdit()
-        self.scrum_template_edit.setMinimumHeight(260)
+        self.scrum_template_edit.setMinimumHeight(220)
         layout.addWidget(self.scrum_template_edit)
 
+        # ==============================================================
+        # Блок 2: НОВОЕ — шаблон промпта для поручений
+        # ==============================================================
+        items_header = QHBoxLayout()
+        items_header.addWidget(
+            QLabel("<b>Шаблон промпта — поручения</b>")
+        )
+        items_header.addStretch()
+        items_icon = make_info_icon("scrum_action_items_template")
+        if items_icon is not None:
+            items_header.addWidget(items_icon)
+        layout.addLayout(items_header)
+
+        items_hint = QLabel(
+            "<span style='color:#666'>"
+            "Этот промпт отправляется LiteLLM <b>отдельным "
+            "запросом</b> после формирования протокола. "
+            "Модель должна вернуть чистый JSON с поручениями "
+            "без markdown-обёртки.<br><br>"
+            "Результат сохраняется в "
+            "<code>action_items.json</code> внутри папки записи "
+            "и доступен в окне «Поручения»."
+            "</span>"
+        )
+        items_hint.setWordWrap(True)
+        layout.addWidget(items_hint)
+
+        self.action_items_prompt_edit = QPlainTextEdit()
+        self.action_items_prompt_edit.setMinimumHeight(220)
+        self.action_items_prompt_edit.setPlaceholderText(
+            "Промпт для извлечения поручений. Должен требовать "
+            "чистый JSON без markdown-обёртки."
+        )
+        layout.addWidget(self.action_items_prompt_edit)
+
+        # ==============================================================
+        # Блок 3: формат экспорта и опции
+        # ==============================================================
         form = QFormLayout()
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
         self.scrum_format_combo = QComboBox()
         self.scrum_format_combo.addItems(["docx", "md", "txt"])
         form.addRow(
             "Формат экспорта:",
             with_info(self.scrum_format_combo, "scrum_format"),
         )
+
+        # --- НОВОЕ: чекбокс автогенерации поручений ---
+        self.generate_action_items_check = QCheckBox(
+            "Извлекать поручения автоматически "
+            "(action_items.json)"
+        )
+        self.generate_action_items_check.setToolTip(
+            "После формирования протокола запустить отдельный "
+            "запрос к LiteLLM для извлечения поручений из "
+            "стенограммы и протокола.\n\n"
+            "Результат сохраняется в action_items.json внутри "
+            "папки записи и доступен в окне «Поручения».\n\n"
+            "Требует настроенного LiteLLM "
+            "(Настройки → Суммаризация)."
+        )
+        form.addRow("", self.generate_action_items_check)
+
         layout.addLayout(form)
 
         layout.addStretch()
@@ -3135,10 +3202,31 @@ class SettingsWindow(QDialog):
 
         # --- Скрам ---
         scrum = cfg.get("scrum", {})
-        from ..config_manager import DEFAULT_SCRUM_PROMPT
+
+        from ..config_manager import (
+            DEFAULT_SCRUM_PROMPT,
+            DEFAULT_ACTION_ITEMS_PROMPT,
+        )
+
+        # Основной шаблон протокола.
         self.scrum_template_edit.setPlainText(
             scrum.get("prompt_template", DEFAULT_SCRUM_PROMPT)
         )
+
+        # --- НОВОЕ: шаблон для поручений ---
+        self.action_items_prompt_edit.setPlainText(
+            scrum.get(
+                "action_items_prompt_template",
+                DEFAULT_ACTION_ITEMS_PROMPT,
+            )
+        )
+
+        # --- НОВОЕ: чекбокс автогенерации поручений ---
+        self.generate_action_items_check.setChecked(
+            bool(scrum.get("generate_action_items", True))
+        )
+
+        # Формат экспорта — без изменений.
         fmt = scrum.get("export_format", "docx")
         i = self.scrum_format_combo.findText(fmt)
         if i >= 0:
@@ -3462,6 +3550,14 @@ class SettingsWindow(QDialog):
         cfg["scrum"] = {
             "prompt_template": (
                 self.scrum_template_edit.toPlainText()
+            ),
+            # --- НОВОЕ: шаблон промпта для поручений ---
+            "action_items_prompt_template": (
+                self.action_items_prompt_edit.toPlainText()
+            ),
+            # --- НОВОЕ: флаг автогенерации поручений ---
+            "generate_action_items": (
+                self.generate_action_items_check.isChecked()
             ),
             "export_format": (
                 self.scrum_format_combo.currentText()
