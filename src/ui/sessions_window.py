@@ -39,7 +39,7 @@ from PySide6.QtGui import QGuiApplication, QAction, QDesktopServices, QKeySequen
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QMenu, QMenuBar, QMessageBox,
+    QInputDialog, QLabel, QLineEdit, QMenu, QMenuBar, QMessageBox,
     QPlainTextEdit, QProgressDialog, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -56,7 +56,9 @@ from ..markdown_to_bitrix import markdown_to_plain, markdown_to_plain_with_bb
 from ..screc_client import ScrecError
 from ..sync_manager import (
     SyncManager,
+    build_public_view_url,
     get_record_id,
+    get_record_path,
     is_record_published,
 )
 from ..task_queue import TaskQueue
@@ -1112,6 +1114,173 @@ class DailyDigestDialog(QDialog):
     def result_count(self) -> int:
         return self._result_count
 
+# ---------------------------------------------------------------------------
+# Диалог публичной ссылки на запись
+# ---------------------------------------------------------------------------
+class PublicLinkDialog(QDialog):
+    """
+    Диалог с публичной ссылкой на запись.
+
+    Позволяет выбрать блоки (video, audio, transcript, protocol,
+    summary), увидеть итоговую ссылку, скопировать её или
+    открыть в браузере.
+    """
+
+    def __init__(
+        self,
+        record_name: str,
+        record_path: str,
+        record_id: str,
+        base_url: str,
+        *,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Ссылка на запись на сервере")
+        self.setModal(True)
+        self.setMinimumWidth(760)
+
+        self._record_name = record_name or ""
+        self._record_path = record_path or ""
+        self._record_id = record_id or ""
+        self._base_url = (base_url or "").rstrip("/")
+
+        self._block_checkboxes: Dict[str, QCheckBox] = {}
+
+        self._build_ui()
+        self._refresh()
+
+    def _build_ui(self) -> None:
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        # --- Инфо ---
+        info = QLabel(
+            f"<b>{html.escape(self._record_name)}</b><br>"
+            f"<span style='color:#666'>Путь на сервере:</span> "
+            f"<code>{html.escape(self._record_path)}</code><br>"
+            f"<span style='color:#666'>Record ID:</span> "
+            f"<code>{html.escape(self._record_id)}</code>"
+        )
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        hint = QLabel(
+            "<span style='color:#666'>Ссылка ведёт на публичную "
+            "HTML-страницу записи на сервере. Открывается в "
+            "браузере без авторизации — можно отправить коллеге. "
+            "Выберите, какие блоки показывать.</span>"
+        )
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        # --- Блоки ---
+        blocks_header = QLabel("<b>Блоки на странице</b>")
+        root.addWidget(blocks_header)
+
+        blocks_row = QHBoxLayout()
+        block_labels = {
+            "video": "Видео",
+            "audio": "Аудио",
+            "transcript": "Стенограмма",
+            "protocol": "Протокол",
+            "summary": "Summary",
+        }
+        for key, label in block_labels.items():
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.toggled.connect(self._refresh)
+            blocks_row.addWidget(cb)
+            self._block_checkboxes[key] = cb
+
+        blocks_row.addStretch()
+
+        all_btn = QPushButton("Все")
+        all_btn.clicked.connect(lambda: self._set_all(True))
+        blocks_row.addWidget(all_btn)
+
+        none_btn = QPushButton("Ничего")
+        none_btn.clicked.connect(lambda: self._set_all(False))
+        blocks_row.addWidget(none_btn)
+
+        root.addLayout(blocks_row)
+
+        # --- Ссылка ---
+        link_label = QLabel("<b>Итоговая ссылка</b>")
+        root.addWidget(link_label)
+
+        link_row = QHBoxLayout()
+
+        self.link_input = QLineEdit()
+        self.link_input.setReadOnly(True)
+        link_row.addWidget(self.link_input, 1)
+
+        copy_btn = QPushButton("Скопировать")
+        copy_btn.clicked.connect(self._copy)
+        link_row.addWidget(copy_btn)
+
+        open_btn = QPushButton("Открыть в браузере")
+        open_btn.clicked.connect(self._open)
+        link_row.addWidget(open_btn)
+
+        root.addLayout(link_row)
+
+        # --- Кнопки ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Close,
+            parent=self,
+        )
+        buttons.button(
+            QDialogButtonBox.StandardButton.Close
+        ).setText("Закрыть")
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        root.addWidget(buttons)
+
+    def _set_all(self, value: bool) -> None:
+        for cb in self._block_checkboxes.values():
+            cb.setChecked(value)
+
+    def _selected_blocks(self) -> List[str]:
+        return [
+            key for key, cb in self._block_checkboxes.items()
+            if cb.isChecked()
+        ]
+
+    def _refresh(self) -> None:
+        blocks = self._selected_blocks()
+        # Если все включены — не добавляем параметр (сервер
+        # покажет all).
+        if set(blocks) == set(self._block_checkboxes.keys()):
+            blocks_arg = None
+        else:
+            blocks_arg = blocks or None
+
+        url = build_public_view_url(
+            self._base_url,
+            self._record_path,
+            self._record_id,
+            blocks=blocks_arg,
+        )
+        self.link_input.setText(url)
+
+    def _copy(self) -> None:
+        link = self.link_input.text().strip()
+        if not link:
+            return
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(link)
+        log.info("Ссылка скопирована: %s", link)
+
+    def _open(self) -> None:
+        link = self.link_input.text().strip()
+        if not link:
+            return
+        QDesktopServices.openUrl(QUrl(link))
+        log.info("Открытие ссылки в браузере: %s", link)
 
 # ---------------------------------------------------------------------------
 # Основное окно
@@ -1247,8 +1416,21 @@ class SessionsWindow(QDialog):
 
         root.addWidget(self._build_legend())
 
-        bottom = QHBoxLayout()
-        bottom.addStretch()
+        # ------------------------------------------------------------------
+        # Нижняя панель — ДВА РЯДА кнопок.
+        #
+        # Ряд 1: работа с контентом записи
+        #   (видео, аудио, стенограмма, протокол).
+        # Ряд 2: серверная синхронизация и сервисные действия
+        #   (готовность, публикация, ссылка на сервер,
+        #    промпт поручений, обновление, свод, поручения, закрытие).
+        #
+        # Такое разделение нужно, потому что при большом количестве
+        # кнопок они не помещаются в одну строку — текст обрезается
+        # и кнопки наезжают друг на друга.
+        # ------------------------------------------------------------------
+        bottom_content = QHBoxLayout()
+        bottom_content.setSpacing(6)
 
         self.play_video_btn = QPushButton("Смотреть видео")
         self.play_video_btn.setToolTip(
@@ -1257,7 +1439,7 @@ class SessionsWindow(QDialog):
             "будет предложено скачать его."
         )
         self.play_video_btn.clicked.connect(self._open_video)
-        bottom.addWidget(self.play_video_btn)
+        bottom_content.addWidget(self.play_video_btn)
 
         self.play_audio_btn = QPushButton("Прослушать аудио")
         self.play_audio_btn.setToolTip(
@@ -1266,7 +1448,7 @@ class SessionsWindow(QDialog):
             "будет предложено скачать его."
         )
         self.play_audio_btn.clicked.connect(self._open_audio)
-        bottom.addWidget(self.play_audio_btn)
+        bottom_content.addWidget(self.play_audio_btn)
 
         self.open_transcript_btn = QPushButton("Стенограмма")
         attach_tooltip(
@@ -1275,7 +1457,7 @@ class SessionsWindow(QDialog):
         self.open_transcript_btn.clicked.connect(
             self._open_transcript
         )
-        bottom.addWidget(self.open_transcript_btn)
+        bottom_content.addWidget(self.open_transcript_btn)
 
         self.open_protocol_btn = QPushButton("Протокол")
         attach_tooltip(
@@ -1284,14 +1466,21 @@ class SessionsWindow(QDialog):
         self.open_protocol_btn.clicked.connect(
             self._view_manual_protocol
         )
-        bottom.addWidget(self.open_protocol_btn)
+        bottom_content.addWidget(self.open_protocol_btn)
+
+        bottom_content.addStretch()
+        root.addLayout(bottom_content)
+
+        # --- Ряд 2: сервер и сервисные действия ---
+        bottom_actions = QHBoxLayout()
+        bottom_actions.setSpacing(6)
 
         self.sync_ready_btn = QPushButton("Готово к синхронизации")
         attach_tooltip(
             self.sync_ready_btn, "sess_sync_ready_button"
         )
         self.sync_ready_btn.clicked.connect(self._toggle_sync_ready)
-        bottom.addWidget(self.sync_ready_btn)
+        bottom_actions.addWidget(self.sync_ready_btn)
 
         self.sync_btn = QPushButton("Синхронизировать…")
         self.sync_btn.setToolTip(
@@ -1304,7 +1493,32 @@ class SessionsWindow(QDialog):
             "Горячая клавиша: Ctrl+Shift+S"
         )
         self.sync_btn.clicked.connect(self._sync_one_record)
-        bottom.addWidget(self.sync_btn)
+        bottom_actions.addWidget(self.sync_btn)
+
+        # --- Публичная ссылка на сервер ---
+        self.public_link_btn = QPushButton("Открыть в браузере")
+        self.public_link_btn.setToolTip(
+            "Открыть публичную HTML-страницу записи на сервере "
+            "синхронизации (без авторизации).\n\n"
+            "Работает, только если запись опубликована и задан "
+            "base_url (Настройки → Синхронизация).\n\n"
+            "Горячая клавиша: Ctrl+Shift+U"
+        )
+        self.public_link_btn.clicked.connect(
+            self._open_public_link_dialog
+        )
+        self.public_link_btn.setEnabled(False)
+        bottom_actions.addWidget(self.public_link_btn)
+
+        self.copy_public_link_btn = QPushButton("Скопировать ссылку")
+        self.copy_public_link_btn.setToolTip(
+            "Скопировать в буфер обмена публичную ссылку на запись."
+        )
+        self.copy_public_link_btn.clicked.connect(
+            self._copy_public_link
+        )
+        self.copy_public_link_btn.setEnabled(False)
+        bottom_actions.addWidget(self.copy_public_link_btn)
 
         self.regen_action_prompt_btn = QPushButton(
             "Обновить промпт поручений"
@@ -1318,11 +1532,13 @@ class SessionsWindow(QDialog):
         self.regen_action_prompt_btn.clicked.connect(
             self._regenerate_action_prompt
         )
-        bottom.addWidget(self.regen_action_prompt_btn)
+        bottom_actions.addWidget(self.regen_action_prompt_btn)
+
+        bottom_actions.addStretch()
 
         self.refresh_btn = QPushButton("Обновить")
         self.refresh_btn.clicked.connect(self.refresh)
-        bottom.addWidget(self.refresh_btn)
+        bottom_actions.addWidget(self.refresh_btn)
 
         self.daily_digest_btn = QPushButton("Свод за день")
         self.daily_digest_btn.setToolTip(
@@ -1334,11 +1550,7 @@ class SessionsWindow(QDialog):
         self.daily_digest_btn.clicked.connect(
             self._open_daily_digest
         )
-        bottom.addWidget(self.daily_digest_btn)
-
-        self.close_btn = QPushButton("Закрыть")
-        self.close_btn.clicked.connect(self.close)
-        bottom.addWidget(self.close_btn)
+        bottom_actions.addWidget(self.daily_digest_btn)
 
         self.tasks_btn = QPushButton("Поручения")
         self.tasks_btn.setToolTip(
@@ -1347,9 +1559,13 @@ class SessionsWindow(QDialog):
             "на сервер синхронизации."
         )
         self.tasks_btn.clicked.connect(self._open_tasks_editor)
-        bottom.addWidget(self.tasks_btn)
+        bottom_actions.addWidget(self.tasks_btn)
 
-        root.addLayout(bottom)
+        self.close_btn = QPushButton("Закрыть")
+        self.close_btn.clicked.connect(self.close)
+        bottom_actions.addWidget(self.close_btn)
+
+        root.addLayout(bottom_actions)
 
     def _build_menu_bar(self) -> None:
         bar = QMenuBar(self)
@@ -1438,6 +1654,33 @@ class SessionsWindow(QDialog):
         )
         act_sync_pull.triggered.connect(self._pull_changes)
         m_file.addAction(act_sync_pull)
+
+        m_file.addSeparator()
+
+        # --- НОВОЕ: публичная ссылка на сервер ---
+        act_public_link = QAction(
+            "Открыть ссылку на сервере…", self
+        )
+        act_public_link.setShortcut(QKeySequence("Ctrl+Shift+U"))
+        act_public_link.setToolTip(
+            "Открыть публичную HTML-страницу записи на сервере "
+            "синхронизации"
+        )
+        act_public_link.triggered.connect(
+            self._open_public_link_dialog
+        )
+        m_file.addAction(act_public_link)
+
+        act_copy_public_link = QAction(
+            "Скопировать ссылку на сервер", self
+        )
+        act_copy_public_link.setToolTip(
+            "Скопировать публичную ссылку на запись в буфер обмена"
+        )
+        act_copy_public_link.triggered.connect(
+            self._copy_public_link
+        )
+        m_file.addAction(act_copy_public_link)
 
         m_file.addSeparator()
 
@@ -1946,6 +2189,11 @@ class SessionsWindow(QDialog):
             self.play_audio_btn.setEnabled(False)
             self.open_transcript_btn.setEnabled(False)
             self.open_protocol_btn.setEnabled(False)
+            # --- НОВОЕ ---
+            if hasattr(self, "public_link_btn"):
+                self.public_link_btn.setEnabled(False)
+            if hasattr(self, "copy_public_link_btn"):
+                self.copy_public_link_btn.setEnabled(False)
             return
 
         parts = [f"<b>{r['name']}</b>"]
@@ -1982,6 +2230,12 @@ class SessionsWindow(QDialog):
         has_local_video = bool(r.get("has_video"))
         has_local_audio = bool(r.get("has_audio"))
         is_published = bool(r.get("published"))
+
+        # --- НОВОЕ: публичная ссылка доступна только после публикации ---
+        if hasattr(self, "public_link_btn"):
+            self.public_link_btn.setEnabled(is_published)
+        if hasattr(self, "copy_public_link_btn"):
+            self.copy_public_link_btn.setEnabled(is_published)
 
         self.play_video_btn.setEnabled(
             has_local_video or is_published
@@ -2997,6 +3251,136 @@ class SessionsWindow(QDialog):
                 f"Ошибка открытия окна:\n{exc}",
             )
 
+    # ------------------------------------------------------------------
+    # Публичная ссылка на сервер
+    # ------------------------------------------------------------------
+    def _get_public_link(self, r: Dict[str, Any]) -> str:
+        """
+        Возвращает публичную ссылку для записи (без выбора блоков).
+
+        Ссылка собирается по base_url из sync_settings,
+        path и record_id — из .sync_published.json.
+        """
+        if self.config_manager is None:
+            return ""
+
+        try:
+            sync_cfg = self.config_manager.get_sync_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать sync-настройки: %s", exc
+            )
+            return ""
+
+        base_url = str(sync_cfg.get("base_url") or "").strip()
+        if not base_url:
+            return ""
+
+        session_dir = r.get("dir") or ""
+        if not session_dir:
+            return ""
+
+        record_id = get_record_id(session_dir)
+        if not record_id:
+            return ""
+
+        record_path = get_record_path(session_dir)
+        if not record_path:
+            return ""
+
+        return build_public_view_url(
+            base_url, record_path, record_id, blocks=None,
+        )
+
+    def _open_public_link_dialog(self) -> None:
+        """Открывает диалог с публичной ссылкой и выбором блоков."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "Ссылка", "Нет доступа к настройкам."
+            )
+            return
+
+        try:
+            sync_cfg = self.config_manager.get_sync_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать sync-настройки: %s", exc
+            )
+            QMessageBox.warning(
+                self, "Ссылка на сервер",
+                f"Не удалось прочитать настройки синхронизации:\n{exc}",
+            )
+            return
+
+        base_url = str(sync_cfg.get("base_url") or "").strip()
+        if not base_url:
+            QMessageBox.information(
+                self, "Ссылка на сервер",
+                "Публичные ссылки недоступны: не задан base_url "
+                "в Настройки → Синхронизация.",
+            )
+            return
+
+        session_dir = r.get("dir") or ""
+        record_id = get_record_id(session_dir)
+        if not record_id:
+            QMessageBox.information(
+                self, "Ссылка на сервер",
+                "Запись ещё не опубликована на сервере.\n\n"
+                "Опубликуйте её через «Синхронизировать…» "
+                "(Ctrl+Shift+S), затем повторите.",
+            )
+            return
+
+        record_path = get_record_path(session_dir)
+        if not record_path:
+            QMessageBox.information(
+                self, "Ссылка на сервер",
+                "В .sync_published.json нет поля path — "
+                "возможно, запись публиковалась старой версией "
+                "клиента. Опубликуйте её заново.",
+            )
+            return
+
+        dlg = PublicLinkDialog(
+            record_name=r.get("name") or "",
+            record_path=record_path,
+            record_id=record_id,
+            base_url=base_url,
+            parent=self,
+        )
+        dlg.exec()
+
+    def _copy_public_link(self) -> None:
+        """Копирует публичную ссылку в буфер обмена."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        link = self._get_public_link(r)
+        if not link:
+            QMessageBox.information(
+                self, "Ссылка на сервер",
+                "Ссылка недоступна:\n"
+                "  • запись не опубликована на сервере;\n"
+                "  • не задан base_url в Настройки → Синхронизация.",
+            )
+            return
+
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(link)
+        log.info("Публичная ссылка скопирована: %s", link)
+        QMessageBox.information(
+            self, "Ссылка на сервер",
+            f"Ссылка скопирована в буфер обмена:\n\n{link}",
+        )
+
     def _pull_changes(self) -> None:
         if self.config_manager is None:
             QMessageBox.warning(
@@ -3109,12 +3493,22 @@ class SessionsWindow(QDialog):
         projects = self.config_manager.get_projects()
         employees = self.config_manager.get_employees()
 
+        # --- НОВОЕ: передаём настройки синхронизации в диалог ---
+        try:
+            sync_settings = self.config_manager.get_sync_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать sync-настройки: %s", exc
+            )
+            sync_settings = {}
+
         dlg = SendToBitrixDialog(
             session_info=session_info,
             chat_id=chat_id,
             bitrix_cfg=bitrix_cfg,
             projects=projects,
             employees=employees,
+            sync_settings=sync_settings,   # ← НОВОЕ
             parent=self,
         )
         dlg.exec()
@@ -4353,6 +4747,26 @@ class SessionsWindow(QDialog):
             "с выбором параметров (медиа, ссылка, удаление)"
         )
 
+        # --- НОВОЕ: публичная ссылка на сервер ---
+        is_published = bool(r.get("published"))
+        act_public = menu.addAction(
+            "Открыть ссылку на сервере…",
+            self._open_public_link_dialog,
+        )
+        act_public.setEnabled(is_published)
+        act_public.setToolTip(
+            "Открыть публичную HTML-страницу записи на сервере"
+        )
+        act_copy_public = menu.addAction(
+            "Скопировать ссылку на сервер",
+            self._copy_public_link,
+        )
+        act_copy_public.setEnabled(is_published)
+        act_copy_public.setToolTip(
+            "Скопировать публичную ссылку на запись "
+            "в буфер обмена"
+        )
+
         menu.addSeparator()
 
         menu.addAction(
@@ -4745,6 +5159,7 @@ class SessionsWindow(QDialog):
             "Ctrl+I        — импорт материалов\n"
             "Ctrl+Shift+Y  — окно синхронизации\n"
             "Ctrl+Shift+S  — синхронизировать выбранную запись\n"
+            "Ctrl+Shift+U  — открыть ссылку на сервере\n"
             "Ctrl+Shift+G  — переключить «готово к синхронизации»\n"
             "Ctrl+Shift+V  — смотреть видео\n"
             "Ctrl+Shift+A  — прослушать аудио\n"

@@ -42,7 +42,10 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import (
+    Any, Callable, Dict, Iterable, List, Optional, Tuple,
+)
+from urllib.parse import quote
 
 from .file_readers import read_json_file
 from .logger import get_logger
@@ -398,6 +401,190 @@ def collect_artifacts(
 
     return small, media
 
+# ---------------------------------------------------------------------------
+# Публичные ссылки на сервер (для браузера, /view/**)
+# ---------------------------------------------------------------------------
+# Допустимые блоки для /view/...?blocks=
+# Должны совпадать с DOCS.md §6.7.
+PUBLIC_VIEW_BLOCKS: Tuple[str, ...] = (
+    "video",
+    "audio",
+    "transcript",
+    "protocol",
+    "summary",
+)
+
+
+def get_record_path(session_dir: str) -> str:
+    """
+    Читает относительный путь записи на сервере из
+    .sync_published.json.
+
+    Путь имеет вид "project/year/month/folder_name" и
+    используется для построения публичной ссылки /view/...
+
+    Возвращает "" если запись ещё не публиковалась или
+    path отсутствует (старые версии state-файла).
+    """
+    state = _read_sync_state(session_dir)
+    return str(state.get("path") or "").strip().strip("/")
+
+
+def split_record_path(path: str) -> Tuple[str, str, str, str]:
+    """
+    Разбивает путь "project/year/month/folder_name" на
+    4 компонента.
+
+    Учитывает, что folder_name может содержать пробелы и
+    кириллицу, но не содержит "/".
+
+    Returns:
+        (project, year, month, folder_name)
+        Все компоненты — строки. При ошибке разбора
+        возвращается ("", "", "", "").
+    """
+    if not path:
+        return "", "", "", ""
+
+    parts = path.strip("/").split("/", 3)
+    if len(parts) < 4:
+        log.warning(
+            "split_record_path: некорректный path=%r "
+            "(нужно 4 сегмента)", path,
+        )
+        return "", "", "", ""
+
+    return parts[0], parts[1], parts[2], parts[3]
+
+
+def build_public_view_url(
+    base_url: str,
+    record_path: str,
+    record_id: str,
+    *,
+    blocks: Optional[Iterable[str]] = None,
+) -> str:
+    """
+    Собирает публичную ссылку на HTML-страницу записи на сервере.
+
+    Args:
+        base_url:    базовый URL сервера (например,
+                     "http://localhost:8000").
+        record_path: путь "project/year/month/folder_name"
+                     (см. get_record_path).
+        record_id:   UUID записи на сервере.
+        blocks:      список блоков для отображения
+                     ("video", "audio", "transcript",
+                     "protocol", "summary"). None или пусто —
+                     не добавлять параметр (сервер покажет all).
+
+    Returns:
+        Готовая ссылка или "" если чего-то не хватает.
+    """
+    if not base_url or not record_path or not record_id:
+        return ""
+
+    project, year, month, folder_name = split_record_path(record_path)
+    if not (project and year and month and folder_name):
+        return ""
+
+    base = base_url.rstrip("/")
+    url = (
+        f"{base}/view/"
+        f"{quote(project, safe='')}/"
+        f"{quote(year, safe='')}/"
+        f"{quote(month, safe='')}/"
+        f"{quote(folder_name, safe='')}"
+        f"?id={quote(record_id, safe='')}"
+    )
+
+    if blocks:
+        valid = [
+            b.strip().lower() for b in blocks
+            if b and b.strip().lower() in PUBLIC_VIEW_BLOCKS
+        ]
+        if valid:
+            url += "&blocks=" + ",".join(valid)
+
+    return url
+
+
+def build_public_artifact_url(
+    base_url: str,
+    record_path: str,
+    record_id: str,
+    filename: str,
+    *,
+    download: bool = False,
+) -> str:
+    """
+    Собирает публичную ссылку на конкретный артефакт записи.
+
+    Args:
+        base_url:    базовый URL сервера.
+        record_path: путь "project/year/month/folder_name".
+        record_id:   UUID записи.
+        filename:    имя файла-артефакта (basename, как в
+                     _meta.json).
+        download:    если True — добавить &download=true.
+
+    Returns:
+        Готовая ссылка или "".
+    """
+    if not (base_url and record_path and record_id and filename):
+        return ""
+
+    project, year, month, folder_name = split_record_path(record_path)
+    if not (project and year and month and folder_name):
+        return ""
+
+    base = base_url.rstrip("/")
+    url = (
+        f"{base}/view/"
+        f"{quote(project, safe='')}/"
+        f"{quote(year, safe='')}/"
+        f"{quote(month, safe='')}/"
+        f"{quote(folder_name, safe='')}"
+        f"/artifact/{quote(os.path.basename(filename), safe='')}"
+        f"?id={quote(record_id, safe='')}"
+    )
+    if download:
+        url += "&download=true"
+    return url
+
+
+def build_public_url_for_session(
+    session_dir: str,
+    sync_settings: Dict[str, Any],
+    *,
+    blocks: Optional[Iterable[str]] = None,
+) -> str:
+    """
+    Удобная обёртка: собирает публичную ссылку для сессии,
+    читая base_url из sync_settings, path и record_id — из
+    .sync_published.json.
+
+    Returns:
+        Готовая ссылка или "" (если запись не опубликована
+        или нет base_url).
+    """
+    base_url = str(
+        (sync_settings or {}).get("base_url") or ""
+    ).strip()
+    if not base_url:
+        return ""
+
+    record_id = get_record_id(session_dir)
+    if not record_id:
+        return ""
+
+    record_path = get_record_path(session_dir)
+    if not record_path:
+        return ""
+
+    return build_public_view_url(
+        base_url, record_path, record_id, blocks=blocks,
+    )
 
 # ---------------------------------------------------------------------------
 # Менеджер синхронизации
