@@ -243,7 +243,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "action_items_prompt_template": DEFAULT_ACTION_ITEMS_PROMPT,
         "export_format": "docx",
         # Генерировать поручения автоматически после протокола
-        "generate_action_items": True,
+        "generate_action_items": False,
     },
     "summarizer": {
         "enabled": False,

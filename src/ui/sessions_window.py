@@ -53,7 +53,7 @@ from ..file_readers import read_any_text, read_json_file
 from ..logger import get_logger
 from ..markdown_docx import markdown_to_docx
 from ..markdown_to_bitrix import markdown_to_plain, markdown_to_plain_with_bb
-from ..screc_client import ScrecError
+from ..screc_client import ScrecClient, ScrecError
 from ..sync_manager import (
     SyncManager,
     build_public_view_url,
@@ -2488,10 +2488,14 @@ class SessionsWindow(QDialog):
 
         self.refresh()
 
-        # --- НОВОЕ: авто-публикация при установке «Готово» ---
+        # --- Если запись опубликована — уведомляем сервер ---
+        if r.get("published") and r.get("record_id"):
+            self._patch_sync_ready_on_server(
+                r["record_id"], new_value,
+            )
+
+        # --- Авто-публикация при установке «Готово» ---
         if new_value:
-            # Обновляем запись в self._rows, чтобы _publish_after_ready
-            # видела свежие данные.
             r["sync_ready"] = True
             self._maybe_publish_after_sync_ready(r, was_ready=current)
         else:
@@ -2518,6 +2522,73 @@ class SessionsWindow(QDialog):
                 f"не перезаписывает локальные файлы, локальные "
                 f"артефакты не удаляются.",
             )
+
+    def _patch_sync_ready_on_server(
+        self, record_id: str, sync_ready: bool,
+    ) -> None:
+        """
+        Уведомляет сервер о смене флага sync_ready.
+
+        Выполняется в фоне, не блокирует UI. Если запись
+        не опубликована — метод не вызывается.
+        """
+        if self.config_manager is None:
+            return
+
+        try:
+            cfg = self.config_manager.get_sync_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать sync-настройки: %s", exc
+            )
+            return
+
+        if not (cfg.get("enabled") and cfg.get("base_url")
+                and cfg.get("api_key")):
+            return
+
+        base_url = cfg["base_url"]
+        api_key = cfg["api_key"]
+
+        async def _patch() -> None:
+            try:
+                async with ScrecClient(
+                    base_url=base_url,
+                    api_key=api_key,
+                    connect_timeout=float(
+                        cfg.get("connect_timeout", 15)
+                    ),
+                    read_timeout=float(
+                        cfg.get("read_timeout", 120)
+                    ),
+                ) as client:
+                    await client.patch_record(
+                        record_id,
+                        {"sync_ready": bool(sync_ready)},
+                    )
+                log.info(
+                    "Сервер уведомлён: record=%s, sync_ready=%s",
+                    record_id, sync_ready,
+                )
+            except ScrecError as exc:
+                log.warning(
+                    "Не удалось уведомить сервер о sync_ready "
+                    "(record=%s): %s", record_id, exc,
+                )
+
+        # Запускаем в отдельном потоке, чтобы не блокировать UI.
+        import threading
+
+        def _runner() -> None:
+            try:
+                asyncio.run(_patch())
+            except Exception as exc:
+                log.warning(
+                    "Ошибка в _patch_sync_ready_on_server: %s", exc
+                )
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
 
     # ------------------------------------------------------------------
     # Просмотр / прослушивание медиа
@@ -2884,24 +2955,48 @@ class SessionsWindow(QDialog):
     # ------------------------------------------------------------------
     # Просмотр протокола
     # ------------------------------------------------------------------
-    @staticmethod
-    def _find_manual_protocol_path(r: Dict[str, Any]) -> str:
+    # Порядок приоритетов при поиске протокола. Ручной протокол
+    # считается «главнее» автоматического.
+    _PROTOCOL_CANDIDATES = (
+        "manual_protocol.docx",
+        "manual_protocol.md",
+        "manual_protocol.txt",
+        "manual_protocol.pdf",
+        "protocol.docx",
+        "protocol.md",
+        "protocol.txt",
+        "protocol.pdf",
+    )
+
+    @classmethod
+    def _find_manual_protocol_path(cls, r: Dict[str, Any]) -> str:
+        """
+        Ищет протокол в папке записи.
+
+        Порядок:
+          1. Путь из session.json (manual_protocol_path).
+          2. Файлы _PROTOCOL_CANDIDATES в корне папки записи.
+          3. Те же файлы в подпапке attachments/.
+        """
         session_dir = r.get("dir") or ""
         if not session_dir:
             return ""
 
+        # 1. Путь из метаданных.
         meta_path = r.get("manual_protocol_path") or ""
         if meta_path and os.path.isfile(meta_path):
             return meta_path
 
-        for name in ("manual_protocol.docx", "protocol.docx"):
+        # 2. Корень папки записи.
+        for name in cls._PROTOCOL_CANDIDATES:
             candidate = os.path.join(session_dir, name)
             if os.path.isfile(candidate):
                 return candidate
 
+        # 3. Подпапка attachments/.
         att_dir = os.path.join(session_dir, "attachments")
         if os.path.isdir(att_dir):
-            for name in ("manual_protocol.docx", "protocol.docx"):
+            for name in cls._PROTOCOL_CANDIDATES:
                 candidate = os.path.join(att_dir, name)
                 if os.path.isfile(candidate):
                     return candidate
@@ -3465,15 +3560,27 @@ class SessionsWindow(QDialog):
                     project, chat_id,
                 )
 
+        # --- Ищем протокол через общий метод ---
+        protocol_path = self._find_manual_protocol_path(r)
+        protocol_label = (
+            os.path.basename(protocol_path) if protocol_path else ""
+        )
+
+        log.info(
+            "Bitrix24: отправка записи «%s» — протокол=%r, "
+            "summary=%d символов, session_dir=%s",
+            r.get("name"),
+            protocol_path or "не найден",
+            len(r.get("summary_bb") or ""),
+            r.get("dir") or "—",
+        )
+
         session_info = {
             "name": r.get("name") or "",
             "project": project,
             "date": r.get("datetime") or "",
-            "protocol_path": r.get("manual_protocol_path") or "",
-            "protocol_label": (
-                os.path.basename(r["manual_protocol_path"])
-                if r.get("manual_protocol_path") else ""
-            ),
+            "protocol_path": protocol_path,
+            "protocol_label": protocol_label,
             "summary_bb": r.get("summary_bb") or "",
             "comment": "",
             "session_dir": r.get("dir") or "",
@@ -4337,8 +4444,33 @@ class SessionsWindow(QDialog):
             return False
 
     def _delete_processed_files(self, session_dir: str) -> None:
-        for fname in ("video.mp3", "video.txt", "video.aac",
-                      "video.wav", "video.opus"):
+        """
+        Удаляет результаты обработки при сбросе статуса
+        в «Сохранено». Исходное видео и вложения не трогает.
+        """
+        for fname in (
+            "video.mp3", "video.txt",
+            "video.aac", "video.wav", "video.opus",
+            "video.ogg", "video.m4a",
+            "video_summary.md", "summary.md",
+            "deepseek_prompt.docx", "deepseek_prompt.md",
+            "deepseek_prompt.txt",
+            "action_items.json",
+            "action_items_prompt.docx",
+            "action_items_prompt.md",
+            "action_items_prompt.txt",
+            "action_items_request.txt",
+            "action_items_response_raw.txt",
+        ):
+            p = os.path.join(session_dir, fname)
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                    log.info("Удалён артефакт: %s", p)
+                except Exception as exc:
+                    log.warning(
+                        "Не удалось удалить %s: %s", p, exc
+                    )
             p = os.path.join(session_dir, fname)
             if os.path.exists(p):
                 try:
@@ -5038,28 +5170,6 @@ class SessionsWindow(QDialog):
                 self, "Ошибка",
                 f"Не удалось удалить: {exc}",
             )
-
-    def _open_tasks_editor(self) -> None:
-        """Открывает редактор поручений для выбранной записи."""
-        r = self._selected_row()
-        if not r:
-            QMessageBox.warning(self, "Поручения", "Выберите запись")
-            return
-
-        session_dir = r.get("dir") or ""
-        if not session_dir or not os.path.isdir(session_dir):
-            QMessageBox.warning(
-                self, "Поручения",
-                "Папка записи не найдена.",
-            )
-            return
-
-        dlg = TasksEditorDialog(
-            session_dir=session_dir,
-            session_name=r.get("name") or "",
-            parent=self,
-        )
-        dlg.exec()
 
     def _open_tasks_window(self) -> None:
         """Открывает сводное окно «Поручения»."""

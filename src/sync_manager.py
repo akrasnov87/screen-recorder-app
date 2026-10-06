@@ -73,7 +73,10 @@ _CONFIG_FOLDER_PROJECTS = "projects"
 _CONFIG_FOLDER_TAGS = "tags"
 
 # Префикс-маркер для JSON-конфигов в summary_bb.
-_CONFIG_JSON_PREFIX = "§CONFIG_JSON§\n"
+# Публичное имя — используется снаружи (screc_client.py).
+CONFIG_JSON_PREFIX = "§CONFIG_JSON§\n"
+# Обратная совместимость со старым именем.
+_CONFIG_JSON_PREFIX = CONFIG_JSON_PREFIX
 
 
 # Соответствие локальных файлов и kind на сервере.
@@ -2452,7 +2455,7 @@ class SyncManager:
             "source": "config",
             "sync_ready": True,
             "summary_bb": (
-                _CONFIG_JSON_PREFIX
+                CONFIG_JSON_PREFIX
                 + json.dumps(data, ensure_ascii=False)
             ),
         }

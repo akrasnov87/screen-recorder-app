@@ -1,23 +1,25 @@
 """Диалог отправки протокола/summary в чат Bitrix24.
 
 Изменения:
-  • Интерфейс переделан на вкладки: «Получатели», «Содержимое»,
-    «Параметры».
-  • Вся логика отправки (в т.ч. _SendWorker и _prepare_file_for_item)
+  • Интерфейс на вкладках: «Получатели», «Заголовки»,
+    «Материалы», «Ссылка на сервер», «Параметры».
+  • Каждая вкладка обёрнута в QScrollArea — ничего не наезжает
+    и не обрезается при любом размере окна.
+  • Проверка публичной ссылки: если пользователь ставит галочку
+    «Добавлять ссылку», но запись не опубликована (нет
+    record_id/path в .sync_published.json) или не задан
+    base_url — перед отправкой показывается предупреждение
+    с выбором «Отправить без ссылки» / «Отмена».
+  • Под полем ссылки на вкладке «Ссылка на сервер» показывается
+    диагностика: почему ссылка доступна или недоступна.
+  • Логика отправки (_SendWorker, _prepare_file_for_item)
     оставлена без изменений.
   • _SendWorker принимает max_message_chars.
-  • SendToBitrixDialog._on_send / _on_test читают
-    max_message_chars из bitrix_cfg.
-  • Для файлов-протоколов имя в чате формируется из заголовка
-    (поле «Заголовок протокола»). Кириллица транслитерируется,
-    недопустимые символы заменяются на «_».
-  • Комментарий к сообщению с файлами формируется из заголовков
-    файлов. Bitrix24 требует непустой MESSAGE — если заголовки
-    не заданы, bitrix_client подставит имя первого файла.
-  • НОВОЕ: блок «Ссылка на запись на сервере» на вкладке
-    «Содержимое». Можно добавить в конец сообщения абзац
-    «Подробнее: <ссылка>» на публичную HTML-страницу записи.
-    Ссылка формируется через sync_manager.build_public_view_url.
+  • Для файлов-протоколов имя в чате формируется из заголовка.
+    Кириллица транслитерируется, недопустимые символы заменяются
+    на «_».
+  • Если протокол отсутствует, но есть summary — «Отправить всё»
+    отправит только summary.
 """
 from __future__ import annotations
 
@@ -33,9 +35,10 @@ from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QProgressDialog, QPushButton, QSizePolicy,
-    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QProgressDialog, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout,
+    QWidget,
 )
 
 from ..bitrix_client import Bitrix24Client, Bitrix24Error
@@ -55,6 +58,19 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Утилиты
 # ---------------------------------------------------------------------------
+# Порядок приоритетов при поиске протокола в папке записи.
+_PROTOCOL_CANDIDATES = (
+    "manual_protocol.docx",
+    "manual_protocol.md",
+    "manual_protocol.txt",
+    "manual_protocol.pdf",
+    "protocol.docx",
+    "protocol.md",
+    "protocol.txt",
+    "protocol.pdf",
+)
+
+
 def _safe_filename(name: str) -> str:
     """Безопасное имя файла для временных документов."""
     bad = '<>:"/\\|?*\n\r\t'
@@ -96,6 +112,30 @@ def _find_summary_file(session_dir: str) -> str:
     return candidates[0][1]
 
 
+def _find_protocol_in_session(session_dir: str) -> str:
+    """
+    Ищет файл протокола в папке сессии.
+
+    Порядок: корень папки → подпапка attachments.
+    """
+    if not session_dir or not os.path.isdir(session_dir):
+        return ""
+
+    for name in _PROTOCOL_CANDIDATES:
+        p = os.path.join(session_dir, name)
+        if os.path.isfile(p):
+            return p
+
+    att_dir = os.path.join(session_dir, "attachments")
+    if os.path.isdir(att_dir):
+        for name in _PROTOCOL_CANDIDATES:
+            p = os.path.join(att_dir, name)
+            if os.path.isfile(p):
+                return p
+
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # QThread для массовой рассылки
 # ---------------------------------------------------------------------------
@@ -122,7 +162,6 @@ class _SendWorker(QThread):
         url_preview: bool,
         forced_folder_id: int,
         prefer_chat_folder: bool,
-        # --- НОВОЕ: хвост, добавляемый к каждому сообщению ---
         extra_tail: str = "",
     ) -> None:
         super().__init__()
@@ -139,7 +178,6 @@ class _SendWorker(QThread):
         self._url_preview = url_preview
         self._forced_folder_id = forced_folder_id
         self._prefer_chat_folder = prefer_chat_folder
-        # --- НОВОЕ ---
         self._extra_tail = extra_tail or ""
 
     def run(self) -> None:
@@ -176,8 +214,6 @@ class _SendWorker(QThread):
                         continue
                     prepared.append(p)
 
-                    # Имя файла в чате: для протокола — заголовок,
-                    # для остальных — basename.
                     try:
                         desired = self._desired_filename_cb(it, p)
                     except Exception as exc:
@@ -200,10 +236,6 @@ class _SendWorker(QThread):
                 prepared = []
 
             if prepared:
-                # Комментарий: заголовки файлов, если они заданы.
-                # Bitrix24 требует непустой MESSAGE — если
-                # заголовков нет, bitrix_client подставит имя
-                # первого файла.
                 headers = [
                     (it.get("header") or "").strip()
                     for it in file_items
@@ -211,7 +243,6 @@ class _SendWorker(QThread):
                 headers = [h for h in headers if h]
                 comment = " / ".join(headers) if headers else ""
 
-                # --- НОВОЕ: добавляем хвост (ссылку на сервер) ---
                 if self._extra_tail:
                     if comment:
                         comment = comment + self._extra_tail
@@ -264,7 +295,6 @@ class _SendWorker(QThread):
             try:
                 text = self._build_text_cb(it)
 
-                # --- НОВОЕ: добавляем хвост (ссылку на сервер) ---
                 if self._extra_tail:
                     text = (text + self._extra_tail).strip()
 
@@ -333,11 +363,12 @@ class SendToBitrixDialog(QDialog):
     """
     Диалог отправки протокола / summary в чат Bitrix24.
 
-    Переделан на вкладки:
-      • Получатели — выбор чатов и ручных ID;
-      • Содержимое — материалы, заголовки, режим отправки,
-        ссылка на запись на сервере;
-      • Параметры — вебхук, таймауты, опции.
+    Вкладки:
+      • Получатели      — выбор чатов и ручных ID;
+      • Заголовки       — текст заголовков протокола и summary;
+      • Материалы       — что и как отправлять;
+      • Ссылка на сервер — публичная ссылка на запись;
+      • Параметры       — вебхук, таймауты, системные флаги.
     """
 
     def __init__(
@@ -347,7 +378,6 @@ class SendToBitrixDialog(QDialog):
         bitrix_cfg: Dict[str, Any],
         projects: Optional[List[Dict[str, str]]] = None,
         employees: Optional[List[Dict[str, str]]] = None,
-        # --- НОВОЕ: настройки синхронизации (для ссылки на сервер) ---
         sync_settings: Optional[Dict[str, Any]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
@@ -358,7 +388,6 @@ class SendToBitrixDialog(QDialog):
         self.projects = list(projects or [])
         self.employees = list(employees or [])
 
-        # --- НОВОЕ: сохраняем настройки синхронизации ---
         self._sync_settings: Dict[str, Any] = dict(sync_settings or {})
         self._sync_base_url: str = str(
             self._sync_settings.get("base_url") or ""
@@ -369,16 +398,30 @@ class SendToBitrixDialog(QDialog):
             f"{self.session_info.get('name', '')}"
         )
         self.setModal(True)
-        self.setMinimumSize(820, 640)
-        self.resize(900, 720)
+        self.setMinimumSize(900, 720)
+        self.resize(980, 780)
 
+        # --- Протокол: путь из session_info или поиск в папке ---
         self._protocol_path = (
             self.session_info.get("protocol_path") or ""
-        )
+        ).strip()
+
+        if not self._protocol_path:
+            session_dir = (
+                self.session_info.get("session_dir") or ""
+            ).strip()
+            if session_dir:
+                self._protocol_path = _find_protocol_in_session(
+                    session_dir
+                )
+                if self._protocol_path:
+                    log.info(
+                        "Bitrix24: протокол найден автоматически: %s",
+                        self._protocol_path,
+                    )
+
         self._protocol_text = ""
-
         self._summary_md = self.session_info.get("summary_bb") or ""
-
         self._session_dir = (
             self.session_info.get("session_dir") or ""
         )
@@ -403,7 +446,7 @@ class SendToBitrixDialog(QDialog):
         self.selected_count_label: Optional[QLabel] = None
         self.empty_hint: Optional[QLabel] = None
 
-        # --- НОВОЕ: чекбоксы блоков для ссылки ---
+        # Чекбоксы блоков для публичной ссылки.
         self.link_blocks_checkboxes: Dict[str, QCheckBox] = {}
 
         self._build_ui()
@@ -411,16 +454,78 @@ class SendToBitrixDialog(QDialog):
         self._load_previews()
         self._update_send_buttons_state()
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # UI
-    # ------------------------------------------------------------------
+    # ==================================================================
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        # --- Плашка с информацией о записи (всегда видна) ---
-        info_row = QHBoxLayout()
+        root.addWidget(self._build_header_info())
+
+        self.tabs = QTabWidget()
+        self.tabs.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        root.addWidget(self.tabs, 1)
+
+        self.tabs.addTab(
+            self._wrap_tab(self._build_recipients_tab()),
+            "Получатели",
+        )
+        self.tabs.addTab(
+            self._wrap_tab(self._build_headers_tab()),
+            "Заголовки",
+        )
+        self.tabs.addTab(
+            self._wrap_tab(self._build_content_tab()),
+            "Материалы",
+        )
+        self.tabs.addTab(
+            self._wrap_tab(self._build_server_link_tab()),
+            "Ссылка на сервер",
+        )
+        self.tabs.addTab(
+            self._wrap_tab(self._build_options_tab()),
+            "Параметры",
+        )
+
+        root.addWidget(self._build_actions_bar())
+
+    @staticmethod
+    def _wrap_tab(widget: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        container = QWidget()
+        container.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
+        inner = QVBoxLayout(container)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(0)
+        inner.addWidget(widget)
+        inner.addStretch(1)
+
+        scroll.setWidget(container)
+        return scroll
+
+    def _build_header_info(self) -> QWidget:
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(6)
+
         name = self.session_info.get("name", "")
         project = self.session_info.get("project", "")
         date = self.session_info.get("date", "")
@@ -441,53 +546,39 @@ class SendToBitrixDialog(QDialog):
             )
         info = QLabel(info_text)
         info.setWordWrap(True)
-        info_row.addWidget(info, 1)
-        root.addLayout(info_row)
+        layout.addWidget(info, 1)
+        return box
 
-        # --- Вкладки ---
-        self.tabs = QTabWidget()
-        root.addWidget(self.tabs, 1)
+    def _build_actions_bar(self) -> QWidget:
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(4, 0, 4, 0)
+        row.setSpacing(6)
 
-        self.tabs.addTab(
-            self._build_recipients_tab(), "Получатели"
-        )
-        self.tabs.addTab(
-            self._build_content_tab(), "Содержимое"
-        )
-        self.tabs.addTab(
-            self._build_options_tab(), "Параметры"
-        )
-
-        # --- Кнопки действий ---
-        actions_row = QHBoxLayout()
-
-        self.send_protocol_btn = QPushButton(
-            "Отправить протокол"
-        )
+        self.send_protocol_btn = QPushButton("Отправить протокол")
         self.send_protocol_btn.clicked.connect(
             lambda: self._on_send(which="protocol")
         )
-        actions_row.addWidget(self.send_protocol_btn)
+        row.addWidget(self.send_protocol_btn)
 
         self.send_summary_btn = QPushButton("Отправить summary")
         self.send_summary_btn.clicked.connect(
             lambda: self._on_send(which="summary")
         )
-        actions_row.addWidget(self.send_summary_btn)
+        row.addWidget(self.send_summary_btn)
 
         self.send_both_btn = QPushButton("Отправить всё")
         self.send_both_btn.setToolTip(
             "Отправить протокол и summary.\n\n"
-            "Если протокол уходит файлом — его имя будет "
-            "совпадать с заголовком, а сам заголовок — текстом "
-            "в том же сообщении."
+            "Если один из материалов недоступен — уйдёт только "
+            "тот, что есть."
         )
         self.send_both_btn.clicked.connect(
             lambda: self._on_send(which="both")
         )
-        actions_row.addWidget(self.send_both_btn)
+        row.addWidget(self.send_both_btn)
 
-        actions_row.addStretch()
+        row.addStretch()
 
         bottom = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Close,
@@ -499,9 +590,9 @@ class SendToBitrixDialog(QDialog):
         close_btn.setText("Закрыть")
         bottom.rejected.connect(self.reject)
         bottom.accepted.connect(self.accept)
-        actions_row.addWidget(bottom)
+        row.addWidget(bottom)
 
-        root.addLayout(actions_row)
+        return box
 
     # ------------------------------------------------------------------
     # Вкладка «Получатели»
@@ -524,18 +615,13 @@ class SendToBitrixDialog(QDialog):
         header = QHBoxLayout()
         header.addWidget(QLabel("<b>Список получателей</b>"))
         header.addStretch()
-        icon = None
-        try:
-            from .tooltips import make_info_icon
-            icon = make_info_icon("bitrix_recipients_list")
-        except Exception:
-            icon = None
+        icon = make_info_icon("bitrix_recipients_list")
         if icon is not None:
             header.addWidget(icon)
         layout.addLayout(header)
 
         self.recipients_list = QListWidget()
-        self.recipients_list.setMinimumHeight(200)
+        self.recipients_list.setMinimumHeight(240)
         self.recipients_list.setSizePolicy(
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Expanding,
@@ -565,7 +651,6 @@ class SendToBitrixDialog(QDialog):
         self.empty_hint.setVisible(True)
         layout.addWidget(self.empty_hint)
 
-        # --- Кнопки управления списком ---
         list_btns = QHBoxLayout()
         list_btns.setSpacing(6)
 
@@ -612,7 +697,6 @@ class SendToBitrixDialog(QDialog):
 
         layout.addLayout(list_btns)
 
-        # --- Ручной ID ---
         manual_form = QFormLayout()
         manual_form.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight
@@ -632,16 +716,25 @@ class SendToBitrixDialog(QDialog):
         return w
 
     # ------------------------------------------------------------------
-    # Вкладка «Содержимое»
+    # Вкладка «Заголовки»
     # ------------------------------------------------------------------
-    def _build_content_tab(self) -> QWidget:
+    def _build_headers_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        # --- Заголовки ---
-        header_header = QHBoxLayout()
+        info = QLabel(
+            "<span style='color:#666'>Заголовок используется как "
+            "ИМЯ ФАЙЛА в чате Bitrix24 (с транслитерацией "
+            "кириллицы в латиницу) и как ТЕКСТ сообщения — это "
+            "ОДНО сообщение с текстом и файлом.<br><br>"
+            "Заголовок summary, если summary уходит текстом, "
+            "добавляется в начало сообщения.</span>"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
         self.header_check = QCheckBox(
             "Добавлять заголовок к сообщениям"
         )
@@ -654,26 +747,23 @@ class SendToBitrixDialog(QDialog):
             "файла в чате и как текст сообщения. Если галочка снята, "
             "и то, и другое будет пустым."
         )
-        header_header.addWidget(self.header_check)
-        header_header.addStretch()
-        layout.addLayout(header_header)
+        layout.addWidget(self.header_check)
 
-        headers_hint = QLabel(
-            "<span style='color:#666'>Заголовок протокола "
-            "используется как ИМЯ ФАЙЛА в чате Bitrix24 "
-            "(с транслитерацией кириллицы в латиницу) и как "
-            "ТЕКСТ сообщения — это ОДНО сообщение с текстом "
-            "и файлом.<br><br>"
-            "Заголовок summary, если summary уходит текстом, "
-            "добавляется в начало сообщения.</span>"
-        )
-        headers_hint.setWordWrap(True)
-        layout.addWidget(headers_hint)
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
 
-        headers_form = QFormLayout()
-        headers_form.setLabelAlignment(
+        form = QFormLayout()
+        form.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight
             | Qt.AlignmentFlag.AlignVCenter
+        )
+        form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        form.setRowWrapPolicy(
+            QFormLayout.RowWrapPolicy.WrapLongRows
         )
 
         self.protocol_header_input = QLineEdit()
@@ -682,10 +772,9 @@ class SendToBitrixDialog(QDialog):
         )
         self.protocol_header_input.setToolTip(
             "Заголовок для протокола. Используется как имя файла "
-            "и как текст сообщения в чате Bitrix24. Кириллица "
-            "транслитерируется в латиницу для имени файла, "
-            "недопустимые символы заменяются на «_»."
+            "и как текст сообщения в чате Bitrix24."
         )
+        form.addRow("Заголовок протокола:", self.protocol_header_input)
 
         self.summary_header_input = QLineEdit()
         self.summary_header_input.setPlaceholderText(
@@ -696,14 +785,9 @@ class SendToBitrixDialog(QDialog):
             "Заголовок для сообщения с кратким описанием. "
             "Если summary уходит текстом — добавляется в начало."
         )
+        form.addRow("Заголовок summary:", self.summary_header_input)
 
-        headers_form.addRow(
-            "Заголовок протокола:", self.protocol_header_input
-        )
-        headers_form.addRow(
-            "Заголовок summary:", self.summary_header_input
-        )
-        layout.addLayout(headers_form)
+        layout.addLayout(form)
 
         self._recalc_protocol_header_default()
         self._recalc_summary_header_default()
@@ -711,18 +795,69 @@ class SendToBitrixDialog(QDialog):
         self.header_check.toggled.connect(self._on_header_toggled)
         self._on_header_toggled(self.header_check.isChecked())
 
-        # --- Разделитель ---
-        sep1 = QLabel("<hr>")
-        layout.addWidget(sep1)
+        preview = QLabel(
+            "<span style='color:#666'>Пример того, как это будет "
+            "выглядеть в чате:</span>"
+        )
+        preview.setWordWrap(True)
+        layout.addWidget(preview)
 
-        # --- НОВОЕ: блок «Ссылка на запись на сервере» ---
-        layout.addWidget(self._build_server_link_section())
+        self.headers_preview = QLabel("")
+        self.headers_preview.setWordWrap(True)
+        self.headers_preview.setTextFormat(Qt.TextFormat.PlainText)
+        self.headers_preview.setStyleSheet(
+            "QLabel {"
+            "  background-color: #f5f5f5;"
+            "  border: 1px solid #ddd;"
+            "  border-radius: 4px;"
+            "  padding: 8px;"
+            "  font-family: monospace;"
+            "  color: #333;"
+            "}"
+        )
+        self.headers_preview.setMinimumHeight(80)
+        layout.addWidget(self.headers_preview)
 
-        # --- Разделитель ---
-        sep2 = QLabel("<hr>")
-        layout.addWidget(sep2)
+        self.protocol_header_input.textChanged.connect(
+            self._refresh_headers_preview
+        )
+        self.summary_header_input.textChanged.connect(
+            self._refresh_headers_preview
+        )
+        self._refresh_headers_preview()
 
-        # --- Режим отправки ---
+        layout.addStretch()
+        return w
+
+    def _refresh_headers_preview(self) -> None:
+        if not hasattr(self, "headers_preview"):
+            return
+        proto = self.protocol_header_input.text().strip()
+        summ = self.summary_header_input.text().strip()
+
+        lines = []
+        if self.header_check.isChecked():
+            if proto:
+                lines.append(
+                    f"[протокол, файл] {_safe_filename(proto)}.docx"
+                )
+                lines.append(f"[сообщение] {proto}")
+            if summ:
+                lines.append(f"[summary] {summ}")
+        else:
+            lines.append("(заголовки отключены)")
+
+        self.headers_preview.setText("\n".join(lines) or "—")
+
+    # ------------------------------------------------------------------
+    # Вкладка «Материалы»
+    # ------------------------------------------------------------------
+    def _build_content_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
         mode_header = QHBoxLayout()
         mode_header.addWidget(
             QLabel("<b>Как отправлять содержимое</b>")
@@ -780,11 +915,11 @@ class SendToBitrixDialog(QDialog):
         )
         self._on_send_mode_changed()
 
-        # --- Разделитель ---
-        sep3 = QLabel("<hr>")
-        layout.addWidget(sep3)
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
 
-        # --- Материалы ---
         materials_header = QHBoxLayout()
         materials_header.addWidget(
             QLabel("<b>Материалы к отправке</b>")
@@ -796,29 +931,39 @@ class SendToBitrixDialog(QDialog):
             "<span style='color:#666'>Содержимое здесь не "
             "отображается — чтобы проверить, откройте файл "
             "двойным кликом по ссылке или кнопкой "
-            "«Открыть файл».</span>"
+            "«Открыть».</span>"
         )
         materials_hint.setWordWrap(True)
         layout.addWidget(materials_hint)
 
-        # --- Протокол ---
-        protocol_row = QHBoxLayout()
-        protocol_row.addWidget(QLabel("Протокол:"))
+        layout.addWidget(self._build_protocol_row())
+        layout.addWidget(self._build_summary_row())
+
+        layout.addStretch()
+        return w
+
+    def _build_protocol_row(self) -> QWidget:
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        row.addWidget(QLabel("Протокол:"))
+
         self.protocol_link = QLabel()
         self.protocol_link.setOpenExternalLinks(False)
         self.protocol_link.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
         )
+        self.protocol_link.setWordWrap(True)
         self.protocol_link.linkActivated.connect(
             self._on_open_protocol_link
         )
-        protocol_row.addWidget(self.protocol_link, 1)
+        row.addWidget(self.protocol_link, 1)
 
         self.open_protocol_btn = QPushButton("Открыть")
-        self.open_protocol_btn.clicked.connect(
-            self._on_open_protocol
-        )
-        protocol_row.addWidget(self.open_protocol_btn)
+        self.open_protocol_btn.clicked.connect(self._on_open_protocol)
+        row.addWidget(self.open_protocol_btn)
 
         self.show_protocol_folder_btn = QPushButton("В папке")
         self.show_protocol_folder_btn.setToolTip(
@@ -827,27 +972,32 @@ class SendToBitrixDialog(QDialog):
         self.show_protocol_folder_btn.clicked.connect(
             lambda: self._show_in_folder(self._protocol_path)
         )
-        protocol_row.addWidget(self.show_protocol_folder_btn)
-        layout.addLayout(protocol_row)
+        row.addWidget(self.show_protocol_folder_btn)
 
-        # --- Summary ---
-        summary_row = QHBoxLayout()
-        summary_row.addWidget(QLabel("Summary:"))
+        return box
+
+    def _build_summary_row(self) -> QWidget:
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        row.addWidget(QLabel("Summary:"))
+
         self.summary_link = QLabel()
         self.summary_link.setOpenExternalLinks(False)
         self.summary_link.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
         )
+        self.summary_link.setWordWrap(True)
         self.summary_link.linkActivated.connect(
             self._on_open_summary_link
         )
-        summary_row.addWidget(self.summary_link, 1)
+        row.addWidget(self.summary_link, 1)
 
         self.open_summary_btn = QPushButton("Открыть")
-        self.open_summary_btn.clicked.connect(
-            self._on_open_summary
-        )
-        summary_row.addWidget(self.open_summary_btn)
+        self.open_summary_btn.clicked.connect(self._on_open_summary)
+        row.addWidget(self.open_summary_btn)
 
         self.show_summary_folder_btn = QPushButton("В папке")
         self.show_summary_folder_btn.setToolTip(
@@ -858,33 +1008,19 @@ class SendToBitrixDialog(QDialog):
                 self._summary_target_path()
             )
         )
-        summary_row.addWidget(self.show_summary_folder_btn)
-        layout.addLayout(summary_row)
+        row.addWidget(self.show_summary_folder_btn)
 
-        layout.addStretch()
-        return w
+        return box
 
     # ------------------------------------------------------------------
-    # НОВОЕ: блок «Ссылка на запись на сервере»
+    # Вкладка «Ссылка на сервер»
     # ------------------------------------------------------------------
-    def _build_server_link_section(self) -> QWidget:
-        """
-        Блок для управления публичной ссылкой на запись.
+    def _build_server_link_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
-        Позволяет:
-          • включить/выключить добавление ссылки в сообщение;
-          • выбрать блоки, которые нужно показать на странице
-            (video, audio, transcript, protocol, summary);
-          • увидеть предпросмотр готовой ссылки;
-          • скопировать ссылку в буфер обмена;
-          • открыть ссылку в браузере.
-        """
-        box = QWidget()
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(0, 8, 0, 0)
-        layout.setSpacing(6)
-
-        # --- Заголовок ---
         header = QHBoxLayout()
         header.addWidget(
             QLabel("<b>Ссылка на запись на сервере</b>")
@@ -899,15 +1035,16 @@ class SendToBitrixDialog(QDialog):
             "<span style='color:#666'>Если включено — в конец "
             "сообщения с протоколом/суммари добавляется абзац "
             "«Подробнее: …» со ссылкой на публичную HTML-страницу "
-            "записи на сервере синхронизации (без авторизации).<br><br>"
+            "записи на сервере синхронизации (без авторизации)."
+            "<br><br>"
             "Ссылка работает только если запись уже опубликована "
-            "на сервере (есть record_id и path в .sync_published.json) "
-            "и задан base_url в Настройки → Синхронизация.</span>"
+            "на сервере (есть record_id и path в "
+            ".sync_published.json) и задан base_url в "
+            "Настройки → Синхронизация.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        # --- Чекбокс включения ---
         self.include_server_link_check = QCheckBox(
             "Добавлять ссылку на запись на сервере"
         )
@@ -922,11 +1059,29 @@ class SendToBitrixDialog(QDialog):
         )
         layout.addWidget(self.include_server_link_check)
 
-        # --- Выбор блоков ---
-        blocks_row = QHBoxLayout()
-        blocks_row.addWidget(QLabel("Показывать на странице:"))
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
 
-        self.link_blocks_checkboxes: Dict[str, QCheckBox] = {}
+        blocks_header = QLabel(
+            "<b>Какие блоки показывать на странице</b>"
+        )
+        layout.addWidget(blocks_header)
+
+        blocks_hint = QLabel(
+            "<span style='color:#666'>Если снять все галочки — "
+            "сервер покажет все доступные блоки.</span>"
+        )
+        blocks_hint.setWordWrap(True)
+        layout.addWidget(blocks_hint)
+
+        blocks_grid = QFormLayout()
+        blocks_grid.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
         block_labels = {
             "video": "Видео",
             "audio": "Аудио",
@@ -942,29 +1097,34 @@ class SendToBitrixDialog(QDialog):
                 f"странице записи."
             )
             cb.toggled.connect(self._refresh_server_link_preview)
-            blocks_row.addWidget(cb)
+            blocks_grid.addRow("", cb)
             self.link_blocks_checkboxes[key] = cb
 
-        blocks_row.addStretch()
+        layout.addLayout(blocks_grid)
 
-        self.link_all_btn = QPushButton("Все")
-        self.link_all_btn.setToolTip("Включить все блоки")
+        blocks_btns = QHBoxLayout()
+        self.link_all_btn = QPushButton("Включить все")
         self.link_all_btn.clicked.connect(
             lambda: self._set_link_blocks(all_on=True)
         )
-        blocks_row.addWidget(self.link_all_btn)
+        blocks_btns.addWidget(self.link_all_btn)
 
-        self.link_none_btn = QPushButton("Ничего")
-        self.link_none_btn.setToolTip("Снять все блоки")
+        self.link_none_btn = QPushButton("Снять все")
         self.link_none_btn.clicked.connect(
             lambda: self._set_link_blocks(all_on=False)
         )
-        blocks_row.addWidget(self.link_none_btn)
+        blocks_btns.addWidget(self.link_none_btn)
 
-        layout.addLayout(blocks_row)
+        blocks_btns.addStretch()
+        layout.addLayout(blocks_btns)
 
-        # --- Предпросмотр ссылки ---
-        preview_row = QHBoxLayout()
+        separator2 = QFrame()
+        separator2.setFrameShape(QFrame.Shape.HLine)
+        separator2.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator2)
+
+        preview_header = QLabel("<b>Готовая ссылка</b>")
+        layout.addWidget(preview_header)
 
         self.server_link_preview = QLineEdit()
         self.server_link_preview.setReadOnly(True)
@@ -977,129 +1137,50 @@ class SendToBitrixDialog(QDialog):
             "Открывается в браузере без авторизации — "
             "можно отправить коллеге."
         )
-        preview_row.addWidget(self.server_link_preview, 1)
+        layout.addWidget(self.server_link_preview)
 
+        # --- Подсказка под ссылкой: почему доступна/недоступна ---
+        self.server_link_hint_label = QLabel("")
+        self.server_link_hint_label.setWordWrap(True)
+        self.server_link_hint_label.setTextFormat(
+            Qt.TextFormat.RichText
+        )
+        self.server_link_hint_label.setStyleSheet(
+            "QLabel {"
+            "  background-color: #fafbfc;"
+            "  border: 1px solid #e0e0e0;"
+            "  border-radius: 4px;"
+            "  padding: 8px;"
+            "  font-size: 12px;"
+            "}"
+        )
+        self.server_link_hint_label.setVisible(False)
+        layout.addWidget(self.server_link_hint_label)
+
+        preview_btns = QHBoxLayout()
         self.copy_link_btn = QPushButton("Скопировать")
         self.copy_link_btn.setToolTip(
             "Скопировать ссылку в буфер обмена"
         )
         self.copy_link_btn.clicked.connect(self._copy_server_link)
-        preview_row.addWidget(self.copy_link_btn)
+        preview_btns.addWidget(self.copy_link_btn)
 
-        self.open_link_btn = QPushButton("Открыть")
+        self.open_link_btn = QPushButton("Открыть в браузере")
         self.open_link_btn.setToolTip(
             "Открыть ссылку в браузере"
         )
         self.open_link_btn.clicked.connect(self._open_server_link)
-        preview_row.addWidget(self.open_link_btn)
+        preview_btns.addWidget(self.open_link_btn)
 
-        layout.addLayout(preview_row)
+        preview_btns.addStretch()
+        layout.addLayout(preview_btns)
 
-        # --- Инициализация состояния ---
+        # --- Инициализация ---
         self._on_server_link_toggled(False)
         self._refresh_server_link_preview()
 
-        return box
-
-    def _on_server_link_toggled(self, enabled: bool) -> None:
-        """Включает/выключает управление блоками и предпросмотром."""
-        for cb in self.link_blocks_checkboxes.values():
-            cb.setEnabled(enabled)
-        self.link_all_btn.setEnabled(enabled)
-        self.link_none_btn.setEnabled(enabled)
-        self.server_link_preview.setEnabled(enabled)
-        self.copy_link_btn.setEnabled(enabled)
-        self.open_link_btn.setEnabled(enabled)
-        self._refresh_server_link_preview()
-
-    def _set_link_blocks(self, *, all_on: bool) -> None:
-        """Включает/выключает все чекбоксы блоков."""
-        for cb in self.link_blocks_checkboxes.values():
-            cb.setChecked(all_on)
-
-    def _selected_link_blocks(self) -> List[str]:
-        """Возвращает список выбранных блоков для ссылки."""
-        return [
-            key for key, cb in self.link_blocks_checkboxes.items()
-            if cb.isChecked()
-        ]
-
-    def _build_current_server_link(self) -> str:
-        """
-        Собирает актуальную публичную ссылку для текущей записи.
-
-        Читает base_url из sync_settings, path и record_id — из
-        .sync_published.json.
-
-        Возвращает "" если что-то не готово.
-        """
-        base_url = self._sync_base_url
-        if not base_url:
-            return ""
-
-        session_dir = self._session_dir or ""
-        if not session_dir:
-            return ""
-
-        # Ленивый импорт, чтобы не тянуть sync_manager
-        # в момент импорта модуля.
-        try:
-            from ..sync_manager import (
-                build_public_view_url,
-                get_record_id,
-                get_record_path,
-            )
-        except Exception as exc:
-            log.warning(
-                "Не удалось импортировать sync_manager: %s", exc
-            )
-            return ""
-
-        record_id = get_record_id(session_dir)
-        if not record_id:
-            return ""
-
-        record_path = get_record_path(session_dir)
-        if not record_path:
-            return ""
-
-        blocks = self._selected_link_blocks() or None
-        return build_public_view_url(
-            base_url, record_path, record_id, blocks=blocks,
-        )
-
-    def _refresh_server_link_preview(self) -> None:
-        """Обновляет поле предпросмотра ссылки."""
-        if not hasattr(self, "server_link_preview"):
-            return
-        link = self._build_current_server_link()
-        self.server_link_preview.setText(link)
-
-    def _copy_server_link(self) -> None:
-        link = self.server_link_preview.text().strip()
-        if not link:
-            QMessageBox.information(
-                self, "Ссылка",
-                "Ссылка недоступна: запись не опубликована "
-                "на сервере или не задан base_url "
-                "(Настройки → Синхронизация).",
-            )
-            return
-        from PySide6.QtWidgets import QApplication
-        QApplication.clipboard().setText(link)
-        log.info("Публичная ссылка скопирована: %s", link)
-
-    def _open_server_link(self) -> None:
-        link = self.server_link_preview.text().strip()
-        if not link:
-            QMessageBox.information(
-                self, "Ссылка",
-                "Ссылка недоступна: запись не опубликована "
-                "на сервере или не задан base_url.",
-            )
-            return
-        QDesktopServices.openUrl(QUrl(link))
-        log.info("Открытие публичной ссылки: %s", link)
+        layout.addStretch()
+        return w
 
     # ------------------------------------------------------------------
     # Вкладка «Параметры»
@@ -1119,7 +1200,6 @@ class SendToBitrixDialog(QDialog):
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        # --- Вебхук ---
         form = QFormLayout()
         form.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight
@@ -1155,7 +1235,11 @@ class SendToBitrixDialog(QDialog):
 
         layout.addLayout(form)
 
-        # --- Опции ---
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
+
         opts_header = QHBoxLayout()
         opts_header.addWidget(QLabel("<b>Поведение сообщений</b>"))
         opts_header.addStretch()
@@ -1177,20 +1261,18 @@ class SendToBitrixDialog(QDialog):
             "Отключить предпросмотр ссылок"
         )
         self.no_preview_check.setChecked(
-            bool(self.bitrix_cfg.get(
-                "disable_url_preview", False
-            ))
+            bool(self.bitrix_cfg.get("disable_url_preview", False))
         )
         self.no_preview_check.setToolTip(
             "Bitrix24 не будет разворачивать ссылки в превью."
         )
         layout.addWidget(self.no_preview_check)
 
-        # --- Разделитель ---
-        sep = QLabel("<hr>")
-        layout.addWidget(sep)
+        separator2 = QFrame()
+        separator2.setFrameShape(QFrame.Shape.HLine)
+        separator2.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator2)
 
-        # --- Проверка подключения ---
         test_row = QHBoxLayout()
         self.test_btn = QPushButton("Проверить подключение")
         self.test_btn.setToolTip(
@@ -1205,9 +1287,9 @@ class SendToBitrixDialog(QDialog):
         layout.addStretch()
         return w
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Логика выбора получателей
-    # ------------------------------------------------------------------
+    # ==================================================================
     def _init_recipient_state(self) -> None:
         self.recipients_list.blockSignals(True)
         self.recipients_list.clear()
@@ -1426,6 +1508,9 @@ class SendToBitrixDialog(QDialog):
 
         return "\n".join(lines)
 
+    # ==================================================================
+    # Заголовки
+    # ==================================================================
     _DATE_TAIL_RE = re.compile(
         r"\d{4}-\d{2}-\d{2}"
         r"(?:\s+\d{2}[-:]\d{2}(?:[-:]\d{2})?)?"
@@ -1491,25 +1576,16 @@ class SendToBitrixDialog(QDialog):
     def _on_header_toggled(self, checked: bool) -> None:
         self.protocol_header_input.setEnabled(checked)
         self.summary_header_input.setEnabled(checked)
+        self._refresh_headers_preview()
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Режим отправки
-    # ------------------------------------------------------------------
+    # ==================================================================
     def _on_send_mode_changed(self) -> None:
         mode = self.send_mode_combo.currentData() or "auto"
         self.auto_file_threshold.setEnabled(mode == "auto")
 
     def _is_file_mode(self, which: str, body_len: int) -> bool:
-        """
-        Решает, отправлять материал файлом или текстом.
-
-        Правило по расширению исходного файла (для протокола):
-          • .docx / .pdf  → всегда файлом (вложением);
-          • .md / .txt    → всегда текстом.
-
-        Если у протокола нет исходного файла — смотрим на
-        выбранный режим отправки и порог длины.
-        """
         if which == "protocol":
             path = self._protocol_path or ""
             if path and os.path.exists(path):
@@ -1527,7 +1603,6 @@ class SendToBitrixDialog(QDialog):
         return body_len > self.auto_file_threshold.value()
 
     def _has_file_for(self, which: str) -> bool:
-        """Есть ли у материала готовый файл для отправки."""
         if which == "protocol":
             path = self._protocol_path or ""
             return bool(path and os.path.exists(path))
@@ -1539,9 +1614,9 @@ class SendToBitrixDialog(QDialog):
             )
         return False
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Ссылки на материалы
-    # ------------------------------------------------------------------
+    # ==================================================================
     def _summary_target_path(self) -> str:
         if (self._summary_file_path
                 and os.path.exists(self._summary_file_path)):
@@ -1582,9 +1657,34 @@ class SendToBitrixDialog(QDialog):
             self.show_protocol_folder_btn.setEnabled(True)
         else:
             self._protocol_text = ""
+            session_dir = self.session_info.get("session_dir") or ""
+
+            log.warning(
+                "Bitrix24: протокол не найден для записи «%s». "
+                "protocol_path=%r, session_dir=%r",
+                self.session_info.get("name"),
+                self._protocol_path or "—",
+                session_dir or "—",
+            )
+            if session_dir and os.path.isdir(session_dir):
+                try:
+                    files = sorted(os.listdir(session_dir))
+                    log.info(
+                        "Bitrix24: содержимое папки %s: %s",
+                        session_dir, files,
+                    )
+                except OSError as exc:
+                    log.warning(
+                        "Bitrix24: не удалось прочитать папку %s: %s",
+                        session_dir, exc,
+                    )
+
             self.protocol_link.setText(
                 "<span style='color:#c62828'>"
-                "Протокол не прикреплён к этой записи.</span>"
+                "Протокол не найден в папке записи.<br>"
+                "Ожидается manual_protocol.docx / .md / .txt / .pdf "
+                "или protocol.docx / .md / .txt / .pdf "
+                "(в корне или в attachments/).</span>"
             )
             self.open_protocol_btn.setEnabled(False)
             self.show_protocol_folder_btn.setEnabled(False)
@@ -1663,9 +1763,9 @@ class SendToBitrixDialog(QDialog):
         log.info("Открытие папки: %s", folder)
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Проверка подключения
-    # ------------------------------------------------------------------
+    # ==================================================================
     def _on_test(self) -> None:
         webhook = self.webhook_input.text().strip()
         if not webhook:
@@ -1725,15 +1825,258 @@ class SendToBitrixDialog(QDialog):
             f"Пользователь вебхука: {name}",
         )
 
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Ссылка на сервер
+    # ==================================================================
+    def _on_server_link_toggled(self, enabled: bool) -> None:
+        for cb in self.link_blocks_checkboxes.values():
+            cb.setEnabled(enabled)
+        self.link_all_btn.setEnabled(enabled)
+        self.link_none_btn.setEnabled(enabled)
+        self.server_link_preview.setEnabled(enabled)
+        self.copy_link_btn.setEnabled(enabled)
+        self.open_link_btn.setEnabled(enabled)
+        self._refresh_server_link_preview()
+
+    def _set_link_blocks(self, *, all_on: bool) -> None:
+        for cb in self.link_blocks_checkboxes.values():
+            cb.setChecked(all_on)
+
+    def _selected_link_blocks(self) -> List[str]:
+        return [
+            key for key, cb in self.link_blocks_checkboxes.items()
+            if cb.isChecked()
+        ]
+
+    def _check_server_link_state(self) -> Dict[str, Any]:
+        """
+        Проверяет, можно ли сформировать публичную ссылку.
+
+        Returns:
+            {
+              "ok": bool,
+              "reason": str,         # машинный код причины
+              "details": str,        # подробное описание для UI
+              "link": str,           # готовая ссылка или ""
+              "record_id": str,
+              "record_path": str,
+              "has_base_url": bool,
+              "has_session_dir": bool,
+              "is_published": bool,
+            }
+        """
+        result: Dict[str, Any] = {
+            "ok": False,
+            "reason": "",
+            "details": "",
+            "link": "",
+            "record_id": "",
+            "record_path": "",
+            "has_base_url": False,
+            "has_session_dir": False,
+            "is_published": False,
+        }
+
+        base_url = self._sync_base_url
+        result["has_base_url"] = bool(base_url)
+        if not base_url:
+            result["reason"] = "no_base_url"
+            result["details"] = (
+                "Не задан base_url сервера синхронизации.\n"
+                "Откройте Настройки → Синхронизация и укажите "
+                "Base URL."
+            )
+            return result
+
+        session_dir = self._session_dir or ""
+        result["has_session_dir"] = bool(session_dir)
+        if not session_dir:
+            result["reason"] = "no_session_dir"
+            result["details"] = (
+                "Не удалось определить папку записи. "
+                "Возможно, диалог открыт не из окна «Записи»."
+            )
+            return result
+
+        try:
+            from ..sync_manager import (
+                build_public_view_url,
+                get_record_id,
+                get_record_path,
+                is_record_published,
+            )
+        except Exception as exc:
+            log.warning(
+                "Не удалось импортировать sync_manager: %s", exc,
+            )
+            result["reason"] = "import_error"
+            result["details"] = (
+                f"Внутренняя ошибка клиента: {exc}"
+            )
+            return result
+
+        record_id = get_record_id(session_dir)
+        result["record_id"] = record_id
+        if not record_id:
+            result["reason"] = "not_published"
+            result["details"] = (
+                "Запись НЕ опубликована на сервере.\n\n"
+                "Чтобы получить публичную ссылку, сначала "
+                "опубликуйте запись:\n"
+                "  • откройте окно «Записи»;\n"
+                "  • выделите запись;\n"
+                "  • «Файл → Синхронизировать выбранную запись…» "
+                "или Ctrl+Shift+S;\n"
+                "  • дождитесь успешной публикации."
+            )
+            return result
+
+        record_path = get_record_path(session_dir)
+        result["record_path"] = record_path
+        if not record_path:
+            result["reason"] = "no_path"
+            result["details"] = (
+                "У записи есть record_id, но нет path в "
+                ".sync_published.json.\n\n"
+                "Скорее всего, запись публиковалась старой версией "
+                "клиента. Перепубликуйте её через "
+                "«Синхронизировать…» (Ctrl+Shift+S)."
+            )
+            return result
+
+        result["is_published"] = bool(
+            is_record_published(session_dir)
+        )
+
+        # --- Формируем список блоков ---
+        # Если выбраны ВСЕ блоки — не передаём параметр: сервер
+        # покажет всё по умолчанию. Это сильно укорачивает URL
+        # и делает BB-ссылку компактнее.
+        selected = self._selected_link_blocks()
+        all_keys = set(self.link_blocks_checkboxes.keys())
+        if set(selected) == all_keys:
+            blocks = None
+        else:
+            blocks = selected or None
+
+        link = build_public_view_url(
+            base_url, record_path, record_id, blocks=blocks,
+        )
+        if not link:
+            result["reason"] = "build_failed"
+            result["details"] = (
+                "Не удалось собрать ссылку — проверьте "
+                "корректность record_id и path."
+            )
+            return result
+
+        result["ok"] = True
+        result["link"] = link
+        return result
+
+    def _build_current_server_link(self) -> str:
+        """Возвращает готовую ссылку или "" (обёртка)."""
+        state = self._check_server_link_state()
+        return state.get("link", "") if state.get("ok") else ""
+
+    def _refresh_server_link_preview(self) -> None:
+        if not hasattr(self, "server_link_preview"):
+            return
+
+        state = self._check_server_link_state()
+        link = state.get("link") or ""
+        self.server_link_preview.setText(link)
+
+        if hasattr(self, "server_link_hint_label"):
+            if state["ok"]:
+                self.server_link_hint_label.setText(
+                    "<span style='color:#2E7D32'>"
+                    "✓ Ссылка готова к отправке."
+                    "</span>"
+                )
+                self.server_link_hint_label.setVisible(True)
+            else:
+                details_html = html.escape(
+                    state.get("details", "")
+                ).replace("\n", "<br>")
+                self.server_link_hint_label.setText(
+                    "<span style='color:#c62828'>"
+                    f"✗ Ссылка недоступна "
+                    f"({html.escape(state.get('reason', ''))})"
+                    f"</span><br><br>"
+                    f"<span style='color:#666'>{details_html}</span>"
+                )
+                self.server_link_hint_label.setVisible(True)
+
+    def _copy_server_link(self) -> None:
+        link = self.server_link_preview.text().strip()
+        if not link:
+            QMessageBox.information(
+                self, "Ссылка",
+                "Ссылка недоступна: запись не опубликована "
+                "на сервере или не задан base_url "
+                "(Настройки → Синхронизация).",
+            )
+            return
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(link)
+        log.info("Публичная ссылка скопирована: %s", link)
+
+    def _open_server_link(self) -> None:
+        link = self.server_link_preview.text().strip()
+        if not link:
+            QMessageBox.information(
+                self, "Ссылка",
+                "Ссылка недоступна: запись не опубликована "
+                "на сервере или не задан base_url.",
+            )
+            return
+        QDesktopServices.openUrl(QUrl(link))
+        log.info("Открытие публичной ссылки: %s", link)
+
+    def _confirm_link_unavailable(
+        self, details: str,
+    ) -> bool:
+        """
+        Показывает предупреждение о недоступности ссылки.
+
+        Returns:
+            True — пользователь выбрал «Отправить без ссылки».
+            False — пользователь отменил отправку.
+        """
+        details_html = html.escape(details).replace("\n", "<br>")
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Bitrix24 — ссылка недоступна")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            "<b>Вы включили «Добавлять ссылку на запись на "
+            "сервере», но ссылка не может быть сформирована.</b>"
+            "<br><br>"
+            f"{details_html}"
+        )
+        box.setInformativeText(
+            "Отправить сообщение без ссылки или отменить "
+            "отправку, чтобы сначала опубликовать запись?"
+        )
+        send_without_btn = box.addButton(
+            "Отправить без ссылки",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_btn = box.addButton(
+            "Отмена", QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(send_without_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        return clicked is send_without_btn
+
+    # ==================================================================
     # Формирование сообщения
-    # ------------------------------------------------------------------
+    # ==================================================================
     def _build_text_message(self, item: Dict[str, Any]) -> str:
-        """
-        Формирует текстовое сообщение БЕЗ ссылки на сервер —
-        ссылка добавляется в _SendWorker через extra_tail,
-        чтобы не задваивать её.
-        """
         header = item.get("header", "")
         body = item.get("body", "")
         if header:
@@ -1803,7 +2146,6 @@ class SendToBitrixDialog(QDialog):
     def _prepare_file_for_item(
         self, item: Dict[str, Any],
     ) -> str:
-        """Готовит один файл к отправке."""
         which = item["which"]
         src = item.get("src_file") or ""
 
@@ -1888,20 +2230,11 @@ class SendToBitrixDialog(QDialog):
 
         return ""
 
-    # ------------------------------------------------------------------
-    # Имя файла в чате
-    # ------------------------------------------------------------------
     def _desired_filename_for_item(
         self,
         item: Dict[str, Any],
         local_path: str,
     ) -> str:
-        """
-        Возвращает желаемое имя файла в Bitrix24.
-
-        Для протокола — заголовок из поля «Заголовок протокола»
-        (если он не пустой и включена галочка «Добавлять заголовок»).
-        """
         which = item.get("which", "")
         if which != "protocol":
             return ""
@@ -1913,9 +2246,9 @@ class SendToBitrixDialog(QDialog):
         ext = os.path.splitext(local_path)[1].lower() or ".docx"
         return f"{header}{ext}"
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Отправка
-    # ------------------------------------------------------------------
+    # ==================================================================
     def _on_send(self, which: str) -> None:
         if self._worker is not None and self._worker.isRunning():
             QMessageBox.information(
@@ -1944,39 +2277,55 @@ class SendToBitrixDialog(QDialog):
             )
             return
 
+        has_protocol = bool(
+            self._protocol_text.strip()
+            or (self._protocol_path
+                and os.path.exists(self._protocol_path))
+        )
+        has_summary = bool(self._summary_bitrix.strip())
+
         targets: List[str] = []
+
         if which == "protocol":
-            if not self._protocol_text.strip() and not (
-                self._protocol_path
-                and os.path.exists(self._protocol_path)
-            ):
+            if not has_protocol:
                 QMessageBox.warning(
-                    self, "Bitrix24", "Протокол не прикреплён."
+                    self, "Bitrix24",
+                    "Протокол не найден в папке записи.\n\n"
+                    "Ожидается manual_protocol.docx / .md / .txt / "
+                    ".pdf или protocol.docx / .md / .txt / .pdf "
+                    "(в корне или в attachments/).",
                 )
                 return
             targets = ["protocol"]
         elif which == "summary":
-            if not self._summary_bitrix.strip():
+            if not has_summary:
                 QMessageBox.warning(
                     self, "Bitrix24", "Summary пустое."
                 )
                 return
             targets = ["summary"]
         elif which == "both":
-            if not self._protocol_text.strip() and not (
-                self._protocol_path
-                and os.path.exists(self._protocol_path)
-            ):
+            if not has_protocol and not has_summary:
                 QMessageBox.warning(
-                    self, "Bitrix24", "Протокол не прикреплён."
+                    self, "Bitrix24",
+                    "Нечего отправлять: нет ни протокола, "
+                    "ни summary.",
                 )
                 return
-            if not self._summary_bitrix.strip():
-                QMessageBox.warning(
-                    self, "Bitrix24", "Summary пустое."
+            if has_protocol:
+                targets.append("protocol")
+            if has_summary:
+                targets.append("summary")
+            if not has_protocol:
+                log.info(
+                    "Bitrix24: «Отправить всё» — протокол "
+                    "отсутствует, отправляем только summary",
                 )
-                return
-            targets = ["protocol", "summary"]
+            if not has_summary:
+                log.info(
+                    "Bitrix24: «Отправить всё» — summary "
+                    "отсутствует, отправляем только протокол",
+                )
 
         plan: List[Dict[str, Any]] = []
         for t in targets:
@@ -1996,7 +2345,9 @@ class SendToBitrixDialog(QDialog):
                     "header": header,
                     "body": body,
                     "src_file": src_file,
-                    "is_file": self._is_file_mode("protocol", len(body)),
+                    "is_file": self._is_file_mode(
+                        "protocol", len(body)
+                    ),
                 })
             elif t == "summary":
                 header = (
@@ -2049,29 +2400,79 @@ class SendToBitrixDialog(QDialog):
 
         recipients_text = self._describe_recipients(chat_ids)
 
-        # --- НОВОЕ: публичная ссылка на сервер ---
+        # --------------------------------------------------------------
+        # Проверка публичной ссылки
+        # --------------------------------------------------------------
         extra_tail = ""
-        if (hasattr(self, "include_server_link_check")
-                and self.include_server_link_check.isChecked()):
-            link = self._build_current_server_link()
-            if link:
-                extra_tail = f"\n\nПодробнее: {link}"
+        include_link = (
+            hasattr(self, "include_server_link_check")
+            and self.include_server_link_check.isChecked()
+        )
+
+        if include_link:
+            state = self._check_server_link_state()
+
+            if state["ok"]:
+                link = state["link"]
+                # BB-код Bitrix24: [url=URL]текст[/url].
+                # Голый URL в plain-тексте Bitrix24 показывает
+                # целиком (percent-encoded кириллица) и иногда
+                # обрезает по лимиту строки.
+                extra_tail = (
+                    "\n\n[url=" + link + "]Подробнее[/url]"
+                )
                 log.info(
-                    "Bitrix24: к сообщению будет добавлена ссылка "
-                    "на сервер: %s", link,
+                    "Bitrix24: к сообщению будет добавлена "
+                    "BB-ссылка на сервер: %s", link,
                 )
             else:
-                log.info(
-                    "Bitrix24: галочка «Добавлять ссылку» включена, "
-                    "но ссылка недоступна — запись не опубликована "
-                    "или не задан base_url"
+                log.warning(
+                    "Bitrix24: галочка «Добавлять ссылку» "
+                    "включена, но ссылка недоступна "
+                    "(reason=%s, record_id=%r, record_path=%r)",
+                    state.get("reason"),
+                    state.get("record_id") or "—",
+                    state.get("record_path") or "—",
                 )
 
+                send_without = self._confirm_link_unavailable(
+                    state.get("details", "")
+                )
+                if not send_without:
+                    log.info(
+                        "Bitrix24: пользователь отменил отправку — "
+                        "ссылка недоступна"
+                    )
+                    return
+
+                log.info(
+                    "Bitrix24: пользователь выбрал «Отправить без "
+                    "ссылки» — extra_tail не добавляется"
+                )
+                extra_tail = ""
+                self.include_server_link_check.setChecked(False)
+
+        # --- Предпросмотр ссылки в диалоге подтверждения ---
         link_note = ""
         if extra_tail:
+            actual_link = ""
+            if include_link:
+                state_now = self._check_server_link_state()
+                actual_link = state_now.get("link", "")
+
             link_note = (
                 "<br><br><b>Ссылка на сервер:</b><br>"
-                f"<code>{html.escape(extra_tail.strip())}</code>"
+                f"<a href='{html.escape(actual_link)}'>"
+                f"Подробнее</a>"
+                f"<br><span style='color:#666; font-size:11px'>"
+                f"<code>{html.escape(actual_link)}</code>"
+                f"</span>"
+            )
+        elif include_link:
+            link_note = (
+                "<br><br><b>Ссылка на сервер:</b> "
+                "<span style='color:#c62828'>не будет добавлена "
+                "(отправка без ссылки)</span>"
             )
 
         reply = QMessageBox.question(
@@ -2141,7 +2542,6 @@ class SendToBitrixDialog(QDialog):
             url_preview=url_preview,
             forced_folder_id=forced_folder_id,
             prefer_chat_folder=prefer_chat_folder,
-            # --- НОВОЕ ---
             extra_tail=extra_tail,
         )
         self._worker.progress.connect(self._on_send_progress)

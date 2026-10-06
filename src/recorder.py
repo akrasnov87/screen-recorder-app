@@ -310,6 +310,7 @@ class ScreenRecorder(QObject):
             self._process = None
             self._output_path = None
             self._start_time = None
+            self._paused = False
             if path and os.path.exists(path):
                 size = os.path.getsize(path)
                 log.info("Файл записи: %s (%.2f МБ)",

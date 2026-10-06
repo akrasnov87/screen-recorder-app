@@ -16,6 +16,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Signal
 
+from .action_items_prompt_builder import (
+    read_protocol_text,
+    regenerate_action_items_prompt,
+)
 from .file_readers import read_any_text
 from .litellm_client import LiteLLMClient, LiteLLMError
 from .logger import get_logger
@@ -473,17 +477,12 @@ class VideoProcessor(QObject):
                 scrum_cfg.get("generate_action_items", True)
             )
 
+            session_dir = os.path.dirname(video_path)
+
             if generate_action_items:
                 self.task_progress.emit(
                     task_id, 85, "Формирование промпта поручений…"
                 )
-
-                from .action_items_prompt_builder import (
-                    read_protocol_text,
-                    regenerate_action_items_prompt,
-                )
-
-                session_dir = os.path.dirname(video_path)
 
                 # --- Читаем протокол ---
                 protocol_text, protocol_source = read_protocol_text(
@@ -553,6 +552,97 @@ class VideoProcessor(QObject):
                     "(scrum.generate_action_items=false)",
                     task_id,
                 )
+
+            # ============================================================
+            # Шаг 5: извлечение поручений через LLM
+            # ============================================================
+            if (generate_action_items
+                    and transcript_path
+                    and metadata.get("generate_action_items", True)):
+                self.task_progress.emit(
+                    task_id, 92, "Извлечение поручений…"
+                )
+
+                # --- Читаем стенограмму и протокол ---
+                transcript_text = ""
+                try:
+                    transcript_text = await asyncio.to_thread(
+                        read_any_text,
+                        transcript_path,
+                        self._max_file_read_chars,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[%s] Не удалось прочитать стенограмму "
+                        "для поручений: %s", task_id, exc,
+                    )
+
+                protocol_text_for_llm = ""
+                try:
+                    protocol_text_for_llm, _ = await asyncio.to_thread(
+                        read_protocol_text,
+                        session_dir,
+                        max_chars=self._max_file_read_chars,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[%s] Не удалось прочитать протокол "
+                        "для поручений: %s", task_id, exc,
+                    )
+
+                # --- Запрос к LLM ---
+                items = await self._extract_action_items_via_llm(
+                    task_id=task_id,
+                    session_dir=session_dir,
+                    transcript=transcript_text,
+                    protocol_text=protocol_text_for_llm,
+                    session_name=str(metadata.get("name") or ""),
+                    session_date=str(metadata.get("date") or ""),
+                )
+
+                # --- Сохраняем в action_items.json ---
+                if items:
+                    try:
+                        from .tasks_manager import (
+                            load_action_items,
+                            save_action_items,
+                        )
+
+                        data = load_action_items(session_dir)
+                        data["session_name"] = (
+                            metadata.get("name") or ""
+                        )
+
+                        existing_ids = {
+                            it.get("id")
+                            for it in data.get("items", [])
+                        }
+                        added = 0
+                        for it in items:
+                            if it.get("id") not in existing_ids:
+                                data["items"].append(it)
+                                existing_ids.add(it.get("id"))
+                                added += 1
+
+                        save_action_items(
+                            session_dir, data, skip_normalize=True
+                        )
+                        log.info(
+                            "[%s] Поручения сохранены: добавлено %d, "
+                            "всего %d",
+                            task_id, added, len(data["items"]),
+                        )
+                    except Exception as exc:
+                        log.exception(
+                            "[%s] Не удалось сохранить поручения: %s",
+                            task_id, exc,
+                        )
+                else:
+                    log.info(
+                        "[%s] LLM не вернул поручений — "
+                        "action_items.json не изменён",
+                        task_id,
+                    )
 
             # --- Завершение ---
             self.task_queue.update_task_status(task_id, "completed", 100)
@@ -1969,58 +2059,6 @@ class VideoProcessor(QObject):
 
         return "\n".join(lines)
 
-    def _build_action_items_prompt_file(
-        self,
-        *,
-        session_dir: str,
-        protocol_text: str,
-        session_name: str = "",
-        session_date: str = "",
-        task_id: str = "",
-    ) -> str:
-        """
-        Формирует action_items_prompt.<ext> через общий модуль.
-
-        Обёртка над action_items_prompt_builder, чтобы processor
-        мог передать свой конфиг (шаблон, формат).
-        """
-        from .action_items_prompt_builder import (
-            build_prompt_blocks,
-            write_prompt_file,
-        )
-
-        scrum_cfg = self.config.get("scrum", {}) or {}
-        template = str(
-            scrum_cfg.get("action_items_prompt_template")
-            or ""
-        ).strip()
-        fmt = str(
-            scrum_cfg.get("export_format") or "docx"
-        ).lower()
-        if fmt not in ("docx", "md", "txt"):
-            fmt = "docx"
-
-        blocks = build_prompt_blocks(
-            protocol_text=protocol_text,
-            session_name=session_name,
-            session_date=session_date,
-            template=template,
-        )
-
-        log.info(
-            "[%s] Сборка промпта поручений: формат=%s, "
-            "протокол=%d символов, шаблон=%d символов",
-            task_id, fmt,
-            len(protocol_text or ""), len(template),
-        )
-
-        path = write_prompt_file(
-            session_dir=session_dir,
-            blocks=blocks,
-            fmt=fmt,
-        )
-        return path
-
     # ------------------------------------------------------------------
     # Управление
     # ------------------------------------------------------------------
@@ -2309,6 +2347,21 @@ class VideoProcessor(QObject):
             result.format_kind,
             result.session_name or "—",
         )
+
+        # --- Присваиваем сквозные номера и метку источника ---
+        try:
+            from .tasks_manager import get_next_item_number
+            for it in result.items:
+                if not it.get("number"):
+                    it["number"] = get_next_item_number(session_dir)
+                it["source"] = "llm"
+                if not it.get("context"):
+                    it["context"] = session_name or ""
+        except Exception as exc:
+            log.warning(
+                "[%s] Не удалось присвоить номера поручениям: %s",
+                task_id, exc,
+            )
 
         return list(result.items)
 

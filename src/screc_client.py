@@ -70,6 +70,11 @@ from .utils import sanitize_filename
 
 log = get_logger(__name__)
 
+# Префикс-маркер для JSON-конфигов, сохраняемых в summary_bb.
+# Определён здесь же, чтобы не импортировать приватный символ
+# из sync_manager.
+CONFIG_JSON_PREFIX = "§CONFIG_JSON§\n"
+
 class ScrecError(RuntimeError):
     """Ошибка при обращении к серверу синхронизации."""
 
@@ -341,6 +346,10 @@ class ScrecClient:
         )
 
         opened_files: List[Any] = []
+        # --- ВАЖНО: сервер сопоставляет files[i] / kinds[i] /
+        #     sha256[i] по индексу. Массивы должны быть
+        #     согласованы. ---
+        kinds_collected: List[str] = []
         try:
             for kind, filename in artifacts:
                 if artifact_dir and not os.path.isabs(filename):
@@ -371,9 +380,15 @@ class ScrecClient:
                     filename=safe_name,
                     content_type="application/octet-stream",
                 )
+                kinds_collected.append(kind)
 
                 sha = artifact_hashes.get(os.path.basename(full_path), "")
                 form.add_field("sha256", sha)
+
+            # --- НОВОЕ: параллельный массив kinds ---
+            # FastAPI принимает повторяющиеся поля формы как List[str].
+            for k in kinds_collected:
+                form.add_field("kinds", k)
 
             async with self._session.post(
                 url, data=form, headers=self._headers()
@@ -1053,15 +1068,15 @@ class ScrecClient:
         Raises:
             ScrecError: если ответ не удаётся распарсить как JSON.
         """
-        from .sync_manager import _CONFIG_JSON_PREFIX
+        from .sync_manager import CONFIG_JSON_PREFIX
 
         raw = await self.get_summary(record_id)
         if not isinstance(raw, str):
             raw = str(raw or "")
 
         text = raw.strip()
-        if text.startswith(_CONFIG_JSON_PREFIX):
-            text = text[len(_CONFIG_JSON_PREFIX):].strip()
+        if text.startswith(CONFIG_JSON_PREFIX):
+            text = text[len(CONFIG_JSON_PREFIX):].strip()
             log.debug(
                 "get_config_json: record=%s, префикс обнаружен, "
                 "%d символов JSON",
