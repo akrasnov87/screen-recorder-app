@@ -35,13 +35,14 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QDate, QThread, QUrl, Signal
-from PySide6.QtGui import QGuiApplication, QAction, QDesktopServices, QKeySequence
+from PySide6.QtGui import QGuiApplication, QAction, QDesktopServices, QKeySequence, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QLineEdit, QMenu, QMenuBar, QMessageBox,
-    QPlainTextEdit, QProgressDialog, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMenu, QMenuBar, QMessageBox, QPlainTextEdit, QProgressDialog,
+    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from ..daily_digest import (
@@ -686,12 +687,13 @@ class DailyDigestDialog(QDialog):
 
     Позволяет выбрать:
       • период (с / по);
+      • проекты (один, несколько или все);
       • промпт из библиотеки (с возможностью редактирования);
       • включать ли краткое описание (summary) каждой записи;
       • формат сохранения (docx / md / txt).
 
     После подтверждения:
-      1. Отбирает записи за период.
+      1. Отбирает записи за период и по выбранным проектам.
       2. Собирает промпт через daily_digest.
       3. Сохраняет файл в папку «Загрузки».
     """
@@ -709,12 +711,16 @@ class DailyDigestDialog(QDialog):
 
         self.setWindowTitle("Свод за день")
         self.setModal(True)
-        self.setMinimumSize(860, 640)
+        self.setMinimumSize(860, 780)
 
         self._result_path: str = ""
         self._result_count: int = 0
 
+        # Список проектов, выбранных пользователем (пусто = все).
+        self._selected_projects: List[str] = []
+
         self._build_ui()
+        self._load_projects()
         self._apply_initial_prompt()
 
     # ------------------------------------------------------------------
@@ -787,6 +793,9 @@ class DailyDigestDialog(QDialog):
         period_row.addStretch()
         root.addLayout(period_row)
 
+        # --- Блок выбора проектов ---
+        root.addWidget(self._build_projects_section())
+
         # --- Промпт ---
         prompt_header = QHBoxLayout()
         prompt_header.addWidget(QLabel("<b>Промпт</b>"))
@@ -840,6 +849,167 @@ class DailyDigestDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    # ------------------------------------------------------------------
+    # Блок выбора проектов
+    # ------------------------------------------------------------------
+    def _build_projects_section(self) -> QWidget:
+        """
+        Блок выбора проектов: список с чекбоксами, кнопки
+        «Выбрать все» / «Снять все» и счётчик выбранных.
+        """
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Проекты</b>"))
+        header.addSpacing(8)
+        hint = QLabel(
+            "<span style='color:#666'>Если ничего не отмечено — "
+            "свод строится по всем проектам за выбранный "
+            "период.</span>"
+        )
+        hint.setWordWrap(True)
+        header.addWidget(hint, 1)
+        layout.addLayout(header)
+
+        self.projects_list = QListWidget()
+        self.projects_list.setMinimumHeight(120)
+        self.projects_list.setMaximumHeight(180)
+        self.projects_list.setSelectionMode(
+            QListWidget.SelectionMode.NoSelection
+        )
+        self.projects_list.setAlternatingRowColors(True)
+        self.projects_list.itemChanged.connect(
+            self._on_project_item_changed
+        )
+        layout.addWidget(self.projects_list)
+
+        btns = QHBoxLayout()
+
+        self.projects_all_btn = QPushButton("Выбрать все")
+        self.projects_all_btn.clicked.connect(
+            lambda: self._set_all_projects(True)
+        )
+        btns.addWidget(self.projects_all_btn)
+
+        self.projects_none_btn = QPushButton("Снять все")
+        self.projects_none_btn.clicked.connect(
+            lambda: self._set_all_projects(False)
+        )
+        btns.addWidget(self.projects_none_btn)
+
+        btns.addStretch()
+
+        self.projects_count_label = QLabel("Проектов не выбрано")
+        self.projects_count_label.setStyleSheet(
+            "QLabel { color: #444; font-weight: bold; }"
+        )
+        btns.addWidget(self.projects_count_label)
+
+        layout.addLayout(btns)
+        return box
+
+    def _load_projects(self) -> None:
+        """
+        Заполняет список проектов уникальными значениями из
+        всех записей в sessions_root.
+        """
+        projects_set: set = set()
+        if os.path.isdir(self._sessions_root):
+            try:
+                entries = sorted(
+                    os.listdir(self._sessions_root)
+                )
+            except OSError:
+                entries = []
+
+            for name in entries:
+                session_dir = os.path.join(
+                    self._sessions_root, name
+                )
+                if not os.path.isdir(session_dir):
+                    continue
+                meta = read_json_file(
+                    os.path.join(session_dir, "session.json")
+                ) or {}
+                p = (meta.get("project") or "").strip()
+                if p:
+                    projects_set.add(p)
+
+        self.projects_list.blockSignals(True)
+        self.projects_list.clear()
+        for p in sorted(projects_set):
+            item = QListWidgetItem(p)
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, p)
+            self.projects_list.addItem(item)
+        self.projects_list.blockSignals(False)
+
+        self._selected_projects = []
+        self._update_projects_count()
+
+    def _on_project_item_changed(
+        self, item: QListWidgetItem,
+    ) -> None:
+        name = item.data(Qt.ItemDataRole.UserRole) or ""
+        if not name:
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            if name not in self._selected_projects:
+                self._selected_projects.append(name)
+        else:
+            self._selected_projects = [
+                p for p in self._selected_projects if p != name
+            ]
+        self._update_projects_count()
+
+    def _set_all_projects(self, value: bool) -> None:
+        self.projects_list.blockSignals(True)
+        for i in range(self.projects_list.count()):
+            item = self.projects_list.item(i)
+            item.setCheckState(
+                Qt.CheckState.Checked if value
+                else Qt.CheckState.Unchecked
+            )
+        self.projects_list.blockSignals(False)
+
+        if value:
+            self._selected_projects = [
+                self.projects_list.item(i).data(
+                    Qt.ItemDataRole.UserRole
+                )
+                for i in range(self.projects_list.count())
+            ]
+        else:
+            self._selected_projects = []
+
+        self._update_projects_count()
+
+    def _update_projects_count(self) -> None:
+        if not hasattr(self, "projects_count_label"):
+            return
+        n = len(self._selected_projects)
+        total = self.projects_list.count()
+
+        if n == 0:
+            self.projects_count_label.setText(
+                f"Все проекты ({total})"
+            )
+        elif n == total:
+            self.projects_count_label.setText(
+                f"Выбраны все ({n})"
+            )
+        else:
+            self.projects_count_label.setText(
+                f"Выбрано: {n} из {total}"
+            )
 
     # ------------------------------------------------------------------
     # Промпт
@@ -897,7 +1067,8 @@ class DailyDigestDialog(QDialog):
     # ------------------------------------------------------------------
     def _collect_sessions_for_period(self) -> List[str]:
         """
-        Возвращает список папок сессий за выбранный период.
+        Возвращает список папок сессий за выбранный период
+        с учётом выбранных проектов.
         """
         qd_from = self.date_from.date()
         qd_to = (
@@ -912,6 +1083,9 @@ class DailyDigestDialog(QDialog):
 
         if not os.path.isdir(self._sessions_root):
             return []
+
+        # --- Фильтр по проектам ---
+        selected_projects_set = set(self._selected_projects)
 
         result: List[str] = []
         try:
@@ -935,6 +1109,12 @@ class DailyDigestDialog(QDialog):
             meta = read_json_file(
                 os.path.join(session_dir, "session.json")
             ) or {}
+
+            # --- Фильтр по проектам ---
+            if selected_projects_set:
+                project = (meta.get("project") or "").strip()
+                if project not in selected_projects_set:
+                    continue
 
             date_str = str(meta.get("date") or "").strip()
             if not date_str:
@@ -970,9 +1150,16 @@ class DailyDigestDialog(QDialog):
 
         session_dirs = self._collect_sessions_for_period()
         if not session_dirs:
+            projects_note = ""
+            if self._selected_projects:
+                projects_note = (
+                    "\n\nВыбранные проекты: "
+                    + ", ".join(sorted(self._selected_projects))
+                )
             QMessageBox.information(
                 self, "Свод за день",
-                "За выбранный период не найдено ни одной записи.",
+                "За выбранный период не найдено ни одной записи."
+                + projects_note,
             )
             return
 
@@ -1047,17 +1234,39 @@ class DailyDigestDialog(QDialog):
         self._result_count = len(entries)
 
         log.info(
-            "Свод за день: %d записей, период=%s, файл=%s",
-            len(entries), period_label, path,
+            "Свод за день: %d записей, период=%s, проекты=%s, файл=%s",
+            len(entries), period_label,
+            self._selected_projects or "все",
+            path,
         )
 
         # --- Итог ---
         protocol_count = sum(
             1 for e in entries if e.get("protocol_text")
         )
+
+        if self._selected_projects:
+            if len(self._selected_projects) <= 5:
+                projects_line = (
+                    "<b>Проекты:</b> "
+                    + ", ".join(
+                        html.escape(p)
+                        for p in sorted(self._selected_projects)
+                    )
+                    + "<br>"
+                )
+            else:
+                projects_line = (
+                    f"<b>Проекты:</b> выбрано "
+                    f"{len(self._selected_projects)}<br>"
+                )
+        else:
+            projects_line = "<b>Проекты:</b> все<br>"
+
         reply = QMessageBox.question(
             self, "Свод за день",
             f"<b>Свод сформирован.</b><br><br>"
+            f"{projects_line}"
             f"Записей за период: <b>{len(entries)}</b><br>"
             f"Протоколов прочитано: <b>{protocol_count}</b><br>"
             f"Файл сохранён:<br><code>{path}</code><br><br>"
@@ -1376,6 +1585,7 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
+        # Название — тянется на всё свободное место.
         hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(
             2, QHeaderView.ResizeMode.ResizeToContents
@@ -1395,14 +1605,22 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             7, QHeaderView.ResizeMode.ResizeToContents
         )
-        hv.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        # Summary — по ширине текста.
+        hv.setSectionResizeMode(
+            8, QHeaderView.ResizeMode.ResizeToContents
+        )
         hv.setSectionResizeMode(
             9, QHeaderView.ResizeMode.ResizeToContents
         )
         hv.setSectionResizeMode(
             10, QHeaderView.ResizeMode.ResizeToContents
         )
-        hv.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            11, QHeaderView.ResizeMode.ResizeToContents
+        )
+        # Скрываем колонку «Папка» — путь к записи доступен
+        # через «Открыть папку записи» и в статусной строке.
+        self.table.setColumnHidden(11, True)
         self.table.itemSelectionChanged.connect(
             self._on_selection_changed
         )
@@ -2348,6 +2566,23 @@ class SessionsWindow(QDialog):
                 tags_item.setToolTip(
                     "Теги записи: " + ", ".join(tags)
                 )
+
+                # Цвет ячейки берём из первого тега,
+                # у которого задан color в справочнике.
+                tag_color = self._resolve_first_tag_color(tags)
+                if tag_color is not None:
+                    qcolor = QColor(tag_color)
+                    if qcolor.isValid():
+                        tags_item.setBackground(qcolor)
+                        if qcolor.lightness() < 128:
+                            tags_item.setForeground(
+                                QColor("#FFFFFF")
+                            )
+                        else:
+                            tags_item.setForeground(
+                                QColor("#000000")
+                            )
+
             self.table.setItem(row, 3, tags_item)
 
             status_item = QTableWidgetItem(r["status"])
@@ -2379,15 +2614,26 @@ class SessionsWindow(QDialog):
                 ),
             )
 
+            # --- Summary: только наличие (да / —) ---
             summary_bb = (r.get("summary_bb") or "").strip()
             if summary_bb:
+                summary_item = QTableWidgetItem("да")
+                summary_item.setForeground(
+                    Qt.GlobalColor.darkGreen
+                )
                 short = summary_bb.replace("\n", " ")
-                if len(short) > 60:
-                    short = short[:57] + "…"
-                summary_item = QTableWidgetItem(short)
-                summary_item.setToolTip(summary_bb[:1000])
+                if len(short) > 200:
+                    short = short[:197] + "…"
+                summary_item.setToolTip(
+                    "Краткое описание записи "
+                    "(первые 200 символов):\n\n" + short
+                )
             else:
                 summary_item = QTableWidgetItem("—")
+                summary_item.setForeground(Qt.GlobalColor.gray)
+                summary_item.setToolTip(
+                    "У этой записи нет краткого описания."
+                )
             self.table.setItem(row, 8, summary_item)
 
             # --- Колонка «Синхр.» ---
@@ -2395,30 +2641,32 @@ class SessionsWindow(QDialog):
             sync_ready = bool(r.get("sync_ready"))
 
             if published:
-                sync_text = "да"
-                sync_item = QTableWidgetItem(sync_text)
-                sync_item.setForeground(Qt.GlobalColor.darkGreen)
+                sync_item = QTableWidgetItem("да")
+                sync_item.setForeground(
+                    Qt.GlobalColor.darkGreen
+                )
                 sync_item.setToolTip(
                     f"Опубликовано. Record ID: "
                     f"{r.get('record_id', '')}"
                 )
             elif sync_ready:
-                sync_text = "готово"
-                sync_item = QTableWidgetItem(sync_text)
-                sync_item.setForeground(Qt.GlobalColor.darkYellow)
+                sync_item = QTableWidgetItem("готово")
+                sync_item.setForeground(
+                    Qt.GlobalColor.darkYellow
+                )
                 sync_item.setToolTip(
-                    "Запись помечена как «готова к синхронизации». "
-                    "Можно публиковать на сервер, фоновый pull "
-                    "будет её учитывать."
+                    "Запись помечена как «готова к "
+                    "синхронизации». Можно публиковать на "
+                    "сервер, фоновый pull будет её учитывать."
                 )
             else:
-                sync_text = "черновик"
-                sync_item = QTableWidgetItem(sync_text)
+                sync_item = QTableWidgetItem("черновик")
                 sync_item.setForeground(Qt.GlobalColor.gray)
                 sync_item.setToolTip(
                     "Запись — черновик (sync_ready=false). "
-                    "Автопубликация не запускается, фоновый pull "
-                    "игнорирует, локальные артефакты не удаляются."
+                    "Автопубликация не запускается, фоновый "
+                    "pull игнорирует, локальные артефакты "
+                    "не удаляются."
                 )
             self.table.setItem(row, 9, sync_item)
 
@@ -3002,6 +3250,37 @@ class SessionsWindow(QDialog):
                     return candidate
 
         return ""
+
+    def _resolve_first_tag_color(
+        self, tag_names: List[str],
+    ) -> Optional[str]:
+        """
+        Возвращает HEX-цвет первого тега из списка, для которого
+        в справочнике (Настройки → Теги) задан цвет.
+
+        Если ни у одного тега цвет не задан — возвращает None.
+        Если config_manager недоступен — тоже None.
+        """
+        if not tag_names or self.config_manager is None:
+            return None
+
+        try:
+            tag_colors = {
+                t["name"]: (t.get("color") or "").strip()
+                for t in self.config_manager.get_tags()
+            }
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать цвета тегов: %s", exc
+            )
+            return None
+
+        for name in tag_names:
+            color = tag_colors.get(name) or ""
+            if color:
+                return color
+
+        return None
 
     def _view_manual_protocol(self) -> None:
         r = self._selected_row()
@@ -3615,7 +3894,8 @@ class SessionsWindow(QDialog):
             bitrix_cfg=bitrix_cfg,
             projects=projects,
             employees=employees,
-            sync_settings=sync_settings,   # ← НОВОЕ
+            sync_settings=sync_settings,
+            default_send=default,   # ← НОВОЕ
             parent=self,
         )
         dlg.exec()

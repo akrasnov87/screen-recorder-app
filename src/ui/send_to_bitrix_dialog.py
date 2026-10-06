@@ -379,6 +379,7 @@ class SendToBitrixDialog(QDialog):
         projects: Optional[List[Dict[str, str]]] = None,
         employees: Optional[List[Dict[str, str]]] = None,
         sync_settings: Optional[Dict[str, Any]] = None,
+        default_send: str = "",
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -387,6 +388,7 @@ class SendToBitrixDialog(QDialog):
         self.bitrix_cfg = bitrix_cfg or {}
         self.projects = list(projects or [])
         self.employees = list(employees or [])
+        self._default_send = default_send or ""
 
         self._sync_settings: Dict[str, Any] = dict(sync_settings or {})
         self._sync_base_url: str = str(
@@ -555,6 +557,12 @@ class SendToBitrixDialog(QDialog):
         row.setContentsMargins(4, 0, 4, 0)
         row.setSpacing(6)
 
+        # --- Определяем эффективный режим ---
+        effective_default = (
+            self._default_send
+            or self.bitrix_cfg.get("default_send", "protocol")
+        )
+
         self.send_protocol_btn = QPushButton("Отправить протокол")
         self.send_protocol_btn.clicked.connect(
             lambda: self._on_send(which="protocol")
@@ -577,6 +585,29 @@ class SendToBitrixDialog(QDialog):
             lambda: self._on_send(which="both")
         )
         row.addWidget(self.send_both_btn)
+
+        # --- Подсветка кнопки по умолчанию ---
+        default_btn = {
+            "protocol": self.send_protocol_btn,
+            "summary": self.send_summary_btn,
+            "both": self.send_both_btn,
+        }.get(effective_default)
+
+        if default_btn is not None:
+            default_btn.setDefault(True)
+            default_btn.setStyleSheet(
+                "QPushButton {"
+                "  font-weight: bold;"
+                "  border: 2px solid #2D7FF9;"
+                "  border-radius: 4px;"
+                "  padding: 4px 12px;"
+                "}"
+            )
+            # Подсказка для пользователя
+            default_btn.setToolTip(
+                f"Режим по умолчанию (из настроек: "
+                f"{effective_default}). Нажмите Enter."
+            )
 
         row.addStretch()
 

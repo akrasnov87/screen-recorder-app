@@ -810,8 +810,54 @@ class TasksEditorDialog(QDialog):
             self.table.setItem(row, 1, status_item)
 
             # --- Текст ---
-            text_item = QTableWidgetItem(it.get("text") or "")
+            text = it.get("text") or ""
+            text_item = QTableWidgetItem(text)
             self.table.setItem(row, 2, text_item)
+
+            # Полный текст поручения — во всплывающей подсказке
+            # на любой ячейке строки.
+            tooltip_lines: List[str] = [text or "(пусто)"]
+
+            extra: List[str] = []
+            if it.get("assignee"):
+                extra.append(f"Исполнитель: {it['assignee']}")
+            if it.get("due_date"):
+                extra.append(f"Срок: {it['due_date']}")
+            status_label = STATUS_LABELS.get(status, status)
+            extra.append(f"Статус: {status_label}")
+            if it.get("comment"):
+                extra.append(f"Комментарий: {it['comment']}")
+            if it.get("session_name"):
+                extra.append(f"Запись: {it['session_name']}")
+            number = it.get("number") or 0
+            try:
+                number = int(number)
+            except (TypeError, ValueError):
+                number = 0
+            if number > 0:
+                extra.insert(0, f"Номер: №{number}")
+
+            if extra:
+                tooltip_lines.append("")
+                tooltip_lines.append("─" * 30)
+                tooltip_lines.extend(extra)
+
+            full_tooltip_text = "\n".join(tooltip_lines)
+
+            import html as _html
+            tooltip_html = (
+                "<html><body style='white-space:pre-wrap; "
+                "max-width:600px'>"
+                + _html.escape(full_tooltip_text)
+                + "</body></html>"
+            )
+
+            # Дублируем tooltip на все ячейки строки, чтобы
+            # подсказка появлялась при наведении в любом месте.
+            for col in range(self.table.columnCount()):
+                cell = self.table.item(row, col)
+                if cell is not None:
+                    cell.setToolTip(tooltip_html)
 
             # --- Исполнитель ---
             assignee_item = QTableWidgetItem(
@@ -960,8 +1006,10 @@ class TasksEditorDialog(QDialog):
                 "Не удалось сохранить изменения.",
             )
             return
-        self._rebuild_assignees()
-        self._reload_table()
+        # Перечитываем action_items.json с диска — update_item
+        # пишет изменения только в файл, а self._data остаётся
+        # со старыми значениями.
+        self._reload()
 
     def _delete_selected(self) -> None:
         item = self._selected_item()

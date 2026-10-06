@@ -598,6 +598,7 @@ class TasksWindow(QDialog):
         hv.setSectionResizeMode(
             1, QHeaderView.ResizeMode.ResizeToContents
         )
+        # Поручение — тянется на всё свободное место.
         hv.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(
             3, QHeaderView.ResizeMode.ResizeToContents
@@ -605,7 +606,10 @@ class TasksWindow(QDialog):
         hv.setSectionResizeMode(
             4, QHeaderView.ResizeMode.ResizeToContents
         )
-        hv.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        # Контекст (запись) — по ширине текста.
+        hv.setSectionResizeMode(
+            5, QHeaderView.ResizeMode.ResizeToContents
+        )
         root.addWidget(self.table, 1)
 
         # --- Действия ---
@@ -1002,10 +1006,49 @@ class TasksWindow(QDialog):
 
             # --- Текст поручения ---
             text = it.get("text") or ""
-            if overdue:
-                text = "⚠  " + text
-            text_item = QTableWidgetItem(text)
+            text_display = ("⚠  " + text) if overdue else text
+            text_item = QTableWidgetItem(text_display)
+
+            tooltip_lines: List[str] = [text or "(пусто)"]
+
+            extra: List[str] = []
+            if it.get("assignee"):
+                extra.append(f"Исполнитель: {it['assignee']}")
+            if it.get("due_date"):
+                extra.append(f"Срок: {it['due_date']}")
+            status_label = STATUS_LABELS.get(
+                it.get("status") or "created", it.get("status") or "—"
+            )
+            extra.append(f"Статус: {status_label}")
+            if it.get("comment"):
+                extra.append(f"Комментарий: {it['comment']}")
+            if it.get("session_name"):
+                extra.append(f"Запись: {it['session_name']}")
+
+            if extra:
+                tooltip_lines.append("")
+                tooltip_lines.append("─" * 30)
+                tooltip_lines.extend(extra)
+
+            full_tooltip_text = "\n".join(tooltip_lines)
+
+            import html as _html
+            tooltip_html = (
+                "<html><body style='white-space:pre-wrap; "
+                "max-width:600px'>"
+                + _html.escape(full_tooltip_text)
+                + "</body></html>"
+            )
+
+            text_item.setToolTip(tooltip_html)
             self.table.setItem(row, 2, text_item)
+
+            for col in range(self.table.columnCount()):
+                if col == 2:
+                    continue
+                cell = self.table.item(row, col)
+                if cell is not None:
+                    cell.setToolTip(tooltip_html)
 
             # --- Исполнитель ---
             self.table.setItem(
@@ -1039,6 +1082,11 @@ class TasksWindow(QDialog):
                     if cell is None:
                         continue
                     cell.setBackground(today_bg)
+
+        # Ограничиваем ширину колонки «Контекст (запись)» —
+        # иначе длинные названия записей съедают место
+        # у колонки «Поручение».
+        self.table.setColumnWidth(5, 280)
 
         # --- Итоги ---
         total = len(self._items)
