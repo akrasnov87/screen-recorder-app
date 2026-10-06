@@ -289,7 +289,25 @@ class SessionsScanThread(QThread):
             # --- Флаг готовности к синхронизации ---
             sync_ready = bool(meta.get("sync_ready", False))
 
+            # --- Поручения: количество элементов в action_items.json ---
+            action_items_count = 0
+            try:
+                action_items_path = os.path.join(
+                    session_dir, "action_items.json"
+                )
+                if os.path.isfile(action_items_path):
+                    ai_data = read_json_file(action_items_path) or {}
+                    items = ai_data.get("items")
+                    if isinstance(items, list):
+                        action_items_count = len(items)
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать поручения из %s: %s",
+                    session_dir, exc,
+                )
+
             rows.append({
+                "action_items_count": action_items_count,
                 "dir": session_dir,
                 "name": meta.get("name") or name,
                 "project": meta.get("project") or "",
@@ -1566,11 +1584,12 @@ class SessionsWindow(QDialog):
         header.addWidget(self.refresh_indicator)
         root.addLayout(header)
 
-        self.table = QTableWidget(0, 12)
+        self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels([
             "Дата и время", "Название", "Проект", "Теги",
             "Статус", "Источник", "Скрам", "Вложения",
-            "Summary", "Синхр.", "Task ID", "Папка",
+            "Поручения", "Summary", "Синхр.", "Task ID",
+            "Папка",
         ])
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -1605,10 +1624,11 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             7, QHeaderView.ResizeMode.ResizeToContents
         )
-        # Summary — по ширине текста.
+        # Поручения — по ширине текста.
         hv.setSectionResizeMode(
             8, QHeaderView.ResizeMode.ResizeToContents
         )
+        # Summary — по ширине текста.
         hv.setSectionResizeMode(
             9, QHeaderView.ResizeMode.ResizeToContents
         )
@@ -1618,9 +1638,11 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             11, QHeaderView.ResizeMode.ResizeToContents
         )
-        # Скрываем колонку «Папка» — путь к записи доступен
-        # через «Открыть папку записи» и в статусной строке.
-        self.table.setColumnHidden(11, True)
+        hv.setSectionResizeMode(
+            12, QHeaderView.ResizeMode.ResizeToContents
+        )
+        # Скрываем колонку «Папка» (теперь индекс 12).
+        self.table.setColumnHidden(12, True)
         self.table.itemSelectionChanged.connect(
             self._on_selection_changed
         )
@@ -2428,6 +2450,12 @@ class SessionsWindow(QDialog):
             parts.append("протокол: прикреплён")
         if (r.get("summary_bb") or "").strip():
             parts.append("summary: есть")
+        ai_count = int(r.get("action_items_count") or 0)
+        if ai_count > 0:
+            parts.append(
+                f"<span style='color:#1565C0'>"
+                f"поручений: {ai_count}</span>"
+            )
         if r.get("has_transcript"):
             parts.append("стенограмма: есть")
         if r.get("published"):
@@ -2614,6 +2642,29 @@ class SessionsWindow(QDialog):
                 ),
             )
 
+            # --- Поручения: количество из action_items.json ---
+            ai_count = int(r.get("action_items_count") or 0)
+            if ai_count > 0:
+                ai_item = QTableWidgetItem(str(ai_count))
+                ai_item.setForeground(Qt.GlobalColor.darkBlue)
+                ai_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight
+                    | Qt.AlignmentFlag.AlignVCenter
+                )
+                ai_item.setToolTip(
+                    f"К записи прикреплено поручений: {ai_count}.\n\n"
+                    f"Открыть: «Поручения» → «Редактор поручений "
+                    f"текущей записи…» (Ctrl+Shift+K)."
+                )
+            else:
+                ai_item = QTableWidgetItem("—")
+                ai_item.setForeground(Qt.GlobalColor.gray)
+                ai_item.setToolTip(
+                    "У этой записи нет поручений "
+                    "(action_items.json отсутствует или пуст)."
+                )
+            self.table.setItem(row, 8, ai_item)
+
             # --- Summary: только наличие (да / —) ---
             summary_bb = (r.get("summary_bb") or "").strip()
             if summary_bb:
@@ -2634,7 +2685,7 @@ class SessionsWindow(QDialog):
                 summary_item.setToolTip(
                     "У этой записи нет краткого описания."
                 )
-            self.table.setItem(row, 8, summary_item)
+            self.table.setItem(row, 9, summary_item)
 
             # --- Колонка «Синхр.» ---
             published = bool(r.get("published"))
@@ -2668,13 +2719,13 @@ class SessionsWindow(QDialog):
                     "pull игнорирует, локальные артефакты "
                     "не удаляются."
                 )
-            self.table.setItem(row, 9, sync_item)
+            self.table.setItem(row, 10, sync_item)
 
             self.table.setItem(
-                row, 10,
+                row, 11,
                 QTableWidgetItem(r["task_id"] or "—"),
             )
-            self.table.setItem(row, 11, QTableWidgetItem(r["dir"]))
+            self.table.setItem(row, 12, QTableWidgetItem(r["dir"]))
 
     # ------------------------------------------------------------------
     # Готовность к синхронизации
@@ -4760,16 +4811,30 @@ class SessionsWindow(QDialog):
                         "Не удалось удалить %s: %s", p, exc
                     )
 
-    def _remove_processed_artifacts(self, session_dir: str) -> None:
+    def _remove_processed_artifacts(
+        self,
+        session_dir: str,
+        *,
+        keep_transcript: bool = False,
+    ) -> None:
+        """
+        Удаляет результаты обработки.
+
+        Args:
+            keep_transcript: если True — файл video.txt НЕ удаляется
+                             (транскрибация будет пропущена).
+        """
         patterns = [
             "video.mp3", "video.aac", "video.wav", "video.opus",
             "video.ogg", "video.m4a",
-            "video.txt",
             "video_summary.md",
             "deepseek_prompt.txt", "deepseek_prompt.md",
             "deepseek_prompt.docx",
             "protocol.docx", "protocol.md", "protocol.txt",
         ]
+        if not keep_transcript:
+            patterns.append("video.txt")
+
         for fname in patterns:
             p = os.path.join(session_dir, fname)
             if os.path.exists(p):
@@ -4928,7 +4993,71 @@ class SessionsWindow(QDialog):
             )
             return
 
-        self._remove_processed_artifacts(r["dir"])
+        # --- Проверяем, есть ли уже стенограмма ---
+        transcript_path = os.path.join(r["dir"], "video.txt")
+        has_transcript = os.path.isfile(transcript_path)
+        transcript_size = 0
+        if has_transcript:
+            try:
+                transcript_size = os.path.getsize(transcript_path)
+            except OSError:
+                transcript_size = 0
+
+        keep_transcript = False
+
+        if has_transcript:
+            # Спрашиваем, что делать со стенограммой.
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Перезапуск обработки")
+            box.setTextFormat(Qt.TextFormat.RichText)
+            box.setText(
+                f"<b>В папке записи уже есть стенограмма.</b>"
+                f"<br><br>"
+                f"Файл: <code>video.txt</code> "
+                f"({transcript_size / 1024:.1f} КБ)<br><br>"
+                f"<b>Сохранить стенограмму</b> — транскрибация "
+                f"будет пропущена (быстро).<br>"
+                f"<b>Пересобрать</b> — стенограмма будет удалена, "
+                f"транскрибация запустится заново (долго)."
+            )
+            keep_btn = box.addButton(
+                "Сохранить стенограмму",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            redo_btn = box.addButton(
+                "Пересобрать стенограмму",
+                QMessageBox.ButtonRole.DestructiveRole,
+            )
+            cancel_btn = box.addButton(
+                "Отмена", QMessageBox.ButtonRole.RejectRole,
+            )
+            box.setDefaultButton(keep_btn)
+            box.exec()
+
+            clicked = box.clickedButton()
+            if clicked is cancel_btn:
+                log.info(
+                    "Перезапуск отменён пользователем на этапе "
+                    "выбора стенограммы"
+                )
+                return
+            keep_transcript = (clicked is keep_btn)
+
+            log.info(
+                "Перезапуск «%s»: стенограмма %s",
+                r["name"],
+                "сохраняется" if keep_transcript else "пересобирается",
+            )
+
+        # --- Удаляем артефакты ---
+        if keep_transcript:
+            # Удаляем всё, кроме video.txt.
+            self._remove_processed_artifacts(
+                r["dir"], keep_transcript=True,
+            )
+        else:
+            self._remove_processed_artifacts(r["dir"])
 
         if r["task_id"]:
             self._remove_from_queue(r["task_id"])
@@ -5449,25 +5578,6 @@ class SessionsWindow(QDialog):
             QMessageBox.critical(
                 self, "Ошибка",
                 f"Не удалось удалить: {exc}",
-            )
-
-    def _open_tasks_window(self) -> None:
-        """Открывает сводное окно «Поручения»."""
-        try:
-            from .tasks_window import TasksWindow
-            dlg = TasksWindow(
-                sessions_root=self.sessions_root,
-                config_manager=self.config_manager,
-                parent=self,
-            )
-            dlg.show()
-        except Exception as exc:
-            log.exception(
-                "Не удалось открыть окно «Поручения»: %s", exc
-            )
-            QMessageBox.critical(
-                self, "Поручения",
-                f"Ошибка открытия окна:\n{exc}",
             )
 
     # ------------------------------------------------------------------

@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import (
@@ -601,20 +602,42 @@ class SyncManager:
     """
 
     # --- Локальные мьютексы на session_dir (publish vs download) ---
-    _session_locks: Dict[str, asyncio.Lock] = {}
-    _session_locks_guard = asyncio.Lock()
+    # Формат: {abspath(session_dir): (loop, asyncio.Lock)}
+    #
+    # ВАЖНО: asyncio.Lock привязывается к event loop при первом
+    # использовании. У нас операции синхронизации выполняются
+    # в разных loop'ах (фоновый loop приложения + отдельные loop'ы
+    # в QThread-воркерах), поэтому храним пару (loop, lock) и
+    # пересоздаём лок при смене loop'а.
+    # Для защиты самого словаря используем threading.Lock —
+    # asyncio.Lock здесь нельзя, он тоже привязывается к loop.
+    _session_locks: Dict[str, tuple] = {}
+    _session_locks_guard = threading.Lock()
 
     @classmethod
     async def _get_session_lock(
         cls, session_dir: str
     ) -> asyncio.Lock:
-        """Возвращает asyncio.Lock для конкретной папки сессии."""
+        """
+        Возвращает asyncio.Lock для конкретной папки сессии.
+
+        Если лок уже создан в текущем event loop — возвращаем
+        его. Если loop сменился (например, publish был в фоновом
+        loop приложения, а download запущен из QThread-воркера) —
+        создаём новый лок.
+        """
         key = os.path.abspath(session_dir)
-        async with cls._session_locks_guard:
-            lock = cls._session_locks.get(key)
-            if lock is None:
-                lock = asyncio.Lock()
-                cls._session_locks[key] = lock
+        current_loop = asyncio.get_running_loop()
+
+        with cls._session_locks_guard:
+            entry = cls._session_locks.get(key)
+            if entry is not None:
+                stored_loop, stored_lock = entry
+                if stored_loop is current_loop:
+                    return stored_lock
+
+            lock = asyncio.Lock()
+            cls._session_locks[key] = (current_loop, lock)
             return lock
 
     def __init__(
