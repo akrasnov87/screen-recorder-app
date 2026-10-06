@@ -382,6 +382,11 @@ class TasksEditorDialog(QDialog):
         self.table.itemDoubleClicked.connect(
             lambda _it: self._edit_selected()
         )
+        
+        # --- СКРЫВАЕМ КОЛОНКУ ID (последняя, индекс 6) ---
+        self.table.setColumnHidden(6, True)
+        # ------------------------------------------------
+
         hv = self.table.horizontalHeader()
         hv.setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents

@@ -31,19 +31,24 @@ import json
 import os
 import shutil
 import traceback
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtCore import Qt, QDate, QThread, QUrl, Signal
 from PySide6.QtGui import QGuiApplication, QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog,
-    QLabel, QMenu, QMenuBar, QMessageBox, QPlainTextEdit,
-    QProgressDialog, QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
+    QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QMenu, QMenuBar, QMessageBox,
+    QPlainTextEdit, QProgressDialog, QPushButton, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from ..daily_digest import (
+    build_digest_prompt,
+    collect_digest_entries,
+    save_digest_prompt,
+)
 from ..file_readers import read_any_text, read_json_file
 from ..logger import get_logger
 from ..markdown_docx import markdown_to_docx
@@ -670,6 +675,443 @@ class SyncOneRecordDialog(QDialog):
     def result_data(self) -> Dict[str, Any]:
         return dict(self._result_data)
 
+# ---------------------------------------------------------------------------
+# Диалог выбора периода для «Свода за день»
+# ---------------------------------------------------------------------------
+class DailyDigestDialog(QDialog):
+    """
+    Диалог формирования свода за период.
+
+    Позволяет выбрать:
+      • период (с / по);
+      • промпт из библиотеки (с возможностью редактирования);
+      • включать ли краткое описание (summary) каждой записи;
+      • формат сохранения (docx / md / txt).
+
+    После подтверждения:
+      1. Отбирает записи за период.
+      2. Собирает промпт через daily_digest.
+      3. Сохраняет файл в папку «Загрузки».
+    """
+
+    def __init__(
+        self,
+        sessions_root: str,
+        config_manager,
+        *,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._sessions_root = sessions_root
+        self._config_manager = config_manager
+
+        self.setWindowTitle("Свод за день")
+        self.setModal(True)
+        self.setMinimumSize(860, 640)
+
+        self._result_path: str = ""
+        self._result_count: int = 0
+
+        self._build_ui()
+        self._apply_initial_prompt()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        # --- Инфо ---
+        info = QLabel(
+            "Формируется единый промпт из протоколов всех записей "
+            "за выбранный период. Промпт можно отредактировать "
+            "и сохранить в папку «Загрузки»."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: #666; }")
+        root.addWidget(info)
+
+        # --- Период ---
+        period_row = QHBoxLayout()
+        period_row.addWidget(QLabel("Период:"))
+
+        self.date_from = QDateEdit()
+        self.date_from.setCalendarPopup(True)
+        self.date_from.setDisplayFormat("yyyy-MM-dd")
+        self.date_from.setDate(QDate.currentDate())
+        period_row.addWidget(self.date_from)
+
+        period_row.addWidget(QLabel("по:"))
+
+        self.date_to = QDateEdit()
+        self.date_to.setCalendarPopup(True)
+        self.date_to.setDisplayFormat("yyyy-MM-dd")
+        self.date_to.setDate(QDate.currentDate())
+        period_row.addWidget(self.date_to)
+
+        self.single_day_check = QCheckBox("Один день")
+        self.single_day_check.setChecked(True)
+        self.single_day_check.setToolTip(
+            "Если включено — дата «по» совпадает с датой «с», "
+            "формируется свод за один день."
+        )
+        self.single_day_check.toggled.connect(
+            self._on_single_day_toggled
+        )
+        period_row.addWidget(self.single_day_check)
+
+        period_row.addSpacing(12)
+
+        self.include_summary_check = QCheckBox(
+            "Включать краткое описание (summary)"
+        )
+        self.include_summary_check.setChecked(False)
+        self.include_summary_check.setToolTip(
+            "Если включено — в промпт также попадут краткие "
+            "описания записей (summary_bb из session.json)."
+        )
+        period_row.addWidget(self.include_summary_check)
+
+        period_row.addSpacing(12)
+        period_row.addWidget(QLabel("Формат:"))
+        self.fmt_combo = QComboBox()
+        self.fmt_combo.addItem("DOCX", "docx")
+        self.fmt_combo.addItem("Markdown", "md")
+        self.fmt_combo.addItem("TXT", "txt")
+        period_row.addWidget(self.fmt_combo)
+
+        period_row.addStretch()
+        root.addLayout(period_row)
+
+        # --- Промпт ---
+        prompt_header = QHBoxLayout()
+        prompt_header.addWidget(QLabel("<b>Промпт</b>"))
+        prompt_header.addSpacing(12)
+        prompt_header.addWidget(QLabel("Из библиотеки:"))
+        self.prompt_combo = QComboBox()
+        self.prompt_combo.setMinimumWidth(280)
+        prompt_header.addWidget(self.prompt_combo, 1)
+        prompt_header.addSpacing(8)
+
+        self.reset_prompt_btn = QPushButton("Сбросить правку")
+        self.reset_prompt_btn.setToolTip(
+            "Вернуть текст промпта к значению из библиотеки."
+        )
+        self.reset_prompt_btn.clicked.connect(
+            self._reset_prompt_from_library
+        )
+        prompt_header.addWidget(self.reset_prompt_btn)
+
+        root.addLayout(prompt_header)
+
+        self.prompt_edit = QPlainTextEdit()
+        self.prompt_edit.setPlaceholderText(
+            "Введите инструкцию для ИИ. Например:\n"
+            "«Составь сводку по дню: ключевые решения, риски, "
+            "поручения. Укажи ответственных и сроки.»"
+        )
+        self.prompt_edit.setMinimumHeight(260)
+        root.addWidget(self.prompt_edit, 1)
+
+        # --- Статус ---
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet(
+            "QLabel { color: #666; }"
+        )
+        self.status_label.setWordWrap(True)
+        root.addWidget(self.status_label)
+
+        # --- Кнопки ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        ).setText("Сформировать и сохранить")
+        buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        ).setText("Отмена")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    # ------------------------------------------------------------------
+    # Промпт
+    # ------------------------------------------------------------------
+    def _apply_initial_prompt(self) -> None:
+        """Заполняет выпадающий список промптов и ставит дефолт."""
+        if self._config_manager is None:
+            return
+
+        try:
+            prompts = self._config_manager.get_prompts()
+            default_prompt = self._config_manager.get_default_prompt()
+        except Exception as exc:
+            log.warning("Не удалось прочитать промпты: %s", exc)
+            prompts, default_prompt = [], ""
+
+        self.prompt_combo.blockSignals(True)
+        self.prompt_combo.clear()
+        self.prompt_combo.addItem("— не выбрано —", "")
+
+        current_idx = 0
+        for i, p in enumerate(prompts, start=1):
+            self.prompt_combo.addItem(p["name"], p["text"])
+            if p.get("text", "").strip() == default_prompt.strip():
+                current_idx = i
+
+        self.prompt_combo.setCurrentIndex(current_idx)
+        self.prompt_combo.blockSignals(False)
+        self.prompt_combo.currentIndexChanged.connect(
+            self._on_prompt_selected
+        )
+
+        self._on_prompt_selected(current_idx)
+
+    def _on_prompt_selected(self, index: int) -> None:
+        if index < 0:
+            return
+        text = self.prompt_combo.itemData(index) or ""
+        self.prompt_edit.setPlainText(text)
+
+    def _reset_prompt_from_library(self) -> None:
+        index = self.prompt_combo.currentIndex()
+        self._on_prompt_selected(index)
+
+    # ------------------------------------------------------------------
+    # Период
+    # ------------------------------------------------------------------
+    def _on_single_day_toggled(self, checked: bool) -> None:
+        if checked:
+            self.date_to.setDate(self.date_from.date())
+        self.date_to.setEnabled(not checked)
+
+    # ------------------------------------------------------------------
+    # Отбор сессий за период
+    # ------------------------------------------------------------------
+    def _collect_sessions_for_period(self) -> List[str]:
+        """
+        Возвращает список папок сессий за выбранный период.
+        """
+        qd_from = self.date_from.date()
+        qd_to = (
+            qd_from if self.single_day_check.isChecked()
+            else self.date_to.date()
+        )
+        if qd_to < qd_from:
+            qd_from, qd_to = qd_to, qd_from
+
+        d_from = date(qd_from.year(), qd_from.month(), qd_from.day())
+        d_to = date(qd_to.year(), qd_to.month(), qd_to.day())
+
+        if not os.path.isdir(self._sessions_root):
+            return []
+
+        result: List[str] = []
+        try:
+            entries = sorted(os.listdir(self._sessions_root))
+        except OSError as exc:
+            log.error(
+                "Не удалось прочитать %s: %s",
+                self._sessions_root, exc,
+            )
+            return []
+
+        for name in entries:
+            session_dir = os.path.join(self._sessions_root, name)
+            if not os.path.isdir(session_dir):
+                continue
+            if not os.path.isfile(
+                os.path.join(session_dir, "session.json")
+            ):
+                continue
+
+            meta = read_json_file(
+                os.path.join(session_dir, "session.json")
+            ) or {}
+
+            date_str = str(meta.get("date") or "").strip()
+            if not date_str:
+                base = name.split("_")[0]
+                if len(base) == 10:
+                    date_str = base
+
+            if not date_str:
+                continue
+
+            try:
+                y, m, d = date_str.split("-")
+                sd = date(int(y), int(m), int(d))
+            except Exception:
+                continue
+
+            if d_from <= sd <= d_to:
+                result.append(session_dir)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Подтверждение
+    # ------------------------------------------------------------------
+    def _on_accept(self) -> None:
+        instruction = self.prompt_edit.toPlainText().strip()
+        if not instruction:
+            QMessageBox.warning(
+                self, "Свод за день",
+                "Введите текст промпта (инструкцию для ИИ).",
+            )
+            return
+
+        session_dirs = self._collect_sessions_for_period()
+        if not session_dirs:
+            QMessageBox.information(
+                self, "Свод за день",
+                "За выбранный период не найдено ни одной записи.",
+            )
+            return
+
+        # --- Сбор данных ---
+        QGuiApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
+        try:
+            entries = collect_digest_entries(session_dirs)
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+
+        if not entries:
+            QMessageBox.warning(
+                self, "Свод за день",
+                "Не удалось прочитать данные записей за период.",
+            )
+            return
+
+        # --- Метка периода ---
+        if self.single_day_check.isChecked():
+            period_label = entries[0]["date"]
+        else:
+            dates = [e["date"] for e in entries if e.get("date")]
+            if dates:
+                period_label = f"{min(dates)} … {max(dates)}"
+            else:
+                period_label = "—"
+
+        # --- Сборка промпта ---
+        prompt_text = build_digest_prompt(
+            entries,
+            user_instruction=instruction,
+            period_label=period_label,
+            include_summary=self.include_summary_check.isChecked(),
+        )
+
+        if not prompt_text.strip():
+            QMessageBox.warning(
+                self, "Свод за день",
+                "Промпт получился пустым.",
+            )
+            return
+
+        # --- Папка «Загрузки» ---
+        downloads = self._downloads_dir()
+        if not os.path.isdir(downloads):
+            QMessageBox.warning(
+                self, "Свод за день",
+                f"Папка «Загрузки» не найдена:\n{downloads}",
+            )
+            return
+
+        fmt = self.fmt_combo.currentData() or "docx"
+        base_name = self._make_base_name(period_label)
+
+        path = save_digest_prompt(
+            prompt_text,
+            downloads,
+            fmt=fmt,
+            base_name=base_name,
+        )
+
+        if not path:
+            QMessageBox.critical(
+                self, "Свод за день",
+                "Не удалось сохранить файл промпта.",
+            )
+            return
+
+        self._result_path = path
+        self._result_count = len(entries)
+
+        log.info(
+            "Свод за день: %d записей, период=%s, файл=%s",
+            len(entries), period_label, path,
+        )
+
+        # --- Итог ---
+        protocol_count = sum(
+            1 for e in entries if e.get("protocol_text")
+        )
+        reply = QMessageBox.question(
+            self, "Свод за день",
+            f"<b>Свод сформирован.</b><br><br>"
+            f"Записей за период: <b>{len(entries)}</b><br>"
+            f"Протоколов прочитано: <b>{protocol_count}</b><br>"
+            f"Файл сохранён:<br><code>{path}</code><br><br>"
+            f"Открыть папку «Загрузки»?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(downloads)
+            )
+
+        self.accept()
+
+    @staticmethod
+    def _make_base_name(period_label: str) -> str:
+        """Формирует безопасное имя файла по метке периода."""
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        safe = period_label.replace("…", "").replace(" ", "_")
+        safe = "".join(
+            c for c in safe if c.isalnum() or c in "-_."
+        )
+        safe = safe.strip("._-") or "period"
+        return f"daily_digest_{safe}_{stamp}"
+
+    @staticmethod
+    def _downloads_dir() -> str:
+        """Возвращает путь к папке «Загрузки»."""
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["xdg-user-dir", "DOWNLOAD"],
+                text=True, timeout=2,
+            ).strip()
+            if out and os.path.isdir(out):
+                return out
+        except Exception:
+            pass
+
+        home = os.path.expanduser("~")
+        for candidate in ("Загрузки", "Downloads"):
+            p = os.path.join(home, candidate)
+            if os.path.isdir(p):
+                return p
+        return home
+
+    # ------------------------------------------------------------------
+    # Результат
+    # ------------------------------------------------------------------
+    def result_path(self) -> str:
+        return self._result_path
+
+    def result_count(self) -> int:
+        return self._result_count
+
 
 # ---------------------------------------------------------------------------
 # Основное окно
@@ -881,6 +1323,18 @@ class SessionsWindow(QDialog):
         self.refresh_btn = QPushButton("Обновить")
         self.refresh_btn.clicked.connect(self.refresh)
         bottom.addWidget(self.refresh_btn)
+
+        self.daily_digest_btn = QPushButton("Свод за день")
+        self.daily_digest_btn.setToolTip(
+            "Сформировать единый промпт из протоколов всех "
+            "записей за выбранный период.\n\n"
+            "Результат сохраняется в папку «Загрузки» в формате "
+            "DOCX / Markdown / TXT."
+        )
+        self.daily_digest_btn.clicked.connect(
+            self._open_daily_digest
+        )
+        bottom.addWidget(self.daily_digest_btn)
 
         self.close_btn = QPushButton("Закрыть")
         self.close_btn.clicked.connect(self.close)
@@ -1320,6 +1774,24 @@ class SessionsWindow(QDialog):
                 "sudo apt install python3-pyside6.qmultimedia "
                 "gstreamer1.0-plugins-good gstreamer1.0-plugins-bad "
                 "gstreamer1.0-libav",
+            )
+
+    def _open_daily_digest(self) -> None:
+        """Открывает диалог формирования «Свода за день»."""
+        try:
+            dlg = DailyDigestDialog(
+                sessions_root=self.sessions_root,
+                config_manager=self.config_manager,
+                parent=self,
+            )
+            dlg.exec()
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть диалог «Свод за день»: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Свод за день",
+                f"Ошибка открытия диалога:\n{exc}",
             )
 
     def _regenerate_action_prompt(self) -> None:
