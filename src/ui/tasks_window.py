@@ -13,14 +13,12 @@
 Изменения:
   • Добавлена колонка «№» — сквозной числовой номер поручения.
   • Убраны колонки «Срок» и «ID» из основной таблицы.
-  • Панель фильтров переработана:
-      – вместо диапазона дат «с/по» — одно поле «Дата создания»;
-      – вместо выпадающего списка «Контекст» — поле поиска
-        по названию записи (частичное совпадение);
-      – по умолчанию показываются поручения за сегодня.
-  • НОВОЕ: добавлено поле «№ поручения» — поиск по номеру.
-    Поддерживаются: одно число, список через запятую, диапазон.
+  • Панель фильтров: одно поле «Дата создания», поле поиска
+    по названию записи, поле поиска по номеру поручения.
   • В сообщения Bitrix24 номер поручения выводится текстом.
+  • При открытии редактора поручений передаётся справочник
+    сотрудников из ConfigManager — для выпадающего списка
+    исполнителей.
 """
 from __future__ import annotations
 
@@ -108,7 +106,6 @@ class _SendTasksDialog(QDialog):
         info.setStyleSheet("QLabel { color: #666; }")
         root.addWidget(info)
 
-        # --- Получатель ---
         rec_row = QHBoxLayout()
         rec_row.addWidget(QLabel("Получатель:"))
 
@@ -149,7 +146,6 @@ class _SendTasksDialog(QDialog):
 
         root.addLayout(rec_row)
 
-        # --- Формат ---
         fmt_row = QHBoxLayout()
         fmt_row.addWidget(QLabel("Формат:"))
 
@@ -177,7 +173,6 @@ class _SendTasksDialog(QDialog):
         fmt_row.addStretch()
         root.addLayout(fmt_row)
 
-        # --- Предпросмотр ---
         root.addWidget(QLabel("<b>Предпросмотр сообщения:</b>"))
         self.preview = QPlainTextEdit()
         self.preview.setReadOnly(True)
@@ -192,7 +187,6 @@ class _SendTasksDialog(QDialog):
         )
         self.header_check.toggled.connect(self._refresh_preview)
 
-        # --- Кнопки ---
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel,
@@ -253,7 +247,6 @@ class _SendTasksDialog(QDialog):
                     f"{due} | {status} |"
                 )
         else:
-            # Список
             if group:
                 by_assignee: Dict[str, List[Dict[str, Any]]] = {}
                 for it in self._items:
@@ -444,7 +437,6 @@ class TasksWindow(QDialog):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
 
-        # --- Инфо ---
         info_row = QHBoxLayout()
         info = QLabel(
             "Сводная таблица поручений по всем записям. "
@@ -494,7 +486,6 @@ class TasksWindow(QDialog):
         )
         filters.addWidget(self.project_filter)
 
-        # --- НОВОЕ: поиск по номеру поручения ---
         filters.addSpacing(8)
         filters.addWidget(QLabel("№ поручения:"))
         self.number_search_input = QLineEdit()
@@ -550,7 +541,6 @@ class TasksWindow(QDialog):
         self.created_date_filter = QDateEdit()
         self.created_date_filter.setCalendarPopup(True)
         self.created_date_filter.setDisplayFormat("yyyy-MM-dd")
-        # По умолчанию — сегодня.
         self.created_date_filter.setDate(QDate.currentDate())
         self.created_date_filter.dateChanged.connect(
             self._reload_table
@@ -702,12 +692,7 @@ class TasksWindow(QDialog):
         root.addLayout(bottom)
 
     def _clear_created_date(self) -> None:
-        """
-        Сбрасывает фильтр по дате создания.
-
-        Устанавливаем «магическую» дату 2000-01-01, которая
-        трактуется в _filtered_items как «фильтр выключен».
-        """
+        """Сбрасывает фильтр по дате создания."""
         self.created_date_filter.setDate(QDate(2000, 1, 1))
         self._reload_table()
 
@@ -783,11 +768,6 @@ class TasksWindow(QDialog):
           • «42, 43, 44» → {42, 43, 44};
           • «40-50» → {40, 41, ..., 50};
           • смешанное: «1, 5-7, 10» → {1, 5, 6, 7, 10}.
-
-        Невалидные куски игнорируются.
-
-        Returns:
-            set[int] или None.
         """
         s = (raw or "").strip()
         if not s:
@@ -800,7 +780,6 @@ class TasksWindow(QDialog):
             if not chunk:
                 continue
 
-            # Диапазон вида «40-50».
             m = re.match(r"^(\d+)\s*-\s*(\d+)$", chunk)
             if m:
                 try:
@@ -810,13 +789,11 @@ class TasksWindow(QDialog):
                     continue
                 if a > b:
                     a, b = b, a
-                # Защита от огромных диапазонов.
                 if b - a > 10000:
                     b = a + 10000
                 result.update(range(a, b + 1))
                 continue
 
-            # Одиночное число.
             if chunk.isdigit():
                 try:
                     result.add(int(chunk))
@@ -863,7 +840,6 @@ class TasksWindow(QDialog):
             for it in self._items
             if (it.get("project") or "").strip()
         })
-        # Проект лежит не в поручении, а в session.json.
         if not projects:
             projects = self._collect_projects_from_sessions()
 
@@ -908,7 +884,6 @@ class TasksWindow(QDialog):
             self.context_search_input.text().strip().lower()
         )
 
-        # --- Поиск по номеру ---
         number_query_raw = (
             self.number_search_input.text().strip()
             if hasattr(self, "number_search_input") else ""
@@ -916,7 +891,6 @@ class TasksWindow(QDialog):
         numbers_filter = self._parse_number_query(number_query_raw)
 
         overdue_only = self.overdue_only_check.isChecked()
-        # Дата 2000-01-01 трактуется как «фильтр выключен».
         date_filter = self.created_date_filter.date()
         use_date_filter = date_filter != QDate(2000, 1, 1)
 
@@ -929,7 +903,6 @@ class TasksWindow(QDialog):
             if project_f and self._project_of(it) != project_f:
                 continue
 
-            # --- Фильтр по номеру ---
             if numbers_filter is not None:
                 try:
                     n = int(it.get("number") or 0)
@@ -938,13 +911,11 @@ class TasksWindow(QDialog):
                 if n not in numbers_filter:
                     continue
 
-            # --- Фильтр по контексту (названию записи) ---
             if context_query:
                 session_name = (it.get("session_name") or "").lower()
                 if context_query not in session_name:
                     continue
 
-            # --- Фильтр по дате создания ---
             if use_date_filter:
                 created_at_str = it.get("created_at") or ""
                 if not created_at_str:
@@ -964,13 +935,11 @@ class TasksWindow(QDialog):
                 except (ValueError, TypeError):
                     continue
 
-            # --- Только просроченные ---
             if overdue_only and not is_overdue(it):
                 continue
 
             result.append(it)
 
-        # --- Сортировка ---
         if self.sort_by_due_check.isChecked():
             result.sort(key=lambda x: (
                 due_date_priority(x),
@@ -1102,12 +1071,6 @@ class TasksWindow(QDialog):
         self.table.clearSelection()
 
     def _selected_items(self) -> List[Dict[str, Any]]:
-        """
-        Возвращает список выбранных поручений.
-
-        Сопоставляем по индексу строки с отфильтрованным списком,
-        так как ID больше не отображается в таблице.
-        """
         rows = sorted(
             {
                 i.row()
@@ -1135,9 +1098,22 @@ class TasksWindow(QDialog):
                 "Папка записи не найдена.",
             )
             return
+
+        # --- Справочник сотрудников для выпадающего списка ---
+        employees: List[Dict[str, str]] = []
+        if self._config_manager is not None:
+            try:
+                employees = self._config_manager.get_employees()
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать справочник сотрудников: %s",
+                    exc,
+                )
+
         dlg = TasksEditorDialog(
             session_dir=sdir,
             session_name=items[0].get("session_name") or "",
+            employees=employees,
             parent=self,
         )
         dlg.exec()

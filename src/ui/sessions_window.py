@@ -5221,9 +5221,21 @@ class SessionsWindow(QDialog):
             )
             return
 
+        # --- Справочник сотрудников для выпадающего списка ---
+        employees: List[Dict[str, str]] = []
+        if self.config_manager is not None:
+            try:
+                employees = self.config_manager.get_employees()
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать справочник сотрудников: %s",
+                    exc,
+                )
+
         dlg = TasksEditorDialog(
             session_dir=session_dir,
             session_name=r.get("name") or "",
+            employees=employees,
             parent=self,
         )
         dlg.exec()

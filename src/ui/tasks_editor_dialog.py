@@ -11,8 +11,10 @@
   • При создании/дублировании номера выдаются из общего
     счётчика (action_items_counter.json в корне sessions/).
   • _selected_item ищет элемент по ID в колонке «ID» (последней).
-  • НОВОЕ: добавлено поле «№ поручения» для поиска по номеру.
-    Поддерживаются: одно число, список через запятую, диапазон.
+  • Поле «№ поручения» для поиска по номеру.
+  • Поле «Исполнитель» в диалоге создания/редактирования —
+    редактируемый QComboBox: можно выбрать сотрудника из
+    справочника или ввести произвольное значение вручную.
 """
 from __future__ import annotations
 
@@ -34,6 +36,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
+
 from ..tasks_json_parser import (
     ParseResult,
     parse_action_items_json,
@@ -62,11 +65,14 @@ from .tooltips import attach_tooltip, make_info_icon, with_info
 import uuid
 from datetime import datetime
 
+
 def _new_uuid_hex() -> str:
     return uuid.uuid4().hex
 
+
 def _iso_now() -> str:
     return datetime.now().replace(microsecond=0).isoformat()
+
 
 log = get_logger(__name__)
 
@@ -81,6 +87,7 @@ class _ItemEditDialog(QDialog):
         self,
         item: Optional[Dict[str, Any]] = None,
         *,
+        employees: Optional[List[Dict[str, str]]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -91,10 +98,12 @@ class _ItemEditDialog(QDialog):
         self.setMinimumWidth(560)
 
         self._initial = item or {}
+        self._employees: List[Dict[str, str]] = list(employees or [])
 
         form = QFormLayout(self)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
+        # --- Текст поручения ---
         self.text_input = QPlainTextEdit()
         self.text_input.setPlaceholderText(
             "Что нужно сделать (например: «Подготовить макет "
@@ -103,17 +112,35 @@ class _ItemEditDialog(QDialog):
         self.text_input.setFixedHeight(80)
         form.addRow("Текст поручения:", self.text_input)
 
-        self.assignee_input = QLineEdit()
-        self.assignee_input.setPlaceholderText(
-            "ФИО или ник исполнителя (например: Иванов И.И.)"
+        # --- Исполнитель: редактируемый QComboBox ---
+        self.assignee_combo = QComboBox()
+        self.assignee_combo.setEditable(True)
+        self.assignee_combo.setInsertPolicy(
+            QComboBox.InsertPolicy.NoInsert
         )
-        form.addRow("Исполнитель:", self.assignee_input)
+        self.assignee_combo.setMinimumWidth(320)
+        self.assignee_combo.lineEdit().setPlaceholderText(
+            "ФИО или ник исполнителя. Выберите из списка или "
+            "введите своё."
+        )
+        self.assignee_combo.setToolTip(
+            "Можно выбрать сотрудника из справочника "
+            "(Настройки → Сотрудники) или ввести произвольное "
+            "значение вручную.\n\n"
+            "Ручной ввод не добавляется в справочник автоматически."
+        )
+        self._populate_employees(
+            current=self._initial.get("assignee") or ""
+        )
+        form.addRow("Исполнитель:", self.assignee_combo)
 
+        # --- Статус ---
         self.status_combo = QComboBox()
         for s in STATUS_ORDER:
             self.status_combo.addItem(STATUS_LABELS[s], s)
         form.addRow("Статус:", self.status_combo)
 
+        # --- Срок ---
         self.due_date_check = QDateEdit()
         self.due_date_check.setCalendarPopup(True)
         self.due_date_check.setDisplayFormat("yyyy-MM-dd")
@@ -121,12 +148,7 @@ class _ItemEditDialog(QDialog):
         self.due_date_check.setDate(QDate.currentDate())
         form.addRow("Срок:", self.due_date_check)
 
-        self.due_date_enabled = QPushButton("Убрать срок")
-        self.due_date_enabled.setCheckable(False)
-        self.due_date_enabled.clicked.connect(
-            lambda: self.due_date_check.setDate(QDate.currentDate())
-        )
-
+        # --- Комментарий ---
         self.comment_input = QPlainTextEdit()
         self.comment_input.setPlaceholderText(
             "Комментарий (необязательно)."
@@ -134,6 +156,7 @@ class _ItemEditDialog(QDialog):
         self.comment_input.setFixedHeight(60)
         form.addRow("Комментарий:", self.comment_input)
 
+        # --- Кнопки ---
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel,
@@ -151,14 +174,68 @@ class _ItemEditDialog(QDialog):
 
         self._apply_initial()
 
+    # ------------------------------------------------------------------
+    # Заполнение списка сотрудников
+    # ------------------------------------------------------------------
+    def _populate_employees(self, *, current: str = "") -> None:
+        """
+        Заполняет QComboBox сотрудниками из справочника.
+
+        Особенности:
+          • первым идёт пустой пункт «— без исполнителя —»;
+          • если current непустой и его нет в списке — он
+            добавляется второй строкой (после пустого),
+            чтобы не потерялся при редактировании;
+          • editable=True позволяет ввести произвольное значение.
+        """
+        self.assignee_combo.blockSignals(True)
+        self.assignee_combo.clear()
+
+        # Пустой вариант
+        self.assignee_combo.addItem("— без исполнителя —", "")
+
+        # Уникальные имена сотрудников (на случай дублей в конфиге)
+        seen: set = set()
+        for e in self._employees:
+            name = (e.get("name") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            self.assignee_combo.addItem(name, name)
+
+        # Текущее значение, если его нет в справочнике —
+        # добавляем второй строкой (после пустого).
+        cur = (current or "").strip()
+        if cur and cur not in seen:
+            self.assignee_combo.insertItem(1, cur, cur)
+
+        # Выбираем текущее значение, если оно есть
+        if cur:
+            idx = self.assignee_combo.findData(cur)
+            if idx >= 0:
+                self.assignee_combo.setCurrentIndex(idx)
+            else:
+                # fallback: поставить текст в line edit
+                self.assignee_combo.setEditText(cur)
+        else:
+            self.assignee_combo.setCurrentIndex(0)
+
+        self.assignee_combo.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Заполнение остальных полей
+    # ------------------------------------------------------------------
     def _apply_initial(self) -> None:
         it = self._initial
         self.text_input.setPlainText(it.get("text") or "")
-        self.assignee_input.setText(it.get("assignee") or "")
+
+        # Исполнитель уже установлен в _populate_employees
+
         status = it.get("status") or "created"
         idx = self.status_combo.findData(status)
         if idx >= 0:
             self.status_combo.setCurrentIndex(idx)
+
         due = (it.get("due_date") or "").strip()
         if due:
             try:
@@ -168,8 +245,12 @@ class _ItemEditDialog(QDialog):
                 )
             except Exception:
                 pass
+
         self.comment_input.setPlainText(it.get("comment") or "")
 
+    # ------------------------------------------------------------------
+    # Обработчики
+    # ------------------------------------------------------------------
     def _on_accept(self) -> None:
         if not self.text_input.toPlainText().strip():
             QMessageBox.warning(
@@ -181,11 +262,27 @@ class _ItemEditDialog(QDialog):
 
     def result_data(self) -> Dict[str, Any]:
         qd = self.due_date_check.date()
+
+        # Исполнитель: currentData() для выбранного из списка,
+        # currentText() — для ручного ввода.
+        # Берём data, если оно непустое; иначе — текст.
+        assignee_data = self.assignee_combo.currentData()
+        if assignee_data:
+            assignee = str(assignee_data).strip()
+        else:
+            assignee = self.assignee_combo.currentText().strip()
+            # Если пользователь выбрал пункт «— без исполнителя —»
+            # через список — считаем, что исполнителя нет.
+            if assignee == "— без исполнителя —":
+                assignee = ""
+
         return {
             "text": self.text_input.toPlainText().strip(),
-            "assignee": self.assignee_input.text().strip(),
+            "assignee": assignee,
             "status": self.status_combo.currentData() or "created",
-            "due_date": f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}",
+            "due_date": (
+                f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
+            ),
             "comment": self.comment_input.toPlainText().strip(),
         }
 
@@ -205,6 +302,7 @@ class TasksEditorDialog(QDialog):
         session_dir: str,
         *,
         session_name: str = "",
+        employees: Optional[List[Dict[str, str]]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -218,6 +316,10 @@ class TasksEditorDialog(QDialog):
         self._session_dir = session_dir
         self._session_name = session_name
         self._data: Dict[str, Any] = {}
+
+        # Справочник сотрудников для выпадающего списка
+        # в диалоге редактирования поручения.
+        self._employees: List[Dict[str, str]] = list(employees or [])
 
         self._build_ui()
         self._reload()
@@ -272,7 +374,6 @@ class TasksEditorDialog(QDialog):
         )
         filters.addWidget(self.assignee_filter)
 
-        # --- НОВОЕ: поиск по номеру поручения ---
         filters.addSpacing(12)
         filters.addWidget(QLabel("№ поручения:"))
         self.number_search_input = QLineEdit()
@@ -382,10 +483,9 @@ class TasksEditorDialog(QDialog):
         self.table.itemDoubleClicked.connect(
             lambda _it: self._edit_selected()
         )
-        
+
         # --- СКРЫВАЕМ КОЛОНКУ ID (последняя, индекс 6) ---
         self.table.setColumnHidden(6, True)
-        # ------------------------------------------------
 
         hv = self.table.horizontalHeader()
         hv.setSectionResizeMode(
@@ -521,9 +621,6 @@ class TasksEditorDialog(QDialog):
           • смешанное: «1, 5-7, 10» → {1, 5, 6, 7, 10}.
 
         Невалидные куски игнорируются.
-
-        Returns:
-            set[int] или None.
         """
         s = (raw or "").strip()
         if not s:
@@ -546,13 +643,11 @@ class TasksEditorDialog(QDialog):
                     continue
                 if a > b:
                     a, b = b, a
-                # Защита от огромных диапазонов.
                 if b - a > 10000:
                     b = a + 10000
                 result.update(range(a, b + 1))
                 continue
 
-            # Одиночное число.
             if chunk.isdigit():
                 try:
                     result.add(int(chunk))
@@ -619,7 +714,6 @@ class TasksEditorDialog(QDialog):
             if assignee_filter and it.get("assignee") != assignee_filter:
                 continue
 
-            # --- Фильтр по номеру ---
             if numbers_filter is not None:
                 try:
                     n = int(it.get("number") or 0)
@@ -638,11 +732,9 @@ class TasksEditorDialog(QDialog):
                 if query not in haystack:
                     continue
 
-            # --- Только просроченные ---
             if overdue_only and not is_overdue(it):
                 continue
 
-            # --- Фильтр по диапазону дат срока ---
             if due_enabled:
                 raw_due = (it.get("due_date") or "").strip()
                 if not raw_due:
@@ -657,7 +749,6 @@ class TasksEditorDialog(QDialog):
 
             result.append(it)
 
-        # --- Сортировка ---
         if self.sort_by_due_check.isChecked():
             result.sort(key=lambda x: (
                 due_date_priority(x),
@@ -671,7 +762,6 @@ class TasksEditorDialog(QDialog):
         items = self._filtered_items()
         self.table.setRowCount(0)
 
-        # Цвета для просроченных строк.
         overdue_bg = QColor("#FFEBEE")
         overdue_fg = QColor("#B71C1C")
         today_bg = QColor("#FFF8E1")
@@ -689,7 +779,6 @@ class TasksEditorDialog(QDialog):
 
             overdue = is_overdue(it)
 
-            # Дата срока.
             raw_due = (it.get("due_date") or "").strip()
             due_is_today = False
             if raw_due:
@@ -776,7 +865,6 @@ class TasksEditorDialog(QDialog):
                     cell.setBackground(overdue_bg)
                     if col != 1:
                         cell.setForeground(overdue_fg)
-                # Дополнительный визуальный маркер — «⚠»
                 first_cell = self.table.item(row, 2)
                 if first_cell is not None:
                     first_cell.setText(
@@ -820,13 +908,16 @@ class TasksEditorDialog(QDialog):
         return None
 
     def _add_item(self) -> None:
-        dlg = _ItemEditDialog(parent=self)
+        dlg = _ItemEditDialog(
+            employees=self._employees,
+            parent=self,
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         patch = dlg.result_data()
         item = make_item(
             patch["text"],
-            session_dir=self._session_dir,   # ← сквозной номер
+            session_dir=self._session_dir,
             assignee=patch["assignee"],
             status=patch["status"],
             due_date=patch["due_date"],
@@ -851,7 +942,11 @@ class TasksEditorDialog(QDialog):
             )
             return
 
-        dlg = _ItemEditDialog(item=item, parent=self)
+        dlg = _ItemEditDialog(
+            item=item,
+            employees=self._employees,
+            parent=self,
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -896,7 +991,7 @@ class TasksEditorDialog(QDialog):
             return
         copy = dict(item)
         copy.pop("id", None)
-        copy.pop("number", None)  # копия получит новый номер
+        copy.pop("number", None)
         copy["text"] = (copy.get("text") or "") + " (копия)"
         new_item = make_item(
             copy["text"],
@@ -1059,7 +1154,6 @@ class TasksEditorDialog(QDialog):
             result.format_kind, result.format_kind or "неизвестный",
         )
 
-        # --- Превью первых элементов ---
         preview_lines: List[str] = []
         for i, it in enumerate(items[:10], start=1):
             text = (it.get("text") or "").strip()
@@ -1082,7 +1176,6 @@ class TasksEditorDialog(QDialog):
             )
         preview_text = "\n".join(preview_lines) or "(нет элементов)"
 
-        # --- Диалог ---
         dlg = QDialog(self)
         dlg.setWindowTitle("Вставка JSON — предпросмотр")
         dlg.setModal(True)
@@ -1130,7 +1223,6 @@ class TasksEditorDialog(QDialog):
         preview_label.setMinimumHeight(200)
         layout.addWidget(preview_label, 1)
 
-        # --- Режим импорта ---
         mode_label = QLabel(
             "<b>Что делать с текущими поручениями?</b>"
         )
@@ -1148,7 +1240,6 @@ class TasksEditorDialog(QDialog):
         )
         layout.addWidget(merge_check)
 
-        # --- Кнопки ---
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel,
@@ -1183,11 +1274,8 @@ class TasksEditorDialog(QDialog):
             existing_ids = {it.get("id") for it in existing}
             added = 0
             for it in items:
-                # Если id уже есть — генерируем новый, чтобы
-                # не перетирать существующее.
                 if it.get("id") in existing_ids:
                     it["id"] = _new_uuid_hex()
-                # Если у элемента нет номера — выдаём новый.
                 if not it.get("number"):
                     from ..tasks_manager import (
                         get_next_item_number,
@@ -1205,7 +1293,6 @@ class TasksEditorDialog(QDialog):
                 added, len(existing),
             )
         else:
-            # При полной замене тоже выдаём номера, если их нет.
             for it in items:
                 if not it.get("number"):
                     from ..tasks_manager import (
