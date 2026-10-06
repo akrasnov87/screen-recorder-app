@@ -22,6 +22,18 @@
         / «Снять отметку»;
       – кнопка «Готово к синхронизации» на нижней панели;
       – метод _toggle_sync_ready.
+  • Добавлена колонка «Поручения» с количеством поручений
+    (из action_items.json).
+  • Добавлена панель фильтров над таблицей:
+      – фильтр по проекту (выпадающий список);
+      – фильтр по периоду (дата с/по + чекбокс «Ограничить»);
+      – текстовый поиск по названию, проекту, тегам, дате;
+      – кнопка «Сбросить фильтры»;
+      – счётчик «Показано: N из M».
+  • Метод «Свод за день» позволяет фильтровать записи
+    по проектам.
+  • Пропуск транскрибации при наличии video.txt: диалог
+    с выбором «сохранить стенограмму / пересобрать».
 """
 from __future__ import annotations
 
@@ -35,7 +47,9 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QDate, QThread, QUrl, Signal
-from PySide6.QtGui import QGuiApplication, QAction, QDesktopServices, QKeySequence, QColor
+from PySide6.QtGui import (
+    QGuiApplication, QAction, QDesktopServices, QKeySequence, QColor,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
@@ -643,6 +657,7 @@ class SyncOneRecordDialog(QDialog):
             ("deepseek_prompt", "deepseek_prompt.docx"),
             ("deepseek_prompt", "deepseek_prompt.md"),
             ("deepseek_prompt", "deepseek_prompt.txt"),
+            ("action_items", "action_items.json"),
         ]
         seen_kinds: set = set()
         for kind, fname in text_files:
@@ -695,6 +710,7 @@ class SyncOneRecordDialog(QDialog):
 
     def result_data(self) -> Dict[str, Any]:
         return dict(self._result_data)
+
 
 # ---------------------------------------------------------------------------
 # Диалог выбора периода для «Свода за день»
@@ -1341,6 +1357,7 @@ class DailyDigestDialog(QDialog):
     def result_count(self) -> int:
         return self._result_count
 
+
 # ---------------------------------------------------------------------------
 # Диалог публичной ссылки на запись
 # ---------------------------------------------------------------------------
@@ -1509,6 +1526,7 @@ class PublicLinkDialog(QDialog):
         QDesktopServices.openUrl(QUrl(link))
         log.info("Открытие ссылки в браузере: %s", link)
 
+
 # ---------------------------------------------------------------------------
 # Основное окно
 # ---------------------------------------------------------------------------
@@ -1534,6 +1552,8 @@ class SessionsWindow(QDialog):
         self.setMinimumSize(1600, 800)
         self.setModal(False)
         self._rows: List[Dict[str, Any]] = []
+        # Полный список записей (до фильтрации).
+        self._all_rows: List[Dict[str, Any]] = []
         self._thread: Optional[SessionsScanThread] = None
         self._sync_worker: Optional[_OneSyncWorker] = None
         self._sync_progress_dlg: Optional[QProgressDialog] = None
@@ -1583,6 +1603,9 @@ class SessionsWindow(QDialog):
         )
         header.addWidget(self.refresh_indicator)
         root.addLayout(header)
+
+        # --- Панель фильтров ---
+        root.addWidget(self._build_filters_bar())
 
         self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels([
@@ -1641,7 +1664,7 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             12, QHeaderView.ResizeMode.ResizeToContents
         )
-        # Скрываем колонку «Папка» (теперь индекс 12).
+        # Скрываем колонку «Папка» (индекс 12).
         self.table.setColumnHidden(12, True)
         self.table.itemSelectionChanged.connect(
             self._on_selection_changed
@@ -1658,16 +1681,6 @@ class SessionsWindow(QDialog):
 
         # ------------------------------------------------------------------
         # Нижняя панель — ДВА РЯДА кнопок.
-        #
-        # Ряд 1: работа с контентом записи
-        #   (видео, аудио, стенограмма, протокол).
-        # Ряд 2: серверная синхронизация и сервисные действия
-        #   (готовность, публикация, ссылка на сервер,
-        #    промпт поручений, обновление, свод, поручения, закрытие).
-        #
-        # Такое разделение нужно, потому что при большом количестве
-        # кнопок они не помещаются в одну строку — текст обрезается
-        # и кнопки наезжают друг на друга.
         # ------------------------------------------------------------------
         bottom_content = QHBoxLayout()
         bottom_content.setSpacing(6)
@@ -1807,6 +1820,265 @@ class SessionsWindow(QDialog):
 
         root.addLayout(bottom_actions)
 
+    def _build_filters_bar(self) -> QWidget:
+        """
+        Панель фильтров над таблицей: проект, период,
+        текстовый поиск. Все фильтры применяются к уже
+        загруженному списку записей (self._all_rows) без
+        повторного сканирования.
+        """
+        box = QFrame()
+        box.setFrameShape(QFrame.Shape.StyledPanel)
+        box.setStyleSheet(
+            "QFrame { background-color: palette(window); "
+            "border: 1px solid palette(mid); border-radius: 6px; }"
+        )
+        row = QHBoxLayout(box)
+        row.setContentsMargins(10, 6, 10, 6)
+        row.setSpacing(8)
+
+        # --- Проект ---
+        row.addWidget(QLabel("Проект:"))
+        self.filter_project_combo = QComboBox()
+        self.filter_project_combo.setMinimumWidth(180)
+        self.filter_project_combo.addItem("— все проекты —", "")
+        self.filter_project_combo.currentIndexChanged.connect(
+            self._apply_filters
+        )
+        self.filter_project_combo.setToolTip(
+            "Показать записи только выбранного проекта."
+        )
+        row.addWidget(self.filter_project_combo)
+
+        row.addSpacing(12)
+
+        # --- Период: с ---
+        row.addWidget(QLabel("Период с:"))
+        self.filter_date_from = QDateEdit()
+        self.filter_date_from.setCalendarPopup(True)
+        self.filter_date_from.setDisplayFormat("yyyy-MM-dd")
+        self.filter_date_from.setDate(
+            QDate.currentDate().addMonths(-1)
+        )
+        self.filter_date_from.dateChanged.connect(self._apply_filters)
+        self.filter_date_from.setToolTip(
+            "Начало периода (включительно)."
+        )
+        row.addWidget(self.filter_date_from)
+
+        # --- Период: по ---
+        row.addWidget(QLabel("по:"))
+        self.filter_date_to = QDateEdit()
+        self.filter_date_to.setCalendarPopup(True)
+        self.filter_date_to.setDisplayFormat("yyyy-MM-dd")
+        self.filter_date_to.setDate(QDate.currentDate())
+        self.filter_date_to.dateChanged.connect(self._apply_filters)
+        self.filter_date_to.setToolTip(
+            "Конец периода (включительно)."
+        )
+        row.addWidget(self.filter_date_to)
+
+        # --- Чекбокс «Ограничить по датам» ---
+        self.filter_date_enabled = QCheckBox("Ограничить по датам")
+        self.filter_date_enabled.setChecked(False)
+        self.filter_date_enabled.setToolTip(
+            "Если снять галочку — период игнорируется, "
+            "показываются все записи."
+        )
+        self.filter_date_enabled.toggled.connect(
+            self._on_date_filter_toggled
+        )
+        row.addWidget(self.filter_date_enabled)
+
+        # --- Кнопка «Сбросить фильтры» ---
+        self.filter_reset_btn = QPushButton("Сбросить фильтры")
+        self.filter_reset_btn.setToolTip(
+            "Убрать все фильтры (проект, даты, поиск)."
+        )
+        self.filter_reset_btn.clicked.connect(self._reset_filters)
+        row.addWidget(self.filter_reset_btn)
+
+        row.addStretch()
+
+        # --- Текстовый поиск ---
+        row.addWidget(QLabel("Поиск:"))
+        self.filter_search_input = QLineEdit()
+        self.filter_search_input.setPlaceholderText(
+            "Подстрока в названии, тегах, проекте…"
+        )
+        self.filter_search_input.setClearButtonEnabled(True)
+        self.filter_search_input.setMinimumWidth(220)
+        self.filter_search_input.textChanged.connect(
+            self._apply_filters
+        )
+        self.filter_search_input.setToolTip(
+            "Поиск по подстроке без учёта регистра в названии, "
+            "тегах, проекте, дате, имени папки."
+        )
+        row.addWidget(self.filter_search_input)
+
+        # --- Счётчик показанных записей ---
+        self.filter_count_label = QLabel("")
+        self.filter_count_label.setStyleSheet(
+            "QLabel { color: #444; font-weight: bold; }"
+        )
+        self.filter_count_label.setMinimumWidth(140)
+        self.filter_count_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+        row.addWidget(self.filter_count_label)
+
+        # --- Начальное состояние ---
+        # Устанавливаем enabled-состояние для полей дат напрямую,
+        # не вызывая _apply_filters (таблица ещё не создана —
+        # _build_filters_bar вызывается до _build_table).
+        self.filter_date_from.setEnabled(
+            self.filter_date_enabled.isChecked()
+        )
+        self.filter_date_to.setEnabled(
+            self.filter_date_enabled.isChecked()
+        )
+
+        return box
+
+    def _on_date_filter_toggled(self, enabled: bool) -> None:
+        self.filter_date_from.setEnabled(enabled)
+        self.filter_date_to.setEnabled(enabled)
+        self._apply_filters()
+
+    def _reset_filters(self) -> None:
+        self.filter_project_combo.blockSignals(True)
+        self.filter_project_combo.setCurrentIndex(0)
+        self.filter_project_combo.blockSignals(False)
+
+        self.filter_date_enabled.blockSignals(True)
+        self.filter_date_enabled.setChecked(False)
+        self.filter_date_enabled.blockSignals(False)
+
+        self.filter_date_from.setDate(
+            QDate.currentDate().addMonths(-1)
+        )
+        self.filter_date_to.setDate(QDate.currentDate())
+
+        self.filter_search_input.clear()
+
+        self._apply_filters()
+        log.info("Записи: фильтры сброшены")
+
+    def _refresh_project_filter(self) -> None:
+        """
+        Заполняет выпадающий список проектов уникальными
+        значениями из self._all_rows.
+        """
+        if not hasattr(self, "filter_project_combo"):
+            return
+
+        current = self.filter_project_combo.currentData() or ""
+
+        projects = sorted({
+            (r.get("project") or "").strip()
+            for r in self._all_rows
+            if (r.get("project") or "").strip()
+        })
+
+        self.filter_project_combo.blockSignals(True)
+        self.filter_project_combo.clear()
+        self.filter_project_combo.addItem("— все проекты —", "")
+        for p in projects:
+            self.filter_project_combo.addItem(p, p)
+        idx = self.filter_project_combo.findData(current)
+        if idx >= 0:
+            self.filter_project_combo.setCurrentIndex(idx)
+        self.filter_project_combo.blockSignals(False)
+
+    def _apply_filters(self) -> None:
+        """
+        Применяет фильтры (проект, период, поиск) к
+        self._all_rows и обновляет self._rows + таблицу.
+        """
+        if not hasattr(self, "filter_project_combo"):
+            return
+        # Таблица ещё не создана — фильтры применим позже,
+        # при первом заполнении через _on_scan_finished.
+        if not hasattr(self, "table"):
+            return
+
+        project_filter = (
+            self.filter_project_combo.currentData() or ""
+        )
+        date_enabled = self.filter_date_enabled.isChecked()
+        search_query = (
+            self.filter_search_input.text().strip().lower()
+        )
+
+        d_from = None
+        d_to = None
+        if date_enabled:
+            qd_from = self.filter_date_from.date()
+            qd_to = self.filter_date_to.date()
+            if qd_to < qd_from:
+                qd_from, qd_to = qd_to, qd_from
+            d_from = date(
+                qd_from.year(), qd_from.month(), qd_from.day()
+            )
+            d_to = date(
+                qd_to.year(), qd_to.month(), qd_to.day()
+            )
+
+        filtered: List[Dict[str, Any]] = []
+
+        for r in self._all_rows:
+            # --- Фильтр по проекту ---
+            if project_filter:
+                if (r.get("project") or "") != project_filter:
+                    continue
+
+            # --- Фильтр по периоду ---
+            if date_enabled and d_from and d_to:
+                r_date_str = (r.get("datetime") or "").strip()
+                if not r_date_str:
+                    continue
+                date_part = r_date_str.split(" ", 1)[0]
+                try:
+                    y, m, d = date_part.split("-")
+                    r_date = date(int(y), int(m), int(d))
+                except Exception:
+                    continue
+                if not (d_from <= r_date <= d_to):
+                    continue
+
+            # --- Текстовый поиск ---
+            if search_query:
+                haystack_parts = [
+                    str(r.get("name") or ""),
+                    str(r.get("project") or ""),
+                    str(r.get("datetime") or ""),
+                    " ".join(r.get("tags") or []),
+                    os.path.basename(r.get("dir") or ""),
+                ]
+                haystack = " ".join(haystack_parts).lower()
+                if search_query not in haystack:
+                    continue
+
+            filtered.append(r)
+
+        self._rows = filtered
+        self._render_rows()
+        self._update_summary()
+
+        if hasattr(self, "filter_count_label"):
+            total = len(self._all_rows)
+            shown = len(filtered)
+            if shown == total:
+                self.filter_count_label.setText(
+                    f"Показано: {shown}"
+                )
+            else:
+                self.filter_count_label.setText(
+                    f"Показано: {shown} из {total}"
+                )
+
     def _build_menu_bar(self) -> None:
         bar = QMenuBar(self)
         _MENU_QSS = (
@@ -1897,7 +2169,6 @@ class SessionsWindow(QDialog):
 
         m_file.addSeparator()
 
-        # --- НОВОЕ: публичная ссылка на сервер ---
         act_public_link = QAction(
             "Открыть ссылку на сервере…", self
         )
@@ -2319,7 +2590,7 @@ class SessionsWindow(QDialog):
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Обновление промпта поручений")
         msg_box.setIcon(QMessageBox.Icon.Question)
-        msg_box.setTextFormat(Qt.TextFormat.RichText)   # ← ключевая строка
+        msg_box.setTextFormat(Qt.TextFormat.RichText)
         msg_box.setText(
             f"Пересобрать <code>action_items_prompt</code> "
             f"на основе протокола записи:<br><br>"
@@ -2429,7 +2700,6 @@ class SessionsWindow(QDialog):
             self.play_audio_btn.setEnabled(False)
             self.open_transcript_btn.setEnabled(False)
             self.open_protocol_btn.setEnabled(False)
-            # --- НОВОЕ ---
             if hasattr(self, "public_link_btn"):
                 self.public_link_btn.setEnabled(False)
             if hasattr(self, "copy_public_link_btn"):
@@ -2467,7 +2737,6 @@ class SessionsWindow(QDialog):
         self.sync_btn.setEnabled(bool(r.get("dir")))
         self.sync_ready_btn.setEnabled(bool(r.get("dir")))
 
-        # Обновляем текст кнопки в зависимости от текущего состояния
         if r.get("sync_ready"):
             self.sync_ready_btn.setText("Снять готовность")
         else:
@@ -2477,7 +2746,6 @@ class SessionsWindow(QDialog):
         has_local_audio = bool(r.get("has_audio"))
         is_published = bool(r.get("published"))
 
-        # --- НОВОЕ: публичная ссылка доступна только после публикации ---
         if hasattr(self, "public_link_btn"):
             self.public_link_btn.setEnabled(is_published)
         if hasattr(self, "copy_public_link_btn"):
@@ -2528,9 +2796,14 @@ class SessionsWindow(QDialog):
         self._thread.start()
 
     def _on_scan_finished(self, rows: list) -> None:
-        self._rows = list(rows or [])
-        self._render_rows()
-        self._update_summary()
+        # Сохраняем полный список — фильтры работают по нему.
+        self._all_rows = list(rows or [])
+
+        # Обновляем список проектов в фильтре.
+        self._refresh_project_filter()
+
+        # Применяем фильтры.
+        self._apply_filters()
 
     def _on_scan_failed(self, error: str) -> None:
         log.error("Сканирование сессий провалено: %s", error)
@@ -2563,8 +2836,15 @@ class SessionsWindow(QDialog):
             1 for r in rows if r.get("sync_ready") and not r.get("published")
         )
 
+        # Показываем итоги по отфильтрованному списку.
+        all_total = len(self._all_rows)
+        if all_total != total:
+            total_text = f"Всего: {total} из {all_total}"
+        else:
+            total_text = f"Всего: {total}"
+
         self.summary_label.setText(
-            f"Всего: {total} | Обработан: {processed} | "
+            f"{total_text} | Обработан: {processed} | "
             f"Сохранено: {uploaded} | В обработке: {in_progress} | "
             f"Ошибок: {errors} | На сервере: {published} | "
             f"Готовы к синхр.: {ready_count}"
@@ -2602,14 +2882,9 @@ class SessionsWindow(QDialog):
                     qcolor = QColor(tag_color)
                     if qcolor.isValid():
                         tags_item.setBackground(qcolor)
-                        if qcolor.lightness() < 128:
-                            tags_item.setForeground(
-                                QColor("#FFFFFF")
-                            )
-                        else:
-                            tags_item.setForeground(
-                                QColor("#000000")
-                            )
+                        tags_item.setForeground(
+                            QColor("#000000")
+                        )
 
             self.table.setItem(row, 3, tags_item)
 
@@ -2746,8 +3021,6 @@ class SessionsWindow(QDialog):
         new_value = not current
 
         if new_value:
-            # Отметить как готовую — предупреждаем, что фоновый pull
-            # начнёт перезаписывать локальные файлы.
             reply = QMessageBox.question(
                 self, "Готово к синхронизации",
                 f"Отметить запись «{r['name']}» как готовую "
@@ -2875,7 +3148,6 @@ class SessionsWindow(QDialog):
                     "(record=%s): %s", record_id, exc,
                 )
 
-        # Запускаем в отдельном потоке, чтобы не блокировать UI.
         import threading
 
         def _runner() -> None:
@@ -3254,8 +3526,6 @@ class SessionsWindow(QDialog):
     # ------------------------------------------------------------------
     # Просмотр протокола
     # ------------------------------------------------------------------
-    # Порядок приоритетов при поиске протокола. Ручной протокол
-    # считается «главнее» автоматического.
     _PROTOCOL_CANDIDATES = (
         "manual_protocol.docx",
         "manual_protocol.md",
@@ -3269,30 +3539,19 @@ class SessionsWindow(QDialog):
 
     @classmethod
     def _find_manual_protocol_path(cls, r: Dict[str, Any]) -> str:
-        """
-        Ищет протокол в папке записи.
-
-        Порядок:
-          1. Путь из session.json (manual_protocol_path).
-          2. Файлы _PROTOCOL_CANDIDATES в корне папки записи.
-          3. Те же файлы в подпапке attachments/.
-        """
         session_dir = r.get("dir") or ""
         if not session_dir:
             return ""
 
-        # 1. Путь из метаданных.
         meta_path = r.get("manual_protocol_path") or ""
         if meta_path and os.path.isfile(meta_path):
             return meta_path
 
-        # 2. Корень папки записи.
         for name in cls._PROTOCOL_CANDIDATES:
             candidate = os.path.join(session_dir, name)
             if os.path.isfile(candidate):
                 return candidate
 
-        # 3. Подпапка attachments/.
         att_dir = os.path.join(session_dir, "attachments")
         if os.path.isdir(att_dir):
             for name in cls._PROTOCOL_CANDIDATES:
@@ -3305,13 +3564,6 @@ class SessionsWindow(QDialog):
     def _resolve_first_tag_color(
         self, tag_names: List[str],
     ) -> Optional[str]:
-        """
-        Возвращает HEX-цвет первого тега из списка, для которого
-        в справочнике (Настройки → Теги) задан цвет.
-
-        Если ни у одного тега цвет не задан — возвращает None.
-        Если config_manager недоступен — тоже None.
-        """
         if not tag_names or self.config_manager is None:
             return None
 
@@ -3449,16 +3701,6 @@ class SessionsWindow(QDialog):
     # Авто-публикация при установке «Готово к синхронизации»
     # ------------------------------------------------------------------
     def _publish_after_ready(self, r: Dict[str, Any]) -> None:
-        """
-        Запускает публикацию записи в фоне сразу после того, как
-        пользователь поставил галочку «Готово к синхронизации».
-
-        Проверяет:
-          • настройка app.sync_publish_on_ready включена;
-          • синхронизация настроена (enabled, base_url, api_key);
-          • запись не публикуется прямо сейчас.
-        """
-        # --- Проверка настройки ---
         if not self._app_cfg.get("sync_publish_on_ready", True):
             log.info(
                 "Авто-публикация при отметке «Готово» выключена "
@@ -3486,7 +3728,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # --- Защита от параллельных публикаций ---
         if (self._sync_worker is not None
                 and self._sync_worker.isRunning()):
             log.info(
@@ -3502,7 +3743,6 @@ class SessionsWindow(QDialog):
             config_manager=self.config_manager,
         )
 
-        # --- Используем настройки по умолчанию ---
         include_media = bool(
             cfg.get("send_media_to_server", False)
         )
@@ -3557,11 +3797,6 @@ class SessionsWindow(QDialog):
         row: Dict[str, Any],
         was_ready: bool,
     ) -> None:
-        """
-        Публикует запись, если флаг sync_ready только что
-        установлен (был False, стал True) и включена настройка
-        app.sync_publish_on_ready.
-        """
         if was_ready or not row.get("sync_ready"):
             return
         if not self._app_cfg.get("sync_publish_on_ready", True):
@@ -3571,7 +3806,6 @@ class SessionsWindow(QDialog):
     def _notify_ready_no_publish(
         self, r: Dict[str, Any], reason: str = "",
     ) -> None:
-        """Показывает уведомление, что публикация не запущена."""
         if reason == "busy":
             QMessageBox.information(
                 self, "Готово к синхронизации",
@@ -3680,12 +3914,6 @@ class SessionsWindow(QDialog):
     # Публичная ссылка на сервер
     # ------------------------------------------------------------------
     def _get_public_link(self, r: Dict[str, Any]) -> str:
-        """
-        Возвращает публичную ссылку для записи (без выбора блоков).
-
-        Ссылка собирается по base_url из sync_settings,
-        path и record_id — из .sync_published.json.
-        """
         if self.config_manager is None:
             return ""
 
@@ -3718,7 +3946,6 @@ class SessionsWindow(QDialog):
         )
 
     def _open_public_link_dialog(self) -> None:
-        """Открывает диалог с публичной ссылкой и выбором блоков."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -3782,7 +4009,6 @@ class SessionsWindow(QDialog):
         dlg.exec()
 
     def _copy_public_link(self) -> None:
-        """Копирует публичную ссылку в буфер обмена."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -3890,7 +4116,6 @@ class SessionsWindow(QDialog):
                     project, chat_id,
                 )
 
-        # --- Ищем протокол через общий метод ---
         protocol_path = self._find_manual_protocol_path(r)
         protocol_label = (
             os.path.basename(protocol_path) if protocol_path else ""
@@ -3930,7 +4155,6 @@ class SessionsWindow(QDialog):
         projects = self.config_manager.get_projects()
         employees = self.config_manager.get_employees()
 
-        # --- НОВОЕ: передаём настройки синхронизации в диалог ---
         try:
             sync_settings = self.config_manager.get_sync_settings()
         except Exception as exc:
@@ -3946,7 +4170,7 @@ class SessionsWindow(QDialog):
             projects=projects,
             employees=employees,
             sync_settings=sync_settings,
-            default_send=default,   # ← НОВОЕ
+            default_send=default,
             parent=self,
         )
         dlg.exec()
@@ -4002,7 +4226,6 @@ class SessionsWindow(QDialog):
 
         new_meta = dlg.result_data
         meta["tags"] = list(new_meta.get("tags", []))
-        # Обновляем также sync_ready, если пользователь его поменял
         meta["sync_ready"] = bool(new_meta.get("sync_ready", False))
         if not self._write_json(session_json, meta):
             QMessageBox.critical(
@@ -4802,14 +5025,6 @@ class SessionsWindow(QDialog):
                     log.warning(
                         "Не удалось удалить %s: %s", p, exc
                     )
-            p = os.path.join(session_dir, fname)
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception as exc:
-                    log.warning(
-                        "Не удалось удалить %s: %s", p, exc
-                    )
 
     def _remove_processed_artifacts(
         self,
@@ -4859,6 +5074,13 @@ class SessionsWindow(QDialog):
             task_id = self.task_queue.add_task(
                 {"video_path": r["video_path"], "metadata": meta}
             )
+            # Сохраняем task_id в session.json.
+            if task_id:
+                meta["task_id"] = task_id
+                self._write_json(
+                    os.path.join(r["dir"], "session.json"),
+                    meta,
+                )
             return task_id
         except Exception as exc:
             log.exception("Не удалось добавить задачу: %s", exc)
@@ -5006,7 +5228,6 @@ class SessionsWindow(QDialog):
         keep_transcript = False
 
         if has_transcript:
-            # Спрашиваем, что делать со стенограммой.
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Question)
             box.setWindowTitle("Перезапуск обработки")
@@ -5052,7 +5273,6 @@ class SessionsWindow(QDialog):
 
         # --- Удаляем артефакты ---
         if keep_transcript:
-            # Удаляем всё, кроме video.txt.
             self._remove_processed_artifacts(
                 r["dir"], keep_transcript=True,
             )
@@ -5211,7 +5431,6 @@ class SessionsWindow(QDialog):
             return
         menu = QMenu(self)
 
-        # --- Воспроизведение ---
         act_play_video = menu.addAction(
             "Смотреть видео", self._open_video
         )
@@ -5263,7 +5482,6 @@ class SessionsWindow(QDialog):
 
         menu.addSeparator()
 
-        # --- Синхронизация ---
         sync_ready_text = (
             "Снять отметку «готово к синхронизации»"
             if r.get("sync_ready")
@@ -5288,7 +5506,6 @@ class SessionsWindow(QDialog):
             "с выбором параметров (медиа, ссылка, удаление)"
         )
 
-        # --- НОВОЕ: публичная ссылка на сервер ---
         is_published = bool(r.get("published"))
         act_public = menu.addAction(
             "Открыть ссылку на сервере…",
@@ -5580,6 +5797,37 @@ class SessionsWindow(QDialog):
                 f"Не удалось удалить: {exc}",
             )
 
+    def _open_tasks_window(self) -> None:
+        """Открывает сводное окно «Поручения» по всем записям."""
+        try:
+            from .tasks_window import TasksWindow
+        except ImportError as exc:
+            log.exception(
+                "Не удалось импортировать окно «Поручения»: %s",
+                exc,
+            )
+            QMessageBox.critical(
+                self, "Поручения",
+                f"Модуль окна «Поручения» недоступен:\n{exc}",
+            )
+            return
+
+        try:
+            dlg = TasksWindow(
+                sessions_root=self.sessions_root,
+                config_manager=self.config_manager,
+                parent=self,
+            )
+            dlg.show()
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть окно «Поручения»: %s", exc,
+            )
+            QMessageBox.critical(
+                self, "Поручения",
+                f"Ошибка открытия окна:\n{exc}",
+            )
+
     # ------------------------------------------------------------------
     # Поручения (action items)
     # ------------------------------------------------------------------
@@ -5629,37 +5877,6 @@ class SessionsWindow(QDialog):
             parent=self,
         )
         dlg.exec()
-
-    def _open_tasks_window(self) -> None:
-        """Открывает сводное окно «Поручения» по всем записям."""
-        try:
-            from .tasks_window import TasksWindow
-        except ImportError as exc:
-            log.exception(
-                "Не удалось импортировать окно «Поручения»: %s",
-                exc,
-            )
-            QMessageBox.critical(
-                self, "Поручения",
-                f"Модуль окна «Поручения» недоступен:\n{exc}",
-            )
-            return
-
-        try:
-            dlg = TasksWindow(
-                sessions_root=self.sessions_root,
-                config_manager=self.config_manager,
-                parent=self,
-            )
-            dlg.show()
-        except Exception as exc:
-            log.exception(
-                "Не удалось открыть окно «Поручения»: %s", exc,
-            )
-            QMessageBox.critical(
-                self, "Поручения",
-                f"Ошибка открытия окна:\n{exc}",
-            )
 
     # ------------------------------------------------------------------
     # Справка
