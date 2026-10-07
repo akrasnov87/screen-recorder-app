@@ -127,6 +127,8 @@ class ScreenRecorder(QObject):
             cmd += [
                 "-c:v", "h264_vaapi",
                 "-b:v", f"{video_bitrate}k",
+                # --- faststart: moov в начало файла, для HTML5-плеера ---
+                "-movflags", "+faststart",
             ]
             if with_microphone:
                 cmd += ["-c:a", "aac", "-b:a", f"{audio_bitrate}k"]
@@ -165,6 +167,8 @@ class ScreenRecorder(QObject):
                 "-preset", "ultrafast",
                 "-pix_fmt", "yuv420p",
                 "-b:v", f"{video_bitrate}k",
+                # --- faststart: moov в начало файла, для HTML5-плеера ---
+                "-movflags", "+faststart",
             ]
             if with_microphone:
                 cmd += ["-c:a", "aac", "-b:a", f"{audio_bitrate}k"]
