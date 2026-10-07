@@ -30,7 +30,7 @@
       – текстовый поиск по названию, проекту, тегам, дате;
       – кнопка «Сбросить фильтры»;
       – счётчик «Показано: N из M».
-  • Метод «Свод за день» позволяет фильтровать записи
+  • Метод «Выборка» позволяет фильтровать записи
     по проектам.
   • Пропуск транскрибации при наличии video.txt: диалог
     с выбором «сохранить стенограмму / пересобрать».
@@ -303,8 +303,9 @@ class SessionsScanThread(QThread):
             # --- Флаг готовности к синхронизации ---
             sync_ready = bool(meta.get("sync_ready", False))
 
-            # --- Поручения: количество элементов в action_items.json ---
-            action_items_count = 0
+            # --- Поручения: разбивка по статусам из action_items.json ---
+            action_items_total = 0
+            action_items_by_status: Dict[str, int] = {}
             try:
                 action_items_path = os.path.join(
                     session_dir, "action_items.json"
@@ -313,7 +314,17 @@ class SessionsScanThread(QThread):
                     ai_data = read_json_file(action_items_path) or {}
                     items = ai_data.get("items")
                     if isinstance(items, list):
-                        action_items_count = len(items)
+                        action_items_total = len(items)
+                        for it in items:
+                            if not isinstance(it, dict):
+                                continue
+                            st = str(it.get("status") or "created").strip().lower()
+                            if st not in ("created", "in_progress",
+                                        "waiting", "done", "cancelled"):
+                                st = "created"
+                            action_items_by_status[st] = (
+                                action_items_by_status.get(st, 0) + 1
+                            )
             except Exception as exc:
                 log.warning(
                     "Не удалось прочитать поручения из %s: %s",
@@ -321,7 +332,10 @@ class SessionsScanThread(QThread):
                 )
 
             rows.append({
-                "action_items_count": action_items_count,
+                "action_items_total": action_items_total,
+                "action_items_by_status": action_items_by_status,
+                "action_items_done": action_items_by_status.get("done", 0),
+                "action_items_cancelled": action_items_by_status.get("cancelled", 0),
                 "dir": session_dir,
                 "name": meta.get("name") or name,
                 "project": meta.get("project") or "",
@@ -743,7 +757,7 @@ class DailyDigestDialog(QDialog):
         self._sessions_root = sessions_root
         self._config_manager = config_manager
 
-        self.setWindowTitle("Свод за день")
+        self.setWindowTitle("Выборка")
         self.setModal(True)
         self.setMinimumSize(860, 780)
 
@@ -1177,7 +1191,7 @@ class DailyDigestDialog(QDialog):
         instruction = self.prompt_edit.toPlainText().strip()
         if not instruction:
             QMessageBox.warning(
-                self, "Свод за день",
+                self, "Выборка",
                 "Введите текст промпта (инструкцию для ИИ).",
             )
             return
@@ -1191,7 +1205,7 @@ class DailyDigestDialog(QDialog):
                     + ", ".join(sorted(self._selected_projects))
                 )
             QMessageBox.information(
-                self, "Свод за день",
+                self, "Выборка",
                 "За выбранный период не найдено ни одной записи."
                 + projects_note,
             )
@@ -1208,7 +1222,7 @@ class DailyDigestDialog(QDialog):
 
         if not entries:
             QMessageBox.warning(
-                self, "Свод за день",
+                self, "Выборка",
                 "Не удалось прочитать данные записей за период.",
             )
             return
@@ -1233,7 +1247,7 @@ class DailyDigestDialog(QDialog):
 
         if not prompt_text.strip():
             QMessageBox.warning(
-                self, "Свод за день",
+                self, "Выборка",
                 "Промпт получился пустым.",
             )
             return
@@ -1242,7 +1256,7 @@ class DailyDigestDialog(QDialog):
         downloads = self._downloads_dir()
         if not os.path.isdir(downloads):
             QMessageBox.warning(
-                self, "Свод за день",
+                self, "Выборка",
                 f"Папка «Загрузки» не найдена:\n{downloads}",
             )
             return
@@ -1259,7 +1273,7 @@ class DailyDigestDialog(QDialog):
 
         if not path:
             QMessageBox.critical(
-                self, "Свод за день",
+                self, "Выборка",
                 "Не удалось сохранить файл промпта.",
             )
             return
@@ -1268,7 +1282,7 @@ class DailyDigestDialog(QDialog):
         self._result_count = len(entries)
 
         log.info(
-            "Свод за день: %d записей, период=%s, проекты=%s, файл=%s",
+            "Выборка: %d записей, период=%s, проекты=%s, файл=%s",
             len(entries), period_label,
             self._selected_projects or "все",
             path,
@@ -1298,7 +1312,7 @@ class DailyDigestDialog(QDialog):
             projects_line = "<b>Проекты:</b> все<br>"
 
         reply = QMessageBox.question(
-            self, "Свод за день",
+            self, "Выборка",
             f"<b>Свод сформирован.</b><br><br>"
             f"{projects_line}"
             f"Записей за период: <b>{len(entries)}</b><br>"
@@ -1793,7 +1807,7 @@ class SessionsWindow(QDialog):
         self.refresh_btn.clicked.connect(self.refresh)
         bottom_actions.addWidget(self.refresh_btn)
 
-        self.daily_digest_btn = QPushButton("Свод за день")
+        self.daily_digest_btn = QPushButton("Выборка")
         self.daily_digest_btn.setToolTip(
             "Сформировать единый промпт из протоколов всех "
             "записей за выбранный период.\n\n"
@@ -2541,10 +2555,10 @@ class SessionsWindow(QDialog):
             dlg.exec()
         except Exception as exc:
             log.exception(
-                "Не удалось открыть диалог «Свод за день»: %s", exc
+                "Не удалось открыть диалог «Выборка»: %s", exc
             )
             QMessageBox.critical(
-                self, "Свод за день",
+                self, "Выборка",
                 f"Ошибка открытия диалога:\n{exc}",
             )
 
@@ -2720,11 +2734,12 @@ class SessionsWindow(QDialog):
             parts.append("протокол: прикреплён")
         if (r.get("summary_bb") or "").strip():
             parts.append("summary: есть")
-        ai_count = int(r.get("action_items_count") or 0)
-        if ai_count > 0:
+        ai_total = int(r.get("action_items_total") or 0)
+        ai_done = int(r.get("action_items_done") or 0)
+        if ai_total > 0:
             parts.append(
                 f"<span style='color:#1565C0'>"
-                f"поручений: {ai_count}</span>"
+                f"поручений: {ai_done}/{ai_total}</span>"
             )
         if r.get("has_transcript"):
             parts.append("стенограмма: есть")
@@ -2917,19 +2932,66 @@ class SessionsWindow(QDialog):
                 ),
             )
 
-            # --- Поручения: количество из action_items.json ---
-            ai_count = int(r.get("action_items_count") or 0)
-            if ai_count > 0:
-                ai_item = QTableWidgetItem(str(ai_count))
-                ai_item.setForeground(Qt.GlobalColor.darkBlue)
+            # --- Поручения: «выполнено/всего» + разбивка по статусам ---
+            ai_total = int(r.get("action_items_total") or 0)
+            ai_by_status: Dict[str, int] = (
+                r.get("action_items_by_status") or {}
+            )
+
+            if ai_total > 0:
+                ai_done = int(ai_by_status.get("done", 0))
+                ai_cancelled = int(ai_by_status.get("cancelled", 0))
+
+                ai_item = QTableWidgetItem(f"{ai_done}/{ai_total}")
+                # Подсветка: если все выполнены — зелёный, если есть
+                # отменённые — учитываем их отдельно.
+                if ai_done == ai_total:
+                    ai_item.setForeground(Qt.GlobalColor.darkGreen)
+                elif ai_done + ai_cancelled == ai_total:
+                    # Все закрыты (выполнены или отменены).
+                    ai_item.setForeground(Qt.GlobalColor.darkGray)
+                elif ai_done > 0:
+                    ai_item.setForeground(Qt.GlobalColor.darkBlue)
+                else:
+                    ai_item.setForeground(Qt.GlobalColor.gray)
+
                 ai_item.setTextAlignment(
                     Qt.AlignmentFlag.AlignRight
                     | Qt.AlignmentFlag.AlignVCenter
                 )
+
+                # --- Подробный tooltip с разбивкой по статусам ---
+                status_order = (
+                    ("created",     "Создан"),
+                    ("in_progress", "В работе"),
+                    ("waiting",     "Ожидание"),
+                    ("done",        "Выполнен"),
+                    ("cancelled",   "Отмена"),
+                )
+                tooltip_lines = [
+                    f"Поручений к записи: <b>{ai_total}</b>",
+                    f"Выполнено: <b>{ai_done}</b>",
+                    "",
+                    "Разбивка по статусам:",
+                ]
+                for key, label in status_order:
+                    cnt = int(ai_by_status.get(key, 0))
+                    if cnt > 0:
+                        tooltip_lines.append(f"  • {label}: {cnt}")
+                tooltip_lines.append("")
+                tooltip_lines.append(
+                    "Открыть редактор: «Поручения» → "
+                    "«Редактор поручений текущей записи…» "
+                    "(Ctrl+Shift+K)."
+                )
+
+                # QTableWidgetItem.setToolTip по умолчанию трактует
+                # строку как plain text; для <br>/<b> нужно явно
+                # обернуть в HTML.
                 ai_item.setToolTip(
-                    f"К записи прикреплено поручений: {ai_count}.\n\n"
-                    f"Открыть: «Поручения» → «Редактор поручений "
-                    f"текущей записи…» (Ctrl+Shift+K)."
+                    "<html><body style='white-space:pre-wrap;'>"
+                    + "<br>".join(tooltip_lines)
+                    + "</body></html>"
                 )
             else:
                 ai_item = QTableWidgetItem("—")
@@ -2938,6 +3000,7 @@ class SessionsWindow(QDialog):
                     "У этой записи нет поручений "
                     "(action_items.json отсутствует или пуст)."
                 )
+
             self.table.setItem(row, 8, ai_item)
 
             # --- Summary: только наличие (да / —) ---

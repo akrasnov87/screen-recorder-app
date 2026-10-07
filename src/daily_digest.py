@@ -298,7 +298,7 @@ def save_digest_prompt(
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(prompt_text)
-            log.info("Свод за день сохранён (txt): %s", path)
+            log.info("Выборка сохранён (txt): %s", path)
             return path
         except Exception as exc:
             log.exception("Не удалось сохранить %s: %s", path, exc)
@@ -308,7 +308,7 @@ def save_digest_prompt(
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(prompt_text)
-            log.info("Свод за день сохранён (md): %s", path)
+            log.info("Выборка сохранён (md): %s", path)
             return path
         except Exception as exc:
             log.exception("Не удалось сохранить %s: %s", path, exc)
@@ -323,7 +323,7 @@ def save_digest_prompt(
             path,
             title="Сводка за период",
         )
-        log.info("Свод за день сохранён (docx): %s", path)
+        log.info("Выборка сохранён (docx): %s", path)
         return path
     except Exception as exc:
         log.exception("Не удалось сохранить DOCX %s: %s", path, exc)

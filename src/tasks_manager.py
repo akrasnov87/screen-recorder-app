@@ -57,10 +57,11 @@ STATUS_LABELS: Dict[str, str] = {
     "in_progress": "В работе",
     "waiting":     "Ожидание",
     "done":        "Выполнен",
+    "cancelled":   "Отмена",
 }
 
 STATUS_ORDER: List[str] = [
-    "created", "in_progress", "waiting", "done",
+    "created", "in_progress", "waiting", "done", "cancelled",
 ]
 
 # Цвета для UI (HEX).
@@ -69,6 +70,7 @@ STATUS_COLORS: Dict[str, str] = {
     "in_progress": "#EF6C00",  # оранжевый
     "waiting":     "#7B1FA2",  # фиолетовый
     "done":        "#2E7D32",  # зелёный
+    "cancelled":   "#757575",  # серый
 }
 
 
@@ -614,7 +616,8 @@ def is_overdue(item: Dict[str, Any]) -> bool:
     Поручение со сроком «сегодня» НЕ считается просроченным —
     оно действительно до конца дня.
     """
-    if (item.get("status") or "created") == "done":
+    st = (item.get("status") or "created")
+    if st in ("done", "cancelled"):
         return False
 
     due = _parse_due_date(item.get("due_date") or "")
@@ -633,7 +636,8 @@ def due_date_priority(item: Dict[str, Any]) -> int:
       3 — срока нет
       4 — выполнено
     """
-    if (item.get("status") or "created") == "done":
+    st = (item.get("status") or "created")
+    if st in ("done", "cancelled"):
         return 4
 
     due = _parse_due_date(item.get("due_date") or "")

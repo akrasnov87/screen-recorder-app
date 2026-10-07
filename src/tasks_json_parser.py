@@ -325,6 +325,14 @@ def _normalize_status(raw: str) -> str:
         "выполнено": "done",
         "готово": "done",
         "закрыт": "done",
+        # --- НОВОЕ: статус «Отмена» ---
+        "отмена": "cancelled",
+        "отменён": "cancelled",
+        "отменено": "cancelled",
+        "отменен": "cancelled",
+        "cancel": "cancelled",
+        "cancelled": "cancelled",
+        "canceled": "cancelled",
     }
     return ru_map.get(raw, "created")
 
