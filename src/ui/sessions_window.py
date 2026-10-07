@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional
 from PySide6.QtCore import Qt, QDate, QThread, QUrl, Signal
 from PySide6.QtGui import (
     QGuiApplication, QAction, QDesktopServices, QKeySequence, QColor,
+    QFont,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
@@ -3031,23 +3032,25 @@ class SessionsWindow(QDialog):
 
             if published:
                 sync_item = QTableWidgetItem("да")
-                sync_item.setForeground(
-                    Qt.GlobalColor.darkGreen
-                )
+                sync_item.setForeground(Qt.GlobalColor.darkGreen)
                 sync_item.setToolTip(
                     f"Опубликовано. Record ID: "
                     f"{r.get('record_id', '')}"
                 )
+                bold_font = QFont(sync_item.font())
+                bold_font.setBold(True)
+                sync_item.setFont(bold_font)
             elif sync_ready:
                 sync_item = QTableWidgetItem("готово")
-                sync_item.setForeground(
-                    Qt.GlobalColor.darkYellow
-                )
+                sync_item.setForeground(Qt.GlobalColor.darkYellow)
                 sync_item.setToolTip(
-                    "Запись помечена как «готова к "
-                    "синхронизации». Можно публиковать на "
-                    "сервер, фоновый pull будет её учитывать."
+                    "Запись помечена как «готова к синхронизации». "
+                    "Можно публиковать на сервер, фоновый pull "
+                    "будет её учитывать."
                 )
+                bold_font = QFont(sync_item.font())
+                bold_font.setBold(True)
+                sync_item.setFont(bold_font)
             else:
                 sync_item = QTableWidgetItem("черновик")
                 sync_item.setForeground(Qt.GlobalColor.gray)
