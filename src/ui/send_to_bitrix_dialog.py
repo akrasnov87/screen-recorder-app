@@ -1079,11 +1079,16 @@ class SendToBitrixDialog(QDialog):
         self.include_server_link_check = QCheckBox(
             "Добавлять ссылку на запись на сервере"
         )
+        # Значение по умолчанию выставим чуть позже — после того,
+        # как проверим доступность ссылки (см. _init_server_link_state).
         self.include_server_link_check.setChecked(False)
         self.include_server_link_check.setToolTip(
             "Если включено — в конец каждого текстового сообщения "
             "и в комментарий к файлу добавляется абзац "
-            "«Подробнее: <ссылка>»."
+            "«Подробнее: <ссылка>».\n\n"
+            "Галочка выставляется автоматически, если запись "
+            "уже опубликована на сервере и base_url задан в "
+            "Настройки → Синхронизация."
         )
         self.include_server_link_check.toggled.connect(
             self._on_server_link_toggled
@@ -1207,8 +1212,10 @@ class SendToBitrixDialog(QDialog):
         layout.addLayout(preview_btns)
 
         # --- Инициализация ---
-        self._on_server_link_toggled(False)
-        self._refresh_server_link_preview()
+        # Сначала проверим, доступна ли ссылка, и только потом
+        # выставим состояние галочки — чтобы не мигать с
+        # "выключено → включено".
+        self._init_server_link_state()
 
         layout.addStretch()
         return w
@@ -1868,6 +1875,47 @@ class SendToBitrixDialog(QDialog):
         self.copy_link_btn.setEnabled(enabled)
         self.open_link_btn.setEnabled(enabled)
         self._refresh_server_link_preview()
+
+    def _init_server_link_state(self) -> None:
+        """
+        Инициализирует состояние вкладки «Ссылка на сервер».
+
+        Если ссылка доступна (запись опубликована + задан
+        base_url) — автоматически ставит галочку «Добавлять
+        ссылку на запись на сервере» и применяет её эффект.
+
+        Если ссылка недоступна — галочка снята, поля
+        заблокированы, а под ссылкой показывается
+        диагностика, почему её нет.
+        """
+        try:
+            state = self._check_server_link_state()
+        except Exception as exc:
+            log.warning(
+                "Не удалось проверить состояние ссылки на "
+                "сервер: %s", exc,
+            )
+            state = {"ok": False, "details": str(exc)}
+
+        link_available = bool(state.get("ok"))
+
+        if link_available:
+            log.info(
+                "Bitrix24: ссылка на сервер доступна — "
+                "автоматически включаю «Добавлять ссылку»"
+            )
+            # ВАЖНО: setChecked вызовет _on_server_link_toggled,
+            # который разблокирует поля и обновит превью.
+            self.include_server_link_check.setChecked(True)
+        else:
+            log.debug(
+                "Bitrix24: ссылка на сервер недоступна (%s) — "
+                "галочка «Добавлять ссылку» остаётся снятой",
+                state.get("reason") or "не опубликована",
+            )
+            # Явно применяем состояние «выключено» — на случай,
+            # если чекбокс уже был включён (повторное открытие).
+            self._on_server_link_toggled(False)
 
     def _set_link_blocks(self, *, all_on: bool) -> None:
         for cb in self.link_blocks_checkboxes.values():

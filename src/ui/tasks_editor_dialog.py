@@ -578,11 +578,29 @@ class TasksEditorDialog(QDialog):
         self.open_folder_btn.clicked.connect(self._open_folder)
         bottom.addWidget(self.open_folder_btn)
 
+        self.save_btn = QPushButton("Сохранить")
+        self.save_btn.setToolTip(
+            "Сохранить изменения в action_items.json, не закрывая "
+            "окно.\n\n"
+            "Удобно для промежуточного сохранения: можно продолжить "
+            "редактировать поручения, а данные уже будут записаны "
+            "на диск."
+        )
+        self.save_btn.clicked.connect(self._save_only)
+        bottom.addWidget(self.save_btn)
+
         self.save_close_btn = QPushButton("Сохранить и закрыть")
+        self.save_close_btn.setToolTip(
+            "Сохранить изменения в action_items.json и закрыть "
+            "окно редактора."
+        )
         self.save_close_btn.clicked.connect(self.accept)
         bottom.addWidget(self.save_close_btn)
 
         self.cancel_btn = QPushButton("Отмена")
+        self.cancel_btn.setToolTip(
+            "Закрыть окно без сохранения изменений."
+        )
         self.cancel_btn.clicked.connect(self.reject)
         bottom.addWidget(self.cancel_btn)
 
@@ -1374,6 +1392,46 @@ class TasksEditorDialog(QDialog):
             self._data.get("session_name") or self._session_name
         )
         save_action_items(self._session_dir, self._data)
+
+    def _save_only(self) -> None:
+        """
+        Сохраняет текущие поручения в action_items.json,
+        не закрывая окно редактора.
+
+        Используется кнопкой «Сохранить». В отличие от
+        «Сохранить и закрыть», окно остаётся открытым —
+        удобно для промежуточного сохранения.
+        """
+        try:
+            self._save()
+        except Exception as exc:
+            log.exception(
+                "Не удалось сохранить поручения: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Поручения",
+                f"Не удалось сохранить поручения:\n{exc}",
+            )
+            return
+
+        # Сбрасываем внутреннее состояние «на диск» и обновляем
+        # список исполнителей в фильтре — на случай, если
+        # пользователь изменил assignee у элемента.
+        self._rebuild_assignees()
+        self._reload_table()
+
+        log.info(
+            "Поручения сохранены без закрытия окна "
+            "(items=%d, session=%s)",
+            len(self._data.get("items", [])),
+            os.path.basename(self._session_dir),
+        )
+
+        QMessageBox.information(
+            self, "Поручения",
+            f"Поручения сохранены.\n\n"
+            f"Всего в записи: {len(self._data.get('items', []))}",
+        )
 
     def _open_folder(self) -> None:
         if not os.path.isdir(self._session_dir):

@@ -3030,29 +3030,70 @@ class SessionsWindow(QDialog):
             published = bool(r.get("published"))
             sync_ready = bool(r.get("sync_ready"))
 
-            if published:
-                sync_item = QTableWidgetItem("да")
+            # Варианты отображения:
+            #   published + sync_ready → "да"    (зелёный, жирный)
+            #   published, нет sync_ready → "да?" (зелёный, не жирный,
+            #                                     с подсказкой-предупреждением)
+            #   не published + sync_ready → "готово" (жёлтый, жирный)
+            #   не published, нет sync_ready → "черновик" (серый)
+            #
+            # ВАЖНО: жирность задаём ТОЛЬКО явно, создавая новый QFont
+            # с нуля. Нельзя наследовать шрифт от QTableWidgetItem —
+            # у вновь созданного элемента он невалидный, а при
+            # копировании через QFont(item.font()) можно случайно
+            # подхватить bold от предыдущей ячейки.
+
+            if published and sync_ready:
+                sync_text = "да"
+                sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.darkGreen)
                 sync_item.setToolTip(
-                    f"Опубликовано. Record ID: "
-                    f"{r.get('record_id', '')}"
+                    f"Опубликовано и помечено как «готово "
+                    f"к синхронизации».\n\n"
+                    f"Record ID: {r.get('record_id', '')}"
                 )
-                bold_font = QFont(sync_item.font())
-                bold_font.setBold(True)
-                sync_item.setFont(bold_font)
-            elif sync_ready:
-                sync_item = QTableWidgetItem("готово")
+                #bold_font = QFont()
+                #bold_font.setBold(True)
+                #sync_item.setFont(bold_font)
+
+            elif published and not sync_ready:
+                # Опубликовано, но признака готовности нет.
+                sync_text = "да?"
+                sync_item = QTableWidgetItem(sync_text)
+                sync_item.setForeground(Qt.GlobalColor.darkYellow)
+                sync_item.setToolTip(
+                    f"Опубликовано, но <b>признак «готово "
+                    f"к синхронизации» не выставлен</b> "
+                    f"(sync_ready=false).\n\n"
+                    f"Запись считается черновиком:\n"
+                    f"  • автопубликация повторно не запускается;\n"
+                    f"  • фоновый pull игнорирует эту запись;\n"
+                    f"  • локальные артефакты не удаляются.\n\n"
+                    f"Поставьте галочку «Готово к синхронизации» "
+                    f"в карточке метаданных или в окне «Записи», "
+                    f"чтобы разрешить фоновую синхронизацию.\n\n"
+                    f"Record ID: {r.get('record_id', '')}"
+                )
+                # Внимание: НЕ жирный — чтобы визуально
+                # отличалось от «полностью готовых».
+
+            elif not published and sync_ready:
+                sync_text = "готово"
+                sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.darkYellow)
                 sync_item.setToolTip(
                     "Запись помечена как «готова к синхронизации». "
                     "Можно публиковать на сервер, фоновый pull "
                     "будет её учитывать."
                 )
-                bold_font = QFont(sync_item.font())
-                bold_font.setBold(True)
-                sync_item.setFont(bold_font)
+                #bold_font = QFont()
+                #bold_font.setBold(True)
+                #sync_item.setFont(bold_font)
+
             else:
-                sync_item = QTableWidgetItem("черновик")
+                # Не опубликовано, нет признака готовности.
+                sync_text = "черновик"
+                sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.gray)
                 sync_item.setToolTip(
                     "Запись — черновик (sync_ready=false). "
@@ -3060,6 +3101,8 @@ class SessionsWindow(QDialog):
                     "pull игнорирует, локальные артефакты "
                     "не удаляются."
                 )
+                # Не жирный.
+
             self.table.setItem(row, 10, sync_item)
 
             self.table.setItem(
