@@ -286,6 +286,53 @@ class MetadataDialog(QDialog):
             with_info(self.comment_input, "meta_comment"),
         )
 
+        # --- Дата и время записи ---
+        from PySide6.QtCore import QDate, QTime
+        from PySide6.QtWidgets import QDateEdit, QTimeEdit
+
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setDate(QDate.currentDate())
+        self.date_edit.setToolTip(
+            "Дата, к которой относится запись.\n\n"
+            "По умолчанию — сегодняшняя дата. Измените, если "
+            "запись сделана не сегодня (например, при вводе "
+            "задним числом или при импорте)."
+        )
+
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat("HH:mm:ss")
+        self.time_edit.setTime(QTime.currentTime())
+        self.time_edit.setToolTip(
+            "Время, к которому относится запись.\n\n"
+            "По умолчанию — текущее время. Измените, если "
+            "запись сделана в другое время."
+        )
+
+        self.date_time_now_btn = QPushButton("Сейчас")
+        self.date_time_now_btn.setToolTip(
+            "Установить текущие дату и время."
+        )
+        self.date_time_now_btn.clicked.connect(
+            self._on_set_now_datetime
+        )
+
+        dt_row = QWidget()
+        dt_layout = QHBoxLayout(dt_row)
+        dt_layout.setContentsMargins(0, 0, 0, 0)
+        dt_layout.setSpacing(6)
+        dt_layout.addWidget(QLabel("Дата:"), 0)
+        dt_layout.addWidget(self.date_edit, 1)
+        dt_layout.addWidget(QLabel("Время:"), 0)
+        dt_layout.addWidget(self.time_edit, 1)
+        dt_layout.addWidget(self.date_time_now_btn, 0)
+        dt_icon = make_info_icon("meta_datetime")
+        if dt_icon is not None:
+            dt_layout.addWidget(dt_icon, 0)
+
+        form.addRow("Дата и время:", dt_row)
+
         layout.addLayout(form)
 
         # --- Теги ---
@@ -302,6 +349,37 @@ class MetadataDialog(QDialog):
         w = QWidget()
         w.setLayout(layout)
         return w
+
+    # ------------------------------------------------------------------
+    # Дата и время записи
+    # ------------------------------------------------------------------
+    def _on_set_now_datetime(self) -> None:
+        """
+        Устанавливает в поля даты/времени текущие значения.
+
+        Используется кнопкой «Сейчас» рядом с полями даты и
+        времени на вкладке «Основное».
+        """
+        from PySide6.QtCore import QDate, QTime
+
+        if not hasattr(self, "date_edit") or not hasattr(
+            self, "time_edit"
+        ):
+            log.warning(
+                "MetadataDialog._on_set_now_datetime вызван до "
+                "создания полей date_edit/time_edit"
+            )
+            return
+
+        self.date_edit.setDate(QDate.currentDate())
+        self.time_edit.setTime(QTime.currentTime())
+
+        log.debug(
+            "MetadataDialog: дата/время сброшены на текущие "
+            "(%s %s)",
+            self.date_edit.date().toString("yyyy-MM-dd"),
+            self.time_edit.time().toString("HH:mm:ss"),
+        )
 
     # ------------------------------------------------------------------
     # Блок тегов
@@ -1284,6 +1362,41 @@ class MetadataDialog(QDialog):
             init.get("comment", "")
         )
 
+        # --- Дата и время записи ---
+        from PySide6.QtCore import QDate, QTime
+
+        date_str = str(init.get("date") or "").strip()
+        time_str = str(init.get("time") or "").strip()
+
+        if date_str:
+            try:
+                y, m, d = date_str.split("-")
+                self.date_edit.setDate(QDate(int(y), int(m), int(d)))
+            except Exception as exc:
+                log.warning(
+                    "MetadataDialog: не удалось разобрать дату %r: %s",
+                    date_str, exc,
+                )
+                self.date_edit.setDate(QDate.currentDate())
+        else:
+            self.date_edit.setDate(QDate.currentDate())
+
+        if time_str:
+            try:
+                parts = time_str.replace("-", ":").split(":")
+                hh = int(parts[0]) if len(parts) > 0 else 0
+                mm = int(parts[1]) if len(parts) > 1 else 0
+                ss = int(parts[2]) if len(parts) > 2 else 0
+                self.time_edit.setTime(QTime(hh, mm, ss))
+            except Exception as exc:
+                log.warning(
+                    "MetadataDialog: не удалось разобрать время %r: %s",
+                    time_str, exc,
+                )
+                self.time_edit.setTime(QTime.currentTime())
+        else:
+            self.time_edit.setTime(QTime.currentTime())
+
         # --- Теги ---
         raw_tags = init.get("tags", []) or []
         selected_tags: List[str] = []
@@ -1415,12 +1528,14 @@ class MetadataDialog(QDialog):
 
         log.debug(
             "Начальные значения применены: project=%r, name=%r, "
-            "template=%r, abbr=%r, tags=%s, sync_ready=%s, "
-            "generate_summary=%s, prompt=%d символов (combo=%r), "
-            "is_scrum=%s, generate_deepseek=%s, ctx_name=%s, "
-            "ctx_project=%s, ctx_comment=%s, ctx_tags=%s, "
-            "attachments=%d",
+            "template=%r, abbr=%r, date=%s, time=%s, tags=%s, "
+            "sync_ready=%s, generate_summary=%s, "
+            "prompt=%d символов (combo=%r), is_scrum=%s, "
+            "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
+            "ctx_comment=%s, ctx_tags=%s, attachments=%d",
             project, init_name, init_template, init_abbr,
+            self.date_edit.date().toString("yyyy-MM-dd"),
+            self.time_edit.time().toString("HH:mm:ss"),
             self._selected_tags,
             self.sync_ready_check.isChecked(),
             self.generate_summary_check.isChecked(),
@@ -1626,6 +1741,12 @@ class MetadataDialog(QDialog):
             if name and name not in ordered_tags:
                 ordered_tags.append(name)
 
+        # --- Дата и время из полей ---
+        qd = self.date_edit.date()
+        qt = self.time_edit.time()
+        date_out = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
+        time_out = f"{qt.hour():02d}:{qt.minute():02d}:{qt.second():02d}"
+
         result: Dict[str, Any] = {
             "project": project,
             "name": final_name,
@@ -1634,6 +1755,9 @@ class MetadataDialog(QDialog):
             "name_abbr": abbr,
             "comment": comment,
             "tags": ordered_tags,
+            # --- Дата и время записи ---
+            "date": date_out,
+            "time": time_out,
             # --- Флаг готовности к синхронизации ---
             "sync_ready": bool(self.sync_ready_check.isChecked()),
             "prompt": prompt,
@@ -1675,13 +1799,14 @@ class MetadataDialog(QDialog):
         self.result_data = result
         log.info(
             "Метаданные подтверждены: project=%s, name=%s, "
-            "template=%r, abbr=%r, tags=%s, sync_ready=%s, "
-            "prompt=%d символов (изменён: %s), generate_summary=%s, "
-            "is_scrum=%s, generate_deepseek=%s, "
+            "template=%r, abbr=%r, date=%s, time=%s, tags=%s, "
+            "sync_ready=%s, prompt=%d символов (изменён: %s), "
+            "generate_summary=%s, is_scrum=%s, generate_deepseek=%s, "
             "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
             "ctx_tags=%s, protocol=%s, attachments=%d, "
             "send_to_transcribe=%s, send_to_deepseek=%s",
-            project, final_name, template, abbr, ordered_tags,
+            project, final_name, template, abbr,
+            date_out, time_out, ordered_tags,
             result["sync_ready"],
             len(prompt),
             result["prompt_edited"],

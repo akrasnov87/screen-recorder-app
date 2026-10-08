@@ -5248,8 +5248,12 @@ class SessionsWindow(QDialog):
         old_sync_ready = bool(meta.get("sync_ready", False))
         new_sync_ready = bool(new_meta.get("sync_ready", False))
 
+        # ВАЖНО: date/time НЕ сохраняем принудительно —
+        # пользователь мог изменить их в диалоге метаданных.
+        # Сохраняем только те поля, которые не редактируются
+        # в MetadataDialog.
         for keep_key in (
-            "date", "time", "monitor",
+            "monitor",
             "summary_bb",
             "manual_protocol_path",
             "source", "source_files",

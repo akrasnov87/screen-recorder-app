@@ -472,7 +472,8 @@ class ScreenRecorderApp(QObject):
         черновиком, пока пользователь явно не поставит галочку.
         """
         default_project = self._resolve_default_project()
-        now_str = f"{datetime.now():%Y-%m-%d %H-%M}"
+        now = datetime.now()
+        now_str = f"{now:%Y-%m-%d %H-%M}"
 
         sum_cfg = self.config_manager.get_summarizer_settings()
         default_generate_summary = bool(sum_cfg.get("enabled", False))
@@ -485,6 +486,9 @@ class ScreenRecorderApp(QObject):
             "name_abbr": "",
             "comment": "",
             "tags": [],
+            # --- Дата и время записи ---
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
             # --- Флаг готовности к синхронизации ---
             "sync_ready": False,
             "prompt": self.config_manager.get_default_prompt(),
@@ -504,8 +508,10 @@ class ScreenRecorderApp(QObject):
         }
         log.debug(
             "Сформированы метаданные по умолчанию: project=%r, "
-            "sync_ready=False, ctx: name=%s project=%s comment=%s tags=%s",
+            "date=%s, time=%s, sync_ready=False, "
+            "ctx: name=%s project=%s comment=%s tags=%s",
             default_project,
+            meta["date"], meta["time"],
             meta["include_name_in_prompt"],
             meta["include_project_in_prompt"],
             meta["include_comment_in_prompt"],
@@ -1149,7 +1155,17 @@ class ScreenRecorderApp(QObject):
             meta = (dict(self._current_session_meta)
                     or self._build_default_meta())
 
-        meta["date"] = datetime.now().strftime("%Y-%m-%d")
+        # --- Дата и время: не перезаписываем то, что уже задано ---
+        now = datetime.now()
+
+        # Если пользователь отказался от ввода метаданных
+        # (meta получен из _build_default_meta или из initial
+        # без явных date/time) — ставим текущие дату и время.
+        if not (meta.get("date") or "").strip():
+            meta["date"] = now.strftime("%Y-%m-%d")
+        if not (meta.get("time") or "").strip():
+            meta["time"] = now.strftime("%H:%M:%S")
+
         meta["monitor"] = (
             self.config_manager.config["recording"].get("monitor", 0)
         )
@@ -1570,7 +1586,6 @@ class ScreenRecorderApp(QObject):
                 "функции.",
             )
 
-
 def main() -> int:
     log_level = os.environ.get(
         "SCREEN_RECORDER_LOG_LEVEL", "DEBUG"
@@ -1598,6 +1613,20 @@ def main() -> int:
     log.info("Python: %s", sys.version)
     log.info("=" * 60)
 
+    # --- ФИКС: принудительно используем xcb (X11) вместо Wayland ---
+    # Причина: Qt пытается загрузить плагин libqgtk3.so, который
+    # обращается к устаревшему ключу 'antialiasing' в
+    # gnome-settings-daemon. На GNOME 40+ этого ключа нет, и GLib
+    # аварийно завершает процесс.
+    # См. https://bugs.launchpad.net/ubuntu/+source/gtk+3.0/+bug/1922464
+    if IS_LINUX and not os.environ.get("QT_QPA_PLATFORM"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+        log.info(
+            "QT_QPA_PLATFORM принудительно установлен в 'xcb' "
+            "(обход конфликта Qt/GTK3 на GNOME 40+)"
+        )
+    # --- КОНЕЦ ФИКСА ---
+
     if not check_ffmpeg_installed():
         if IS_LINUX:
             log.critical("ffmpeg не установлен")
@@ -1607,8 +1636,6 @@ def main() -> int:
             )
             return 1
         else:
-            # На Windows ffmpeg нужен только для конвертации
-            # и автосжатия медиа. Продолжаем работу.
             log.warning(
                 "ffmpeg не найден в PATH — конвертация видео и "
                 "автосжатие медиа будут недоступны"
