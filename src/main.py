@@ -1423,8 +1423,6 @@ class ScreenRecorderApp(QObject):
             self.app_cfg = self.config_manager.get_app_settings()
             self.recorder.config = self.config_manager.config
             self.processor.config = self.config_manager.config
-            # Обновляем ссылку на ConfigManager в процессоре —
-            # на случай, если он был пересоздан.
             self.processor.config_manager = self.config_manager
             self.hotkey_manager.update_hotkeys(
                 self.config_manager.config

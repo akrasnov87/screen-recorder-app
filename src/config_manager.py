@@ -198,11 +198,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "name_templates": DEFAULT_NAME_TEMPLATES,
     },
     "transcribe": {
-        "url": "http://localhost:8000",
-        "access_key": "",
-        "connect_timeout": 15,
-        "read_timeout": 120,
-        "max_wait": 7200,
+        "active_service": "default",
+        "services": [
+            {
+                "id": "default",
+                "name": "По умолчанию",
+                "url": "http://localhost:8000",
+                "access_key": "",
+                "connect_timeout": 15,
+                "read_timeout": 120,
+                "max_wait": 7200,
+            },
+        ],
     },
     "recording": {
         "monitor": 0,
@@ -647,14 +654,192 @@ class ConfigManager:
         }
 
     def get_transcribe_settings(self) -> Dict[str, Any]:
-        cfg = self.config.get("transcribe", {})
+        """
+        Возвращает настройки АКТИВНОГО сервиса транскрибации.
+
+        Формат возвращаемого словаря сохранён обратно совместимым
+        со старым API: url, access_key, connect_timeout,
+        read_timeout, max_wait.
+
+        Дополнительно добавлены поля:
+          • service_id   — id активного сервиса;
+          • service_name — человекочитаемое имя активного сервиса;
+          • services     — полный список сервисов (для UI и
+                           отладочных целей).
+        """
+        cfg = self.config.get("transcribe", {}) or {}
+
+        services = cfg.get("services") or []
+        if not isinstance(services, list):
+            services = []
+
+        active_id = str(cfg.get("active_service") or "").strip()
+
+        # --- Если список пуст — синтезируем один сервис из
+        #     старой структуры (миграция на лету). ---
+        if not services:
+            legacy_url = str(cfg.get("url") or "").strip()
+            legacy_key = str(cfg.get("access_key") or "")
+            services = [{
+                "id": "default",
+                "name": "По умолчанию",
+                "url": legacy_url,
+                "access_key": legacy_key,
+                "connect_timeout": int(
+                    cfg.get("connect_timeout", 15)
+                ),
+                "read_timeout": int(cfg.get("read_timeout", 120)),
+                "max_wait": int(cfg.get("max_wait", 7200)),
+            }]
+            active_id = "default"
+
+        # --- Находим активный сервис ---
+        active: Optional[Dict[str, Any]] = None
+        for s in services:
+            if not isinstance(s, dict):
+                continue
+            if str(s.get("id") or "") == active_id:
+                active = s
+                break
+
+        if active is None:
+            # Активный id не найден — берём первый доступный.
+            for s in services:
+                if isinstance(s, dict) and str(s.get("id") or ""):
+                    active = s
+                    active_id = str(s.get("id") or "")
+                    break
+
+        if active is None:
+            # Совсем ничего нет — возвращаем пустой сервис.
+            return {
+                "service_id": "",
+                "service_name": "",
+                "url": "",
+                "access_key": "",
+                "connect_timeout": 15,
+                "read_timeout": 120,
+                "max_wait": 7200,
+                "services": [],
+            }
+
         return {
-            "url": cfg.get("url", ""),
-            "access_key": cfg.get("access_key", ""),
-            "connect_timeout": int(cfg.get("connect_timeout", 15)),
-            "read_timeout": int(cfg.get("read_timeout", 120)),
-            "max_wait": int(cfg.get("max_wait", 7200)),
+            "service_id": active_id,
+            "service_name": str(active.get("name") or ""),
+            "url": str(active.get("url") or "").strip(),
+            "access_key": str(active.get("access_key") or ""),
+            "connect_timeout": int(
+                active.get("connect_timeout", 15)
+            ),
+            "read_timeout": int(
+                active.get("read_timeout", 120)
+            ),
+            "max_wait": int(active.get("max_wait", 7200)),
+            "services": [
+                {
+                    "id": str(s.get("id") or ""),
+                    "name": str(s.get("name") or ""),
+                    "url": str(s.get("url") or "").strip(),
+                    "access_key": str(s.get("access_key") or ""),
+                    "connect_timeout": int(
+                        s.get("connect_timeout", 15)
+                    ),
+                    "read_timeout": int(
+                        s.get("read_timeout", 120)
+                    ),
+                    "max_wait": int(s.get("max_wait", 7200)),
+                }
+                for s in services
+                if isinstance(s, dict)
+            ],
         }
+
+    def set_transcribe_settings(
+        self, settings: Dict[str, Any]
+    ) -> None:
+        """
+        Сохраняет список сервисов транскрибации и активный id.
+
+        Ожидаемый формат settings:
+          {
+            "active_service": "vnext",
+            "services": [
+              {"id": "...", "name": "...", "url": "...",
+               "access_key": "...", "connect_timeout": 15,
+               "read_timeout": 120, "max_wait": 7200},
+              ...
+            ]
+          }
+
+        Гарантирует уникальность id, отбрасывает пустые
+        сервисы (без url) и, если active_service не найден
+        среди services, ставит active_service = id первого
+        сервиса (или "" если список пуст).
+        """
+        raw_services = settings.get("services") or []
+        if not isinstance(raw_services, list):
+            raw_services = []
+
+        cleaned: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+
+        for s in raw_services:
+            if not isinstance(s, dict):
+                continue
+            sid = str(s.get("id") or "").strip()
+            name = str(s.get("name") or "").strip()
+            url = str(s.get("url") or "").strip()
+            if not url:
+                # Сервис без URL бесполезен — пропускаем.
+                continue
+            if not sid:
+                # Генерируем id по индексу.
+                sid = f"service_{len(cleaned) + 1}"
+            # Уникальность id.
+            base_id = sid
+            n = 1
+            while sid in seen_ids:
+                n += 1
+                sid = f"{base_id}_{n}"
+            seen_ids.add(sid)
+
+            cleaned.append({
+                "id": sid,
+                "name": name or sid,
+                "url": url,
+                "access_key": str(s.get("access_key") or ""),
+                "connect_timeout": int(
+                    s.get("connect_timeout", 15)
+                ),
+                "read_timeout": int(
+                    s.get("read_timeout", 120)
+                ),
+                "max_wait": int(s.get("max_wait", 7200)),
+            })
+
+        active = str(
+            settings.get("active_service") or ""
+        ).strip()
+
+        if active not in seen_ids:
+            active = cleaned[0]["id"] if cleaned else ""
+
+        cfg = self.config.setdefault("transcribe", {})
+
+        # --- Удаляем legacy-поля, чтобы не путали ---
+        for legacy in ("url", "access_key", "connect_timeout",
+                       "read_timeout", "max_wait"):
+            cfg.pop(legacy, None)
+
+        cfg["active_service"] = active
+        cfg["services"] = cleaned
+
+        self.save()
+        log.info(
+            "Настройки транскрибации сохранены: services=%d, "
+            "active=%r",
+            len(cleaned), active,
+        )
 
     def get_scrum_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("scrum", {})

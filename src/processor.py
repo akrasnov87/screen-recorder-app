@@ -183,9 +183,39 @@ class VideoProcessor(QObject):
             # ============================================================
             # Шаг 2: транскрибация + суммаризация
             # ============================================================
-            transcribe_cfg = self.config.get("transcribe", {})
-            transcribe_url = (transcribe_cfg.get("url") or "").strip()
+            # --- Настройки активного сервиса транскрибации ---
+            transcribe_cfg: Dict[str, Any]
+            if self.config_manager is not None:
+                try:
+                    transcribe_cfg = (
+                        self.config_manager.get_transcribe_settings()
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Не удалось прочитать настройки "
+                        "транскрибации: %s", exc,
+                    )
+                    transcribe_cfg = self.config.get(
+                        "transcribe", {}
+                    ) or {}
+            else:
+                transcribe_cfg = self.config.get(
+                    "transcribe", {}
+                ) or {}
+
+            transcribe_url = (
+                transcribe_cfg.get("url") or ""
+            ).strip()
             transcribe_available = bool(transcribe_url)
+
+            log.info(
+                "[%s] Сервис транскрибации: id=%r, name=%r, "
+                "url=%r",
+                task_id,
+                transcribe_cfg.get("service_id"),
+                transcribe_cfg.get("service_name"),
+                transcribe_url or "—",
+            )
             vm_session = None
 
             # --- Проверка доступности транскрибации и ВМ ---
@@ -1098,10 +1128,14 @@ class VideoProcessor(QObject):
         read_timeout = float(config.get("read_timeout", 120))
         max_wait = float(config.get("max_wait", 7200))
 
-        log.info("Транскрибация через %s (prompt=%d символов, "
-                 "connect=%.0f, read=%.0f, max_wait=%.0f)",
-                 base_url, len(prompt),
-                 connect_timeout, read_timeout, max_wait)
+        log.info(
+            "Транскрибация через %s (id=%r, prompt=%d символов, "
+            "connect=%.0f, read=%.0f, max_wait=%.0f)",
+            base_url,
+            config.get("service_id"),
+            len(prompt),
+            connect_timeout, read_timeout, max_wait,
+        )
 
         try:
             async with TranscribeClient(
@@ -1126,9 +1160,11 @@ class VideoProcessor(QObject):
                     max_wait=max_wait,
                     cancel_event=cancel_event,
                 )
-                log.info("Транскрибация: получен результат (status=%s)",
-                         result.get("status")
-                         if isinstance(result, dict) else "—")
+                log.info(
+                    "Транскрибация: получен результат (status=%s)",
+                    result.get("status")
+                    if isinstance(result, dict) else "—",
+                )
                 return result
         except Exception as exc:
             log.exception("Ошибка транскрибации: %s", exc)

@@ -37,7 +37,9 @@ from typing import Dict, List, Optional
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QGuiApplication,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -62,6 +64,7 @@ from ..platform_utils import (
     is_screen_recording_available,
     screen_recording_unavailable_reason,
 )
+from .transcribe_service_dialog import TranscribeServiceEditDialog
 
 log = get_logger(__name__)
 
@@ -1897,71 +1900,380 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(w)
 
         info = QLabel(
-            "Параметры подключения к серверу транскрибации."
+            "Здесь можно хранить несколько сервисов транскрибации "
+            "и выбирать, какой из них используется в обработке."
+            "<br><br>"
+            "Активный сервис помечен в таблице. При обработке "
+            "записи приложение обращается именно к нему."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        tr_box = QFormLayout()
-        self.tr_url_input = QLineEdit()
-        self.tr_url_input.setPlaceholderText("http://localhost:8000")
+        # --- Таблица сервисов ---
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Сервисы транскрибации</b>"))
+        header.addStretch()
+        icon = make_info_icon("tr_services_list")
+        if icon is not None:
+            header.addWidget(icon)
+        layout.addLayout(header)
 
-        self.tr_key_input = QLineEdit()
-        self.tr_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-
-        self.tr_show_key = QCheckBox("Показать ключ")
-        self.tr_show_key.toggled.connect(
-            lambda checked: self.toggle_password_visibility(
-                self.tr_key_input, self.tr_show_key
-            )
+        self.tr_services_table = QTableWidget(0, 5)
+        self.tr_services_table.setHorizontalHeaderLabels([
+            "Активен", "Название", "URL", "Access key",
+            "Таймауты (connect/read/max)",
+        ])
+        self.tr_services_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
         )
-
-        self.tr_connect_timeout = QSpinBox()
-        self.tr_connect_timeout.setRange(1, 600)
-        self.tr_connect_timeout.setSuffix(" сек")
-        self.tr_connect_timeout.setValue(15)
-
-        self.tr_read_timeout = QSpinBox()
-        self.tr_read_timeout.setRange(5, 3600)
-        self.tr_read_timeout.setSuffix(" сек")
-        self.tr_read_timeout.setValue(120)
-
-        self.tr_max_wait = QSpinBox()
-        self.tr_max_wait.setRange(60, 24 * 3600)
-        self.tr_max_wait.setSuffix(" сек")
-        self.tr_max_wait.setValue(7200)
-
-        self.test_tr_btn = QPushButton("Проверить подключение")
-        self.test_tr_btn.clicked.connect(
-            self.test_transcribe_connection
+        self.tr_services_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
         )
+        self.tr_services_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        hv = self.tr_services_table.horizontalHeader()
+        hv.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.tr_services_table.setMinimumHeight(220)
+        self.tr_services_table.doubleClicked.connect(
+            lambda _idx: self._on_edit_transcribe_service()
+        )
+        layout.addWidget(self.tr_services_table)
 
-        tr_box.addRow(
-            "URL сервера:",
-            with_info(self.tr_url_input, "tr_url"),
-        )
-        tr_box.addRow(
-            "Access key:",
-            with_info(self.tr_key_input, "tr_key"),
-        )
-        tr_box.addRow("", self.tr_show_key)
-        tr_box.addRow(
-            "Таймаут соединения:",
-            with_info(self.tr_connect_timeout, "tr_connect_timeout"),
-        )
-        tr_box.addRow(
-            "Таймаут чтения:",
-            with_info(self.tr_read_timeout, "tr_read_timeout"),
-        )
-        tr_box.addRow(
-            "Максимум ожидания:",
-            with_info(self.tr_max_wait, "tr_max_wait"),
-        )
-        tr_box.addRow("", self.test_tr_btn)
+        # --- Кнопки управления списком ---
+        btns = QHBoxLayout()
 
-        layout.addLayout(tr_box)
+        self.tr_add_btn = QPushButton("Добавить…")
+        self.tr_add_btn.setToolTip(
+            "Добавить новый сервис транскрибации."
+        )
+        self.tr_add_btn.clicked.connect(
+            self._on_add_transcribe_service
+        )
+        btns.addWidget(self.tr_add_btn)
+
+        self.tr_edit_btn = QPushButton("Изменить…")
+        self.tr_edit_btn.setToolTip(
+            "Изменить параметры выбранного сервиса."
+        )
+        self.tr_edit_btn.clicked.connect(
+            self._on_edit_transcribe_service
+        )
+        btns.addWidget(self.tr_edit_btn)
+
+        self.tr_remove_btn = QPushButton("Удалить")
+        self.tr_remove_btn.setToolTip(
+            "Удалить выбранный сервис из списка."
+        )
+        self.tr_remove_btn.clicked.connect(
+            self._on_remove_transcribe_service
+        )
+        btns.addWidget(self.tr_remove_btn)
+
+        btns.addSpacing(12)
+
+        self.tr_make_active_btn = QPushButton(
+            "Сделать активным"
+        )
+        self.tr_make_active_btn.setToolTip(
+            "Выбрать выбранный сервис как активный. "
+            "Именно к нему будет обращаться обработка записей."
+        )
+        self.tr_make_active_btn.clicked.connect(
+            self._on_make_active_transcribe_service
+        )
+        btns.addWidget(self.tr_make_active_btn)
+
+        btns.addStretch()
+
+        self.tr_test_active_btn = QPushButton(
+            "Проверить активный сервис"
+        )
+        self.tr_test_active_btn.setToolTip(
+            "Проверить подключение к сервису, помеченному "
+            "как активный (логин + токен)."
+        )
+        self.tr_test_active_btn.clicked.connect(
+            self._on_test_active_transcribe_service
+        )
+        btns.addWidget(self.tr_test_active_btn)
+
+        layout.addLayout(btns)
+
         layout.addStretch()
         return w
+
+    # ------------------------------------------------------------------
+    # Управление списком сервисов транскрибации
+    # ------------------------------------------------------------------
+    def _get_transcribe_services_from_table(
+        self,
+    ) -> List[Dict[str, Any]]:
+        """
+        Считывает список сервисов из таблицы.
+
+        Каждая строка хранит полный dict сервиса в
+        Qt.ItemDataRole.UserRole на колонке 0.
+        """
+        services: List[Dict[str, Any]] = []
+        for row in range(self.tr_services_table.rowCount()):
+            item = self.tr_services_table.item(row, 0)
+            if item is None:
+                continue
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict):
+                services.append(dict(data))
+        return services
+
+    def _set_transcribe_services_to_table(
+        self, services: List[Dict[str, Any]],
+        active_id: str,
+    ) -> None:
+        """
+        Заполняет таблицу сервисами и помечает активный.
+        """
+        self.tr_services_table.setRowCount(0)
+        for s in services:
+            row = self.tr_services_table.rowCount()
+            self.tr_services_table.insertRow(row)
+
+            is_active = (s.get("id") == active_id)
+
+            # Колонка 0: маркер «●» для активного + сам dict в data.
+            marker = "●" if is_active else ""
+            marker_item = QTableWidgetItem(marker)
+            marker_item.setForeground(
+                QColor("#2E7D32") if is_active
+                else QColor("#888")
+            )
+            marker_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignCenter
+            )
+            marker_item.setData(
+                Qt.ItemDataRole.UserRole, dict(s)
+            )
+            self.tr_services_table.setItem(row, 0, marker_item)
+
+            # Колонка 1: название.
+            name_item = QTableWidgetItem(
+                str(s.get("name") or s.get("id") or "")
+            )
+            if is_active:
+                bold = QFont()
+                bold.setBold(True)
+                name_item.setFont(bold)
+            self.tr_services_table.setItem(row, 1, name_item)
+
+            # Колонка 2: URL.
+            self.tr_services_table.setItem(
+                row, 2,
+                QTableWidgetItem(str(s.get("url") or "")),
+            )
+
+            # Колонка 3: маскированный access_key.
+            key = str(s.get("access_key") or "")
+            if key:
+                masked = (
+                    key[:4] + "…" + key[-4:]
+                    if len(key) > 10 else "•••"
+                )
+            else:
+                masked = "—"
+            self.tr_services_table.setItem(
+                row, 3, QTableWidgetItem(masked)
+            )
+
+            # Колонка 4: таймауты.
+            timeouts = (
+                f"{int(s.get('connect_timeout', 15))} / "
+                f"{int(s.get('read_timeout', 120))} / "
+                f"{int(s.get('max_wait', 7200))}"
+            )
+            self.tr_services_table.setItem(
+                row, 4, QTableWidgetItem(timeouts)
+            )
+
+    def _get_active_transcribe_service_from_table(
+        self,
+    ) -> Optional[Dict[str, Any]]:
+        """Возвращает dict активного сервиса (по маркеру ●)."""
+        for row in range(self.tr_services_table.rowCount()):
+            item = self.tr_services_table.item(row, 0)
+            if item is None:
+                continue
+            if item.text().strip() != "●":
+                continue
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict):
+                return dict(data)
+        return None
+
+    def _get_selected_transcribe_service(
+        self,
+    ) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """
+        Возвращает (row_index, dict) выбранного сервиса или None.
+        """
+        row = self.tr_services_table.currentRow()
+        if row < 0:
+            return None
+        item = self.tr_services_table.item(row, 0)
+        if item is None:
+            return None
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return None
+        return row, dict(data)
+
+    def _on_add_transcribe_service(self) -> None:
+        """Открывает диалог добавления нового сервиса."""
+        dlg = TranscribeServiceEditDialog(
+            service=None,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_service = dlg.result_service()
+        if not new_service:
+            return
+
+        services = self._get_transcribe_services_from_table()
+        # Проверка на дубликат id.
+        existing_ids = {s.get("id") for s in services}
+        base_id = str(new_service.get("id") or "").strip()
+        if not base_id:
+            base_id = f"service_{len(services) + 1}"
+        sid = base_id
+        n = 1
+        while sid in existing_ids:
+            n += 1
+            sid = f"{base_id}_{n}"
+        new_service["id"] = sid
+
+        services.append(new_service)
+
+        # Определяем активный: если его не было — новый
+        # становится активным.
+        active = self._get_active_transcribe_service_from_table()
+        active_id = active.get("id") if active else sid
+
+        self._set_transcribe_services_to_table(
+            services, active_id=active_id
+        )
+        log.info(
+            "Транскрибация: добавлен сервис id=%r, name=%r",
+            sid, new_service.get("name"),
+        )
+
+    def _on_edit_transcribe_service(self) -> None:
+        """Редактирование выбранного сервиса."""
+        sel = self._get_selected_transcribe_service()
+        if sel is None:
+            QMessageBox.information(
+                self, "Транскрибация",
+                "Выберите сервис в таблице.",
+            )
+            return
+        row, current = sel
+
+        dlg = TranscribeServiceEditDialog(
+            service=current,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated = dlg.result_service()
+        if not updated:
+            return
+        # id не меняем при редактировании.
+        updated["id"] = current.get("id")
+
+        services = self._get_transcribe_services_from_table()
+        for i, s in enumerate(services):
+            if s.get("id") == current.get("id"):
+                services[i] = updated
+                break
+
+        active = self._get_active_transcribe_service_from_table()
+        active_id = active.get("id") if active else ""
+        self._set_transcribe_services_to_table(
+            services, active_id=active_id
+        )
+        log.info(
+            "Транскрибация: сервис id=%r обновлён",
+            current.get("id"),
+        )
+
+    def _on_remove_transcribe_service(self) -> None:
+        """Удаление выбранного сервиса."""
+        sel = self._get_selected_transcribe_service()
+        if sel is None:
+            QMessageBox.information(
+                self, "Транскрибация",
+                "Выберите сервис в таблице.",
+            )
+            return
+        _, current = sel
+        name = current.get("name") or current.get("id") or ""
+        reply = QMessageBox.question(
+            self, "Удалить сервис",
+            f"Удалить сервис «{name}»?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        services = self._get_transcribe_services_from_table()
+        services = [
+            s for s in services
+            if s.get("id") != current.get("id")
+        ]
+
+        # Если удалили активный — активным становится первый.
+        active_id = ""
+        for s in services:
+            active_id = s.get("id") or ""
+            break
+
+        self._set_transcribe_services_to_table(
+            services, active_id=active_id
+        )
+        log.info(
+            "Транскрибация: сервис id=%r удалён",
+            current.get("id"),
+        )
+
+    def _on_make_active_transcribe_service(self) -> None:
+        """Помечает выбранный сервис активным."""
+        sel = self._get_selected_transcribe_service()
+        if sel is None:
+            QMessageBox.information(
+                self, "Транскрибация",
+                "Выберите сервис в таблице.",
+            )
+            return
+        _, current = sel
+        services = self._get_transcribe_services_from_table()
+        active_id = str(current.get("id") or "")
+        self._set_transcribe_services_to_table(
+            services, active_id=active_id
+        )
+        log.info(
+            "Транскрибация: активный сервис = %r",
+            active_id,
+        )
 
     # ------------------------------------------------------------------
     # Суммаризация
@@ -3066,15 +3378,23 @@ class SettingsWindow(QDialog):
                 row, 1, QTableWidgetItem(tpl.get("template", ""))
             )
 
-        # --- Транскрибация ---
-        tr = cfg.get("transcribe", {})
-        self.tr_url_input.setText(tr.get("url", ""))
-        self.tr_key_input.setText(tr.get("access_key", ""))
-        self.tr_connect_timeout.setValue(
-            int(tr.get("connect_timeout", 15))
+        # --- Транскрибация (список сервисов) ---
+        try:
+            tr_settings = self.config_manager.get_transcribe_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать настройки транскрибации: %s",
+                exc,
+            )
+            tr_settings = {
+                "service_id": "",
+                "services": [],
+            }
+
+        self._set_transcribe_services_to_table(
+            tr_settings.get("services") or [],
+            active_id=tr_settings.get("service_id") or "",
         )
-        self.tr_read_timeout.setValue(int(tr.get("read_timeout", 120)))
-        self.tr_max_wait.setValue(int(tr.get("max_wait", 7200)))
 
         # --- Суммаризация ---
         sum_cfg = self.config_manager.get_summarizer_settings()
@@ -3503,13 +3823,30 @@ class SettingsWindow(QDialog):
         )
         meta_cfg["name_templates"] = name_templates
 
-        cfg["transcribe"] = {
-            "url": self.tr_url_input.text().strip(),
-            "access_key": self.tr_key_input.text(),
-            "connect_timeout": self.tr_connect_timeout.value(),
-            "read_timeout": self.tr_read_timeout.value(),
-            "max_wait": self.tr_max_wait.value(),
-        }
+        # --- Транскрибация (список сервисов) ---
+        try:
+            services_from_table = (
+                self._get_transcribe_services_from_table()
+            )
+            active_from_table = (
+                self._get_active_transcribe_service_from_table()
+            )
+            active_id = (
+                active_from_table.get("id")
+                if active_from_table else ""
+            )
+            if not active_id and services_from_table:
+                active_id = services_from_table[0].get("id") or ""
+
+            self.config_manager.set_transcribe_settings({
+                "active_service": active_id,
+                "services": services_from_table,
+            })
+        except Exception as exc:
+            log.exception(
+                "Не удалось сохранить настройки транскрибации: %s",
+                exc,
+            )
         cfg["recording"] = {
             "monitor": self.monitor_combo.currentIndex(),
             "with_microphone": self.mic_check.isChecked(),
@@ -4060,16 +4397,29 @@ class SettingsWindow(QDialog):
                 self, "Ошибка", f"Не удалось очистить: {exc}"
             )
 
-    def test_transcribe_connection(self) -> None:
-        url = self.tr_url_input.text().strip()
-        key = self.tr_key_input.text()
-        connect_timeout = float(self.tr_connect_timeout.value())
-        read_timeout = float(self.tr_read_timeout.value())
+    def _on_test_active_transcribe_service(self) -> None:
+        """
+        Проверяет подключение к активному сервису
+        транскрибации из таблицы.
+        """
+        active = self._get_active_transcribe_service_from_table()
+        if active is None:
+            QMessageBox.warning(
+                self, "Транскрибация",
+                "Не выбран активный сервис. Добавьте сервис "
+                "и сделайте его активным.",
+            )
+            return
+
+        url = str(active.get("url") or "").strip()
+        key = str(active.get("access_key") or "")
+        connect_timeout = float(active.get("connect_timeout", 15))
+        read_timeout = float(active.get("read_timeout", 120))
 
         if not url:
             QMessageBox.warning(
                 self, "Транскрибация",
-                "URL сервера пустой.",
+                "У активного сервиса не задан URL.",
             )
             return
 
@@ -4084,12 +4434,20 @@ class SettingsWindow(QDialog):
         try:
             asyncio.run(_run())
             QMessageBox.information(
-                self, "Транскрибация", "Подключение успешно"
+                self, "Транскрибация",
+                f"Подключение успешно.\n\n"
+                f"Сервис: {active.get('name') or active.get('id')}\n"
+                f"URL: {url}",
             )
         except Exception as exc:
             QMessageBox.warning(
-                self, "Транскрибация", f"Ошибка: {exc}"
+                self, "Транскрибация",
+                f"Ошибка подключения:\n{exc}",
             )
+
+    def test_transcribe_connection(self) -> None:
+        """Совместимость со старым API."""
+        self._on_test_active_transcribe_service()
 
     # ------------------------------------------------------------------
     # Справка
