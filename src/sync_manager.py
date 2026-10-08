@@ -1077,6 +1077,84 @@ class SyncManager:
 
             record_id = result.get("id") or ""
 
+            # --------------------------------------------------------
+            # ЗАЩИТА ОТ ДУБЛИРОВАНИЯ (шаг 1/2):
+            # Сразу после создания/обновления записи на сервере
+            # сохраняем record_id в .sync_published.json.
+            #
+            # Иначе фоновый pull_changes может получить наше же
+            # изменение action=create раньше, чем publish_session
+            # успеет записать record_id (загрузка больших медиа
+            # занимает минуты) — и создаст локальный дубликат.
+            # --------------------------------------------------------
+            if record_id:
+                early_state = _read_sync_state(session_dir)
+                early_state.update({
+                    "record_id": record_id,
+                    "path": result.get("path", ""),
+                    "revision": result.get("revision", 0),
+                    "action": result.get("action", "create"),
+                    "published_at": _iso_now(),
+                    "folder_name": payload.get("folder_name", ""),
+                    "project": payload.get("project", ""),
+                    "sync_ready": bool(
+                        meta.get("sync_ready", False)
+                    ),
+                    "media_uploaded": list(
+                        early_state.get("media_uploaded") or []
+                    ),
+                })
+                _write_sync_state(session_dir, early_state)
+                self._update_record_index(record_id, session_dir)
+
+                log.info(
+                    "publish_session: record_id=%s сохранён в "
+                    ".sync_published.json до загрузки медиа "
+                    "(защита от дублирования при pull_changes)",
+                    record_id,
+                )
+
+                # ----------------------------------------------------
+                # ЗАЩИТА ОТ ДУБЛИРОВАНИЯ (шаг 2/2):
+                # Дублируем server_id в session.json. Это даёт
+                # _find_local_session дополнительный fallback —
+                # поиск локальной папки по server_id, если
+                # .sync_published.json ещё не записан.
+                # ----------------------------------------------------
+                session_json_path = os.path.join(
+                    session_dir, "session.json"
+                )
+                meta_for_save = read_json_file(
+                    session_json_path
+                ) or {}
+                meta_for_save["server_id"] = record_id
+                meta_for_save["server_revision"] = result.get(
+                    "revision", 0
+                )
+                meta_for_save["server_path"] = result.get(
+                    "path", ""
+                )
+                try:
+                    tmp = session_json_path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(
+                            meta_for_save,
+                            f,
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    os.replace(tmp, session_json_path)
+                    log.debug(
+                        "publish_session: server_id=%s записан "
+                        "в session.json",
+                        record_id,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Не удалось записать server_id в %s: %s",
+                        session_json_path, exc,
+                    )
+
             skipped_small = result.get("skipped_artifacts") or []
             uploaded_small = result.get("uploaded_artifacts") or []
             if skipped_small or uploaded_small:
@@ -1249,6 +1327,7 @@ class SyncManager:
                             "reason": str(exc),
                         })
 
+        # --- Финальная запись состояния (с учётом медиа) ---
         if record_id:
             state = _read_sync_state(session_dir)
             state.update({
@@ -2131,6 +2210,11 @@ class SyncManager:
         «готова к синхронизации» (sync_ready=false), изменение
         игнорируется. Это защищает черновик от перезаписи
         серверной версией.
+
+        Дополнительная защита от дублирования: если локальная
+        папка не найдена по record_id, но существует папка
+        с таким же folder_name (name из session.json) —
+        скачиваем в неё, а не создаём новую.
         """
         action = change.get("action")
         record_id = change.get("id") or ""
@@ -2160,6 +2244,26 @@ class SyncManager:
                     action, record_id,
                 )
                 return
+        else:
+            # Fallback: возможно, это наша собственная только что
+            # созданная запись, у которой .sync_published.json
+            # ещё не записан, но локальная папка с таким же
+            # folder_name уже существует. Проверяем её sync_ready.
+            same_folder = self._find_by_folder_name(path)
+            if same_folder:
+                meta = read_json_file(
+                    os.path.join(same_folder, "session.json")
+                ) or {}
+                if not meta.get("sync_ready", False):
+                    log.info(
+                        "apply_change: пропускаю %s для "
+                        "record_id=%s — найдена локальная папка "
+                        "%s с тем же folder_name, но запись "
+                        "не sync_ready",
+                        action, record_id, same_folder,
+                    )
+                    return
+                session_dir = same_folder
 
         log.info(
             "SyncManager: применяю изменение action=%s id=%s path=%s",
@@ -2239,7 +2343,23 @@ class SyncManager:
                     record_id, session_dir=session_dir
                 )
             else:
-                await self.download_record(record_id)
+                # --- Защита от дублирования собственной записи ---
+                # Если локальная папка не найдена по record_id,
+                # но существует папка с таким же folder_name —
+                # скачиваем в неё, не создавая новую.
+                same_folder = self._find_by_folder_name(path)
+                if same_folder:
+                    log.info(
+                        "apply_change: для record_id=%s найдена "
+                        "локальная папка %s с тем же folder_name — "
+                        "скачиваем в неё, а не создаём новую",
+                        record_id, same_folder,
+                    )
+                    await self.download_record(
+                        record_id, session_dir=same_folder
+                    )
+                else:
+                    await self.download_record(record_id)
             return
 
         if action == "artifact_delete_all":
@@ -2249,10 +2369,62 @@ class SyncManager:
                     record_id, session_dir=session_dir
                 )
             else:
-                await self.download_record(record_id)
+                same_folder = self._find_by_folder_name(path)
+                if same_folder:
+                    log.info(
+                        "apply_change: artifact_delete_all — "
+                        "использую локальную папку %s по folder_name",
+                        same_folder,
+                    )
+                    await self.download_record(
+                        record_id, session_dir=same_folder
+                    )
+                else:
+                    await self.download_record(record_id)
             return
 
         log.debug("Неизвестный action=%r — пропускаю", action)
+
+    def _find_by_folder_name(self, path: str) -> str:
+        """
+        Ищет локальную папку по folder_name из серверного path.
+
+        Используется как защита от дублирования: серверная
+        запись с path 'vNext/2026/10/FolderName' соответствует
+        локальной папке, у которой session.json → name ==
+        FolderName (именно это значение уходит на сервер как
+        folder_name в payload).
+
+        Возвращает путь к папке или "" если не найдено.
+        """
+        if not path or not os.path.isdir(self.sessions_root):
+            return ""
+
+        target_folder = os.path.basename(path.rstrip("/"))
+        if not target_folder:
+            return ""
+
+        try:
+            entries = os.listdir(self.sessions_root)
+        except OSError:
+            return ""
+
+        for name in entries:
+            full = os.path.join(self.sessions_root, name)
+            if not os.path.isdir(full):
+                continue
+
+            meta = read_json_file(
+                os.path.join(full, "session.json")
+            ) or {}
+            if not meta:
+                continue
+
+            meta_name = str(meta.get("name") or "").strip()
+            if meta_name and meta_name == target_folder:
+                return full
+
+        return ""
 
     def _delete_local_artifact(
         self, session_dir: str, filename: str
@@ -2319,10 +2491,16 @@ class SyncManager:
         """
         Ищет локальную папку сессии по record_id.
 
-        Порядок:
+        Порядок поиска:
           1. Индекс record_id → session_dir в sync_state.json.
-          2. Fallback: обход всех папок sessions/.
-          3. Fallback: поиск по basename(path) из change.
+          2. Fallback: обход папок sessions/ и чтение
+             .sync_published.json (поле record_id).
+          3. Fallback: обход папок sessions/ и чтение
+             session.json (поле server_id). Это защищает от
+             дублирования, когда .sync_published.json ещё не
+             записан, но publish_session уже успел сохранить
+             server_id в session.json.
+          4. Fallback: поиск по basename(path) из change.
         """
         indexed = self._lookup_in_record_index(record_id)
         if indexed:
@@ -2341,17 +2519,32 @@ class SyncManager:
             full = os.path.join(self.sessions_root, name)
             if not os.path.isdir(full):
                 continue
+
+            # --- .sync_published.json (record_id) ---
             marker = os.path.join(full, _SYNC_MARKER_FILE)
-            if not os.path.isfile(marker):
-                continue
-            try:
-                with open(marker, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if str(data.get("record_id") or "") == record_id:
-                    found = full
-                    break
-            except Exception:
-                continue
+            if os.path.isfile(marker):
+                try:
+                    with open(marker, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if str(data.get("record_id") or "") == record_id:
+                        found = full
+                        break
+                except Exception:
+                    pass
+
+            # --- session.json (server_id) ---
+            session_json = os.path.join(full, "session.json")
+            if os.path.isfile(session_json):
+                try:
+                    with open(
+                        session_json, "r", encoding="utf-8"
+                    ) as f:
+                        data = json.load(f)
+                    if str(data.get("server_id") or "") == record_id:
+                        found = full
+                        break
+                except Exception:
+                    pass
 
         if not found and path:
             folder = os.path.basename(path.rstrip("/"))
