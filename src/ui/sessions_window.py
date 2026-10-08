@@ -34,6 +34,13 @@
     по проектам.
   • Пропуск транскрибации при наличии video.txt: диалог
     с выбором «сохранить стенограмму / пересобрать».
+  • НОВОЕ: По умолчанию фильтр по датам включён и показывает
+    записи за последние 31 день.
+  • НОВОЕ: Панель статистики теперь содержит два блока:
+      – «Записи» — итоги по обработанным/ошибкам и т.п.;
+      – «Записей по тегам» — горизонтально прокручиваемые
+        цветные чипы тегов с количеством записей.
+        Клик по чипу применяет фильтр по тегу.
 """
 from __future__ import annotations
 
@@ -43,7 +50,7 @@ import json
 import os
 import shutil
 import traceback
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QDate, QThread, QUrl, Signal
@@ -56,8 +63,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMenuBar, QMessageBox, QPlainTextEdit, QProgressDialog,
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QPushButton, QScrollArea, QSizePolicy, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..daily_digest import (
@@ -1576,6 +1583,9 @@ class SessionsWindow(QDialog):
         self._media_progress_dlg: Optional[QProgressDialog] = None
         self._pending_media_request: Optional[Dict[str, Any]] = None
 
+        # Ссылки на активные чипы тегов (для подсветки выбранного).
+        self._active_tag_chips: Dict[str, QPushButton] = {}
+
         self._app_cfg: Dict[str, Any] = {}
         if config_manager is not None:
             try:
@@ -1603,21 +1613,8 @@ class SessionsWindow(QDialog):
         root.setContentsMargins(8, 4, 8, 8)
         root.setSpacing(6)
 
-        header = QHBoxLayout()
-        self.summary_label = QLabel("")
-        header.addWidget(self.summary_label)
-        header.addSpacing(20)
-        self.selection_label = QLabel("")
-        self.selection_label.setStyleSheet("QLabel { color: #666; }")
-        header.addWidget(self.selection_label)
-        header.addStretch()
-
-        self.refresh_indicator = QLabel("")
-        self.refresh_indicator.setStyleSheet(
-            "QLabel { color: #4a90d9; font-style: italic; }"
-        )
-        header.addWidget(self.refresh_indicator)
-        root.addLayout(header)
+        # --- Панель статистики: Записи + Теги ---
+        root.addWidget(self._build_stats_bar())
 
         # --- Панель фильтров ---
         root.addWidget(self._build_filters_bar())
@@ -1835,12 +1832,475 @@ class SessionsWindow(QDialog):
 
         root.addLayout(bottom_actions)
 
+    # ------------------------------------------------------------------
+    # Панель статистики (Записи + Теги)
+    # ------------------------------------------------------------------
+    def _build_stats_bar(self) -> QWidget:
+        """
+        Панель статистики: сводка по записям + счётчики по тегам.
+
+        Левая часть — итоги по записям (всего/обработано/…).
+        Правая часть — горизонтально прокручиваемый список
+        цветных чипов тегов с количеством записей у каждого.
+
+        При клике по чипу тега — применяется фильтр по этому
+        тегу (см. _on_tag_chip_clicked).
+
+        Внизу — индикатор выбранной записи и статус сканирования.
+        """
+        box = QFrame()
+        box.setFrameShape(QFrame.Shape.StyledPanel)
+        box.setObjectName("statsBar")
+        box.setStyleSheet(
+            "QFrame#statsBar {"
+            "  background-color: palette(window);"
+            "  border: 1px solid palette(mid);"
+            "  border-radius: 6px;"
+            "}"
+        )
+
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(10, 6, 10, 6)
+        outer.setSpacing(4)
+
+        # ============================================================
+        # Верхний ряд: записи (слева) + теги (справа, со скроллом)
+        # ============================================================
+        top_row = QHBoxLayout()
+        top_row.setSpacing(16)
+
+        # --- Блок «Записи» ---
+        records_col = QVBoxLayout()
+        records_col.setContentsMargins(0, 0, 0, 0)
+        records_col.setSpacing(2)
+
+        records_title = QLabel("<b>Записи</b>")
+        records_title.setStyleSheet("QLabel { color: #444; }")
+        records_col.addWidget(records_title)
+
+        self.summary_label = QLabel("")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet(
+            "QLabel { color: #333; font-size: 12px; }"
+        )
+        records_col.addWidget(self.summary_label)
+
+        records_widget = QWidget()
+        records_widget.setLayout(records_col)
+        # Ограничиваем ширину блока записей, чтобы теги
+        # получали больше места.
+        records_widget.setMaximumWidth(620)
+        top_row.addWidget(records_widget, 0)
+
+        # Разделитель
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        top_row.addWidget(sep)
+
+        # --- Блок «Теги» ---
+        tags_col = QVBoxLayout()
+        tags_col.setContentsMargins(0, 0, 0, 0)
+        tags_col.setSpacing(2)
+
+        tags_header = QHBoxLayout()
+        tags_header.setContentsMargins(0, 0, 0, 0)
+        tags_header.setSpacing(6)
+
+        tags_title = QLabel("<b>Записей по тегам</b>")
+        tags_title.setStyleSheet("QLabel { color: #444; }")
+        tags_header.addWidget(tags_title)
+
+        tags_hint = QLabel(
+            "<span style='color:#888; font-size:11px'>"
+            "(клик по тегу — фильтр, повторный — снять)"
+            "</span>"
+        )
+        tags_header.addWidget(tags_hint)
+        tags_header.addStretch()
+
+        self.tag_reset_btn = QPushButton("Сбросить фильтр тега")
+        self.tag_reset_btn.setToolTip(
+            "Снять активный фильтр по тегу (если он установлен)."
+        )
+        self.tag_reset_btn.setVisible(False)
+        self.tag_reset_btn.setFlat(True)
+        self.tag_reset_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.tag_reset_btn.setStyleSheet(
+            "QPushButton {"
+            "  color: #2D7FF9;"
+            "  border: none;"
+            "  text-decoration: underline;"
+            "  font-size: 11px;"
+            "  padding: 0 4px;"
+            "}"
+            "QPushButton:hover { color: #1E5FBF; }"
+        )
+        self.tag_reset_btn.clicked.connect(
+            self._on_tag_reset_clicked
+        )
+        tags_header.addWidget(self.tag_reset_btn)
+
+        tags_col.addLayout(tags_header)
+
+        # Горизонтальный скролл с чипами тегов.
+        self.tag_stats_scroll = QScrollArea()
+        self.tag_stats_scroll.setWidgetResizable(True)
+        self.tag_stats_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.tag_stats_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.tag_stats_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.tag_stats_scroll.setFixedHeight(52)
+        self.tag_stats_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+        )
+
+        self.tag_stats_container = QWidget()
+        self.tag_stats_container.setStyleSheet(
+            "QWidget { background: transparent; }"
+        )
+        self.tag_stats_layout = QHBoxLayout(
+            self.tag_stats_container
+        )
+        self.tag_stats_layout.setContentsMargins(0, 4, 0, 4)
+        self.tag_stats_layout.setSpacing(6)
+        self.tag_stats_layout.addStretch()
+
+        self.tag_stats_scroll.setWidget(self.tag_stats_container)
+
+        tags_col.addWidget(self.tag_stats_scroll)
+
+        tags_widget = QWidget()
+        tags_widget.setLayout(tags_col)
+        top_row.addWidget(tags_widget, 1)
+
+        outer.addLayout(top_row)
+
+        # ============================================================
+        # Нижний ряд: выбранная запись + индикатор сканирования
+        # ============================================================
+        bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(0, 0, 0, 0)
+        bottom_row.setSpacing(8)
+
+        self.selection_label = QLabel("")
+        self.selection_label.setStyleSheet(
+            "QLabel { color: #666; font-size: 12px; }"
+        )
+        self.selection_label.setWordWrap(True)
+        bottom_row.addWidget(self.selection_label, 1)
+
+        self.refresh_indicator = QLabel("")
+        self.refresh_indicator.setStyleSheet(
+            "QLabel { color: #4a90d9; font-style: italic; }"
+        )
+        bottom_row.addWidget(self.refresh_indicator, 0)
+
+        outer.addLayout(bottom_row)
+
+        return box
+
+    def _rebuild_tag_stats(self) -> None:
+        """
+        Пересобирает чипы тегов в панели статистики.
+
+        Считает количество записей по каждому тегу на основе
+        self._all_rows (полный список, без учёта фильтров).
+        Цвет чипа берётся из справочника тегов
+        (config_manager.get_tags()).
+
+        Если тегов нет — показывает серую надпись «нет тегов».
+        Клик по чипу устанавливает фильтр по тегу.
+        """
+        # --- Очищаем прежние чипы ---
+        # Удаляем все виджеты, оставляя stretch в конце.
+        self._active_tag_chips.clear()
+        while self.tag_stats_layout.count() > 1:
+            item = self.tag_stats_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        # --- Считаем статистику ---
+        counts: Dict[str, int] = {}
+        untagged_count = 0
+
+        for r in self._all_rows:
+            tags = r.get("tags") or []
+            if not tags:
+                untagged_count += 1
+                continue
+            for t in tags:
+                t = (t or "").strip()
+                if not t:
+                    continue
+                counts[t] = counts.get(t, 0) + 1
+
+        # --- Цвета из справочника ---
+        tag_colors: Dict[str, str] = {}
+        if self.config_manager is not None:
+            try:
+                for t in self.config_manager.get_tags():
+                    name = (t.get("name") or "").strip()
+                    color = (t.get("color") or "").strip()
+                    if name:
+                        tag_colors[name] = color
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать справочник тегов: %s", exc
+                )
+
+        # --- Сортировка: по убыванию количества, затем по имени ---
+        sorted_tags = sorted(
+            counts.items(), key=lambda kv: (-kv[1], kv[0].lower())
+        )
+
+        if not sorted_tags and untagged_count == 0:
+            placeholder = QLabel(
+                "<span style='color:#999; font-style:italic'>"
+                "нет тегов</span>"
+            )
+            self.tag_stats_layout.insertWidget(0, placeholder)
+            return
+
+        # --- Активный фильтр по тегу (подсветка) ---
+        active_tag = ""
+        active_untagged = False
+        if hasattr(self, "filter_tag_enabled") and \
+                self.filter_tag_enabled.isChecked():
+            data = self.filter_tag_combo.currentData() or ""
+            if data == "__untagged__":
+                active_untagged = True
+            else:
+                active_tag = str(data).strip()
+
+        # --- Создаём чипы тегов ---
+        for name, cnt in sorted_tags:
+            chip = self._make_tag_chip(
+                name=name,
+                count=cnt,
+                color=tag_colors.get(name, ""),
+                clickable=True,
+                is_active=(name == active_tag),
+            )
+            self.tag_stats_layout.insertWidget(
+                self.tag_stats_layout.count() - 1, chip
+            )
+            self._active_tag_chips[name] = chip
+
+        # --- Чип «без тега» (серый) ---
+        if untagged_count > 0:
+            chip = self._make_tag_chip(
+                name="— без тега —",
+                count=untagged_count,
+                color="",
+                clickable=True,
+                is_active=active_untagged,
+                is_untagged=True,
+            )
+            self.tag_stats_layout.insertWidget(
+                self.tag_stats_layout.count() - 1, chip
+            )
+            self._active_tag_chips["__untagged__"] = chip
+
+        # --- Показ/скрытие кнопки сброса ---
+        if hasattr(self, "tag_reset_btn"):
+            self.tag_reset_btn.setVisible(
+                bool(active_tag) or active_untagged
+            )
+
+    def _make_tag_chip(
+        self,
+        *,
+        name: str,
+        count: int,
+        color: str,
+        clickable: bool,
+        is_active: bool = False,
+        is_untagged: bool = False,
+    ) -> QPushButton:
+        """
+        Создаёт «чип» тега: [Имя · N].
+
+        Args:
+            name:        название тега.
+            count:       количество записей с этим тегом.
+            color:       HEX-цвет тега (или "" — серый).
+            clickable:   если True — при клике применяется
+                         фильтр по тегу.
+            is_active:   True — этот тег сейчас активен
+                         как фильтр (подсветить).
+            is_untagged: True для чипа «— без тега —».
+        """
+        chip = QPushButton()
+        chip.setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if clickable else Qt.CursorShape.ArrowCursor
+        )
+        chip.setFlat(True)
+        chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        chip.setMinimumHeight(28)
+
+        # --- Цвета чипа ---
+        if is_untagged or not color:
+            base_color = QColor("#9E9E9E")
+        else:
+            base_color = QColor(color)
+            if not base_color.isValid():
+                base_color = QColor("#4a90d9")
+
+        if is_active:
+            # Активный — плотный фон с белым текстом.
+            bg_rgba = (
+                f"rgba({base_color.red()}, {base_color.green()}, "
+                f"{base_color.blue()}, 230)"
+            )
+            fg_color = "#FFFFFF"
+            border_rgba = base_color.name()
+            font_weight = "bold"
+        else:
+            # Обычный — светлый фон с тёмным текстом.
+            bg_rgba = (
+                f"rgba({base_color.red()}, {base_color.green()}, "
+                f"{base_color.blue()}, 45)"
+            )
+            fg_color = "#222222"
+            border_color = QColor(base_color)
+            border_color.setAlpha(180)
+            border_rgba = (
+                f"rgba({border_color.red()}, "
+                f"{border_color.green()}, "
+                f"{border_color.blue()}, 180)"
+            )
+            font_weight = "normal"
+
+        # --- Текст ---
+        display_name = name if not is_untagged else "— без тега —"
+        chip.setText(f"{display_name} · {count}")
+
+        if is_active:
+            chip.setToolTip(
+                f"Тег: {display_name}\n"
+                f"Записей с этим тегом: {count}\n\n"
+                f"Фильтр активен. Клик — снять фильтр."
+            )
+        else:
+            chip.setToolTip(
+                f"Тег: {display_name}\n"
+                f"Записей с этим тегом: {count}\n\n"
+                f"Клик — показать только эти записи."
+            )
+
+        chip.setStyleSheet(
+            "QPushButton {"
+            f"  background-color: {bg_rgba};"
+            f"  color: {fg_color};"
+            f"  border: 1px solid {border_rgba};"
+            "  border-radius: 12px;"
+            "  padding: 3px 12px;"
+            f"  font-weight: {font_weight};"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover {"
+            f"  background-color: {bg_rgba};"
+            f"  border: 1px solid {base_color.name()};"
+            "}"
+        )
+
+        if clickable:
+            if is_untagged:
+                chip.clicked.connect(
+                    lambda: self._on_tag_chip_clicked(
+                        "__untagged__"
+                    )
+                )
+            else:
+                chip.clicked.connect(
+                    lambda _checked=False, n=name:
+                        self._on_tag_chip_clicked(n)
+                )
+
+        return chip
+
+    def _on_tag_chip_clicked(self, tag_name: str) -> None:
+        """
+        Обрабатывает клик по чипу тега.
+
+        Если этот тег уже активен как фильтр — снимает фильтр.
+        Иначе — включает фильтр по этому тегу.
+        """
+        if not hasattr(self, "filter_tag_enabled"):
+            return
+
+        data = (
+            self.filter_tag_combo.currentData() or ""
+        )
+        is_active = (
+            self.filter_tag_enabled.isChecked()
+            and data == tag_name
+        )
+
+        if is_active:
+            # Снимаем фильтр по тегу.
+            self.filter_tag_enabled.setChecked(False)
+            log.info(
+                "Записи: фильтр по тегу снят (повторный клик по «%s»)",
+                tag_name,
+            )
+        else:
+            # Устанавливаем фильтр по тегу.
+            self.filter_tag_enabled.blockSignals(True)
+            self.filter_tag_enabled.setChecked(True)
+            self.filter_tag_enabled.blockSignals(False)
+
+            idx = self.filter_tag_combo.findData(tag_name)
+            if idx >= 0:
+                self.filter_tag_combo.blockSignals(True)
+                self.filter_tag_combo.setCurrentIndex(idx)
+                self.filter_tag_combo.blockSignals(False)
+            log.info(
+                "Записи: фильтр по тегу «%s»", tag_name,
+            )
+
+        # Применяем фильтры и перерисовываем чипы (для подсветки).
+        self._apply_filters()
+        self._rebuild_tag_stats()
+
+    def _on_tag_reset_clicked(self) -> None:
+        """Сбрасывает активный фильтр по тегу."""
+        if not hasattr(self, "filter_tag_enabled"):
+            return
+        self.filter_tag_enabled.blockSignals(True)
+        self.filter_tag_enabled.setChecked(False)
+        self.filter_tag_enabled.blockSignals(False)
+
+        idx = self.filter_tag_combo.findData("__untagged__")
+        if idx < 0:
+            idx = 0
+        self.filter_tag_combo.blockSignals(True)
+        self.filter_tag_combo.setCurrentIndex(idx)
+        self.filter_tag_combo.blockSignals(False)
+
+        self._apply_filters()
+        self._rebuild_tag_stats()
+        log.info("Записи: фильтр по тегу сброшен")
+
     def _build_filters_bar(self) -> QWidget:
         """
-        Панель фильтров над таблицей: проект, период,
+        Панель фильтров над таблицей: проект, период, тег,
         текстовый поиск. Все фильтры применяются к уже
         загруженному списку записей (self._all_rows) без
         повторного сканирования.
+
+        Изменения:
+          • Чекбокс «Ограничить по датам» включён по умолчанию.
+          • Дата «с» по умолчанию — текущая минус 31 день.
+          • Добавлен фильтр по тегу.
         """
         box = QFrame()
         box.setFrameShape(QFrame.Shape.StyledPanel)
@@ -1869,12 +2329,14 @@ class SessionsWindow(QDialog):
 
         # --- Период: с ---
         row.addWidget(QLabel("Период с:"))
+
+        # По умолчанию — текущая дата минус 31 день.
+        default_from = QDate.currentDate().addDays(-31)
+
         self.filter_date_from = QDateEdit()
         self.filter_date_from.setCalendarPopup(True)
         self.filter_date_from.setDisplayFormat("yyyy-MM-dd")
-        self.filter_date_from.setDate(
-            QDate.currentDate().addMonths(-1)
-        )
+        self.filter_date_from.setDate(default_from)
         self.filter_date_from.dateChanged.connect(self._apply_filters)
         self.filter_date_from.setToolTip(
             "Начало периода (включительно)."
@@ -1894,8 +2356,9 @@ class SessionsWindow(QDialog):
         row.addWidget(self.filter_date_to)
 
         # --- Чекбокс «Ограничить по датам» ---
+        # Включён по умолчанию.
         self.filter_date_enabled = QCheckBox("Ограничить по датам")
-        self.filter_date_enabled.setChecked(False)
+        self.filter_date_enabled.setChecked(True)
         self.filter_date_enabled.setToolTip(
             "Если снять галочку — период игнорируется, "
             "показываются все записи."
@@ -1908,12 +2371,41 @@ class SessionsWindow(QDialog):
         # --- Кнопка «Сбросить фильтры» ---
         self.filter_reset_btn = QPushButton("Сбросить фильтры")
         self.filter_reset_btn.setToolTip(
-            "Убрать все фильтры (проект, даты, поиск)."
+            "Убрать все фильтры (проект, даты, тег, поиск)."
         )
         self.filter_reset_btn.clicked.connect(self._reset_filters)
         row.addWidget(self.filter_reset_btn)
 
         row.addStretch()
+
+        # --- Фильтр по тегу ---
+        row.addWidget(QLabel("Тег:"))
+
+        self.filter_tag_enabled = QCheckBox()
+        self.filter_tag_enabled.setChecked(False)
+        self.filter_tag_enabled.setToolTip(
+            "Включить фильтр по тегу.\n\n"
+            "После включения выберите тег в выпадающем списке "
+            "справа.\n\n"
+            "«— без тега —» оставляет только записи без тегов."
+        )
+        self.filter_tag_enabled.toggled.connect(
+            self._on_tag_filter_toggled
+        )
+        row.addWidget(self.filter_tag_enabled)
+
+        self.filter_tag_combo = QComboBox()
+        self.filter_tag_combo.setMinimumWidth(180)
+        self.filter_tag_combo.addItem("— без тега —", "__untagged__")
+        self.filter_tag_combo.setEnabled(False)
+        self.filter_tag_combo.currentIndexChanged.connect(
+            self._on_tag_filter_changed
+        )
+        self.filter_tag_combo.setToolTip(
+            "Выберите тег.\n\n"
+            "«— без тега —» оставляет только записи без тегов."
+        )
+        row.addWidget(self.filter_tag_combo)
 
         # --- Текстовый поиск ---
         row.addWidget(QLabel("Поиск:"))
@@ -1945,17 +2437,26 @@ class SessionsWindow(QDialog):
         row.addWidget(self.filter_count_label)
 
         # --- Начальное состояние ---
-        # Устанавливаем enabled-состояние для полей дат напрямую,
-        # не вызывая _apply_filters (таблица ещё не создана —
-        # _build_filters_bar вызывается до _build_table).
-        self.filter_date_from.setEnabled(
-            self.filter_date_enabled.isChecked()
-        )
-        self.filter_date_to.setEnabled(
-            self.filter_date_enabled.isChecked()
-        )
+        # Чекбокс «Ограничить по датам» включён → поля активны.
+        self.filter_date_from.setEnabled(True)
+        self.filter_date_to.setEnabled(True)
 
         return box
+
+    def _on_tag_filter_toggled(self, enabled: bool) -> None:
+        """Включает/выключает выпадающий список тегов."""
+        if hasattr(self, "filter_tag_combo"):
+            self.filter_tag_combo.setEnabled(enabled)
+        self._apply_filters()
+        # Обновляем подсветку чипов.
+        if hasattr(self, "tag_stats_layout"):
+            self._rebuild_tag_stats()
+
+    def _on_tag_filter_changed(self, _index: int) -> None:
+        """Реагирует на смену тега в фильтре."""
+        self._apply_filters()
+        if hasattr(self, "tag_stats_layout"):
+            self._rebuild_tag_stats()
 
     def _on_date_filter_toggled(self, enabled: bool) -> None:
         self.filter_date_from.setEnabled(enabled)
@@ -1963,23 +2464,61 @@ class SessionsWindow(QDialog):
         self._apply_filters()
 
     def _reset_filters(self) -> None:
+        """
+        Сбрасывает фильтры.
+
+        Изменения:
+          • Чекбокс «Ограничить по датам» остаётся включённым.
+          • Дата «с» — текущая минус 31 день.
+          • Дата «по» — текущая.
+          • Фильтр по тегу снимается.
+        """
         self.filter_project_combo.blockSignals(True)
         self.filter_project_combo.setCurrentIndex(0)
         self.filter_project_combo.blockSignals(False)
 
         self.filter_date_enabled.blockSignals(True)
-        self.filter_date_enabled.setChecked(False)
+        self.filter_date_enabled.setChecked(True)
         self.filter_date_enabled.blockSignals(False)
 
+        self.filter_date_from.blockSignals(True)
         self.filter_date_from.setDate(
-            QDate.currentDate().addMonths(-1)
+            QDate.currentDate().addDays(-31)
         )
+        self.filter_date_from.blockSignals(False)
+
+        self.filter_date_to.blockSignals(True)
         self.filter_date_to.setDate(QDate.currentDate())
+        self.filter_date_to.blockSignals(False)
+
+        # Принудительно включаем поля дат, так как чекбокс включён.
+        self.filter_date_from.setEnabled(True)
+        self.filter_date_to.setEnabled(True)
+
+        # --- Сброс фильтра по тегу ---
+        if hasattr(self, "filter_tag_enabled"):
+            self.filter_tag_enabled.blockSignals(True)
+            self.filter_tag_enabled.setChecked(False)
+            self.filter_tag_enabled.blockSignals(False)
+        if hasattr(self, "filter_tag_combo"):
+            idx = self.filter_tag_combo.findData("__untagged__")
+            if idx < 0:
+                idx = 0
+            self.filter_tag_combo.blockSignals(True)
+            self.filter_tag_combo.setCurrentIndex(idx)
+            self.filter_tag_combo.blockSignals(False)
+            self.filter_tag_combo.setEnabled(False)
 
         self.filter_search_input.clear()
 
         self._apply_filters()
-        log.info("Записи: фильтры сброшены")
+        if hasattr(self, "tag_stats_layout"):
+            self._rebuild_tag_stats()
+
+        log.info(
+            "Записи: фильтры сброшены (период: последние 31 день, "
+            "ограничение по датам включено, тег снят)"
+        )
 
     def _refresh_project_filter(self) -> None:
         """
@@ -2007,9 +2546,68 @@ class SessionsWindow(QDialog):
             self.filter_project_combo.setCurrentIndex(idx)
         self.filter_project_combo.blockSignals(False)
 
+    def _refresh_tag_filter(self) -> None:
+        """
+        Заполняет выпадающий список тегов.
+
+        Объединяет справочник тегов из настроек и теги,
+        реально встречающиеся в self._all_rows. Теги из
+        записей идут после справочника.
+        """
+        if not hasattr(self, "filter_tag_combo"):
+            return
+
+        current = self.filter_tag_combo.currentData() or ""
+
+        # --- Теги из справочника ---
+        tags_from_config: List[str] = []
+        if self.config_manager is not None:
+            try:
+                tags_from_config = self.config_manager.get_tag_names()
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать справочник тегов: %s",
+                    exc,
+                )
+
+        # --- Теги из записей ---
+        tags_from_sessions: List[str] = []
+        seen = set()
+        for r in self._all_rows:
+            for t in (r.get("tags") or []):
+                t = (t or "").strip()
+                if t and t not in seen:
+                    tags_from_sessions.append(t)
+                    seen.add(t)
+
+        # --- Объединение с сохранением порядка ---
+        merged: List[str] = []
+        seen = set()
+        for t in tags_from_config + tags_from_sessions:
+            t = (t or "").strip()
+            if t and t not in seen:
+                merged.append(t)
+                seen.add(t)
+
+        self.filter_tag_combo.blockSignals(True)
+        self.filter_tag_combo.clear()
+        self.filter_tag_combo.addItem(
+            "— без тега —", "__untagged__"
+        )
+        for t in merged:
+            self.filter_tag_combo.addItem(t, t)
+
+        idx = self.filter_tag_combo.findData(current)
+        if idx < 0:
+            idx = self.filter_tag_combo.findData("__untagged__")
+        if idx < 0:
+            idx = 0
+        self.filter_tag_combo.setCurrentIndex(idx)
+        self.filter_tag_combo.blockSignals(False)
+
     def _apply_filters(self) -> None:
         """
-        Применяет фильтры (проект, период, поиск) к
+        Применяет фильтры (проект, период, тег, поиск) к
         self._all_rows и обновляет self._rows + таблицу.
         """
         if not hasattr(self, "filter_project_combo"):
@@ -2026,6 +2624,17 @@ class SessionsWindow(QDialog):
         search_query = (
             self.filter_search_input.text().strip().lower()
         )
+
+        # --- Фильтр по тегу ---
+        tag_filter = ""
+        tag_only_untagged = False
+        if (hasattr(self, "filter_tag_enabled")
+                and self.filter_tag_enabled.isChecked()):
+            data = self.filter_tag_combo.currentData() or ""
+            if data == "__untagged__":
+                tag_only_untagged = True
+            else:
+                tag_filter = str(data).strip()
 
         d_from = None
         d_to = None
@@ -2049,6 +2658,15 @@ class SessionsWindow(QDialog):
                 if (r.get("project") or "") != project_filter:
                     continue
 
+            # --- Фильтр по тегу ---
+            row_tags = r.get("tags") or []
+            if tag_filter:
+                if tag_filter not in row_tags:
+                    continue
+            elif tag_only_untagged:
+                if row_tags:
+                    continue
+
             # --- Фильтр по периоду ---
             if date_enabled and d_from and d_to:
                 r_date_str = (r.get("datetime") or "").strip()
@@ -2069,7 +2687,7 @@ class SessionsWindow(QDialog):
                     str(r.get("name") or ""),
                     str(r.get("project") or ""),
                     str(r.get("datetime") or ""),
-                    " ".join(r.get("tags") or []),
+                    " ".join(row_tags),
                     os.path.basename(r.get("dir") or ""),
                 ]
                 haystack = " ".join(haystack_parts).lower()
@@ -2815,8 +3433,13 @@ class SessionsWindow(QDialog):
         # Сохраняем полный список — фильтры работают по нему.
         self._all_rows = list(rows or [])
 
-        # Обновляем список проектов в фильтре.
+        # Обновляем списки в фильтрах.
         self._refresh_project_filter()
+        self._refresh_tag_filter()
+
+        # Пересобираем чипы тегов в статистике.
+        if hasattr(self, "tag_stats_layout"):
+            self._rebuild_tag_stats()
 
         # Применяем фильтры.
         self._apply_filters()
@@ -2860,9 +3483,12 @@ class SessionsWindow(QDialog):
             total_text = f"Всего: {total}"
 
         self.summary_label.setText(
-            f"{total_text} | Обработан: {processed} | "
-            f"Сохранено: {uploaded} | В обработке: {in_progress} | "
-            f"Ошибок: {errors} | На сервере: {published} | "
+            f"{total_text}<br>"
+            f"Обработан: {processed} · "
+            f"Сохранено: {uploaded} · "
+            f"В обработке: {in_progress}<br>"
+            f"Ошибок: {errors} · "
+            f"На сервере: {published} · "
             f"Готовы к синхр.: {ready_count}"
         )
         self._on_selection_changed()
@@ -3030,19 +3656,6 @@ class SessionsWindow(QDialog):
             published = bool(r.get("published"))
             sync_ready = bool(r.get("sync_ready"))
 
-            # Варианты отображения:
-            #   published + sync_ready → "да"    (зелёный, жирный)
-            #   published, нет sync_ready → "да?" (зелёный, не жирный,
-            #                                     с подсказкой-предупреждением)
-            #   не published + sync_ready → "готово" (жёлтый, жирный)
-            #   не published, нет sync_ready → "черновик" (серый)
-            #
-            # ВАЖНО: жирность задаём ТОЛЬКО явно, создавая новый QFont
-            # с нуля. Нельзя наследовать шрифт от QTableWidgetItem —
-            # у вновь созданного элемента он невалидный, а при
-            # копировании через QFont(item.font()) можно случайно
-            # подхватить bold от предыдущей ячейки.
-
             if published and sync_ready:
                 sync_text = "да"
                 sync_item = QTableWidgetItem(sync_text)
@@ -3052,12 +3665,8 @@ class SessionsWindow(QDialog):
                     f"к синхронизации».\n\n"
                     f"Record ID: {r.get('record_id', '')}"
                 )
-                #bold_font = QFont()
-                #bold_font.setBold(True)
-                #sync_item.setFont(bold_font)
 
             elif published and not sync_ready:
-                # Опубликовано, но признака готовности нет.
                 sync_text = "да?"
                 sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.darkYellow)
@@ -3074,8 +3683,6 @@ class SessionsWindow(QDialog):
                     f"чтобы разрешить фоновую синхронизацию.\n\n"
                     f"Record ID: {r.get('record_id', '')}"
                 )
-                # Внимание: НЕ жирный — чтобы визуально
-                # отличалось от «полностью готовых».
 
             elif not published and sync_ready:
                 sync_text = "готово"
@@ -3086,12 +3693,8 @@ class SessionsWindow(QDialog):
                     "Можно публиковать на сервер, фоновый pull "
                     "будет её учитывать."
                 )
-                #bold_font = QFont()
-                #bold_font.setBold(True)
-                #sync_item.setFont(bold_font)
 
             else:
-                # Не опубликовано, нет признака готовности.
                 sync_text = "черновик"
                 sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.gray)
@@ -3101,7 +3704,6 @@ class SessionsWindow(QDialog):
                     "pull игнорирует, локальные артефакты "
                     "не удаляются."
                 )
-                # Не жирный.
 
             self.table.setItem(row, 10, sync_item)
 
