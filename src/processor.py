@@ -127,6 +127,108 @@ class VideoProcessor(QObject):
             self.task_started.emit(task_id)
 
             # ============================================================
+            # Проверка флага «Выполнять транскрибацию»
+            # ============================================================
+            do_transcribe = bool(
+                metadata.get("skip_transcription", True)
+            )
+
+            if not do_transcribe:
+                log.info(
+                    "[%s] Транскрибация отключена пользователем "
+                    "(skip_transcription=False). Пропускаю "
+                    "конвертацию, транскрибацию, суммаризацию "
+                    "и формирование DeepSeek-промпта. "
+                    "Сохраняю только исходное видео и "
+                    "прикреплённый протокол.",
+                    task_id,
+                )
+                self.task_progress.emit(
+                    task_id, 50,
+                    "Транскрибация отключена — сохранение записи"
+                )
+
+                # --- Формируем файл-промпт поручений из
+                #     прикреплённого протокола, если он есть
+                #     и генерация поручений не отключена. ---
+                scrum_cfg = self.config.get("scrum", {}) or {}
+                generate_action_items = bool(
+                    scrum_cfg.get("generate_action_items", True)
+                )
+                session_dir = os.path.dirname(video_path)
+
+                if generate_action_items:
+                    self.task_progress.emit(
+                        task_id, 85,
+                        "Формирование промпта поручений…"
+                    )
+                    try:
+                        res = await asyncio.to_thread(
+                            regenerate_action_items_prompt,
+                            session_dir=session_dir,
+                            fmt=str(
+                                scrum_cfg.get("export_format")
+                                or "docx"
+                            ),
+                            template=str(
+                                scrum_cfg.get(
+                                    "action_items_prompt_template"
+                                ) or ""
+                            ),
+                            session_name=str(
+                                metadata.get("name") or ""
+                            ),
+                            session_date=str(
+                                metadata.get("date") or ""
+                            ),
+                            max_chars=self._max_file_read_chars,
+                        )
+                        if res.get("ok"):
+                            log.info(
+                                "[%s] Промпт поручений готов: %s "
+                                "(источник протокола: %s)",
+                                task_id, res["path"],
+                                res.get("protocol_path") or "—",
+                            )
+                        else:
+                            log.info(
+                                "[%s] Промпт поручений не создан: %s",
+                                task_id, res.get("warning"),
+                            )
+                    except Exception as exc:
+                        log.exception(
+                            "[%s] Ошибка формирования промпта "
+                            "поручений: %s", task_id, exc,
+                        )
+
+                # --- Завершаем задачу успешно. ---
+                self.task_queue.update_task_status(
+                    task_id, "completed", 100
+                )
+                self.task_progress.emit(
+                    task_id, 100, "completed"
+                )
+
+                result = {
+                    "video": video_path,
+                    "audio": "",
+                    "transcript": "",
+                    "summary": "",
+                    "output_dir": os.path.dirname(video_path),
+                    "skipped_transcription": True,
+                    "vm_session": None,
+                }
+                total = time.monotonic() - t0
+                log.info(
+                    "[%s] Задача завершена (транскрибация "
+                    "пропущена) за %.1f с. Файлы: %s",
+                    task_id, total, result["output_dir"],
+                )
+                log.info("=" * 60)
+                self.task_completed.emit(task_id, result)
+                return result
+
+            # ============================================================
             # Шаг 1: конвертация в аудио — только если нужна
             # ============================================================
             existing_transcript = str(

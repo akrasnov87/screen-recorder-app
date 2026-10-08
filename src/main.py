@@ -470,6 +470,9 @@ class ScreenRecorderApp(QObject):
 
         По умолчанию sync_ready=False — запись считается
         черновиком, пока пользователь явно не поставит галочку.
+
+        По умолчанию skip_transcription=True — транскрибация
+        выполняется как обычно.
         """
         default_project = self._resolve_default_project()
         now = datetime.now()
@@ -491,6 +494,8 @@ class ScreenRecorderApp(QObject):
             "time": now.strftime("%H:%M:%S"),
             # --- Флаг готовности к синхронизации ---
             "sync_ready": False,
+            # --- НОВОЕ: выполнять ли транскрибацию ---
+            "skip_transcription": True,
             "prompt": self.config_manager.get_default_prompt(),
             "prompt_name": "",
             "prompt_edited": False,
@@ -509,6 +514,7 @@ class ScreenRecorderApp(QObject):
         log.debug(
             "Сформированы метаданные по умолчанию: project=%r, "
             "date=%s, time=%s, sync_ready=False, "
+            "do_transcribe=True, "
             "ctx: name=%s project=%s comment=%s tags=%s",
             default_project,
             meta["date"], meta["time"],
@@ -979,6 +985,8 @@ class ScreenRecorderApp(QObject):
             "tags": list(data.get("tags") or []),
             # --- Флаг готовности к синхронизации ---
             "sync_ready": False,
+            # --- НОВОЕ: выполнять ли транскрибацию ---
+            "skip_transcription": True,
             "source": "import",
             "source_files": {
                 "video": video_src,

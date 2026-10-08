@@ -794,6 +794,52 @@ class MetadataDialog(QDialog):
         info.setStyleSheet("QLabel { color: #666; }")
         layout.addWidget(info)
 
+        # ==============================================================
+        # НОВОЕ: блок управления транскрибацией
+        # ==============================================================
+        transcribe_header = QHBoxLayout()
+        transcribe_header.addWidget(
+            QLabel("<b>Транскрибация</b>")
+        )
+        transcribe_header.addStretch()
+        transcribe_icon = make_info_icon("meta_skip_transcription")
+        if transcribe_icon is not None:
+            transcribe_header.addWidget(transcribe_icon)
+        layout.addLayout(transcribe_header)
+
+        self.skip_transcription_check = QCheckBox(
+            "Выполнять транскрибацию для этой записи"
+        )
+        attach_tooltip(
+            self.skip_transcription_check,
+            "meta_skip_transcription",
+        )
+        # По умолчанию галочка ВКЛЮЧЕНА — это текущее
+        # поведение: запись проходит транскрибацию.
+        self.skip_transcription_check.setChecked(True)
+        layout.addWidget(self.skip_transcription_check)
+
+        # Динамическая подсказка под чекбоксом.
+        self.skip_transcription_hint = QLabel("")
+        self.skip_transcription_hint.setWordWrap(True)
+        self.skip_transcription_hint.setStyleSheet(
+            "QLabel { color: #666; font-size: 11px; }"
+        )
+        layout.addWidget(self.skip_transcription_hint)
+
+        self.skip_transcription_check.toggled.connect(
+            self._on_skip_transcription_toggled
+        )
+        # Первичная отрисовка подсказки.
+        self._on_skip_transcription_toggled(
+            self.skip_transcription_check.isChecked()
+        )
+
+        layout.addSpacing(8)
+
+        # ==============================================================
+        # Краткое содержание (summary)
+        # ==============================================================
         summary_header = QHBoxLayout()
         summary_header.addWidget(
             QLabel("<b>Краткое содержание (summary)</b>")
@@ -813,6 +859,9 @@ class MetadataDialog(QDialog):
         self.generate_summary_check.setChecked(False)
         layout.addWidget(self.generate_summary_check)
 
+        # ==============================================================
+        # Промпт для DeepSeek
+        # ==============================================================
         deepseek_header = QHBoxLayout()
         deepseek_header.addWidget(
             QLabel("<b>Промпт для DeepSeek</b>")
@@ -843,6 +892,9 @@ class MetadataDialog(QDialog):
         deepseek_hint.setWordWrap(True)
         layout.addWidget(deepseek_hint)
 
+        # ==============================================================
+        # Скрам-митинг
+        # ==============================================================
         scrum_header = QHBoxLayout()
         scrum_header.addWidget(QLabel("<b>Скрам-митинг</b>"))
         scrum_header.addStretch()
@@ -914,6 +966,48 @@ class MetadataDialog(QDialog):
 
         layout.addStretch()
         return w
+
+    def _on_skip_transcription_toggled(self, enabled: bool) -> None:
+        """
+        Обновляет подсказку под чекбоксом «Выполнять
+        транскрибацию» и при необходимости блокирует
+        зависимые элементы управления.
+        """
+        if not hasattr(self, "skip_transcription_hint"):
+            return
+
+        if enabled:
+            self.skip_transcription_hint.setText(
+                "<span style='color:#666'>"
+                "Запись будет обработана как обычно: "
+                "аудио → транскрибация → (опционально) "
+                "суммаризация → DeepSeek-промпт."
+                "</span>"
+            )
+        else:
+            self.skip_transcription_hint.setText(
+                "<span style='color:#B8860B'>"
+                "⚠ Транскрибация будет пропущена. "
+                "Сохранятся только исходное видео, "
+                "аудио и протокол (если прикреплён). "
+                "Стенограмма, summary и DeepSeek-промпт "
+                "формироваться не будут. "
+                "Позже можно включить транскрибацию и "
+                "перезапустить обработку через окно "
+                "«Записи»."
+                "</span>"
+            )
+
+        # При выключенной транскрибации зависимые элементы
+        # не имеют смысла — визуально гасим их.
+        for widget_name in (
+            "generate_summary_check",
+            "generate_deepseek_check",
+            "is_scrum_check",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
 
     # ------------------------------------------------------------------
     # Вкладка «Вложения»
@@ -1416,6 +1510,19 @@ class MetadataDialog(QDialog):
             bool(init.get("sync_ready", False))
         )
 
+        # --- НОВОЕ: транскрибация ---
+        # По умолчанию True (текущее поведение — выполнять).
+        # Если в initial есть явное значение — используем его.
+        if "skip_transcription" in init:
+            do_transcribe = bool(init.get("skip_transcription"))
+        else:
+            do_transcribe = True
+
+        self.skip_transcription_check.blockSignals(True)
+        self.skip_transcription_check.setChecked(do_transcribe)
+        self.skip_transcription_check.blockSignals(False)
+        self._on_skip_transcription_toggled(do_transcribe)
+
         # --- Summary / DeepSeek ---
         self.generate_summary_check.blockSignals(True)
         self.generate_summary_check.setChecked(
@@ -1529,7 +1636,8 @@ class MetadataDialog(QDialog):
         log.debug(
             "Начальные значения применены: project=%r, name=%r, "
             "template=%r, abbr=%r, date=%s, time=%s, tags=%s, "
-            "sync_ready=%s, generate_summary=%s, "
+            "sync_ready=%s, do_transcribe=%s, "
+            "generate_summary=%s, "
             "prompt=%d символов (combo=%r), is_scrum=%s, "
             "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
             "ctx_comment=%s, ctx_tags=%s, attachments=%d",
@@ -1538,6 +1646,7 @@ class MetadataDialog(QDialog):
             self.time_edit.time().toString("HH:mm:ss"),
             self._selected_tags,
             self.sync_ready_check.isChecked(),
+            do_transcribe,
             self.generate_summary_check.isChecked(),
             len(prompt_text),
             self.prompt_combo.currentText(),
@@ -1747,6 +1856,11 @@ class MetadataDialog(QDialog):
         date_out = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
         time_out = f"{qt.hour():02d}:{qt.minute():02d}:{qt.second():02d}"
 
+        # --- НОВОЕ: транскрибация ---
+        do_transcribe = bool(
+            self.skip_transcription_check.isChecked()
+        )
+
         result: Dict[str, Any] = {
             "project": project,
             "name": final_name,
@@ -1755,11 +1869,11 @@ class MetadataDialog(QDialog):
             "name_abbr": abbr,
             "comment": comment,
             "tags": ordered_tags,
-            # --- Дата и время записи ---
             "date": date_out,
             "time": time_out,
-            # --- Флаг готовности к синхронизации ---
             "sync_ready": bool(self.sync_ready_check.isChecked()),
+            # --- НОВОЕ: флаг выполнения транскрибации ---
+            "skip_transcription": do_transcribe,
             "prompt": prompt,
             "prompt_name": prompt_name,
             "prompt_edited": bool(self._prompt_edited),
@@ -1800,7 +1914,8 @@ class MetadataDialog(QDialog):
         log.info(
             "Метаданные подтверждены: project=%s, name=%s, "
             "template=%r, abbr=%r, date=%s, time=%s, tags=%s, "
-            "sync_ready=%s, prompt=%d символов (изменён: %s), "
+            "sync_ready=%s, do_transcribe=%s, "
+            "prompt=%d символов (изменён: %s), "
             "generate_summary=%s, is_scrum=%s, generate_deepseek=%s, "
             "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
             "ctx_tags=%s, protocol=%s, attachments=%d, "
@@ -1808,6 +1923,7 @@ class MetadataDialog(QDialog):
             project, final_name, template, abbr,
             date_out, time_out, ordered_tags,
             result["sync_ready"],
+            do_transcribe,
             len(prompt),
             result["prompt_edited"],
             result["generate_summary"],
