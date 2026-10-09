@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import html as _html
 import os
 import traceback
@@ -45,7 +46,7 @@ from PySide6.QtGui import (
     QAction, QDesktopServices, QGuiApplication, QKeySequence,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QHBoxLayout,
+    QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QSplitter, QTreeWidget, QTreeWidgetItem, QTextBrowser,
@@ -352,10 +353,11 @@ class TfsWindow(QDialog):
 
         # --- Дерево задач (используется и для плоского списка) ---
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(7)
+        self.tree.setColumnCount(11)
         self.tree.setHeaderLabels([
             "ID", "Тип", "Заголовок", "Статус",
-            "Исполнитель", "Оценка", "Осталось",
+            "Исполнитель", "Effort", "Size",
+            "Оценка", "Осталось", "Completed Work", "Work Date",
         ])
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionBehavior(
@@ -398,10 +400,22 @@ class TfsWindow(QDialog):
         )   # Исполнитель
         hv.setSectionResizeMode(
             5, QHeaderView.ResizeMode.ResizeToContents
-        )   # Оценка
+        )   # Effort
         hv.setSectionResizeMode(
             6, QHeaderView.ResizeMode.ResizeToContents
+        )   # Size
+        hv.setSectionResizeMode(
+            7, QHeaderView.ResizeMode.ResizeToContents
+        )   # Оценка
+        hv.setSectionResizeMode(
+            8, QHeaderView.ResizeMode.ResizeToContents
         )   # Осталось
+        hv.setSectionResizeMode(
+            9, QHeaderView.ResizeMode.ResizeToContents
+        )   # Completed Work
+        hv.setSectionResizeMode(
+            10, QHeaderView.ResizeMode.ResizeToContents
+        )   # Work Date
 
         left_layout.addWidget(self.tree, 1)
         splitter.addWidget(left)
@@ -465,6 +479,15 @@ class TfsWindow(QDialog):
         )
         self.copy_url_btn.clicked.connect(self._copy_url)
         bottom.addWidget(self.copy_url_btn)
+
+        # --- НОВОЕ: экспорт в CSV ---
+        self.export_csv_btn = QPushButton("Экспорт в CSV…")
+        self.export_csv_btn.setToolTip(
+            "Сохранить все задачи из текущего результата "
+            "в CSV-файл (открывается в Excel)."
+        )
+        self.export_csv_btn.clicked.connect(self._export_csv)
+        bottom.addWidget(self.export_csv_btn)
 
         bottom.addStretch()
 
@@ -812,6 +835,7 @@ class TfsWindow(QDialog):
             self.project_combo, self.template_combo,
             self.open_btn, self.copy_id_btn, self.copy_url_btn,
             self.expand_all_btn, self.collapse_all_btn,
+            self.export_csv_btn,
         ):
             w.setEnabled(not busy)
 
@@ -933,6 +957,7 @@ class TfsWindow(QDialog):
                 placeholder = QTreeWidgetItem([
                     str(item_id), "", "(нет данных)",
                     "", "", "", "",
+                    "", "", "", "",
                 ])
                 placeholder.setData(
                     0, Qt.ItemDataRole.UserRole, item_id
@@ -983,12 +1008,48 @@ class TfsWindow(QDialog):
     def _make_tree_item(
         self, it: Dict[str, Any]
     ) -> QTreeWidgetItem:
-        """Создаёт QTreeWidgetItem для одной задачи."""
+        """
+        Создаёт QTreeWidgetItem для одной задачи.
+
+        Колонки:
+          0  — ID
+          1  — Тип
+          2  — Заголовок
+          3  — Статус
+          4  — Исполнитель
+          5  — Effort
+          6  — Size
+          7  — Оценка (Original Estimate)
+          8  — Осталось (Remaining Work)
+          9  — Completed Work
+          10 — Work Date
+        """
+        # --- Effort ---
+        effort = it.get("effort") or 0
+        effort_str = f"{effort:g}" if effort else "—"
+
+        # --- Size ---
+        size = it.get("size") or 0
+        size_str = f"{size:g}" if size else "—"
+
+        # --- Original Estimate ---
+        estimate = it.get("original_estimate") or 0
+        est_str = f"{estimate:g}" if estimate else "—"
+
+        # --- Remaining Work ---
         remaining = it.get("remaining_work") or 0
         rem_str = f"{remaining:g}" if remaining else "—"
 
-        estimate = it.get("original_estimate") or 0
-        est_str = f"{estimate:g}" if estimate else "—"
+        # --- Completed Work ---
+        completed = it.get("completed_work") or 0
+        completed_str = f"{completed:g}" if completed else "—"
+
+        # --- Work Date (кастомное поле, лежит в it["fields"]) ---
+        fields = it.get("fields") or {}
+        wd_raw = str(
+            fields.get("IServ.VSTS.Scheduling.WorkDate") or ""
+        )
+        wd_str = self._short_date(wd_raw) if wd_raw else "—"
 
         item = QTreeWidgetItem([
             str(it.get("id") or ""),
@@ -996,8 +1057,12 @@ class TfsWindow(QDialog):
             it.get("title") or "—",
             it.get("state") or "—",
             it.get("assigned_to") or "—",
+            effort_str,
+            size_str,
             est_str,
             rem_str,
+            completed_str,
+            wd_str,
         ])
         item.setData(
             0, Qt.ItemDataRole.UserRole, int(it.get("id") or 0)
@@ -1060,7 +1125,16 @@ class TfsWindow(QDialog):
             ("Статус", _esc(it.get("state"))),
             ("Исполнитель", _esc(it.get("assigned_to"))),
             ("Приоритет", str(it.get("priority") or "—")),
-            ("Rating", _esc(it.get("rating"))),                       # ← НОВОЕ
+            ("Rating", _esc(it.get("rating"))),
+            # --- Оценки ---
+            (
+                "Effort",
+                self._fmt_hours(it.get("effort")),
+            ),
+            (
+                "Size",
+                self._fmt_hours(it.get("size")),
+            ),
             (
                 "Оценка (Original Estimate)",
                 self._fmt_hours(it.get("original_estimate")),
@@ -1077,23 +1151,18 @@ class TfsWindow(QDialog):
                 "Story Points",
                 self._fmt_hours(it.get("story_points")),
             ),
-            ("Effort", self._fmt_hours(it.get("effort"))),
             (
                 "Target Date",
                 _esc(self._short_date(it.get("target_date"))),
             ),
-            (
-                "Родитель",
-                str(it.get("parent_id") or "—"),
-            ),
-            (
-                "Создано",
-                _esc(self._short_date(it.get("created_date"))),
-            ),
-            (
-                "Изменено",
-                _esc(self._short_date(it.get("changed_date"))),
-            ),
+            ("Work Date", _esc(self._short_date(
+                (it.get("fields") or {}).get(
+                    "IServ.VSTS.Scheduling.WorkDate"
+                )
+            ))),
+            ("Родитель", str(it.get("parent_id") or "—")),
+            ("Создано", _esc(self._short_date(it.get("created_date")))),
+            ("Изменено", _esc(self._short_date(it.get("changed_date")))),
             ("Область", _esc(it.get("area_path"))),
             ("Итерация", _esc(it.get("iteration_path"))),
             ("Теги", _esc(it.get("tags"))),
@@ -1215,6 +1284,149 @@ class TfsWindow(QDialog):
         QGuiApplication.clipboard().setText(url)
         self.status_label.setText("Ссылка скопирована")
 
+    def _export_csv(self) -> None:
+        """
+        Экспорт текущего результата (self._items) в CSV.
+
+        Особенности:
+          • кодировка UTF-8 с BOM (utf-8-sig) — Excel корректно
+            открывает кириллицу;
+          • разделитель «;» — стандарт для русской локали Excel;
+          • все значения экранируются через csv.writer;
+          • сортировка по ID (по возрастанию);
+          • экспортируются ВСЕ поля, включая те, что не видны
+            в дереве (Rating, Priority, Severity, Effort и т.д.).
+        """
+        if not self._items:
+            QMessageBox.information(
+                self, "Экспорт в CSV",
+                "Нет данных для экспорта. Сначала выполните "
+                "WIQL-запрос.",
+            )
+            return
+
+        # Имя по умолчанию: tfs_tasks_YYYY-MM-DD_HH-MM-SS.csv
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        default_name = f"tfs_tasks_{stamp}.csv"
+        default_path = os.path.join(
+            os.path.expanduser("~"), default_name
+        )
+
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить результат в CSV",
+            default_path,
+            "CSV-файлы (*.csv);;Все файлы (*)",
+        )
+        if not target:
+            return
+
+        if not target.lower().endswith(".csv"):
+            target += ".csv"
+
+        # Колонки CSV: ключ в объекте задачи → заголовок столбца
+        columns: List[tuple] = [
+            ("id",                 "ID"),
+            ("work_item_type",     "Тип"),
+            ("title",              "Заголовок"),
+            ("state",              "Статус"),
+            ("assigned_to",        "Исполнитель"),
+            ("rating",             "Rating"),
+            ("priority",           "Приоритет"),
+            ("severity",           "Важность"),
+            ("effort",             "Effort"),
+            ("size",               "Size"),
+            ("original_estimate",  "Оценка (Original Estimate)"),
+            ("remaining_work",     "Осталось (Remaining Work)"),
+            ("completed_work",     "Выполнено (Completed Work)"),
+            ("story_points",       "Story Points"),
+            ("target_date",        "Target Date"),
+            ("parent_id",          "Родитель"),
+            ("iteration_path",     "Итерация"),
+            ("area_path",          "Область"),
+            ("tags",               "Теги"),
+            ("created_date",       "Создано"),
+            ("changed_date",       "Изменено"),
+            ("url",                "URL"),
+        ]
+
+        # Дополнительные поля из it["fields"] — если их нет
+        # в списке columns, но они интересны. Например,
+        # кастомное IServ.VSTS.Scheduling.WorkDate.
+        extra_fields: List[tuple] = [
+            ("IServ.VSTS.Scheduling.WorkDate", "Work Date"),
+        ]
+
+        try:
+            with open(
+                target, "w",
+                encoding="utf-8-sig",
+                newline="",
+            ) as f:
+                writer = csv.writer(
+                    f,
+                    delimiter=";",
+                    quoting=csv.QUOTE_MINIMAL,
+                )
+
+                # Заголовки
+                header = [label for _, label in columns]
+                header += [label for _, label in extra_fields]
+                writer.writerow(header)
+
+                # Сортировка по ID.
+                items_sorted = sorted(
+                    self._items,
+                    key=lambda x: int(x.get("id") or 0),
+                )
+
+                for it in items_sorted:
+                    row: List[Any] = []
+                    for key, _label in columns:
+                        v = it.get(key)
+                        row.append(
+                            _csv_cell(v, key)
+                        )
+
+                    # Дополнительные кастомные поля
+                    fields = it.get("fields") or {}
+                    for ref_name, _label in extra_fields:
+                        v = fields.get(ref_name)
+                        row.append(_csv_cell(v, "date"))
+
+                    writer.writerow(row)
+
+            log.info(
+                "Экспорт CSV: %s (%d задач)",
+                target, len(self._items),
+            )
+            QMessageBox.information(
+                self, "Экспорт в CSV",
+                f"Сохранено задач: {len(self._items)}\n\n"
+                f"Файл: {target}",
+            )
+
+            # Спросим, открыть ли файл.
+            reply = QMessageBox.question(
+                self, "Экспорт в CSV",
+                "Открыть папку с файлом?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                folder = os.path.dirname(target) or "."
+                QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(folder)
+                )
+
+        except Exception as exc:
+            log.exception("Ошибка экспорта CSV: %s", exc)
+            QMessageBox.critical(
+                self, "Экспорт в CSV",
+                f"Не удалось сохранить файл:\n{exc}",
+            )
+
     def _show_context_menu(self, pos) -> None:
         if not self._selected_item():
             return
@@ -1244,3 +1456,43 @@ class TfsWindow(QDialog):
                 event.ignore()
                 return
         event.accept()
+
+def _csv_cell(value: Any, key: str = "") -> str:
+    """
+    Приводит значение Work Item к строке для CSV.
+
+    • None → пустая строка
+    • Списки (например, tags) → разделённые запятой
+    • Дата/время (ключи *_date) → короткий формат YYYY-MM-DD HH:MM
+    • Числа → без .0 для целых
+    • Остальное → str()
+    """
+    if value is None:
+        return ""
+
+    # Списки — в строку через запятую.
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(x) for x in value)
+
+    # Даты — обрезаем ISO до минут.
+    if key.endswith("_date") or key == "date":
+        s = str(value).strip()
+        if not s:
+            return ""
+        if "." in s:
+            s = s.split(".", 1)[0]
+        if s.endswith("Z"):
+            s = s[:-1]
+        if "T" in s:
+            s = s.replace("T", " ")
+        return s[:16]
+
+    # Числа — без .0.
+    if isinstance(value, float):
+        if value == int(value):
+            return str(int(value))
+        return f"{value:g}"
+    if isinstance(value, int):
+        return str(value)
+
+    return str(value)

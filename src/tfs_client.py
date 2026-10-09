@@ -850,6 +850,9 @@ class TfsClient:
         result["effort"] = _extract_number(
             fields.get("Microsoft.VSTS.Scheduling.Effort")
         )
+        result["size"] = _extract_number(
+            fields.get("Microsoft.VSTS.Scheduling.Size")
+        )
         result["target_date"] = str(
             fields.get("Microsoft.VSTS.Scheduling.TargetDate") or ""
         )
