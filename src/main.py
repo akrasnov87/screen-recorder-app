@@ -1,24 +1,11 @@
 """Точка входа приложения Screen Recorder & Transcriber.
 
 Изменения:
-  • _build_default_meta() и _ask_metadata() учитывают
-    config.default_project — имя проекта по умолчанию для
-    новых записей.
-  • Добавлена поддержка тегов: передача справочника в
-    MetadataDialog, сохранение новых тегов в config.
-  • Добавлена интеграция с удалённым сервером синхронизации:
-      – окно «Синхронизация» (SyncWindow);
-      – автопубликация записи после успешной обработки;
-      – фоновый воркер дельта-синхронизации.
-  • Пути из QFileDialog нормализуются через safe_local_path().
-  • Автопубликация проверяет флаг sync_ready (если включена
-    настройка sync_auto_publish_ready_only). Это защищает от
-    публикации черновиков и от гонки publish/pull.
-  • Управление ВМ Yandex: при недоступности сервиса
-    транскрибации приложение может временно включить ВМ,
-    дождаться запуска и продолжить обработку. После
-    обработки пользователю предлагается отключить ВМ
-    (восстановить исходное расписание).
+  • Добавлена интеграция с TFS / Azure DevOps Server:
+      – импорт TfsWindow;
+      – поле self.tfs_window;
+      – обработчик _open_tfs();
+      – подключение сигнала open_tfs_requested.
 """
 from __future__ import annotations
 
@@ -50,6 +37,8 @@ if __package__ in (None, ""):
     from src.ui.tray_manager import TrayManager
     from src.ui.yandex_vm_window import YandexVMDialog
     from src.ui.tasks_window import TasksWindow
+    # --- НОВОЕ: TFS ---
+    from src.ui.tfs_window import TfsWindow
     from src.logger import (
         get_logger,
         register_gui_handler,
@@ -90,6 +79,8 @@ else:
     from .ui.tray_manager import TrayManager
     from .ui.yandex_vm_window import YandexVMDialog
     from .ui.tasks_window import TasksWindow
+    # --- НОВОЕ: TFS ---
+    from .ui.tfs_window import TfsWindow
     from .logger import (
         get_logger,
         register_gui_handler,
@@ -173,6 +164,8 @@ class ScreenRecorderApp(QObject):
         self.library_window: Optional[LibraryWindow] = None
         self.sync_window: Optional[SyncWindow] = None
         self.tasks_window: Optional[TasksWindow] = None
+        # --- НОВОЕ: TFS ---
+        self.tfs_window: Optional[TfsWindow] = None
 
         self.hotkey_manager = GlobalHotkeyManager(
             self.recorder,
@@ -247,6 +240,10 @@ class ScreenRecorderApp(QObject):
         )
         self.tray_manager.open_sync_requested.connect(
             self._open_sync
+        )
+        # --- НОВОЕ: TFS ---
+        self.tray_manager.open_tfs_requested.connect(
+            self._open_tfs
         )
         self.tray_manager.import_requested.connect(self._open_import)
         self.tray_manager.upload_video_requested.connect(
@@ -686,7 +683,6 @@ class ScreenRecorderApp(QObject):
     def _start_recording(self) -> None:
         log.info("Запрос на старт записи (UI)")
 
-        # --- Проверка доступности записи ---
         if not is_screen_recording_available():
             reason = screen_recording_unavailable_reason()
             log.warning(
@@ -983,9 +979,7 @@ class ScreenRecorderApp(QObject):
             "time": date_dt.strftime("%H:%M:%S"),
             "comment": comment,
             "tags": list(data.get("tags") or []),
-            # --- Флаг готовности к синхронизации ---
             "sync_ready": False,
-            # --- НОВОЕ: выполнять ли транскрибацию ---
             "skip_transcription": True,
             "source": "import",
             "source_files": {
@@ -1163,12 +1157,8 @@ class ScreenRecorderApp(QObject):
             meta = (dict(self._current_session_meta)
                     or self._build_default_meta())
 
-        # --- Дата и время: не перезаписываем то, что уже задано ---
         now = datetime.now()
 
-        # Если пользователь отказался от ввода метаданных
-        # (meta получен из _build_default_meta или из initial
-        # без явных date/time) — ставим текущие дату и время.
         if not (meta.get("date") or "").strip():
             meta["date"] = now.strftime("%Y-%m-%d")
         if not (meta.get("time") or "").strip():
@@ -1230,7 +1220,6 @@ class ScreenRecorderApp(QObject):
         if output_dir:
             self._auto_publish_after_processing(task_id, output_dir)
 
-        # --- Завершение VM-сессии (отключение ВМ) ---
         vm_info = result.get("vm_session")
         if vm_info and vm_info.get("schedule_modified"):
             self._finish_vm_session(vm_info)
@@ -1238,10 +1227,6 @@ class ScreenRecorderApp(QObject):
     def _finish_vm_session(self, vm_info: dict) -> None:
         """
         Спрашивает пользователя, отключить ли ВМ после обработки.
-
-        Восстанавливает расписание из резервной копии, если
-        пользователь согласен. Иначе — предупреждает, до какого
-        времени ВМ продолжит работу.
         """
         vm_name = vm_info.get("vm_name", "")
         schedule_path = vm_info.get("schedule_path", "")
@@ -1345,13 +1330,6 @@ class ScreenRecorderApp(QObject):
     def _auto_publish_after_processing(
         self, task_id: str, output_dir: str
     ) -> None:
-        """
-        Публикует запись на сервер, если это включено в настройках.
-
-        Если включена настройка sync_auto_publish_ready_only —
-        публикация выполняется только для записей с флагом
-        sync_ready=true (защита от гонки publish/pull).
-        """
         try:
             cfg = self.config_manager.get_sync_settings()
         except Exception as exc:
@@ -1372,7 +1350,6 @@ class ScreenRecorderApp(QObject):
             )
             return
 
-        # --- Проверка флага готовности ---
         if self.app_cfg.get("sync_auto_publish_ready_only", True):
             meta = self._read_session_meta(output_dir)
             if not meta.get("sync_ready", False):
@@ -1487,7 +1464,7 @@ class ScreenRecorderApp(QObject):
                 None, "Синхронизация",
                 f"Не удалось открыть окно синхронизации:\n{exc}",
             )
-            
+
     def _open_tasks_window(self) -> None:
         """Открывает сводное окно «Поручения»."""
         try:
@@ -1504,6 +1481,24 @@ class ScreenRecorderApp(QObject):
             QMessageBox.critical(
                 None, "Поручения",
                 f"Не удалось открыть окно поручений:\n{exc}",
+            )
+
+    # --- НОВОЕ: TFS ---
+    def _open_tfs(self) -> None:
+        """Открывает окно «Задачи TFS»."""
+        try:
+            self.tfs_window = TfsWindow(
+                config_manager=self.config_manager,
+                parent=None,
+            )
+            self.tfs_window.show()
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть окно «Задачи TFS»: %s", exc
+            )
+            QMessageBox.critical(
+                None, "Задачи TFS",
+                f"Не удалось открыть окно:\n{exc}",
             )
 
     def _open_yandex_vm(self) -> None:
@@ -1592,6 +1587,7 @@ class ScreenRecorderApp(QObject):
                 "функции.",
             )
 
+
 def main() -> int:
     log_level = os.environ.get(
         "SCREEN_RECORDER_LOG_LEVEL", "DEBUG"
@@ -1619,19 +1615,12 @@ def main() -> int:
     log.info("Python: %s", sys.version)
     log.info("=" * 60)
 
-    # --- ФИКС: принудительно используем xcb (X11) вместо Wayland ---
-    # Причина: Qt пытается загрузить плагин libqgtk3.so, который
-    # обращается к устаревшему ключу 'antialiasing' в
-    # gnome-settings-daemon. На GNOME 40+ этого ключа нет, и GLib
-    # аварийно завершает процесс.
-    # См. https://bugs.launchpad.net/ubuntu/+source/gtk+3.0/+bug/1922464
     if IS_LINUX and not os.environ.get("QT_QPA_PLATFORM"):
         os.environ["QT_QPA_PLATFORM"] = "xcb"
         log.info(
             "QT_QPA_PLATFORM принудительно установлен в 'xcb' "
             "(обход конфликта Qt/GTK3 на GNOME 40+)"
         )
-    # --- КОНЕЦ ФИКСА ---
 
     if not check_ffmpeg_installed():
         if IS_LINUX:
@@ -1694,8 +1683,6 @@ def main() -> int:
     controller.startup()
 
     if IS_LINUX:
-        # На Linux этот хак нужен, чтобы Ctrl+C в консоли
-        # корректно останавливал Qt-приложение.
         signal.signal(
             signal.SIGINT, lambda *_: controller._quit()
         )

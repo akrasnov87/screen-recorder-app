@@ -1,25 +1,12 @@
 """Управление настройками с шифрованием паролей.
 
 Изменения:
-  • Добавлены ключи default_project и default_chat_id.
-  • Добавлен справочник тегов: секция config["tags"].
-  • Секция config["sync"] дополнена ключами:
-      – send_media_to_server — передавать ли видео/аудио на сервер
-        как артефакты (kind=video / kind=audio);
-      – delete_local_on_server_delete — удалять ли локальную папку
-        при delete на сервере;
-      – force_overwrite_on_download — перезаписывать ли локальные
-        артефакты при скачивании (умная стратегия по sha256);
-      – use_hash_check — использовать ли условную загрузку
-        (HEAD/POST check) перед отправкой файла, чтобы не гонять
-        по сети то, что уже есть на сервере.
-  • Секция config["app"] дополнена ключами для встроенного плеера:
-      – media_prefer_builtin_player — использовать встроенный плеер;
-      – media_auto_download_from_server — авто-скачивание медиа с
-        сервера, если файла нет локально;
-      – media_download_timeout — таймаут скачивания медиа (сек);
-      – media_player_window_width — ширина окна плеера;
-      – media_player_window_height — высота окна плеера.
+  • Добавлена секция config["tfs"] — интеграция с TFS / Azure
+    DevOps Server (просмотр списка задач). PAT шифруется.
+  • Добавлены методы get_tfs_settings(), set_tfs_settings(),
+    get_tfs_wiql_templates(), add_tfs_wiql_template(),
+    remove_tfs_wiql_template().
+  • Сохранены все прежние ключи и методы без изменений.
 """
 from __future__ import annotations
 
@@ -124,6 +111,17 @@ DEFAULT_NAME_TEMPLATES: List[Dict[str, str]] = [
      "template": "Совещание: {name} — {date}"},
     {"label": "Только название", "template": "{name}"},
 ]
+
+
+# WIQL-запрос по умолчанию для интеграции с TFS.
+# Возвращает активные задачи текущего пользователя.
+DEFAULT_TFS_WIQL: str = (
+    "SELECT [System.Id] FROM WorkItems "
+    "WHERE [System.AssignedTo] = @Me "
+    "AND [System.State] <> 'Closed' "
+    "AND [System.State] <> 'Done' "
+    "ORDER BY [System.ChangedDate] DESC"
+)
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -329,6 +327,36 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "compression_preset": "veryfast",
         "retry_count": 3,
         "retry_delay": 2.0,
+    },
+    # --- НОВОЕ: интеграция с TFS / Azure DevOps Server ---
+    "tfs": {
+        # Включить интеграцию. Пока False — пункт меню в трее
+        # будет отключён, окно TFS покажет подсказку.
+        "enabled": False,
+        # Базовый URL коллекции TFS.
+        # Примеры:
+        #   https://tfs.company.com/tfs/DefaultCollection
+        #   https://dev.azure.com/myorg
+        "base_url": "",
+        # Personal Access Token. Хранится в зашифрованном виде
+        # (префикс "enc:"). При чтении автоматически расшифровывается.
+        "api_key": "",
+        # Версия REST API. Для Azure DevOps Server 2022 — "7.0".
+        "api_version": "7.0",
+        # Таймауты сетевых операций (сек).
+        "connect_timeout": 15,
+        "read_timeout": 60,
+        # WIQL-запрос по умолчанию.
+        "default_wiql": DEFAULT_TFS_WIQL,
+        # Проект по умолчанию (пусто = без привязки к проекту).
+        "default_project": "",
+        # Максимум задач в одном запросе. 0 = без ограничения.
+        "max_items": 200,
+        # Время жизни локального кэша ответов (сек). 0 = без кэша.
+        "cache_ttl_sec": 60,
+        # Список сохранённых WIQL-шаблонов:
+        # [{"name": "...", "wiql": "..."}]
+        "wiql_templates": [],
     },
     "app": {
         "max_file_read_chars": 5_000_000,
@@ -1259,3 +1287,170 @@ class ConfigManager:
             and cfg.get("base_url")
             and cfg.get("api_key")
         )
+
+    # ------------------------------------------------------------------
+    # TFS / Azure DevOps Server
+    # ------------------------------------------------------------------
+    def get_tfs_settings(self) -> Dict[str, Any]:
+        """
+        Возвращает настройки интеграции с TFS.
+
+        PAT расшифровывается прозрачно (если хранится с
+        префиксом "enc:").
+        """
+        cfg = self.config.get("tfs", {}) or {}
+
+        raw_key = str(cfg.get("api_key", "") or "")
+        if raw_key.startswith("enc:"):
+            api_key = self.decrypt(raw_key[4:])
+        else:
+            api_key = raw_key
+
+        templates_raw = cfg.get("wiql_templates", [])
+        if not isinstance(templates_raw, list):
+            templates_raw = []
+
+        templates: List[Dict[str, str]] = []
+        for item in templates_raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            wiql = str(item.get("wiql") or "").strip()
+            if name and wiql:
+                templates.append({"name": name, "wiql": wiql})
+
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "base_url": str(cfg.get("base_url", "")).strip().rstrip("/"),
+            "api_key": api_key,
+            "api_version": str(cfg.get("api_version", "7.0")).strip()
+                           or "7.0",
+            "connect_timeout": float(cfg.get("connect_timeout", 15)),
+            "read_timeout": float(cfg.get("read_timeout", 60)),
+            "default_wiql": str(
+                cfg.get("default_wiql", DEFAULT_TFS_WIQL)
+            ),
+            "default_project": str(
+                cfg.get("default_project", "") or ""
+            ).strip(),
+            "max_items": int(cfg.get("max_items", 200)),
+            "cache_ttl_sec": int(cfg.get("cache_ttl_sec", 60)),
+            "wiql_templates": templates,
+        }
+
+    def set_tfs_settings(self, settings: Dict[str, Any]) -> None:
+        """
+        Сохраняет настройки TFS. PAT шифруется (префикс "enc:").
+        """
+        cfg = self.config.setdefault("tfs", {})
+
+        api_key = str(settings.get("api_key", "") or "")
+        if api_key:
+            cfg["api_key"] = "enc:" + self.encrypt(api_key)
+        else:
+            cfg["api_key"] = ""
+
+        for key in (
+            "enabled", "base_url", "api_version",
+            "connect_timeout", "read_timeout",
+            "default_wiql", "default_project",
+            "max_items", "cache_ttl_sec",
+        ):
+            if key in settings:
+                cfg[key] = settings[key]
+
+        if "wiql_templates" in settings:
+            templates_in = settings.get("wiql_templates") or []
+            cleaned: List[Dict[str, str]] = []
+            for item in templates_in:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                wiql = str(item.get("wiql") or "").strip()
+                if name and wiql:
+                    cleaned.append({"name": name, "wiql": wiql})
+            cfg["wiql_templates"] = cleaned
+
+        self.save()
+        log.info(
+            "Настройки TFS сохранены: enabled=%s, base_url=%r, "
+            "api_version=%s, default_project=%r, "
+            "templates=%d",
+            cfg.get("enabled"), cfg.get("base_url"),
+            cfg.get("api_version"),
+            cfg.get("default_project"),
+            len(cfg.get("wiql_templates") or []),
+        )
+
+    def is_tfs_enabled(self) -> bool:
+        cfg = self.get_tfs_settings()
+        return bool(
+            cfg.get("enabled")
+            and cfg.get("base_url")
+            and cfg.get("api_key")
+        )
+
+    def get_tfs_wiql_templates(self) -> List[Dict[str, str]]:
+        """Возвращает список сохранённых WIQL-шаблонов."""
+        return self.get_tfs_settings().get("wiql_templates", [])
+
+    def add_tfs_wiql_template(self, name: str, wiql: str) -> bool:
+        """
+        Добавляет или обновляет WIQL-шаблон по имени.
+
+        Возвращает True при успехе.
+        """
+        name = (name or "").strip()
+        wiql = (wiql or "").strip()
+        if not name or not wiql:
+            return False
+
+        cfg = self.config.setdefault("tfs", {})
+        templates = cfg.setdefault("wiql_templates", [])
+        if not isinstance(templates, list):
+            templates = []
+            cfg["wiql_templates"] = templates
+
+        replaced = False
+        for i, item in enumerate(templates):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name") or "").strip() == name:
+                templates[i] = {"name": name, "wiql": wiql}
+                replaced = True
+                break
+
+        if not replaced:
+            templates.append({"name": name, "wiql": wiql})
+
+        self.save()
+        log.info(
+            "WIQL-шаблон TFS %s: %r (%d символов)",
+            "обновлён" if replaced else "добавлен",
+            name, len(wiql),
+        )
+        return True
+
+    def remove_tfs_wiql_template(self, name: str) -> bool:
+        """Удаляет WIQL-шаблон по имени."""
+        name = (name or "").strip()
+        if not name:
+            return False
+
+        cfg = self.config.setdefault("tfs", {})
+        templates = cfg.get("wiql_templates") or []
+        if not isinstance(templates, list):
+            return False
+
+        before = len(templates)
+        cfg["wiql_templates"] = [
+            item for item in templates
+            if not (isinstance(item, dict)
+                    and str(item.get("name") or "").strip() == name)
+        ]
+        if len(cfg["wiql_templates"]) == before:
+            return False
+
+        self.save()
+        log.info("WIQL-шаблон TFS удалён: %r", name)
+        return True

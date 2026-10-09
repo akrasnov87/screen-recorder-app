@@ -155,6 +155,10 @@ class SettingsWindow(QDialog):
             "Синхронизация",
         )
         self.tabs.addTab(
+            self._wrap_in_scroll(self._build_tfs_tab()),
+            "TFS",
+        )
+        self.tabs.addTab(
             self._wrap_in_scroll(self._build_compression_tab()),
             "Сжатие медиа",
         )
@@ -1485,6 +1489,342 @@ class SettingsWindow(QDialog):
 
         layout.addStretch()
         return w
+
+
+        # ------------------------------------------------------------------
+    # TFS / Azure DevOps Server
+    # ------------------------------------------------------------------
+    def _build_tfs_tab(self) -> QWidget:
+        """Вкладка «TFS» — интеграция с TFS / Azure DevOps Server."""
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        # --- Вводная плашка ---
+        intro = QLabel(
+            "Интеграция с <b>TFS / Azure DevOps Server</b> для "
+            "просмотра списка задач (work items) по WIQL-запросу.\n\n"
+            "Что можно делать:\n"
+            "  • открыть окно «Задачи TFS» (трей → «Задачи TFS»);\n"
+            "  • выполнить WIQL-запрос и увидеть список задач;\n"
+            "  • открыть задачу в браузере TFS;\n"
+            "  • сохранить удачный WIQL как шаблон.\n\n"
+            "Это <b>только просмотр</b>. Редактировать задачи, "
+            "менять статусы и создавать новые из приложения "
+            "нельзя."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # --- Основное подключение ---
+        conn_header = QHBoxLayout()
+        conn_header.addWidget(QLabel("<b>Подключение</b>"))
+        conn_header.addStretch()
+        layout.addLayout(conn_header)
+
+        form = QFormLayout()
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.tfs_enabled_check = QCheckBox(
+            "Включить интеграцию с TFS"
+        )
+        attach_tooltip(self.tfs_enabled_check, "tfs_enabled")
+        form.addRow("", self.tfs_enabled_check)
+
+        self.tfs_url_input = QLineEdit()
+        self.tfs_url_input.setPlaceholderText(
+            "https://tfs.company.com/tfs/DefaultCollection"
+        )
+        form.addRow(
+            "Base URL:",
+            with_info(self.tfs_url_input, "tfs_base_url"),
+        )
+
+        self.tfs_key_input = QLineEdit()
+        self.tfs_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tfs_key_input.setPlaceholderText(
+            "Personal Access Token (PAT) — хранится в "
+            "зашифрованном виде"
+        )
+
+        self.tfs_show_key = QCheckBox("Показать")
+        self.tfs_show_key.toggled.connect(
+            lambda checked: self.tfs_key_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked
+                else QLineEdit.EchoMode.Password
+            )
+        )
+
+        tfs_key_row = QWidget()
+        tfs_key_layout = QHBoxLayout(tfs_key_row)
+        tfs_key_layout.setContentsMargins(0, 0, 0, 0)
+        tfs_key_layout.setSpacing(6)
+        tfs_key_layout.addWidget(self.tfs_key_input, 1)
+        tfs_key_layout.addWidget(self.tfs_show_key, 0)
+        form.addRow(
+            "PAT:",
+            with_info(tfs_key_row, "tfs_api_key"),
+        )
+
+        self.tfs_api_version_input = QLineEdit()
+        self.tfs_api_version_input.setPlaceholderText("7.0")
+        self.tfs_api_version_input.setMaximumWidth(80)
+        form.addRow(
+            "Версия API:",
+            with_info(self.tfs_api_version_input, "tfs_api_version"),
+        )
+
+        self.tfs_connect_timeout = QSpinBox()
+        self.tfs_connect_timeout.setRange(1, 600)
+        self.tfs_connect_timeout.setSuffix(" сек")
+        self.tfs_connect_timeout.setValue(15)
+        form.addRow(
+            "Таймаут соединения:",
+            with_info(
+                self.tfs_connect_timeout, "tfs_connect_timeout"
+            ),
+        )
+
+        self.tfs_read_timeout = QSpinBox()
+        self.tfs_read_timeout.setRange(5, 3600)
+        self.tfs_read_timeout.setSuffix(" сек")
+        self.tfs_read_timeout.setValue(60)
+        form.addRow(
+            "Таймаут чтения:",
+            with_info(
+                self.tfs_read_timeout, "tfs_read_timeout"
+            ),
+        )
+
+        layout.addLayout(form)
+
+        # --- Тест подключения ---
+        test_row = QHBoxLayout()
+        self.tfs_test_btn = QPushButton("Проверить подключение")
+        attach_tooltip(self.tfs_test_btn, "tfs_test_connection")
+        self.tfs_test_btn.clicked.connect(
+            self._test_tfs_connection
+        )
+        test_row.addWidget(self.tfs_test_btn)
+        test_row.addStretch()
+        layout.addLayout(test_row)
+
+        # --- WIQL и поведение ---
+        behavior_header = QHBoxLayout()
+        behavior_header.addWidget(
+            QLabel("<b>WIQL и поведение</b>")
+        )
+        behavior_header.addStretch()
+        layout.addLayout(behavior_header)
+
+        behavior_form = QFormLayout()
+        behavior_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.tfs_default_wiql_edit = QPlainTextEdit()
+        self.tfs_default_wiql_edit.setMinimumHeight(120)
+        self.tfs_default_wiql_edit.setPlaceholderText(
+            "SELECT [System.Id] FROM WorkItems\n"
+            "WHERE [System.AssignedTo] = @Me\n"
+            "AND [System.State] <> 'Closed'\n"
+            "ORDER BY [System.ChangedDate] DESC"
+        )
+        behavior_form.addRow(
+            "WIQL по умолчанию:",
+            with_info(
+                self.tfs_default_wiql_edit, "tfs_default_wiql"
+            ),
+        )
+
+        self.tfs_default_project_input = QLineEdit()
+        self.tfs_default_project_input.setPlaceholderText(
+            "Имя проекта TFS (пусто = без проекта)"
+        )
+        behavior_form.addRow(
+            "Проект по умолчанию:",
+            with_info(
+                self.tfs_default_project_input,
+                "tfs_default_project",
+            ),
+        )
+
+        self.tfs_max_items_spin = QSpinBox()
+        self.tfs_max_items_spin.setRange(0, 10000)
+        self.tfs_max_items_spin.setSingleStep(50)
+        self.tfs_max_items_spin.setValue(200)
+        self.tfs_max_items_spin.setSpecialValueText(
+            "без ограничения"
+        )
+        behavior_form.addRow(
+            "Максимум задач:",
+            with_info(
+                self.tfs_max_items_spin, "tfs_max_items"
+            ),
+        )
+
+        self.tfs_cache_ttl_spin = QSpinBox()
+        self.tfs_cache_ttl_spin.setRange(0, 24 * 3600)
+        self.tfs_cache_ttl_spin.setSingleStep(30)
+        self.tfs_cache_ttl_spin.setSuffix(" сек")
+        self.tfs_cache_ttl_spin.setValue(60)
+        self.tfs_cache_ttl_spin.setSpecialValueText("без кэша")
+        behavior_form.addRow(
+            "TTL кэша:",
+            with_info(
+                self.tfs_cache_ttl_spin, "tfs_cache_ttl_sec"
+            ),
+        )
+
+        layout.addLayout(behavior_form)
+
+        # --- Сохранённые WIQL-шаблоны ---
+        templates_header = QHBoxLayout()
+        templates_header.addWidget(
+            QLabel("<b>Сохранённые WIQL-шаблоны</b>")
+        )
+        templates_header.addStretch()
+        templates_icon = make_info_icon("tfs_wiql_templates")
+        if templates_icon is not None:
+            templates_header.addWidget(templates_icon)
+        layout.addLayout(templates_header)
+
+        self.tfs_templates_table = QTableWidget(0, 2)
+        self.tfs_templates_table.setHorizontalHeaderLabels(
+            ["Название", "WIQL"]
+        )
+        self.tfs_templates_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.tfs_templates_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        hv = self.tfs_templates_table.horizontalHeader()
+        hv.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.tfs_templates_table.setMinimumHeight(180)
+        layout.addWidget(self.tfs_templates_table)
+
+        tpl_btns = QHBoxLayout()
+        add_btn = QPushButton("Добавить")
+        add_btn.clicked.connect(self._tfs_template_add)
+        del_btn = QPushButton("Удалить")
+        del_btn.clicked.connect(self._tfs_template_delete)
+        up_btn = QPushButton("Вверх")
+        up_btn.clicked.connect(lambda: self._tfs_template_move(-1))
+        down_btn = QPushButton("Вниз")
+        down_btn.clicked.connect(lambda: self._tfs_template_move(1))
+        tpl_btns.addWidget(add_btn)
+        tpl_btns.addWidget(del_btn)
+        tpl_btns.addWidget(up_btn)
+        tpl_btns.addWidget(down_btn)
+        tpl_btns.addStretch()
+        layout.addLayout(tpl_btns)
+
+        layout.addStretch()
+        return w
+
+    # ------------------------------------------------------------------
+    # Действия на вкладке TFS
+    # ------------------------------------------------------------------
+    def _test_tfs_connection(self) -> None:
+        """Проверяет подключение к TFS через список проектов."""
+        base_url = self.tfs_url_input.text().strip().rstrip("/")
+        pat = self.tfs_key_input.text()
+        api_version = (
+            self.tfs_api_version_input.text().strip() or "7.0"
+        )
+        connect_timeout = float(self.tfs_connect_timeout.value())
+        read_timeout = float(self.tfs_read_timeout.value())
+
+        if not base_url or not pat:
+            QMessageBox.warning(
+                self, "TFS",
+                "Укажите Base URL и PAT.",
+            )
+            return
+
+        from ..tfs_client import TfsClient, TfsError
+
+        QGuiApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
+
+        async def _run_ping() -> str:
+            async with TfsClient(
+                base_url=base_url,
+                pat=pat,
+                api_version=api_version,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            ) as client:
+                return await client.ping()
+
+        try:
+            result = asyncio.run(_run_ping())
+        except TfsError as exc:
+            log.warning("Проверка TFS не удалась: %s", exc)
+            QMessageBox.warning(
+                self, "TFS",
+                f"Не удалось подключиться:\n\n{exc}",
+            )
+            return
+        except Exception as exc:
+            log.exception("Ошибка при проверке TFS: %s", exc)
+            QMessageBox.critical(self, "TFS", f"Ошибка:\n{exc}")
+            return
+        finally:
+            if QGuiApplication.overrideCursor() is not None:
+                QGuiApplication.restoreOverrideCursor()
+
+        QMessageBox.information(
+            self, "TFS",
+            f"Подключение успешно.\n\n{result}",
+        )
+
+    def _tfs_template_add(self) -> None:
+        row = self.tfs_templates_table.rowCount()
+        self.tfs_templates_table.insertRow(row)
+        self.tfs_templates_table.setItem(
+            row, 0, QTableWidgetItem("Новый шаблон")
+        )
+        self.tfs_templates_table.setItem(
+            row, 1, QTableWidgetItem("SELECT [System.Id] FROM WorkItems")
+        )
+        self.tfs_templates_table.editItem(
+            self.tfs_templates_table.item(row, 0)
+        )
+
+    def _tfs_template_delete(self) -> None:
+        row = self.tfs_templates_table.currentRow()
+        if row < 0:
+            return
+        item = self.tfs_templates_table.item(row, 0)
+        name = item.text() if item else ""
+        if QMessageBox.question(
+            self, "Удалить шаблон",
+            f"Удалить шаблон «{name}»?",
+        ) == QMessageBox.StandardButton.Yes:
+            self.tfs_templates_table.removeRow(row)
+
+    def _tfs_template_move(self, delta: int) -> None:
+        row = self.tfs_templates_table.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= self.tfs_templates_table.rowCount():
+            return
+        for col in range(self.tfs_templates_table.columnCount()):
+            a = self.tfs_templates_table.takeItem(row, col)
+            b = self.tfs_templates_table.takeItem(new_row, col)
+            self.tfs_templates_table.setItem(row, col, b)
+            self.tfs_templates_table.setItem(new_row, col, a)
+        self.tfs_templates_table.setCurrentCell(new_row, 0)
 
     # ------------------------------------------------------------------
     # Сжатие медиа
@@ -3328,6 +3668,36 @@ class SettingsWindow(QDialog):
         self.sync_retry_count.setValue(int(sync["retry_count"]))
         self.sync_retry_delay.setValue(float(sync["retry_delay"]))
 
+        # --- TFS ---
+        tfs = self.config_manager.get_tfs_settings()
+        self.tfs_enabled_check.setChecked(bool(tfs["enabled"]))
+        self.tfs_url_input.setText(tfs["base_url"])
+        self.tfs_key_input.setText(tfs["api_key"])
+        self.tfs_api_version_input.setText(tfs["api_version"])
+        self.tfs_connect_timeout.setValue(
+            int(tfs["connect_timeout"])
+        )
+        self.tfs_read_timeout.setValue(int(tfs["read_timeout"]))
+        self.tfs_default_wiql_edit.setPlainText(
+            tfs["default_wiql"]
+        )
+        self.tfs_default_project_input.setText(
+            tfs["default_project"]
+        )
+        self.tfs_max_items_spin.setValue(int(tfs["max_items"]))
+        self.tfs_cache_ttl_spin.setValue(int(tfs["cache_ttl_sec"]))
+
+        self.tfs_templates_table.setRowCount(0)
+        for tpl in tfs["wiql_templates"]:
+            row = self.tfs_templates_table.rowCount()
+            self.tfs_templates_table.insertRow(row)
+            self.tfs_templates_table.setItem(
+                row, 0, QTableWidgetItem(tpl.get("name", ""))
+            )
+            self.tfs_templates_table.setItem(
+                row, 1, QTableWidgetItem(tpl.get("wiql", ""))
+            )
+
         # --- Сжатие медиа (отдельная вкладка) ---
         self.compress_enabled_check.setChecked(
             bool(sync.get("compress_media_if_too_large", True))
@@ -3787,6 +4157,49 @@ class SettingsWindow(QDialog):
             "compression_preset": (
                 self.compress_preset_combo.currentText()
             ),
+        })
+
+        # --- TFS ---
+        tfs_templates: List[Dict[str, str]] = []
+        for row in range(self.tfs_templates_table.rowCount()):
+            name_item = self.tfs_templates_table.item(row, 0)
+            wiql_item = self.tfs_templates_table.item(row, 1)
+            name = name_item.text().strip() if name_item else ""
+            wiql = wiql_item.text().strip() if wiql_item else ""
+            if not name or not wiql:
+                continue
+            tfs_templates.append({"name": name, "wiql": wiql})
+
+        log.info(
+            "Сохранение TFS: enabled=%s, base_url=%r, "
+            "api_version=%r, default_project=%r, templates=%d",
+            self.tfs_enabled_check.isChecked(),
+            self.tfs_url_input.text().strip(),
+            self.tfs_api_version_input.text().strip(),
+            self.tfs_default_project_input.text().strip(),
+            len(tfs_templates),
+        )
+
+        self.config_manager.set_tfs_settings({
+            "enabled": self.tfs_enabled_check.isChecked(),
+            "base_url": self.tfs_url_input.text().strip().rstrip("/"),
+            "api_key": self.tfs_key_input.text(),
+            "api_version": (
+                self.tfs_api_version_input.text().strip() or "7.0"
+            ),
+            "connect_timeout": int(
+                self.tfs_connect_timeout.value()
+            ),
+            "read_timeout": int(self.tfs_read_timeout.value()),
+            "default_wiql": (
+                self.tfs_default_wiql_edit.toPlainText().strip()
+            ),
+            "default_project": (
+                self.tfs_default_project_input.text().strip()
+            ),
+            "max_items": int(self.tfs_max_items_spin.value()),
+            "cache_ttl_sec": int(self.tfs_cache_ttl_spin.value()),
+            "wiql_templates": tfs_templates,
         })
 
         # --- Промпты ---

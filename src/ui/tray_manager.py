@@ -1,16 +1,8 @@
 """Управление иконкой в системном трее.
 
 Изменения:
-  • Таймаут уведомлений и максимальные длины берутся из
-    config["app"]: notification_timeout_ms,
-    notification_max_title, notification_max_message.
-  • Добавлен пункт меню «Синхронизация» и сигнал
-    open_sync_requested.
-  • Иконка трея берётся из QApplication.windowIcon(), чтобы
-    совпадала с иконкой панели задач / дока. Если у приложения
-    иконка не задана — используется fallback на resources/icons/app.*
-  • Путь к ресурсам скорректирован с учётом нового расположения
-    модуля в src/ui/.
+  • Добавлен пункт меню «Задачи TFS» и сигнал
+    open_tfs_requested.
 """
 from __future__ import annotations
 
@@ -106,7 +98,9 @@ class TrayManager(QObject):
     upload_video_requested = Signal()
     quit_requested = Signal()
     open_tasks_requested = Signal()
-    open_tasks_editor_requested = Signal()   # если нужно открыть сразу редактор
+    open_tasks_editor_requested = Signal()
+    # --- НОВОЕ: окно «Задачи TFS» ---
+    open_tfs_requested = Signal()
 
     def __init__(
         self,
@@ -196,6 +190,16 @@ class TrayManager(QObject):
         tasks_action.triggered.connect(self.open_tasks)
         menu.addAction(tasks_action)
 
+        # --- НОВОЕ: пункт «Задачи TFS» ---
+        tfs_action = QAction("Задачи TFS", menu)
+        tfs_action.setToolTip(
+            "Просмотр списка задач из TFS / Azure DevOps Server "
+            "по WIQL-запросу.\n\n"
+            "Настраивается в Настройки → TFS."
+        )
+        tfs_action.triggered.connect(self.open_tfs)
+        menu.addAction(tfs_action)
+
         yandex_vm_action = QAction("ВМ Yandex", menu)
         yandex_vm_action.setToolTip(
             "Просмотр и редактирование конфигураций виртуальных "
@@ -238,9 +242,12 @@ class TrayManager(QObject):
         log.debug("Клик: открыть окно «Поручения»")
         self.open_tasks_requested.emit()
 
+    def open_tfs(self) -> None:
+        log.debug("Клик: открыть окно «Задачи TFS»")
+        self.open_tfs_requested.emit()
+
     def set_recording_state(self, state: str) -> None:
         if not is_screen_recording_available():
-            # На Windows запись недоступна — трей всегда "idle".
             return
         log.info("Состояние трея: %s → %s", self._state, state)
         self._state = state
@@ -259,8 +266,6 @@ class TrayManager(QObject):
         if path:
             self._tray.setIcon(QIcon(path))
         else:
-            # Иконки конкретного состояния нет — используем иконку
-            # приложения, чтобы в трее не было «пусто».
             self._tray.setIcon(_app_icon())
 
         if self._record_action:
