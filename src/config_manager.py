@@ -1412,6 +1412,16 @@ class ConfigManager:
 
         PAT расшифровывается прозрачно (если хранится с
         префиксом "enc:").
+
+        Каждый WIQL-шаблон имеет структуру:
+            {
+              "name": str,
+              "wiql": str,
+              "variables": {имя: значение-по-умолчанию},
+            }
+        где variables — значения по умолчанию для шаблонных
+        переменных WIQL ({{Имя}}). Могут быть переопределены
+        пользователем при выполнении запроса.
         """
         cfg = self.config.get("tfs", {}) or {}
 
@@ -1425,14 +1435,30 @@ class ConfigManager:
         if not isinstance(templates_raw, list):
             templates_raw = []
 
-        templates: List[Dict[str, str]] = []
+        templates: List[Dict[str, Any]] = []
         for item in templates_raw:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "").strip()
             wiql = str(item.get("wiql") or "").strip()
-            if name and wiql:
-                templates.append({"name": name, "wiql": wiql})
+            if not name or not wiql:
+                continue
+
+            # --- Значения переменных по умолчанию ---
+            vars_raw = item.get("variables")
+            variables: Dict[str, str] = {}
+            if isinstance(vars_raw, dict):
+                for k, v in vars_raw.items():
+                    k_str = str(k or "").strip()
+                    if not k_str:
+                        continue
+                    variables[k_str] = str(v if v is not None else "")
+
+            templates.append({
+                "name": name,
+                "wiql": wiql,
+                "variables": variables,
+            })
 
         return {
             "enabled": bool(cfg.get("enabled", False)),
@@ -1456,6 +1482,9 @@ class ConfigManager:
     def set_tfs_settings(self, settings: Dict[str, Any]) -> None:
         """
         Сохраняет настройки TFS. PAT шифруется (префикс "enc:").
+
+        Каждый WIQL-шаблон может содержать поле "variables" —
+        словарь {имя: значение-по-умолчанию}.
         """
         cfg = self.config.setdefault("tfs", {})
 
@@ -1476,21 +1505,38 @@ class ConfigManager:
 
         if "wiql_templates" in settings:
             templates_in = settings.get("wiql_templates") or []
-            cleaned: List[Dict[str, str]] = []
+            cleaned: List[Dict[str, Any]] = []
             for item in templates_in:
                 if not isinstance(item, dict):
                     continue
                 name = str(item.get("name") or "").strip()
                 wiql = str(item.get("wiql") or "").strip()
-                if name and wiql:
-                    cleaned.append({"name": name, "wiql": wiql})
+                if not name or not wiql:
+                    continue
+
+                # --- Сохраняем дефолты переменных ---
+                vars_raw = item.get("variables")
+                variables: Dict[str, str] = {}
+                if isinstance(vars_raw, dict):
+                    for k, v in vars_raw.items():
+                        k_str = str(k or "").strip()
+                        if not k_str:
+                            continue
+                        variables[k_str] = str(
+                            v if v is not None else ""
+                        )
+
+                cleaned.append({
+                    "name": name,
+                    "wiql": wiql,
+                    "variables": variables,
+                })
             cfg["wiql_templates"] = cleaned
 
         self.save()
         log.info(
             "Настройки TFS сохранены: enabled=%s, base_url=%r, "
-            "api_version=%s, default_project=%r, "
-            "templates=%d",
+            "api_version=%s, default_project=%r, templates=%d",
             cfg.get("enabled"), cfg.get("base_url"),
             cfg.get("api_version"),
             cfg.get("default_project"),
@@ -1509,9 +1555,21 @@ class ConfigManager:
         """Возвращает список сохранённых WIQL-шаблонов."""
         return self.get_tfs_settings().get("wiql_templates", [])
 
-    def add_tfs_wiql_template(self, name: str, wiql: str) -> bool:
+    def add_tfs_wiql_template(
+        self,
+        name: str,
+        wiql: str,
+        variables: Optional[Dict[str, str]] = None,
+    ) -> bool:
         """
         Добавляет или обновляет WIQL-шаблон по имени.
+
+        Args:
+            name:      имя шаблона.
+            wiql:      текст запроса.
+            variables: значения по умолчанию для шаблонных
+                       переменных {имя: значение}. Может быть
+                       None или пустым — тогда дефолтов нет.
 
         Возвращает True при успехе.
         """
@@ -1519,6 +1577,15 @@ class ConfigManager:
         wiql = (wiql or "").strip()
         if not name or not wiql:
             return False
+
+        # Нормализуем дефолты.
+        vars_clean: Dict[str, str] = {}
+        if isinstance(variables, dict):
+            for k, v in variables.items():
+                k_str = str(k or "").strip()
+                if not k_str:
+                    continue
+                vars_clean[k_str] = str(v if v is not None else "")
 
         cfg = self.config.setdefault("tfs", {})
         templates = cfg.setdefault("wiql_templates", [])
@@ -1531,20 +1598,88 @@ class ConfigManager:
             if not isinstance(item, dict):
                 continue
             if str(item.get("name") or "").strip() == name:
-                templates[i] = {"name": name, "wiql": wiql}
+                templates[i] = {
+                    "name": name,
+                    "wiql": wiql,
+                    "variables": vars_clean,
+                }
                 replaced = True
                 break
 
         if not replaced:
-            templates.append({"name": name, "wiql": wiql})
+            templates.append({
+                "name": name,
+                "wiql": wiql,
+                "variables": vars_clean,
+            })
 
         self.save()
         log.info(
-            "WIQL-шаблон TFS %s: %r (%d символов)",
+            "WIQL-шаблон TFS %s: %r (%d символов, дефолтов: %d)",
             "обновлён" if replaced else "добавлен",
-            name, len(wiql),
+            name, len(wiql), len(vars_clean),
         )
         return True
+
+    def set_tfs_wiql_template_variables(
+        self,
+        name: str,
+        variables: Dict[str, str],
+    ) -> bool:
+        """
+        Обновляет ТОЛЬКО значения по умолчанию у существующего
+        WIQL-шаблона (не меняя сам WIQL).
+
+        Используется, когда пользователь правит дефолты в UI,
+        не пересоздавая шаблон.
+
+        Args:
+            name:      имя шаблона.
+            variables: {имя: значение}.
+
+        Returns:
+            True, если шаблон найден и обновлён.
+        """
+        name = (name or "").strip()
+        if not name:
+            return False
+
+        vars_clean: Dict[str, str] = {}
+        if isinstance(variables, dict):
+            for k, v in variables.items():
+                k_str = str(k or "").strip()
+                if not k_str:
+                    continue
+                vars_clean[k_str] = str(v if v is not None else "")
+
+        cfg = self.config.setdefault("tfs", {})
+        templates = cfg.get("wiql_templates") or []
+        if not isinstance(templates, list):
+            return False
+
+        for i, item in enumerate(templates):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name") or "").strip() == name:
+                # Сохраняем name и wiql, обновляем только variables.
+                templates[i] = {
+                    "name": item.get("name") or name,
+                    "wiql": item.get("wiql") or "",
+                    "variables": vars_clean,
+                }
+                self.save()
+                log.info(
+                    "WIQL-шаблон %r: обновлены дефолты "
+                    "переменных (%d шт.)",
+                    name, len(vars_clean),
+                )
+                return True
+
+        log.warning(
+            "set_tfs_wiql_template_variables: шаблон %r не найден",
+            name,
+        )
+        return False
 
     def remove_tfs_wiql_template(self, name: str) -> bool:
         """Удаляет WIQL-шаблон по имени."""

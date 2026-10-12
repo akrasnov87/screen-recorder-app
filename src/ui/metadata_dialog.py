@@ -1252,7 +1252,10 @@ class MetadataDialog(QDialog):
         """
         Пересобирает поля ввода переменных под текущий шаблон.
 
-        Вызывается при смене шаблона TFS.
+        Значения по умолчанию из шаблона подставляются в поля,
+        если для переменной ещё нет введённого/сохранённого
+        значения. Так пользователь сразу видит, что будет
+        использоваться, и может поправить при необходимости.
         """
         if not hasattr(self, "_tfs_variables_form"):
             return
@@ -1265,12 +1268,20 @@ class MetadataDialog(QDialog):
                 w.deleteLater()
         self._tfs_variable_inputs.clear()
 
-        # Получаем WIQL текущего шаблона.
+        # Находим WIQL и дефолты выбранного шаблона.
         template_name = self.tfs_template_combo.currentData() or ""
         wiql = ""
+        template_defaults: Dict[str, str] = {}
         for tpl in self._tfs_templates:
             if (tpl.get("name") or "").strip() == template_name:
                 wiql = (tpl.get("wiql") or "").strip()
+                raw_vars = tpl.get("variables")
+                if isinstance(raw_vars, dict):
+                    template_defaults = {
+                        str(k): str(v if v is not None else "")
+                        for k, v in raw_vars.items()
+                        if str(k or "").strip()
+                    }
                 break
 
         variables = extract_variables(wiql) if wiql else []
@@ -1281,24 +1292,45 @@ class MetadataDialog(QDialog):
 
         self._tfs_variables_box.setVisible(True)
 
-        # Для каждой переменной — QLineEdit.
         for name in variables:
             line = QLineEdit()
+
+            # Приоритет: уже введённое значение → дефолт шаблона.
+            current = self._tfs_variable_values.get(name, "").strip()
+            default_val = template_defaults.get(name, "").strip()
+
+            if current:
+                line.setText(current)
+            elif default_val:
+                line.setText(default_val)
+                # Помечаем как «из шаблона» — пользователь может
+                # поправить.
+                line.setStyleSheet(
+                    "QLineEdit { color: #666; font-style: italic; }"
+                )
+                line.setToolTip(
+                    f"Переменная шаблона WIQL: {name}\n\n"
+                    f"Значение по умолчанию из шаблона: "
+                    f"«{default_val}».\n\n"
+                    f"Можно изменить — оно будет использовано "
+                    f"только для этой записи."
+                )
+            else:
+                line.setToolTip(
+                    f"Переменная шаблона WIQL: {name}\n\n"
+                    f"У шаблона нет значения по умолчанию. "
+                    f"Заполните вручную — иначе обработка "
+                    f"пропустит TFS-выборку с предупреждением."
+                )
+
             line.setPlaceholderText(f"Значение для «{name}»…")
-            line.setText(self._tfs_variable_values.get(name, ""))
-            line.setToolTip(
-                f"Переменная шаблона WIQL: {name}\n\n"
-                f"Подставляется в запрос вместо "
-                f"конструкции {{{{{name}}}}}.\n\n"
-                f"Спецсимволы (одинарная кавычка) "
-                f"экранируются автоматически."
-            )
             self._tfs_variable_inputs[name] = line
             self._tfs_variables_form.addRow(f"{name}:", line)
 
         log.debug(
-            "TFS-переменные шаблона %r: %s",
+            "TFS-переменные шаблона %r: %s (дефолтов: %d)",
             template_name, ", ".join(variables),
+            len(template_defaults),
         )
 
     # ------------------------------------------------------------------
@@ -2290,28 +2322,47 @@ class MetadataDialog(QDialog):
         # --- Значения переменных TFS ---
         tfs_vars_collected = self._collect_tfs_variable_values()
 
-        # Проверяем: если шаблон использует переменные, но не все
-        # заполнены — не даём подтвердить.
+        # Проверяем: если шаблон использует переменные,
+        # для которых нет ни значения в поле, ни дефолта
+        # в шаблоне — не даём подтвердить при активной галочке.
         if tfs_template_value:
             wiql = ""
+            template_defaults: Dict[str, str] = {}
             for tpl in self._tfs_templates:
                 if (tpl.get("name") or "").strip() == tfs_template_value:
                     wiql = (tpl.get("wiql") or "").strip()
+                    raw_vars = tpl.get("variables")
+                    if isinstance(raw_vars, dict):
+                        template_defaults = {
+                            str(k): str(v if v is not None else "")
+                            for k, v in raw_vars.items()
+                            if str(k or "").strip()
+                        }
                     break
+
             required = extract_variables(wiql)
             if required:
-                missing = [
-                    n for n in required
-                    if not tfs_vars_collected.get(n, "").strip()
-                ]
+                missing = []
+                for n in required:
+                    has_value = bool(
+                        tfs_vars_collected.get(n, "").strip()
+                    )
+                    has_default = bool(
+                        template_defaults.get(n, "").strip()
+                    )
+                    if not has_value and not has_default:
+                        missing.append(n)
+
                 if missing and tfs_save_value:
                     QMessageBox.warning(
                         self, "TFS",
                         f"В шаблоне «{tfs_template_value}» есть "
                         f"переменные, для которых не заданы "
-                        f"значения:\n\n  • "
+                        f"ни значения, ни дефолты:\n\n  • "
                         + "\n  • ".join(missing)
-                        + "\n\nЗаполните их или снимите галочку "
+                        + "\n\nЗаполните их, укажите дефолты "
+                        "(окно «Задачи TFS» → «Сохранить "
+                        "шаблон…») или снимите галочку "
                         "«Сохранять выборку в вложения записи».",
                     )
                     return

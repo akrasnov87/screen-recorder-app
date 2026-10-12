@@ -75,6 +75,11 @@ from .tooltips import attach_tooltip, make_info_icon, with_info
 log = get_logger(__name__)
 
 
+def _html_escape(s: str) -> str:
+    """Минимальное экранирование HTML."""
+    import html
+    return html.escape(str(s or ""))
+
 # ---------------------------------------------------------------------------
 # Диалог ввода значений шаблонных переменных
 # ---------------------------------------------------------------------------
@@ -85,6 +90,12 @@ class TfsVariablesDialog(QDialog):
     Показывает по одному полю ввода на каждую переменную.
     Используется и в окне «Задачи TFS», и (потенциально) в
     других местах.
+
+    Режимы:
+      • allow_empty=False (по умолчанию) — все поля обязательны
+        (для выполнения запроса).
+      • allow_empty=True — пустые значения допускаются
+        (для сохранения дефолтов шаблона).
     """
 
     def __init__(
@@ -94,6 +105,8 @@ class TfsVariablesDialog(QDialog):
         initial: Optional[Dict[str, str]] = None,
         title: str = "Значения переменных WIQL",
         description: str = "",
+        allow_empty: bool = False,
+        empty_label: str = "",
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -105,6 +118,8 @@ class TfsVariablesDialog(QDialog):
         self._initial = dict(initial or {})
         self._inputs: Dict[str, QLineEdit] = {}
         self._result: Dict[str, str] = {}
+        self._allow_empty = bool(allow_empty)
+        self._empty_label = empty_label or ""
 
         self._build_ui(description)
 
@@ -146,17 +161,36 @@ class TfsVariablesDialog(QDialog):
             line = QLineEdit()
             line.setPlaceholderText(f"Значение для «{name}»…")
             line.setText(self._initial.get(name, ""))
-            line.setToolTip(
-                f"Переменная шаблона WIQL: {name}\n\n"
-                f"Значение подставляется в запрос вместо "
-                f"конструкции {{{{{name}}}}}.\n\n"
-                f"Спецсимволы (одинарная кавычка) экранируются "
-                f"автоматически."
-            )
+            if self._allow_empty:
+                line.setToolTip(
+                    f"Переменная шаблона WIQL: {name}\n\n"
+                    f"Значение по умолчанию. Подставляется в "
+                    f"запрос автоматически, когда шаблон "
+                    f"используется без ручного ввода.\n\n"
+                    f"Если оставить пустым — значение будет "
+                    f"запрашиваться у пользователя."
+                )
+            else:
+                line.setToolTip(
+                    f"Переменная шаблона WIQL: {name}\n\n"
+                    f"Подставляется в запрос вместо "
+                    f"конструкции {{{{{name}}}}}.\n\n"
+                    f"Спецсимволы (одинарная кавычка) "
+                    f"экранируются автоматически."
+                )
             self._inputs[name] = line
             form.addRow(f"{name}:", line)
 
         root.addLayout(form)
+
+        # --- Плашка «пустые допустимы» ---
+        if self._allow_empty and self._empty_label:
+            hint = QLabel(
+                f"<span style='color:#666; font-size:11px'>"
+                f"{_html_escape(self._empty_label)}</span>"
+            )
+            hint.setWordWrap(True)
+            root.addWidget(hint)
 
         # --- Кнопки ---
         buttons = QDialogButtonBox(
@@ -166,7 +200,7 @@ class TfsVariablesDialog(QDialog):
         )
         buttons.button(
             QDialogButtonBox.StandardButton.Ok
-        ).setText("Выполнить")
+        ).setText("Сохранить" if self._allow_empty else "Выполнить")
         buttons.button(
             QDialogButtonBox.StandardButton.Cancel
         ).setText("Отмена")
@@ -174,7 +208,6 @@ class TfsVariablesDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        # Ставим фокус на первое поле.
         if self._inputs:
             first = next(iter(self._inputs.values()))
             first.setFocus()
@@ -187,7 +220,7 @@ class TfsVariablesDialog(QDialog):
         for name, field in self._inputs.items():
             value = field.text().strip()
             values[name] = value
-            if not value:
+            if not value and not self._allow_empty:
                 missing.append(name)
 
         if missing:
@@ -202,8 +235,24 @@ class TfsVariablesDialog(QDialog):
         self._result = values
         self.accept()
 
-    def result_values(self) -> Dict[str, str]:
-        return dict(self._result)
+    def result_values(
+        self, *, include_empty: bool = False,
+    ) -> Dict[str, str]:
+        """
+        Возвращает введённые значения.
+
+        Args:
+            include_empty: если False (по умолчанию) — пустые
+                           значения не попадают в результат.
+                           Если True — попадают (для сохранения
+                           дефолтов, когда пустая строка = «нет
+                           дефолта»).
+        """
+        if include_empty:
+            return dict(self._result)
+        return {
+            k: v for k, v in self._result.items() if v
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +943,15 @@ class TfsWindow(QDialog):
         log.info("WIQL сброшен к значению по умолчанию")
 
     def _on_save_template(self) -> None:
+        """
+        Сохраняет текущий WIQL как шаблон.
+
+        Если WIQL содержит шаблонные переменные — открывается
+        диалог для указания значений по умолчанию. Эти значения
+        будут автоматически подставляться, когда шаблон
+        используется без ручного ввода (например, при
+        автоматической обработке записи).
+        """
         wiql = self.wiql_edit.toPlainText().strip()
         if not wiql:
             QMessageBox.information(
@@ -902,6 +960,14 @@ class TfsWindow(QDialog):
             )
             return
 
+        # --- Значения по умолчанию для переменных ---
+        variables = extract_variables(wiql)
+
+        # Если шаблон с таким WIQL уже есть — подтянем
+        # его текущие дефолты.
+        existing_defaults: Dict[str, str] = {}
+
+        # Сначала имя.
         name, ok = QInputDialog.getText(
             self, "Сохранить шаблон WIQL",
             "Название шаблона (например, «Мои активные задачи»):",
@@ -910,8 +976,49 @@ class TfsWindow(QDialog):
             return
         name = name.strip()
 
+        # Если в конфиге уже есть шаблон с таким именем —
+        # берём его дефолты как основу.
+        for tpl in self._templates:
+            if (tpl.get("name") or "").strip() == name:
+                raw_vars = tpl.get("variables") or {}
+                if isinstance(raw_vars, dict):
+                    existing_defaults = {
+                        str(k): str(v)
+                        for k, v in raw_vars.items()
+                    }
+                break
+
+        defaults: Dict[str, str] = {}
+
+        if variables:
+            # Диалог с полями значений по умолчанию.
+            dlg = TfsVariablesDialog(
+                variables,
+                initial=existing_defaults,
+                title="Значения по умолчанию",
+                description=(
+                    "Укажите значения по умолчанию для "
+                    "переменных шаблона.<br><br>"
+                    "Они будут автоматически подставляться, "
+                    "когда шаблон используется без ручного "
+                    "ввода (например, при автоматической "
+                    "обработке записи).<br><br>"
+                    "<b>Можно оставить пустыми</b> — тогда при "
+                    "использовании шаблона значения будут "
+                    "запрашиваться у пользователя."
+                ),
+                allow_empty=True,
+                empty_label="По умолчанию не задано",
+                parent=self,
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            defaults = dlg.result_values(include_empty=True)
+
         try:
-            self.config_manager.add_tfs_wiql_template(name, wiql)
+            self.config_manager.add_tfs_wiql_template(
+                name, wiql, variables=defaults,
+            )
         except Exception as exc:
             log.exception(
                 "Не удалось сохранить шаблон WIQL: %s", exc
@@ -927,11 +1034,40 @@ class TfsWindow(QDialog):
         if idx >= 0:
             self.template_combo.setCurrentIndex(idx)
 
+        # --- Итог ---
+        saved_defaults_count = sum(
+            1 for v in defaults.values() if v
+        )
+        note = ""
+        if variables:
+            if saved_defaults_count == len(variables):
+                note = (
+                    f"\n\nЗначения по умолчанию заданы для всех "
+                    f"переменных ({saved_defaults_count})."
+                )
+            elif saved_defaults_count > 0:
+                note = (
+                    f"\n\nЗначения по умолчанию заданы для "
+                    f"{saved_defaults_count} из {len(variables)} "
+                    f"переменных. Остальные будут "
+                    f"запрашиваться при выполнении."
+                )
+            else:
+                note = (
+                    f"\n\nЗначения по умолчанию не заданы — "
+                    f"все {len(variables)} переменных будут "
+                    f"запрашиваться при использовании шаблона."
+                )
+
         QMessageBox.information(
             self, "Задачи TFS",
-            f"Шаблон «{name}» сохранён.",
+            f"Шаблон «{name}» сохранён.{note}",
         )
-        log.info("Шаблон WIQL сохранён: %r", name)
+        log.info(
+            "Шаблон WIQL сохранён: %r, переменных=%d, "
+            "дефолтов=%d",
+            name, len(variables), saved_defaults_count,
+        )
 
     # ------------------------------------------------------------------
     # Выполнение запроса

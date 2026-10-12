@@ -164,7 +164,7 @@ def fetch_and_save_tfs_work_items(
     tfs_settings: Dict[str, Any],
     tfs_project: str,
     template_name: str,
-    templates: List[Dict[str, str]],
+    templates: List[Dict[str, Any]],
     fmt: str = "csv",
     max_items: int = 0,
     variable_values: Optional[Dict[str, str]] = None,
@@ -172,19 +172,27 @@ def fetch_and_save_tfs_work_items(
     """
     Выполняет WIQL-шаблон и сохраняет результат в attachments/.
 
+    Значения шаблонных переменных определяются так:
+      1. Сначала берутся переданные variable_values (то, что
+         пользователь ввёл в UI или что сохранено в session.json).
+      2. Затем — значения по умолчанию из шаблона
+         (templates[i]["variables"]).
+      3. Если переменная не получила значения ни там, ни там —
+         возвращается ошибка с перечнем недостающих (запрос
+         НЕ выполняется).
+
     Args:
         session_dir:      папка сессии.
         tfs_settings:     dict из ConfigManager.get_tfs_settings().
         tfs_project:      имя проекта TFS (может быть пустым).
         template_name:    имя WIQL-шаблона (обязательно).
-        templates:        список шаблонов.
+        templates:        список шаблонов. Каждый элемент —
+                          {"name": str, "wiql": str,
+                           "variables": {имя: значение}}.
         fmt:              "csv" | "md" | "both".
         max_items:        максимум задач (0 — из tfs_settings["max_items"]).
-        variable_values:  значения шаблонных переменных
-                          {имя: значение}. Если в шаблоне есть
-                          переменные, а значения не заданы —
-                          возвращается ошибка с перечнем
-                          недостающих.
+        variable_values:  значения переменных {имя: значение}.
+                          Приоритетнее дефолтов шаблона.
 
     Returns:
         {
@@ -217,33 +225,87 @@ def fetch_and_save_tfs_work_items(
         result["error"] = "TFS не настроен"
         return result
 
-    wiql = find_template_wiql(templates, template_name)
-    if not wiql:
+    # --- Находим шаблон ---
+    template_obj: Optional[Dict[str, Any]] = None
+    target_name = (template_name or "").strip()
+    for tpl in templates or []:
+        if (tpl.get("name") or "").strip() == target_name:
+            template_obj = tpl
+            break
+
+    if template_obj is None:
         result["error"] = (
             f"WIQL-шаблон {template_name!r} не найден в настройках"
         )
         return result
 
+    wiql = (template_obj.get("wiql") or "").strip()
+    if not wiql:
+        result["error"] = (
+            f"У шаблона {template_name!r} пустой WIQL"
+        )
+        return result
+
+    # --- Дефолты из шаблона ---
+    template_defaults: Dict[str, str] = {}
+    raw_defaults = template_obj.get("variables")
+    if isinstance(raw_defaults, dict):
+        for k, v in raw_defaults.items():
+            k_str = str(k or "").strip()
+            if not k_str:
+                continue
+            template_defaults[k_str] = str(v if v is not None else "")
+
     # --- Работа с переменными ---
     required_vars = extract_variables(wiql)
     result["variables"] = required_vars
 
-    var_values = dict(variable_values or {})
+    # Значения от пользователя (приоритетнее).
+    user_values: Dict[str, str] = {}
+    if isinstance(variable_values, dict):
+        for k, v in variable_values.items():
+            k_str = str(k or "").strip()
+            if not k_str:
+                continue
+            v_str = str(v if v is not None else "").strip()
+            if v_str:
+                user_values[k_str] = v_str
+
+    # Итоговые значения: user_values поверх дефолтов.
+    final_values: Dict[str, str] = {}
+    for name in required_vars:
+        if name in user_values:
+            final_values[name] = user_values[name]
+        elif name in template_defaults and template_defaults[name]:
+            final_values[name] = template_defaults[name]
 
     if required_vars:
-        ok, missing = validate_variables(wiql, var_values)
-        if not ok:
+        # Проверяем, что для всех есть значение.
+        missing = [
+            n for n in required_vars
+            if not final_values.get(n, "").strip()
+        ]
+        if missing:
             result["error"] = (
                 f"В шаблоне {template_name!r} есть переменные, "
-                f"для которых не заданы значения: "
+                f"для которых не заданы значения (ни в записи, "
+                f"ни по умолчанию в шаблоне): "
                 f"{', '.join(missing)}"
             )
             return result
 
-        wiql = substitute_variables(wiql, var_values)
+        wiql = substitute_variables(wiql, final_values)
+
         log.info(
-            "TFS-выборка: в WIQL подставлены переменные %s",
+            "TFS-выборка: в WIQL подставлены переменные %s "
+            "(из пользователя: %d, из дефолтов: %d)",
             ", ".join(required_vars),
+            len(user_values),
+            sum(
+                1 for n in required_vars
+                if n not in user_values
+                and n in template_defaults
+            ),
         )
 
     if max_items <= 0:

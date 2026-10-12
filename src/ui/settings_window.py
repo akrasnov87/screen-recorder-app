@@ -1796,6 +1796,13 @@ class SettingsWindow(QDialog):
         self.tfs_templates_table.setItem(
             row, 1, QTableWidgetItem("SELECT [System.Id] FROM WorkItems")
         )
+        # Храним дефолты в data() колонки 0 — на случай
+        # редактирования существующих шаблонов.
+        item = self.tfs_templates_table.item(row, 0)
+        if item is not None:
+            item.setData(
+                Qt.ItemDataRole.UserRole, {}
+            )
         self.tfs_templates_table.editItem(
             self.tfs_templates_table.item(row, 0)
         )
@@ -3691,9 +3698,23 @@ class SettingsWindow(QDialog):
         for tpl in tfs["wiql_templates"]:
             row = self.tfs_templates_table.rowCount()
             self.tfs_templates_table.insertRow(row)
-            self.tfs_templates_table.setItem(
-                row, 0, QTableWidgetItem(tpl.get("name", ""))
-            )
+
+            name_item = QTableWidgetItem(tpl.get("name", ""))
+            # --- Сохраняем дефолты в data() ---
+            raw_vars = tpl.get("variables")
+            if isinstance(raw_vars, dict):
+                name_item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    {
+                        str(k): str(v if v is not None else "")
+                        for k, v in raw_vars.items()
+                        if str(k or "").strip()
+                    },
+                )
+            else:
+                name_item.setData(Qt.ItemDataRole.UserRole, {})
+
+            self.tfs_templates_table.setItem(row, 0, name_item)
             self.tfs_templates_table.setItem(
                 row, 1, QTableWidgetItem(tpl.get("wiql", ""))
             )
@@ -4160,7 +4181,7 @@ class SettingsWindow(QDialog):
         })
 
         # --- TFS ---
-        tfs_templates: List[Dict[str, str]] = []
+        tfs_templates: List[Dict[str, Any]] = []
         for row in range(self.tfs_templates_table.rowCount()):
             name_item = self.tfs_templates_table.item(row, 0)
             wiql_item = self.tfs_templates_table.item(row, 1)
@@ -4168,7 +4189,25 @@ class SettingsWindow(QDialog):
             wiql = wiql_item.text().strip() if wiql_item else ""
             if not name or not wiql:
                 continue
-            tfs_templates.append({"name": name, "wiql": wiql})
+
+            # --- Достаём дефолты из data() ---
+            raw_vars = (
+                name_item.data(Qt.ItemDataRole.UserRole)
+                if name_item is not None else None
+            )
+            variables: Dict[str, str] = {}
+            if isinstance(raw_vars, dict):
+                for k, v in raw_vars.items():
+                    k_str = str(k or "").strip()
+                    if not k_str:
+                        continue
+                    variables[k_str] = str(v if v is not None else "")
+
+            tfs_templates.append({
+                "name": name,
+                "wiql": wiql,
+                "variables": variables,
+            })
 
         log.info(
             "Сохранение TFS: enabled=%s, base_url=%r, "
