@@ -1799,6 +1799,21 @@ class SessionsWindow(QDialog):
         )
         bottom_actions.addWidget(self.regen_action_prompt_btn)
 
+        self.regen_tfs_btn = QPushButton("Обновить TFS-выборку")
+        self.regen_tfs_btn.setToolTip(
+            "Пересобрать attachments/tfs_work_items.csv "
+            "для выбранной скрам-записи.\n\n"
+            "Читает из session.json параметры tfs_project и "
+            "tfs_template_name, выполняет WIQL к TFS и "
+            "перезаписывает файл выборки.\n\n"
+            "Полезно, когда задачи в TFS обновились после "
+            "обработки записи."
+        )
+        self.regen_tfs_btn.clicked.connect(
+            self._regenerate_tfs_attachment
+        )
+        bottom_actions.addWidget(self.regen_tfs_btn)
+
         bottom_actions.addStretch()
 
         self.refresh_btn = QPushButton("Обновить")
@@ -3269,6 +3284,161 @@ class SessionsWindow(QDialog):
                 self, "Промпт поручений",
                 f"Не удалось сформировать файл:\n\n"
                 f"{res.get('warning') or 'Неизвестная ошибка'}",
+            )
+
+    def _regenerate_tfs_attachment(self) -> None:
+        """Пересобирает TFS-выборку для выбранной записи."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(
+                self, "TFS-выборка", "Выберите запись"
+            )
+            return
+
+        session_dir = r.get("dir") or ""
+        if not session_dir or not os.path.isdir(session_dir):
+            QMessageBox.warning(
+                self, "TFS-выборка",
+                f"Папка записи не найдена:\n{session_dir}",
+            )
+            return
+
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "TFS-выборка",
+                "Нет доступа к настройкам.",
+            )
+            return
+
+        # --- Читаем session.json ---
+        session_json = os.path.join(session_dir, "session.json")
+        meta = read_json_file(session_json) or {}
+
+        if not meta.get("is_scrum"):
+            QMessageBox.information(
+                self, "TFS-выборка",
+                "Запись не помечена как скрам-митинг.",
+            )
+            return
+
+        tfs_project = str(
+            meta.get("tfs_project") or ""
+        ).strip()
+        tfs_template = str(
+            meta.get("tfs_template_name") or ""
+        ).strip()
+
+        if not tfs_template:
+            QMessageBox.information(
+                self, "TFS-выборка",
+                "В метаданных записи не выбран TFS-шаблон.\n\n"
+                "Откройте «Метаданные» (Ctrl+E) и выберите "
+                "шаблон на вкладке «Скрам и DeepSeek».",
+            )
+            return
+
+        # --- Проверяем TFS ---
+        try:
+            tfs_settings = self.config_manager.get_tfs_settings()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "TFS-выборка",
+                f"Не удалось прочитать настройки TFS:\n{exc}",
+            )
+            return
+
+        if not (tfs_settings.get("enabled")
+                and tfs_settings.get("base_url")
+                and tfs_settings.get("api_key")):
+            QMessageBox.warning(
+                self, "TFS-выборка",
+                "Интеграция с TFS не настроена.\n\n"
+                "Откройте Настройки → TFS.",
+            )
+            return
+
+        templates = list(
+            tfs_settings.get("wiql_templates") or []
+        )
+
+        # --- Подтверждение ---
+        reply = QMessageBox.question(
+            self, "TFS-выборка",
+            f"<b>Пересобрать TFS-выборку?</b><br><br>"
+            f"Запись: <b>{html.escape(r.get('name') or '')}</b><br>"
+            f"Проект TFS: "
+            f"<code>{html.escape(tfs_project or '—')}</code><br>"
+            f"Шаблон: "
+            f"<code>{html.escape(tfs_template)}</code><br><br>"
+            f"Файл <code>attachments/tfs_work_items.csv</code> "
+            f"будет перезаписан.<br><br>Продолжить?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # --- Формат и лимит ---
+        app_cfg = self.app_cfg or {}
+        fmt = str(
+            app_cfg.get("tfs_attachment_format", "csv")
+        ).lower()
+        max_items = int(
+            app_cfg.get("tfs_attachment_max_items", 0)
+        )
+
+        # --- Запускаем в отдельном потоке ---
+        QGuiApplication.setOverrideCursor(
+            Qt.CursorShape.WaitCursor
+        )
+        try:
+            from ..tfs_attachment_builder import (
+                fetch_and_save_tfs_work_items,
+            )
+            res = fetch_and_save_tfs_work_items(
+                session_dir=session_dir,
+                tfs_settings=tfs_settings,
+                tfs_project=tfs_project,
+                template_name=tfs_template,
+                templates=templates,
+                fmt=fmt,
+                max_items=max_items,
+            )
+        except Exception as exc:
+            log.exception("Ошибка TFS-выборки: %s", exc)
+            res = {"ok": False, "error": str(exc), "files": []}
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+
+        # --- Обновляем attachments в session.json ---
+        if res.get("ok") and res.get("files"):
+            current = list(meta.get("attachments") or [])
+            for p in res["files"]:
+                if p not in current:
+                    current.append(p)
+            meta["attachments"] = current
+            self._write_json(session_json, meta)
+            self.refresh()
+
+        # --- Результат ---
+        if res.get("ok"):
+            QMessageBox.information(
+                self, "TFS-выборка",
+                f"<b>Выборка сохранена.</b><br><br>"
+                f"Задач: <b>{res.get('count', 0)}</b><br>"
+                f"Тип запроса: {res.get('kind') or '—'}<br><br>"
+                f"Файлы:<br>"
+                + "<br>".join(
+                    f"<code>{html.escape(p)}</code>"
+                    for p in (res.get("files") or [])
+                ),
+            )
+        else:
+            QMessageBox.warning(
+                self, "TFS-выборка",
+                f"Не удалось сформировать выборку:\n\n"
+                f"{res.get('error') or 'Неизвестная ошибка'}",
             )
 
     # ------------------------------------------------------------------

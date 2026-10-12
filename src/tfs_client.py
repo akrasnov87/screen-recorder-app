@@ -143,6 +143,84 @@ class TfsClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def get_work_items_universal(
+        self,
+        wiql: str,
+        project: str = "",
+        *,
+        max_items: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Универсальная обёртка: сама определяет тип WIQL
+        (плоский или link) и возвращает плоский список задач.
+
+        Для link-запросов дерево разворачивается в плоский
+        список, а родитель каждого узла сохраняется в
+        поле parent_id.
+
+        Returns:
+            {
+              "kind": "flat" | "link",
+              "items": [<нормализованные задачи>],
+              "relations": [...],   # только для link
+              "count": int,
+            }
+        """
+        if not wiql or not wiql.strip():
+            return {
+                "kind": "flat",
+                "items": [],
+                "relations": [],
+                "count": 0,
+            }
+
+        if self.is_link_query(wiql):
+            result = await self.get_work_items_by_wiql_links(
+                wiql, project
+            )
+            items = list(result.get("items") or [])
+
+            # Присваиваем parent_id из relations.
+            items_by_id = {
+                int(it["id"]): it
+                for it in items if it.get("id")
+            }
+            for rel in result.get("relations") or []:
+                src = rel.get("source")
+                tgt = rel.get("target")
+                if not isinstance(src, dict) or not src.get("id"):
+                    continue
+                if not isinstance(tgt, dict) or not tgt.get("id"):
+                    continue
+                try:
+                    child = items_by_id.get(int(tgt["id"]))
+                    parent_id = int(src["id"])
+                except (TypeError, ValueError):
+                    continue
+                if child is not None:
+                    child["parent_id"] = parent_id
+
+            if max_items > 0:
+                items = items[:max_items]
+
+            return {
+                "kind": "link",
+                "items": items,
+                "relations": result.get("relations") or [],
+                "count": len(items),
+            }
+
+        items = await self.get_work_items_by_wiql(
+            wiql, project,
+            max_items=max_items,
+        )
+        return {
+            "kind": "flat",
+            "items": items,
+            "relations": [],
+            "count": len(items),
+        }
+
     # ------------------------------------------------------------------
     # Низкоуровневые помощники
     # ------------------------------------------------------------------

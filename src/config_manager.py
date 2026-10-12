@@ -395,6 +395,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # Если True — при переключении sync_ready с false на true
         # запись автоматически публикуется на сервер в фоне.
         "sync_publish_on_ready": True,
+        # --- TFS-выборка (attachments/tfs_work_items.csv) ---
+        "tfs_attachment_format": "csv",     # csv | md | both
+        "tfs_attachment_max_items": 0,      # 0 = взять из tfs.max_items
+        "tfs_projects_cache_ttl": 300,      # секунд, 0 = без кэша
+        "tfs_save_attachment": True,        # дефолт для новых записей
     }
 }
 
@@ -511,6 +516,116 @@ class ConfigManager:
         self._fernet = Fernet(key_b64.encode("ascii"))
         log.info("Мастер-ключ восстановлен из base64")
         return True
+
+    def get_tfs_projects_cached(
+        self, *, force: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Возвращает кэшированный список проектов TFS.
+
+        Формат ответа:
+            {
+              "ok": bool,
+              "projects": [str, ...],
+              "cached_at": float,   # unix timestamp
+              "error": str,
+            }
+
+        Если TFS не настроен или кэш устарел — пытаемся
+        обновить. При ошибке возвращаем то, что было в кэше,
+        либо пустой список.
+
+        ВАЖНО: этот метод синхронный — дёргает asyncio.run().
+        Его нельзя вызывать из event loop. Используйте из UI
+        (QThread) или из processor через to_thread().
+        """
+        import time
+
+        cfg = self.get_tfs_settings()
+        if not (cfg.get("enabled")
+                and cfg.get("base_url")
+                and cfg.get("api_key")):
+            return {
+                "ok": False,
+                "projects": [],
+                "cached_at": 0.0,
+                "error": "TFS не настроен",
+            }
+
+        cache = self.config.setdefault("tfs_projects_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            self.config["tfs_projects_cache"] = cache
+
+        ttl = int(
+            self.config.get("app", {}).get(
+                "tfs_projects_cache_ttl", 300
+            )
+        )
+        cached_at = float(cache.get("cached_at") or 0.0)
+        now = time.time()
+
+        cached_projects = list(cache.get("projects") or [])
+
+        if (not force and cached_projects
+                and ttl > 0 and (now - cached_at) < ttl):
+            return {
+                "ok": True,
+                "projects": cached_projects,
+                "cached_at": cached_at,
+                "error": "",
+            }
+
+        # --- Обновляем ---
+        try:
+            from .tfs_client import TfsClient, TfsError
+            import asyncio as _asyncio
+
+            async def _fetch():
+                async with TfsClient(
+                    base_url=cfg["base_url"],
+                    pat=cfg["api_key"],
+                    api_version=cfg.get("api_version", "7.0"),
+                    connect_timeout=float(
+                        cfg.get("connect_timeout", 15)
+                    ),
+                    read_timeout=float(
+                        cfg.get("read_timeout", 60)
+                    ),
+                ) as client:
+                    return await client.list_projects()
+
+            projects_raw = _asyncio.run(_fetch())
+            names = [
+                str(p.get("name") or "")
+                for p in projects_raw
+                if p.get("name")
+            ]
+            names.sort()
+
+            cache["projects"] = names
+            cache["cached_at"] = now
+            self.save()
+
+            log.info(
+                "Список проектов TFS обновлён: %d", len(names)
+            )
+            return {
+                "ok": True,
+                "projects": names,
+                "cached_at": now,
+                "error": "",
+            }
+        except Exception as exc:
+            log.warning(
+                "Не удалось получить проекты TFS: %s", exc
+            )
+            return {
+                "ok": bool(cached_projects),
+                "projects": cached_projects,
+                "cached_at": cached_at,
+                "error": str(exc),
+            }
 
     def encrypt(self, plaintext: str) -> str:
         if not plaintext:

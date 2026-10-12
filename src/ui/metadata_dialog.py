@@ -115,6 +115,11 @@ class MetadataDialog(QDialog):
         get_tags: Optional[
             Callable[[], List[Dict[str, str]]]
         ] = None,
+        # --- НОВОЕ: TFS ---
+        tfs_settings: Optional[Dict[str, Any]] = None,
+        tfs_templates: Optional[List[Dict[str, str]]] = None,
+        on_request_tfs_projects: Optional[Callable[[], List[str]]] = None,
+        default_tfs_save_attachment: bool = True,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -142,15 +147,27 @@ class MetadataDialog(QDialog):
         self._get_tags_cb = get_tags
         self._selected_tags: List[str] = []
 
+        # --- НОВОЕ: TFS (инициализация ДО _build_ui!) ---
+        self._tfs_settings: Dict[str, Any] = dict(tfs_settings or {})
+        self._tfs_templates: List[Dict[str, str]] = list(
+            tfs_templates or []
+        )
+        self._on_request_tfs_projects = on_request_tfs_projects
+        self._default_tfs_save_attachment = bool(
+            default_tfs_save_attachment
+        )
+
         self.result_data: Dict[str, Any] = {}
         self._prompt_edited = False
         self._attachments: List[str] = []
 
         log.debug(
             "MetadataDialog: title=%r, projects=%d, prompts=%d, "
-            "name_templates=%d, tags=%d, sessions_root=%s",
+            "name_templates=%d, tags=%d, tfs_templates=%d, "
+            "sessions_root=%s",
             title, len(self._projects), len(self._prompts),
             len(self._name_templates), len(self._tags),
+            len(self._tfs_templates),
             sessions_root or "—",
         )
 
@@ -787,15 +804,15 @@ class MetadataDialog(QDialog):
         info = QLabel(
             "Управление генерацией итоговых документов: "
             "краткого содержания и файла-промпта для DeepSeek. "
-            "Здесь же — признак скрам-митинга и файл предыдущего "
-            "протокола."
+            "Здесь же — признак скрам-митинга, файл предыдущего "
+            "протокола и выборка задач из TFS."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
         layout.addWidget(info)
 
         # ==============================================================
-        # НОВОЕ: блок управления транскрибацией
+        # Блок «Транскрибация» — без изменений
         # ==============================================================
         transcribe_header = QHBoxLayout()
         transcribe_header.addWidget(
@@ -814,12 +831,9 @@ class MetadataDialog(QDialog):
             self.skip_transcription_check,
             "meta_skip_transcription",
         )
-        # По умолчанию галочка ВКЛЮЧЕНА — это текущее
-        # поведение: запись проходит транскрибацию.
         self.skip_transcription_check.setChecked(True)
         layout.addWidget(self.skip_transcription_check)
 
-        # Динамическая подсказка под чекбоксом.
         self.skip_transcription_hint = QLabel("")
         self.skip_transcription_hint.setWordWrap(True)
         self.skip_transcription_hint.setStyleSheet(
@@ -830,7 +844,6 @@ class MetadataDialog(QDialog):
         self.skip_transcription_check.toggled.connect(
             self._on_skip_transcription_toggled
         )
-        # Первичная отрисовка подсказки.
         self._on_skip_transcription_toggled(
             self.skip_transcription_check.isChecked()
         )
@@ -838,7 +851,7 @@ class MetadataDialog(QDialog):
         layout.addSpacing(8)
 
         # ==============================================================
-        # Краткое содержание (summary)
+        # Краткое содержание (summary) — без изменений
         # ==============================================================
         summary_header = QHBoxLayout()
         summary_header.addWidget(
@@ -860,7 +873,7 @@ class MetadataDialog(QDialog):
         layout.addWidget(self.generate_summary_check)
 
         # ==============================================================
-        # Промпт для DeepSeek
+        # Промпт для DeepSeek — без изменений
         # ==============================================================
         deepseek_header = QHBoxLayout()
         deepseek_header.addWidget(
@@ -893,7 +906,7 @@ class MetadataDialog(QDialog):
         layout.addWidget(deepseek_hint)
 
         # ==============================================================
-        # Скрам-митинг
+        # Скрам-митинг — без изменений
         # ==============================================================
         scrum_header = QHBoxLayout()
         scrum_header.addWidget(QLabel("<b>Скрам-митинг</b>"))
@@ -964,8 +977,261 @@ class MetadataDialog(QDialog):
         )
         self._update_scrum_visibility(False)
 
+        # ==============================================================
+        # НОВОЕ: блок «TFS-выборка»
+        # ==============================================================
+        layout.addWidget(self._build_tfs_section())
+
         layout.addStretch()
         return w
+
+    # ------------------------------------------------------------------
+    # НОВОЕ: блок TFS-выборки
+    # ------------------------------------------------------------------
+    def _build_tfs_section(self) -> QWidget:
+        """Блок выбора проекта и шаблона TFS."""
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 12, 0, 0)
+        layout.setSpacing(6)
+
+        # --- Заголовок ---
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>TFS-выборка</b>"))
+        header.addStretch()
+        icon = make_info_icon("meta_tfs_section")
+        if icon is not None:
+            header.addWidget(icon)
+        layout.addLayout(header)
+
+        # --- Подсказка ---
+        hint = QLabel(
+            "<span style='color:#666'>Если отметить — во время "
+            "обработки записи будет выполнен WIQL-запрос к TFS, "
+            "а результат сохранён в <code>attachments/"
+            "tfs_work_items.csv</code>. Файл попадёт в промпт "
+            "DeepSeek, если включено «Передавать вложения "
+            "в промпт DeepSeek».</span>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # --- Чекбокс «Сохранять выборку» ---
+        self.tfs_save_attachment_check = QCheckBox(
+            "Сохранять выборку в вложения записи"
+        )
+        attach_tooltip(
+            self.tfs_save_attachment_check,
+            "meta_tfs_save_attachment",
+        )
+        self.tfs_save_attachment_check.setChecked(
+            self._default_tfs_save_attachment
+        )
+        layout.addWidget(self.tfs_save_attachment_check)
+
+        # --- Форма выбора ---
+        form = QFormLayout()
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        # --- Проект ---
+        project_row = QHBoxLayout()
+
+        self.tfs_project_combo = QComboBox()
+        self.tfs_project_combo.setEditable(False)
+        self.tfs_project_combo.setMinimumWidth(280)
+        self.tfs_project_combo.addItem("— без проекта —", "")
+        project_row.addWidget(self.tfs_project_combo, 1)
+
+        self.tfs_reload_projects_btn = QPushButton(
+            "Обновить список"
+        )
+        self.tfs_reload_projects_btn.setToolTip(
+            "Запросить список проектов у сервера TFS "
+            "(обходит кэш)"
+        )
+        self.tfs_reload_projects_btn.clicked.connect(
+            lambda: self._load_tfs_projects(force=True)
+        )
+        project_row.addWidget(self.tfs_reload_projects_btn, 0)
+
+        form.addRow(
+            "Проект:",
+            with_info(
+                self._wrap(project_row), "meta_tfs_project"
+            ),
+        )
+
+        # --- Шаблон ---
+        self.tfs_template_combo = QComboBox()
+        self.tfs_template_combo.setEditable(False)
+        self.tfs_template_combo.setMinimumWidth(360)
+        self.tfs_template_combo.addItem("— не выбрано —", "")
+
+        self._populate_tfs_templates()
+
+        form.addRow(
+            "Шаблон WIQL:",
+            with_info(
+                self.tfs_template_combo, "meta_tfs_template"
+            ),
+        )
+
+        layout.addLayout(form)
+
+        # --- Превью WIQL ---
+        self.tfs_wiql_preview = QLabel("")
+        self.tfs_wiql_preview.setWordWrap(True)
+        self.tfs_wiql_preview.setTextFormat(
+            Qt.TextFormat.PlainText
+        )
+        self.tfs_wiql_preview.setStyleSheet(
+            "QLabel {"
+            "  background-color: #f5f5f5;"
+            "  border: 1px solid #ddd;"
+            "  border-radius: 4px;"
+            "  padding: 6px;"
+            "  font-family: monospace;"
+            "  font-size: 10px;"
+            "  color: #333;"
+            "}"
+        )
+        self.tfs_wiql_preview.setVisible(False)
+        layout.addWidget(self.tfs_wiql_preview)
+
+        self.tfs_template_combo.currentIndexChanged.connect(
+            self._on_tfs_template_changed
+        )
+
+        # --- Состояние TFS ---
+        tfs_enabled = bool(
+            self._tfs_settings.get("enabled")
+            and self._tfs_settings.get("base_url")
+            and self._tfs_settings.get("api_key")
+        )
+
+        self.tfs_status_label = QLabel("")
+        self.tfs_status_label.setWordWrap(True)
+        layout.addWidget(self.tfs_status_label)
+
+        if not tfs_enabled:
+            self.tfs_status_label.setText(
+                "<span style='color:#c62828'>"
+                "Интеграция с TFS не настроена. "
+                "Откройте Настройки → TFS.</span>"
+            )
+            self.tfs_save_attachment_check.setEnabled(False)
+            self.tfs_save_attachment_check.setChecked(False)
+            self.tfs_project_combo.setEnabled(False)
+            self.tfs_template_combo.setEnabled(False)
+            self.tfs_reload_projects_btn.setEnabled(False)
+        else:
+            self.tfs_status_label.setText("")
+            # Асинхронная загрузка проектов
+            self._load_tfs_projects(force=False)
+
+        # --- Связь чекбокса «Сохранять» с активностью полей ---
+        self.tfs_save_attachment_check.toggled.connect(
+            self._on_tfs_save_toggled
+        )
+        self._on_tfs_save_toggled(
+            self.tfs_save_attachment_check.isChecked()
+        )
+
+        return box
+
+    def _populate_tfs_templates(self) -> None:
+        """Заполняет выпадающий список шаблонов WIQL."""
+        self.tfs_template_combo.blockSignals(True)
+        self.tfs_template_combo.clear()
+        self.tfs_template_combo.addItem("— не выбрано —", "")
+        for tpl in self._tfs_templates:
+            name = (tpl.get("name") or "").strip()
+            if not name:
+                continue
+            self.tfs_template_combo.addItem(name, name)
+        self.tfs_template_combo.blockSignals(False)
+
+    def _load_tfs_projects(self, *, force: bool = False) -> None:
+        """
+        Загружает список проектов TFS.
+
+        Вызывается асинхронно через колбэк
+        on_request_tfs_projects, который передан из main.py.
+        Если колбэк не задан — заполняет только кэшем (или
+        «— без проекта —»).
+        """
+        self.tfs_project_combo.blockSignals(True)
+
+        current = self.tfs_project_combo.currentData() or ""
+
+        # Очищаем, оставляя первый пункт.
+        while self.tfs_project_combo.count() > 1:
+            self.tfs_project_combo.removeItem(1)
+
+        if self._on_request_tfs_projects is None:
+            self.tfs_project_combo.blockSignals(False)
+            return
+
+        try:
+            projects = self._on_request_tfs_projects() or []
+        except Exception as exc:
+            log.warning(
+                "Не удалось получить проекты TFS: %s", exc
+            )
+            projects = []
+
+        for name in projects:
+            self.tfs_project_combo.addItem(name, name)
+
+        if current:
+            idx = self.tfs_project_combo.findData(current)
+            if idx >= 0:
+                self.tfs_project_combo.setCurrentIndex(idx)
+
+        self.tfs_project_combo.blockSignals(False)
+
+    def _on_tfs_template_changed(self, index: int) -> None:
+        """Показывает превью WIQL выбранного шаблона."""
+        name = self.tfs_template_combo.currentData() or ""
+        if not name:
+            self.tfs_wiql_preview.setVisible(False)
+            self.tfs_wiql_preview.setText("")
+            return
+
+        wiql = ""
+        for tpl in self._tfs_templates:
+            if (tpl.get("name") or "").strip() == name:
+                wiql = (tpl.get("wiql") or "").strip()
+                break
+
+        if wiql:
+            self.tfs_wiql_preview.setText(wiql)
+            self.tfs_wiql_preview.setVisible(True)
+        else:
+            self.tfs_wiql_preview.setVisible(False)
+
+    def _on_tfs_save_toggled(self, enabled: bool) -> None:
+        """Включает/выключает поля выбора TFS."""
+        for w in (
+            self.tfs_project_combo,
+            self.tfs_template_combo,
+            self.tfs_reload_projects_btn,
+        ):
+            w.setEnabled(enabled)
+
+        # Если включили и есть непустой проект —
+        # автоматически включаем передачу в DeepSeek.
+        if enabled:
+            project = self.tfs_project_combo.currentData() or ""
+            if project and hasattr(
+                self, "send_attachments_to_deepseek_check"
+            ):
+                self.send_attachments_to_deepseek_check.setChecked(
+                    True
+                )
 
     def _on_skip_transcription_toggled(self, enabled: bool) -> None:
         """
@@ -1633,6 +1899,33 @@ class MetadataDialog(QDialog):
             bool(init.get("send_attachments_to_deepseek", False))
         )
 
+        # --- НОВОЕ: TFS-поля ---
+        tfs_project = str(init.get("tfs_project") or "").strip()
+        if tfs_project:
+            idx = self.tfs_project_combo.findData(tfs_project)
+            if idx >= 0:
+                self.tfs_project_combo.setCurrentIndex(idx)
+
+        tfs_template = str(
+            init.get("tfs_template_name") or ""
+        ).strip()
+        if tfs_template:
+            idx = self.tfs_template_combo.findData(tfs_template)
+            if idx >= 0:
+                self.tfs_template_combo.setCurrentIndex(idx)
+            self._on_tfs_template_changed(
+                self.tfs_template_combo.currentIndex()
+            )
+
+        if "tfs_save_attachment" in init:
+            self.tfs_save_attachment_check.setChecked(
+                bool(init["tfs_save_attachment"])
+            )
+        else:
+            self.tfs_save_attachment_check.setChecked(
+                self._default_tfs_save_attachment
+            )
+
         log.debug(
             "Начальные значения применены: project=%r, name=%r, "
             "template=%r, abbr=%r, date=%s, time=%s, tags=%s, "
@@ -1861,6 +2154,18 @@ class MetadataDialog(QDialog):
             self.skip_transcription_check.isChecked()
         )
 
+        # --- НОВОЕ: TFS ---
+        tfs_project_value = (
+            self.tfs_project_combo.currentData() or ""
+        )
+        tfs_template_value = (
+            self.tfs_template_combo.currentData() or ""
+        )
+        tfs_save_value = bool(
+            self.tfs_save_attachment_check.isChecked()
+            and self.tfs_save_attachment_check.isEnabled()
+        )
+
         result: Dict[str, Any] = {
             "project": project,
             "name": final_name,
@@ -1906,6 +2211,10 @@ class MetadataDialog(QDialog):
             "send_attachments_to_deepseek": bool(
                 self.send_attachments_to_deepseek_check.isChecked()
             ),
+            # --- НОВОЕ: TFS ---
+            "tfs_project": tfs_project_value,
+            "tfs_template_name": tfs_template_value,
+            "tfs_save_attachment": tfs_save_value,
         }
         if "new_prompt" in self.result_data:
             result["new_prompt"] = self.result_data["new_prompt"]
@@ -1919,7 +2228,8 @@ class MetadataDialog(QDialog):
             "generate_summary=%s, is_scrum=%s, generate_deepseek=%s, "
             "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
             "ctx_tags=%s, protocol=%s, attachments=%d, "
-            "send_to_transcribe=%s, send_to_deepseek=%s",
+            "send_to_transcribe=%s, send_to_deepseek=%s, "
+            "tfs_project=%r, tfs_template=%r, tfs_save=%s",
             project, final_name, template, abbr,
             date_out, time_out, ordered_tags,
             result["sync_ready"],
@@ -1939,6 +2249,7 @@ class MetadataDialog(QDialog):
             len(self._attachments),
             result["send_attachments_to_transcribe"],
             result["send_attachments_to_deepseek"],
+            tfs_project_value, tfs_template_value, tfs_save_value,
         )
         self.accept()
 

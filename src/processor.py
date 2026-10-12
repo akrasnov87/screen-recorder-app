@@ -31,6 +31,9 @@ from .markdown_to_bitrix import markdown_to_plain_with_bb
 from .task_queue import TaskQueue
 from .transcribe_client import TranscribeClient
 from .platform_utils import ffmpeg_binary_name
+from .tfs_attachment_builder import (
+    fetch_and_save_tfs_work_items,
+)
 
 log = get_logger(__name__)
 
@@ -885,6 +888,50 @@ class VideoProcessor(QObject):
                 )
 
             # ============================================================
+            # Шаг 4: TFS-выборка (только для скрам-записей)
+            # ============================================================
+            session_dir = os.path.dirname(video_path)
+            tfs_result = await self._maybe_fetch_tfs_work_items(
+                task_id=task_id,
+                session_dir=session_dir,
+                metadata=metadata,
+            )
+            if tfs_result and tfs_result.get("ok"):
+                # Файл(ы) попали в attachments/ — обновляем
+                # metadata["attachments"], чтобы они попали
+                # в промпт DeepSeek (если включено).
+                new_files = list(tfs_result.get("files") or [])
+                if new_files:
+                    current_atts = list(
+                        metadata.get("attachments") or []
+                    )
+                    for p in new_files:
+                        if p not in current_atts:
+                            current_atts.append(p)
+                    metadata["attachments"] = current_atts
+
+                    # Сохраняем обновлённые метаданные в
+                    # session.json — иначе они потеряются.
+                    try:
+                        session_json = os.path.join(
+                            session_dir, "session.json"
+                        )
+                        meta_saved = await asyncio.to_thread(
+                            self._read_json_safe, session_json
+                        ) or {}
+                        meta_saved["attachments"] = current_atts
+                        await asyncio.to_thread(
+                            self._write_json_safe,
+                            session_json, meta_saved,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "[%s] Не удалось сохранить обновлённый "
+                            "список вложений: %s",
+                            task_id, exc,
+                        )
+
+            # ============================================================
             # Шаг 4: формирование файла-промпта для поручений
             # ============================================================
             scrum_cfg = self.config.get("scrum", {}) or {}
@@ -1521,6 +1568,147 @@ class VideoProcessor(QObject):
             )
 
         return "\n\n".join(blocks)
+
+    # ------------------------------------------------------------------
+    # TFS-выборка
+    # ------------------------------------------------------------------
+    async def _maybe_fetch_tfs_work_items(
+        self,
+        *,
+        task_id: str,
+        session_dir: str,
+        metadata: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Если запись — скрам-митинг и указан TFS-шаблон —
+        выполняет WIQL-запрос и сохраняет выборку в attachments/.
+
+        Возвращает dict результата или None, если шаг не нужен.
+        """
+        # --- Проверяем необходимость ---
+        if not metadata.get("is_scrum"):
+            return None
+        if not metadata.get("tfs_save_attachment"):
+            return None
+
+        tfs_project = str(
+            metadata.get("tfs_project") or ""
+        ).strip()
+        tfs_template = str(
+            metadata.get("tfs_template_name") or ""
+        ).strip()
+
+        if not tfs_template:
+            log.info(
+                "[%s] TFS-выборка пропущена: шаблон WIQL "
+                "не выбран", task_id,
+            )
+            return None
+
+        # --- Настройки TFS ---
+        if self.config_manager is None:
+            log.warning(
+                "[%s] TFS-выборка: нет config_manager", task_id
+            )
+            return None
+
+        try:
+            tfs_settings = self.config_manager.get_tfs_settings()
+        except Exception as exc:
+            log.warning(
+                "[%s] Не удалось прочитать TFS-настройки: %s",
+                task_id, exc,
+            )
+            return None
+
+        if not (tfs_settings.get("enabled")
+                and tfs_settings.get("base_url")
+                and tfs_settings.get("api_key")):
+            log.info(
+                "[%s] TFS-выборка пропущена: TFS не настроен",
+                task_id,
+            )
+            return None
+
+        templates = list(
+            tfs_settings.get("wiql_templates") or []
+        )
+
+        # --- Формат и лимит ---
+        app_cfg = self.config.get("app", {}) or {}
+        fmt = str(
+            app_cfg.get("tfs_attachment_format", "csv")
+        ).lower()
+        max_items = int(
+            app_cfg.get("tfs_attachment_max_items", 0)
+        )
+
+        self.task_progress.emit(
+            task_id, 80, "TFS-выборка: запрос к серверу…"
+        )
+
+        log.info(
+            "[%s] TFS-выборка: project=%r, template=%r, "
+            "fmt=%s, max_items=%d",
+            task_id, tfs_project or "—", tfs_template,
+            fmt, max_items,
+        )
+
+        try:
+            res = await asyncio.to_thread(
+                fetch_and_save_tfs_work_items,
+                session_dir=session_dir,
+                tfs_settings=tfs_settings,
+                tfs_project=tfs_project,
+                template_name=tfs_template,
+                templates=templates,
+                fmt=fmt,
+                max_items=max_items,
+            )
+        except Exception as exc:
+            log.exception(
+                "[%s] Ошибка TFS-выборки: %s", task_id, exc
+            )
+            return {"ok": False, "error": str(exc), "files": []}
+
+        if res.get("ok"):
+            log.info(
+                "[%s] TFS-выборка сохранена: %d задач, "
+                "файлов: %d",
+                task_id, res.get("count", 0),
+                len(res.get("files") or []),
+            )
+        else:
+            log.warning(
+                "[%s] TFS-выборка не удалась: %s",
+                task_id, res.get("error"),
+            )
+
+        return res
+
+    # ------------------------------------------------------------------
+    # Мелкие JSON-помощники (для сохранения обновлённых вложений)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_json_safe(path: str) -> Dict[str, Any]:
+        try:
+            import json as _json
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _write_json_safe(path: str, data: Dict[str, Any]) -> None:
+        try:
+            import json as _json
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as exc:
+            log.warning("Не удалось записать %s: %s", path, exc)
 
     # ------------------------------------------------------------------
     # Глоссарий

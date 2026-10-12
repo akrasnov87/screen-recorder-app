@@ -431,6 +431,30 @@ class ScreenRecorderApp(QObject):
             len(tags), list(init.keys()), init.get("project"),
         )
 
+        try:
+            tfs_settings = self.config_manager.get_tfs_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать TFS-настройки: %s", exc
+            )
+            tfs_settings = {"enabled": False}
+
+        tfs_templates = list(
+            tfs_settings.get("wiql_templates") or []
+        )
+
+        def _on_request_tfs_projects() -> List[str]:
+            try:
+                res = (
+                    self.config_manager.get_tfs_projects_cached()
+                )
+                return list(res.get("projects") or [])
+            except Exception as exc:
+                log.warning(
+                    "Не удалось получить проекты TFS: %s", exc
+                )
+                return []
+
         dlg = MetadataDialog(
             projects=projects,
             prompts=prompts,
@@ -446,6 +470,13 @@ class ScreenRecorderApp(QObject):
             tags=tags,
             on_save_tag=self._add_tag_to_library,
             get_tags=self.config_manager.get_tags,
+            # --- НОВОЕ: TFS ---
+            tfs_settings=tfs_settings,
+            tfs_templates=tfs_templates,
+            on_request_tfs_projects=_on_request_tfs_projects,
+            default_tfs_save_attachment=bool(
+                self.app_cfg.get("tfs_save_attachment", True)
+            ),
             parent=None,
         )
         if dlg.exec() == dlg.DialogCode.Accepted:
@@ -507,6 +538,12 @@ class ScreenRecorderApp(QObject):
             "attachments": [],
             "send_attachments_to_transcribe": False,
             "send_attachments_to_deepseek": False,
+            # --- НОВОЕ: TFS ---
+            "tfs_project": "",
+            "tfs_template_name": "",
+            "tfs_save_attachment": bool(
+                self.app_cfg.get("tfs_save_attachment", True)
+            ),
         }
         log.debug(
             "Сформированы метаданные по умолчанию: project=%r, "
@@ -1010,6 +1047,9 @@ class ScreenRecorderApp(QObject):
             "attachments": [],
             "send_attachments_to_transcribe": False,
             "send_attachments_to_deepseek": False,
+            "tfs_project": "",
+            "tfs_template_name": "",
+            "tfs_save_attachment": False,
         }
 
         self._save_session_metadata(meta, session_dir)
