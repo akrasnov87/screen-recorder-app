@@ -101,6 +101,8 @@ class TrayManager(QObject):
     open_tasks_editor_requested = Signal()
     # --- НОВОЕ: окно «Задачи TFS» ---
     open_tfs_requested = Signal()
+    # --- НОВОЕ: создание записи-документа ---
+    create_document_requested = Signal()
 
     def __init__(
         self,
@@ -160,6 +162,21 @@ class TrayManager(QObject):
         )
         upload_action.triggered.connect(self.upload_video)
         menu.addAction(upload_action)
+
+        # --- НОВОЕ: создать запись из документов ---
+        create_doc_action = QAction(
+            "Создать запись (документ)…", menu
+        )
+        create_doc_action.setToolTip(
+            "Создать запись без видео — только из документов "
+            "(Word, PDF, TXT, MD, CSV, XLSX и т.п.).\n\n"
+            "Текст документов используется для формирования "
+            "summary и DeepSeek-промпта."
+        )
+        create_doc_action.triggered.connect(
+            self.create_document_record
+        )
+        menu.addAction(create_doc_action)
 
         import_action = QAction("Импорт", menu)
         import_action.setToolTip(
@@ -327,6 +344,11 @@ class TrayManager(QObject):
     def upload_video(self) -> None:
         log.debug("Клик: загрузить видео")
         self.upload_video_requested.emit()
+
+    def create_document_record(self) -> None:
+        """Клик: создать запись из документов."""
+        log.debug("Клик: создать запись-документ")
+        self.create_document_requested.emit()
 
     def quit_app(self) -> None:
         log.info("Запрошен выход из приложения")

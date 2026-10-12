@@ -245,6 +245,10 @@ class ScreenRecorderApp(QObject):
         self.tray_manager.open_tfs_requested.connect(
             self._open_tfs
         )
+        # --- НОВОЕ: создание записи-документа ---
+        self.tray_manager.create_document_requested.connect(
+            self._create_document_record
+        )
         self.tray_manager.import_requested.connect(self._open_import)
         self.tray_manager.upload_video_requested.connect(
             self._open_upload_video
@@ -407,6 +411,8 @@ class ScreenRecorderApp(QObject):
         self,
         title: str = "Метаданные записи",
         initial: Optional[Dict[str, Any]] = None,
+        *,
+        allow_document_only: bool = False,
     ) -> Optional[Dict[str, Any]]:
         projects = self.config_manager.get_project_names()
         prompts = self.config_manager.get_prompts()
@@ -422,14 +428,6 @@ class ScreenRecorderApp(QObject):
         project = init.get("project")
         if project and project not in projects:
             projects = [project] + projects
-
-        log.debug(
-            "Открытие диалога метаданных: title=%r, projects=%d, "
-            "prompts=%d, name_templates=%d, tags=%d, "
-            "initial_keys=%s, default_project=%r",
-            title, len(projects), len(prompts), len(name_templates),
-            len(tags), list(init.keys()), init.get("project"),
-        )
 
         try:
             tfs_settings = self.config_manager.get_tfs_settings()
@@ -470,13 +468,14 @@ class ScreenRecorderApp(QObject):
             tags=tags,
             on_save_tag=self._add_tag_to_library,
             get_tags=self.config_manager.get_tags,
-            # --- НОВОЕ: TFS ---
             tfs_settings=tfs_settings,
             tfs_templates=tfs_templates,
             on_request_tfs_projects=_on_request_tfs_projects,
             default_tfs_save_attachment=bool(
                 self.app_cfg.get("tfs_save_attachment", True)
             ),
+            # --- НОВОЕ ---
+            allow_document_only=allow_document_only,
             parent=None,
         )
         if dlg.exec() == dlg.DialogCode.Accepted:
@@ -892,6 +891,212 @@ class ScreenRecorderApp(QObject):
             QMessageBox.critical(
                 None, "Загрузить видео",
                 f"Не удалось добавить в очередь:\n{exc}",
+            )
+
+    @Slot()
+    def _create_document_record(self) -> None:
+        """
+        Создаёт запись без видео — только из документов.
+
+        Что делает:
+          1. Открывает диалог метаданных в режиме
+             allow_document_only=True.
+          2. Пользователь выбирает документы на вкладке «Документ».
+          3. Создаётся папка сессии, файлы копируются в
+             attachments/.
+          4. Формируется запись с флагами:
+               • skip_transcription=False  — транскрибация
+                 выключена (для документа не имеет смысла);
+               • generate_summary=False    — summary не
+                 формируется (обращение к LiteLLM не требуется);
+               • generate_deepseek_prompt=True — формируется
+                 только файл промпта для DeepSeek;
+               • document_only=True.
+          5. Если generate_deepseek_prompt=True — задача ставится
+             в очередь (обрабатывается processor.process_document_record).
+          6. Если false — запись просто сохраняется локально.
+
+        Пользователь может изменить эти флаги в карточке
+        метаданных вручную.
+        """
+        log.info("Запрос на создание записи-документа")
+
+        initial: Dict[str, Any] = {
+            "include_name_in_prompt": True,
+            "include_project_in_prompt": True,
+            "include_comment_in_prompt": True,
+            "include_tags_in_prompt": True,
+            # --- НОВОЕ: для документа ---
+            # Транскрибация не имеет смысла.
+            "skip_transcription": False,
+            # Summary не формируем — не дёргаем LiteLLM.
+            "generate_summary": False,
+            # Формируем только файл промпта для DeepSeek.
+            "generate_deepseek_prompt": True,
+            # Опции обработки документов.
+            "document_save_transcript": True,
+            "document_to_deepseek": True,
+        }
+
+        meta = self._ask_metadata(
+            title="Создание записи из документов",
+            initial=initial,
+            allow_document_only=True,
+        )
+        if meta is None:
+            log.info(
+                "Пользователь отменил создание записи-документа"
+            )
+            return
+
+        documents = list(meta.get("documents") or [])
+        if not documents:
+            # Если документы не выбраны, но есть вложения —
+            # используем их как документы.
+            attachments = list(meta.get("attachments") or [])
+            if attachments:
+                log.info(
+                    "Документы не выбраны, но есть вложения (%d) — "
+                    "используем их как источник текста",
+                    len(attachments),
+                )
+                documents = attachments
+                meta["documents"] = documents
+                meta["document_only"] = True
+
+        if not documents:
+            QMessageBox.warning(
+                None, "Записи",
+                "Не выбрано ни одного документа.\n\n"
+                "Откройте вкладку «Документ» и прикрепите хотя бы "
+                "один файл (или добавьте вложение на вкладке "
+                "«Вложения»).",
+            )
+            return
+
+        session_dir = self._new_session_dir()
+
+        # --- Копируем документы в attachments/ ---
+        att_dir = os.path.join(session_dir, "attachments")
+        os.makedirs(att_dir, exist_ok=True)
+
+        max_chars = int(
+            self.app_cfg.get("attachment_name_max_chars", 50)
+        )
+
+        copied: List[str] = []
+        for src in documents:
+            if not src or not os.path.isfile(src):
+                log.warning("Документ не найден: %s", src)
+                continue
+            base = sanitize_filename(
+                os.path.basename(src), max_chars=max_chars
+            )
+            dst = os.path.join(att_dir, base)
+            if os.path.exists(dst):
+                stem, ext = os.path.splitext(base)
+                i = 1
+                while os.path.exists(dst):
+                    dst = os.path.join(
+                        att_dir, f"{stem}_{i}{ext}"
+                    )
+                    i += 1
+            try:
+                shutil.copy2(src, dst)
+                copied.append(dst)
+            except Exception as exc:
+                log.exception(
+                    "Не удалось скопировать документ %s: %s",
+                    src, exc,
+                )
+
+        if not copied:
+            QMessageBox.critical(
+                None, "Записи",
+                "Не удалось скопировать ни одного документа.",
+            )
+            return
+
+        # --- Обновляем метаданные ---
+        meta["attachments"] = copied
+        meta["documents"] = copied
+        meta["session_dir"] = session_dir
+        meta["video_path"] = ""
+        meta["source"] = "document"
+        meta["document_only"] = True
+        meta.pop("task_id", None)
+
+        # --- Флаги обработки по умолчанию для документа ---
+        # (могли быть переопределены пользователем в диалоге).
+        meta.setdefault("skip_transcription", False)
+        meta.setdefault("generate_summary", False)
+        meta.setdefault("generate_deepseek_prompt", True)
+        meta.setdefault("document_save_transcript", True)
+        meta.setdefault("document_to_deepseek", True)
+
+        if not (meta.get("date") or "").strip():
+            meta["date"] = datetime.now().strftime("%Y-%m-%d")
+        if not (meta.get("time") or "").strip():
+            meta["time"] = datetime.now().strftime("%H:%M:%S")
+
+        self._save_session_metadata(meta, session_dir)
+
+        # --- Ставим задачу в очередь, если нужно что-то генерировать ---
+        # Для документа — только DeepSeek-промпт (summary
+        # отключён по умолчанию).
+        need_processing = bool(
+            meta.get("generate_deepseek_prompt")
+            or meta.get("generate_summary")
+        )
+
+        task_id = ""
+        if need_processing:
+            try:
+                task_payload = {
+                    "video_path": "",
+                    "metadata": dict(meta),
+                }
+                task_id = self.task_queue.add_task(task_payload)
+                log.info(
+                    "Задача-документ добавлена в очередь: %s "
+                    "(документов: %d, deepseek=%s, summary=%s)",
+                    task_id, len(copied),
+                    meta.get("generate_deepseek_prompt"),
+                    meta.get("generate_summary"),
+                )
+            except Exception as exc:
+                log.exception(
+                    "Не удалось поставить задачу-документ в "
+                    "очередь: %s", exc,
+                )
+                QMessageBox.critical(
+                    None, "Записи",
+                    f"Не удалось поставить в очередь:\n{exc}",
+                )
+                return
+
+        # --- Итог ---
+        if task_id:
+            self._notify(
+                "Запись-документ",
+                f"Запись «{meta.get('name', '')}» создана "
+                f"({len(copied)} док.) и поставлена в очередь",
+            )
+        else:
+            self._notify(
+                "Запись-документ",
+                f"Запись «{meta.get('name', '')}» создана "
+                f"({len(copied)} док.) без обработки",
+            )
+
+        # --- Открыть папку ---
+        try:
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(session_dir)
+            )
+        except Exception as exc:
+            log.warning(
+                "Не удалось открыть папку сессии: %s", exc
             )
 
     # ------------------------------------------------------------------

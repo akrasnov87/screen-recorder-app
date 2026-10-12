@@ -1,20 +1,22 @@
 """Диалоговое окно для ввода метаданных записи с библиотекой промптов.
 
 Изменения:
-  • Интерфейс переделан на вкладки: «Основное», «Промпт»,
-    «Скрам и DeepSeek», «TFS», «Вложения».
-  • Блок «TFS-выборка» вынесен из вкладки «Скрам и DeepSeek»
-    в отдельную вкладку «TFS».
-  • На вкладке «TFS» добавлена поддержка шаблонных переменных
-    WIQL: если выбранный шаблон содержит {{Переменные}}, под
-    формой выбора появляются поля для их значений.
-    Значения сохраняются в метаданных записи и используются
-    при обработке без повторного запроса.
+  • Интерфейс переделан на вкладки: «Основное», «Документ»,
+    «Промпт», «Скрам и DeepSeek», «TFS», «Вложения».
+  • Добавлена вкладка «Документ»: позволяет прикрепить один или
+    несколько документов (.docx / .pdf / .txt / .md / .csv /
+    .json / .xlsx и т.п.) и создать запись без видео.
+    При создании такой записи:
+      – файлы копируются в attachments/;
+      – session.json получает флаг document_only=True;
+      – в очередь ставится задача-документ (обрабатывается
+        отдельной веткой processor.process_document_record);
+      – если и summary, и deepseek_prompt отключены — запись
+        создаётся локально без очереди.
+  • Блок «TFS-выборка» вынесен в отдельную вкладку «TFS».
+  • На вкладке «TFS» поддерживаются шаблонные переменные WIQL.
   • Добавлен блок «Теги» (на вкладке «Основное»).
-  • Вкладка «Промпт» содержит библиотеку промптов и контекст
-    записи в промпте.
-  • Добавлен блок «Синхронизация» на вкладке «Основное»:
-    чекбокс «Готово к синхронизации с сервером» (sync_ready).
+  • Добавлен блок «Синхронизация» на вкладке «Основное».
 """
 from __future__ import annotations
 
@@ -38,6 +40,14 @@ from ..tfs_client import extract_variables
 from .tooltips import attach_tooltip, make_info_icon, with_info
 
 log = get_logger(__name__)
+
+
+# Расширения, которые можно прикреплять на вкладке «Документ».
+_DOCUMENT_EXTS = (
+    ".docx", ".doc", ".pdf", ".txt", ".md",
+    ".csv", ".json", ".xlsx", ".xls",
+    ".rtf", ".odt", ".pptx",
+)
 
 
 def format_name_template(
@@ -80,16 +90,18 @@ def format_name_template(
 
 class MetadataDialog(QDialog):
     """
-    Окно ввода метаданных. Вкладки:
+    Окно ввода метаданных.
+
+    Вкладки:
       • Основное
+      • Документ (новая)
       • Промпт
       • Скрам и DeepSeek
       • TFS
       • Вложения
 
-    Возвращает self.result_data — тот же формат словаря,
-    что и раньше (обратная совместимость с main.py и
-    sessions_window.py).
+    Атрибут result_data содержит поле document_only=True,
+    если пользователь создаёт запись-документ (без видео).
     """
 
     def __init__(
@@ -116,18 +128,19 @@ class MetadataDialog(QDialog):
         get_tags: Optional[
             Callable[[], List[Dict[str, str]]]
         ] = None,
-        # --- TFS ---
         tfs_settings: Optional[Dict[str, Any]] = None,
         tfs_templates: Optional[List[Dict[str, str]]] = None,
         on_request_tfs_projects: Optional[Callable[[], List[str]]] = None,
         default_tfs_save_attachment: bool = True,
+        # --- НОВОЕ: режим «документ» ---
+        allow_document_only: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
         self.setMinimumWidth(820)
-        self.setMinimumHeight(600)
+        self.setMinimumHeight(620)
 
         self._projects = projects or []
         self._prompts = list(prompts or [])
@@ -148,7 +161,6 @@ class MetadataDialog(QDialog):
         self._get_tags_cb = get_tags
         self._selected_tags: List[str] = []
 
-        # --- TFS ---
         self._tfs_settings: Dict[str, Any] = dict(tfs_settings or {})
         self._tfs_templates: List[Dict[str, str]] = list(
             tfs_templates or []
@@ -158,27 +170,23 @@ class MetadataDialog(QDialog):
             default_tfs_save_attachment
         )
 
-        # --- Значения переменных TFS (последнее известное) ---
-        # Заполняется в _apply_initial из init["tfs_variables"].
-        # Обновляется в _on_tfs_template_changed / _on_accept.
         self._tfs_variable_values: Dict[str, str] = {}
-
-        # Динамические поля ввода переменных (QLineEdit) —
-        # создаются/пересоздаются в _rebuild_tfs_variables_inputs().
         self._tfs_variable_inputs: Dict[str, QLineEdit] = {}
+
+        # --- Документы ---
+        self._allow_document_only = bool(allow_document_only)
+        self._documents: List[str] = []
 
         self.result_data: Dict[str, Any] = {}
         self._prompt_edited = False
         self._attachments: List[str] = []
 
         log.debug(
-            "MetadataDialog: title=%r, projects=%d, prompts=%d, "
-            "name_templates=%d, tags=%d, tfs_templates=%d, "
-            "sessions_root=%s",
-            title, len(self._projects), len(self._prompts),
-            len(self._name_templates), len(self._tags),
-            len(self._tfs_templates),
-            sessions_root or "—",
+            "MetadataDialog: title=%r, allow_document_only=%s, "
+            "projects=%d, prompts=%d, tags=%d, tfs_templates=%d",
+            title, self._allow_document_only,
+            len(self._projects), len(self._prompts),
+            len(self._tags), len(self._tfs_templates),
         )
 
         self._build_ui()
@@ -196,6 +204,14 @@ class MetadataDialog(QDialog):
         root.addWidget(self.tabs, 1)
 
         self.tabs.addTab(self._build_main_tab(), "Основное")
+
+        # Вкладку «Документ» показываем только в режиме
+        # allow_document_only (создание записи без видео).
+        if self._allow_document_only:
+            self.tabs.addTab(
+                self._build_document_tab(), "Документ"
+            )
+
         self.tabs.addTab(self._build_prompt_tab(), "Промпт")
         self.tabs.addTab(
             self._build_scrum_tab(), "Скрам и DeepSeek"
@@ -371,7 +387,6 @@ class MetadataDialog(QDialog):
         return w
 
     def _on_set_now_datetime(self) -> None:
-        """Устанавливает в поля даты/времени текущие значения."""
         from PySide6.QtCore import QDate, QTime
 
         if not hasattr(self, "date_edit") or not hasattr(
@@ -386,12 +401,287 @@ class MetadataDialog(QDialog):
         self.date_edit.setDate(QDate.currentDate())
         self.time_edit.setTime(QTime.currentTime())
 
-        log.debug(
-            "MetadataDialog: дата/время сброшены на текущие "
-            "(%s %s)",
-            self.date_edit.date().toString("yyyy-MM-dd"),
-            self.time_edit.time().toString("HH:mm:ss"),
+    # ------------------------------------------------------------------
+    # Вкладка «Документ» (НОВАЯ)
+    # ------------------------------------------------------------------
+    def _build_document_tab(self) -> QWidget:
+        """
+        Вкладка «Документ» — прикрепить один или несколько
+        документов вместо видео.
+        """
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        # --- Инфо-плашка ---
+        info_row = QHBoxLayout()
+        info = QLabel(
+            "Создайте запись без видео — только из документов.<br><br>"
+            "Что можно прикрепить:\n"
+            "  • Word: <code>.docx</code>, <code>.doc</code>, "
+            "<code>.odt</code>, <code>.rtf</code>;\n"
+            "  • PDF: <code>.pdf</code>;\n"
+            "  • текст: <code>.txt</code>, <code>.md</code>;\n"
+            "  • таблицы: <code>.csv</code>, <code>.xlsx</code>, "
+            "<code>.xls</code>;\n"
+            "  • структурированное: <code>.json</code>;\n"
+            "  • презентации: <code>.pptx</code>.<br><br>"
+            "При создании записи файлы копируются в "
+            "<code>attachments/</code>, а их текст используется "
+            "как «стенограмма» — для формирования summary и "
+            "DeepSeek-промпта."
         )
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: #666; }")
+        info_row.addWidget(info, 1)
+
+        icon = make_info_icon("meta_document_tab_intro")
+        if icon is not None:
+            info_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+
+        layout.addLayout(info_row)
+
+        # --- Заголовок списка ---
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Прикреплённые документы</b>"))
+        header.addStretch()
+        hint_icon = make_info_icon("meta_documents")
+        if hint_icon is not None:
+            header.addWidget(hint_icon)
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "<span style='color:#666'>Отметьте один или несколько "
+            "файлов. Порядок в списке сохраняется — при извлечении "
+            "текста документы будут склеены в указанном порядке."
+            "</span>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # --- Список документов ---
+        self.documents_list = QListWidget()
+        self.documents_list.setMinimumHeight(200)
+        self.documents_list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection
+        )
+        self.documents_list.setAlternatingRowColors(True)
+        attach_tooltip(self.documents_list, "meta_documents_list")
+        layout.addWidget(self.documents_list, 1)
+
+        # --- Кнопки ---
+        doc_btns = QHBoxLayout()
+
+        self.add_document_btn = QPushButton("Добавить файлы…")
+        self.add_document_btn.setToolTip(
+            "Выбрать один или несколько документов.\n\n"
+            "Поддерживаются: docx, doc, odt, rtf, pdf, txt, "
+            "md, csv, json, xlsx, xls, pptx."
+        )
+        self.add_document_btn.clicked.connect(
+            self._on_add_document
+        )
+        doc_btns.addWidget(self.add_document_btn)
+
+        self.remove_document_btn = QPushButton("Удалить выбранные")
+        self.remove_document_btn.setToolTip(
+            "Убрать выбранные документы из записи (файлы "
+            "на диске не удаляются)."
+        )
+        self.remove_document_btn.clicked.connect(
+            self._on_remove_document
+        )
+        doc_btns.addWidget(self.remove_document_btn)
+
+        self.move_up_doc_btn = QPushButton("Вверх")
+        self.move_up_doc_btn.setToolTip(
+            "Поменять порядок: выбранный документ станет "
+            "выше в списке"
+        )
+        self.move_up_doc_btn.clicked.connect(
+            lambda: self._move_document(-1)
+        )
+        doc_btns.addWidget(self.move_up_doc_btn)
+
+        self.move_down_doc_btn = QPushButton("Вниз")
+        self.move_down_doc_btn.setToolTip(
+            "Поменять порядок: выбранный документ станет "
+            "ниже в списке"
+        )
+        self.move_down_doc_btn.clicked.connect(
+            lambda: self._move_document(1)
+        )
+        doc_btns.addWidget(self.move_down_doc_btn)
+
+        doc_btns.addStretch()
+
+        self.documents_count_label = QLabel("Документов: 0")
+        self.documents_count_label.setStyleSheet(
+            "QLabel { color: #444; font-weight: bold; }"
+        )
+        doc_btns.addWidget(self.documents_count_label)
+
+        layout.addLayout(doc_btns)
+
+        # --- Что делать с документами ---
+        layout.addWidget(self._build_document_options_section())
+
+        return w
+
+    def _build_document_options_section(self) -> QWidget:
+        box = QFrame()
+        box.setFrameShape(QFrame.Shape.StyledPanel)
+        box.setStyleSheet(
+            "QFrame {"
+            "  background-color: #FAFAFA;"
+            "  border: 1px solid #DDD;"
+            "  border-radius: 4px;"
+            "}"
+        )
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.addWidget(
+            QLabel("<b>Что делать с документами</b>")
+        )
+        header.addStretch()
+        icon = make_info_icon("meta_documents_actions")
+        if icon is not None:
+            header.addWidget(icon)
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "<span style='color:#666'>Текст документов будет "
+            "извлечён и использован так же, как стенограмма. "
+            "Отметьте, что формировать при обработке записи."
+            "</span>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.doc_generate_summary_check = QCheckBox(
+            "Сформировать summary из документов"
+        )
+        attach_tooltip(
+            self.doc_generate_summary_check,
+            "meta_doc_generate_summary",
+        )
+        self.doc_generate_summary_check.setChecked(True)
+        layout.addWidget(self.doc_generate_summary_check)
+
+        self.doc_generate_deepseek_check = QCheckBox(
+            "Сформировать файл промпта для DeepSeek"
+        )
+        attach_tooltip(
+            self.doc_generate_deepseek_check,
+            "meta_doc_generate_deepseek",
+        )
+        self.doc_generate_deepseek_check.setChecked(True)
+        layout.addWidget(self.doc_generate_deepseek_check)
+
+        self.doc_include_text_as_transcript_check = QCheckBox(
+            "Сохранить извлечённый текст как «стенограмму» "
+            "(video.txt)"
+        )
+        attach_tooltip(
+            self.doc_include_text_as_transcript_check,
+            "meta_doc_save_transcript",
+        )
+        self.doc_include_text_as_transcript_check.setChecked(True)
+        layout.addWidget(
+            self.doc_include_text_as_transcript_check
+        )
+
+        self.doc_send_to_deepseek_check = QCheckBox(
+            "Передать извлечённый текст в промпт DeepSeek "
+            "как вложение"
+        )
+        attach_tooltip(
+            self.doc_send_to_deepseek_check,
+            "meta_doc_to_deepseek",
+        )
+        self.doc_send_to_deepseek_check.setChecked(True)
+        layout.addWidget(self.doc_send_to_deepseek_check)
+
+        return box
+
+    # ------------------------------------------------------------------
+    # Работа с документами
+    # ------------------------------------------------------------------
+    def _refresh_documents_list(self) -> None:
+        if not hasattr(self, "documents_list"):
+            return
+        self.documents_list.clear()
+        for p in self._documents:
+            name = os.path.basename(p)
+            it = QListWidgetItem(name)
+            it.setToolTip(p)
+            it.setData(Qt.ItemDataRole.UserRole, p)
+            self.documents_list.addItem(it)
+
+        if hasattr(self, "documents_count_label"):
+            self.documents_count_label.setText(
+                f"Документов: {len(self._documents)}"
+            )
+
+        log.debug(
+            "Список документов обновлён: %d файлов",
+            len(self._documents),
+        )
+
+    def _on_add_document(self) -> None:
+        patterns = " ".join(f"*{ext}" for ext in _DOCUMENT_EXTS)
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Выберите документы",
+            os.path.expanduser("~"),
+            f"Документы ({patterns});;Все файлы (*)",
+        )
+        if not files:
+            return
+        added = 0
+        for f in files:
+            if f and f not in self._documents:
+                self._documents.append(f)
+                added += 1
+        if added:
+            log.info(
+                "Добавлено документов: %d (всего %d)",
+                added, len(self._documents),
+            )
+            self._refresh_documents_list()
+
+    def _on_remove_document(self) -> None:
+        items = self.documents_list.selectedItems()
+        if not items:
+            return
+        to_remove = {
+            it.data(Qt.ItemDataRole.UserRole) for it in items
+        }
+        self._documents = [
+            p for p in self._documents if p not in to_remove
+        ]
+        self._refresh_documents_list()
+        log.info(
+            "Удалено документов: %d (осталось %d)",
+            len(to_remove), len(self._documents),
+        )
+
+    def _move_document(self, delta: int) -> None:
+        row = self.documents_list.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= len(self._documents):
+            return
+        self._documents[row], self._documents[new_row] = (
+            self._documents[new_row], self._documents[row]
+        )
+        self._refresh_documents_list()
+        self.documents_list.setCurrentRow(new_row)
 
     # ------------------------------------------------------------------
     # Блок тегов
@@ -478,9 +768,7 @@ class MetadataDialog(QDialog):
             "запись считается черновиком: автопубликация на "
             "сервер не запускается, фоновый pull не "
             "перезаписывает локальные файлы, локальные "
-            "артефакты не удаляются. Поставьте галочку, когда "
-            "запись полностью готова — протокол, summary и "
-            "вложения на месте.</span>"
+            "артефакты не удаляются.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -582,7 +870,6 @@ class MetadataDialog(QDialog):
                 t for t in self._selected_tags if t != name
             ]
         self._update_tags_count()
-        log.debug("Теги записи: %s", self._selected_tags)
 
     def _on_add_new_tag(self) -> None:
         name, ok = QInputDialog.getText(
@@ -628,12 +915,10 @@ class MetadataDialog(QDialog):
         self._refresh_tags_list(
             selected_names=list(self._selected_tags)
         )
-        log.info("Тег «%s» добавлен и выбран у записи", name)
 
     def _on_clear_tags(self) -> None:
         self._selected_tags = []
         self._populate_tags_list()
-        log.debug("Все теги сняты")
 
     # ------------------------------------------------------------------
     # Вкладка «Промпт»
@@ -715,10 +1000,8 @@ class MetadataDialog(QDialog):
         hint = QLabel(
             "<span style='color:#666'>Выберите, что из карточки "
             "записи добавить в промпт. Информация добавляется "
-            "отдельным блоком «КОНТЕКСТ ЗАПИСИ» перед инструкцией. "
-            "Это помогает ИИ корректнее писать результат. "
-            "По умолчанию включены все четыре пункта — "
-            "снимите галочки, если не нужно.</span>"
+            "отдельным блоком «КОНТЕКСТ ЗАПИСИ» перед инструкцией."
+            "</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -759,19 +1042,12 @@ class MetadataDialog(QDialog):
         ctx_row.addStretch()
 
         self.context_all_btn = QPushButton("Включить всё")
-        self.context_all_btn.setToolTip(
-            "Проставить все галочки контекста"
-        )
         self.context_all_btn.clicked.connect(
             self._on_context_enable_all
         )
         ctx_row.addWidget(self.context_all_btn)
 
         self.context_none_btn = QPushButton("Снять всё")
-        self.context_none_btn.setToolTip(
-            "Снять все галочки контекста — в промпт пойдёт "
-            "только текст инструкции"
-        )
         self.context_none_btn.clicked.connect(
             self._on_context_disable_all
         )
@@ -785,7 +1061,12 @@ class MetadataDialog(QDialog):
         self.include_project_check.setChecked(False)
         self.include_comment_check.setChecked(False)
         self.include_tags_check.setChecked(False)
-        log.info("Сняты все чекбоксы контекста записи")
+
+    def _on_context_enable_all(self) -> None:
+        self.include_name_check.setChecked(True)
+        self.include_project_check.setChecked(True)
+        self.include_comment_check.setChecked(True)
+        self.include_tags_check.setChecked(True)
 
     # ------------------------------------------------------------------
     # Вкладка «Скрам и DeepSeek»
@@ -797,20 +1078,14 @@ class MetadataDialog(QDialog):
         layout.setSpacing(10)
 
         info = QLabel(
-            "Управление генерацией итоговых документов: "
-            "краткого содержания и файла-промпта для DeepSeek. "
-            "Здесь же — признак скрам-митинга и файл предыдущего "
-            "протокола.<br><br>"
-            "<span style='color:#666'>Настройки TFS-выборки — "
-            "на отдельной вкладке «TFS».</span>"
+            "Управление генерацией итоговых документов. "
+            "Настройки TFS-выборки — на отдельной вкладке «TFS»."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
         layout.addWidget(info)
 
-        # ==============================================================
-        # Блок «Транскрибация»
-        # ==============================================================
+        # --- Транскрибация ---
         transcribe_header = QHBoxLayout()
         transcribe_header.addWidget(
             QLabel("<b>Транскрибация</b>")
@@ -847,9 +1122,7 @@ class MetadataDialog(QDialog):
 
         layout.addSpacing(8)
 
-        # ==============================================================
-        # Краткое содержание (summary)
-        # ==============================================================
+        # --- Summary ---
         summary_header = QHBoxLayout()
         summary_header.addWidget(
             QLabel("<b>Краткое содержание (summary)</b>")
@@ -869,9 +1142,7 @@ class MetadataDialog(QDialog):
         self.generate_summary_check.setChecked(False)
         layout.addWidget(self.generate_summary_check)
 
-        # ==============================================================
-        # Промпт для DeepSeek
-        # ==============================================================
+        # --- DeepSeek ---
         deepseek_header = QHBoxLayout()
         deepseek_header.addWidget(
             QLabel("<b>Промпт для DeepSeek</b>")
@@ -880,8 +1151,7 @@ class MetadataDialog(QDialog):
         layout.addLayout(deepseek_header)
 
         self.generate_deepseek_check = QCheckBox(
-            "Сформировать файл промпта для DeepSeek "
-            "(включено по умолчанию)"
+            "Сформировать файл промпта для DeepSeek"
         )
         attach_tooltip(
             self.generate_deepseek_check,
@@ -890,21 +1160,7 @@ class MetadataDialog(QDialog):
         self.generate_deepseek_check.setChecked(True)
         layout.addWidget(self.generate_deepseek_check)
 
-        deepseek_hint = QLabel(
-            "<span style='color:#666'>Шаблон промпта зависит "
-            "от признака «Скрам-митинг»:<br>"
-            "  • <b>Скрам включён</b> → используется шаблон из "
-            "Настройки → Скрам (плюс предыдущий протокол "
-            "и стенограмма).<br>"
-            "  • <b>Скрам выключен</b> → используется промпт "
-            "с вкладки «Промпт».</span>"
-        )
-        deepseek_hint.setWordWrap(True)
-        layout.addWidget(deepseek_hint)
-
-        # ==============================================================
-        # Скрам-митинг
-        # ==============================================================
+        # --- Скрам ---
         scrum_header = QHBoxLayout()
         scrum_header.addWidget(QLabel("<b>Скрам-митинг</b>"))
         scrum_header.addStretch()
@@ -937,9 +1193,6 @@ class MetadataDialog(QDialog):
         )
 
         self.from_session_btn = QPushButton("Из записи…")
-        self.from_session_btn.setToolTip(
-            "Выбрать предыдущий протокол из существующих сессий"
-        )
         self.from_session_btn.clicked.connect(
             self._on_pick_from_session
         )
@@ -981,12 +1234,6 @@ class MetadataDialog(QDialog):
     # Вкладка «TFS»
     # ------------------------------------------------------------------
     def _build_tfs_tab(self) -> QWidget:
-        """
-        Отдельная вкладка «TFS» с блоком TFS-выборки и
-        полями значений шаблонных переменных.
-        """
-        # Оборачиваем в QScrollArea — при большом количестве
-        # переменных контент может не влезть.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1005,21 +1252,10 @@ class MetadataDialog(QDialog):
         info_row = QHBoxLayout()
         info = QLabel(
             "Настройки выборки задач из <b>TFS / Azure DevOps "
-            "Server</b> для этой записи.<br><br>"
+            "Server</b>.<br><br>"
             "Если отметить «Сохранять выборку» — во время обработки "
-            "записи будет выполнен WIQL-запрос к TFS, а результат "
-            "сохранён в <code>attachments/tfs_work_items.csv</code>. "
-            "Файл попадёт в промпт DeepSeek, если на вкладке "
-            "«Вложения» включено «Передавать вложения в промпт "
-            "DeepSeek».<br><br>"
-            "<span style='color:#666'><b>Шаблонные переменные.</b> "
-            "Если в выбранном шаблоне WIQL есть переменные вида "
-            "<code>{{Имя}}</code>, ниже появятся поля для их "
-            "значений. Значения сохранятся в метаданных записи и "
-            "будут использованы при обработке без повторного "
-            "запроса.<br><br>"
-            "Интеграция с TFS настраивается в Настройки → TFS. "
-            "Шаблоны WIQL — там же.</span>"
+            "записи будет выполнен WIQL-запрос, результат "
+            "сохранится в <code>attachments/tfs_work_items.csv</code>."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
@@ -1030,22 +1266,14 @@ class MetadataDialog(QDialog):
             info_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
 
         layout.addLayout(info_row)
-
         layout.addWidget(self._build_tfs_section())
-
-        # --- Блок переменных (создаётся динамически) ---
         layout.addWidget(self._build_tfs_variables_section())
-
         layout.addStretch()
 
         scroll.setWidget(w)
         return scroll
 
-    # ------------------------------------------------------------------
-    # Блок TFS-выборки
-    # ------------------------------------------------------------------
     def _build_tfs_section(self) -> QWidget:
-        """Блок выбора проекта и шаблона TFS."""
         box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1058,17 +1286,6 @@ class MetadataDialog(QDialog):
         if icon is not None:
             header.addWidget(icon)
         layout.addLayout(header)
-
-        hint = QLabel(
-            "<span style='color:#666'>Если отметить — во время "
-            "обработки записи будет выполнен WIQL-запрос к TFS, "
-            "а результат сохранён в <code>attachments/"
-            "tfs_work_items.csv</code>. Файл попадёт в промпт "
-            "DeepSeek, если включено «Передавать вложения "
-            "в промпт DeepSeek».</span>"
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
 
         self.tfs_save_attachment_check = QCheckBox(
             "Сохранять выборку в вложения записи"
@@ -1088,9 +1305,7 @@ class MetadataDialog(QDialog):
             | Qt.AlignmentFlag.AlignVCenter
         )
 
-        # --- Проект ---
         project_row = QHBoxLayout()
-
         self.tfs_project_combo = QComboBox()
         self.tfs_project_combo.setEditable(False)
         self.tfs_project_combo.setMinimumWidth(280)
@@ -1099,10 +1314,6 @@ class MetadataDialog(QDialog):
 
         self.tfs_reload_projects_btn = QPushButton(
             "Обновить список"
-        )
-        self.tfs_reload_projects_btn.setToolTip(
-            "Запросить список проектов у сервера TFS "
-            "(обходит кэш)"
         )
         self.tfs_reload_projects_btn.clicked.connect(
             lambda: self._load_tfs_projects(force=True)
@@ -1116,7 +1327,6 @@ class MetadataDialog(QDialog):
             ),
         )
 
-        # --- Шаблон ---
         self.tfs_template_combo = QComboBox()
         self.tfs_template_combo.setEditable(False)
         self.tfs_template_combo.setMinimumWidth(360)
@@ -1133,7 +1343,6 @@ class MetadataDialog(QDialog):
 
         layout.addLayout(form)
 
-        # --- Превью WIQL ---
         self.tfs_wiql_preview = QLabel("")
         self.tfs_wiql_preview.setWordWrap(True)
         self.tfs_wiql_preview.setTextFormat(
@@ -1157,7 +1366,6 @@ class MetadataDialog(QDialog):
             self._on_tfs_template_changed
         )
 
-        # --- Состояние TFS ---
         tfs_enabled = bool(
             self._tfs_settings.get("enabled")
             and self._tfs_settings.get("base_url")
@@ -1192,22 +1400,12 @@ class MetadataDialog(QDialog):
 
         return box
 
-    # ------------------------------------------------------------------
-    # Блок переменных TFS
-    # ------------------------------------------------------------------
     def _build_tfs_variables_section(self) -> QWidget:
-        """
-        Контейнер для полей ввода переменных выбранного шаблона.
-
-        Содержимое перестраивается динамически в
-        _rebuild_tfs_variables_inputs() — при смене шаблона.
-        """
         self._tfs_variables_box = QWidget()
         layout = QVBoxLayout(self._tfs_variables_box)
         layout.setContentsMargins(0, 12, 0, 0)
         layout.setSpacing(6)
 
-        # Заголовок
         header = QHBoxLayout()
         header.addWidget(
             QLabel("<b>Переменные шаблона WIQL</b>")
@@ -1218,17 +1416,14 @@ class MetadataDialog(QDialog):
             header.addWidget(icon)
         layout.addLayout(header)
 
-        # Подсказка (статичная)
         hint = QLabel(
             "<span style='color:#666'>В выбранном шаблоне есть "
             "шаблонные переменные. Укажите их значения — они "
-            "подставятся в запрос перед выполнением. Значения "
-            "сохранятся в метаданных записи.</span>"
+            "подставятся в запрос перед выполнением.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        # Сюда будут добавляться поля ввода
         self._tfs_variables_form = QFormLayout()
         self._tfs_variables_form.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight
@@ -1242,25 +1437,13 @@ class MetadataDialog(QDialog):
         form_container.setLayout(self._tfs_variables_form)
         layout.addWidget(form_container)
 
-        # Пустая плашка на случай отсутствия переменных —
-        # весь блок скрыт по умолчанию.
         self._tfs_variables_box.setVisible(False)
-
         return self._tfs_variables_box
 
     def _rebuild_tfs_variables_inputs(self) -> None:
-        """
-        Пересобирает поля ввода переменных под текущий шаблон.
-
-        Значения по умолчанию из шаблона подставляются в поля,
-        если для переменной ещё нет введённого/сохранённого
-        значения. Так пользователь сразу видит, что будет
-        использоваться, и может поправить при необходимости.
-        """
         if not hasattr(self, "_tfs_variables_form"):
             return
 
-        # Удаляем старые поля.
         while self._tfs_variables_form.count() > 0:
             item = self._tfs_variables_form.takeAt(0)
             w = item.widget()
@@ -1268,7 +1451,6 @@ class MetadataDialog(QDialog):
                 w.deleteLater()
         self._tfs_variable_inputs.clear()
 
-        # Находим WIQL и дефолты выбранного шаблона.
         template_name = self.tfs_template_combo.currentData() or ""
         wiql = ""
         template_defaults: Dict[str, str] = {}
@@ -1294,8 +1476,6 @@ class MetadataDialog(QDialog):
 
         for name in variables:
             line = QLineEdit()
-
-            # Приоритет: уже введённое значение → дефолт шаблона.
             current = self._tfs_variable_values.get(name, "").strip()
             default_val = template_defaults.get(name, "").strip()
 
@@ -1303,41 +1483,15 @@ class MetadataDialog(QDialog):
                 line.setText(current)
             elif default_val:
                 line.setText(default_val)
-                # Помечаем как «из шаблона» — пользователь может
-                # поправить.
                 line.setStyleSheet(
                     "QLineEdit { color: #666; font-style: italic; }"
-                )
-                line.setToolTip(
-                    f"Переменная шаблона WIQL: {name}\n\n"
-                    f"Значение по умолчанию из шаблона: "
-                    f"«{default_val}».\n\n"
-                    f"Можно изменить — оно будет использовано "
-                    f"только для этой записи."
-                )
-            else:
-                line.setToolTip(
-                    f"Переменная шаблона WIQL: {name}\n\n"
-                    f"У шаблона нет значения по умолчанию. "
-                    f"Заполните вручную — иначе обработка "
-                    f"пропустит TFS-выборку с предупреждением."
                 )
 
             line.setPlaceholderText(f"Значение для «{name}»…")
             self._tfs_variable_inputs[name] = line
             self._tfs_variables_form.addRow(f"{name}:", line)
 
-        log.debug(
-            "TFS-переменные шаблона %r: %s (дефолтов: %d)",
-            template_name, ", ".join(variables),
-            len(template_defaults),
-        )
-
-    # ------------------------------------------------------------------
-    # Управление списком шаблонов
-    # ------------------------------------------------------------------
     def _populate_tfs_templates(self) -> None:
-        """Заполняет выпадающий список шаблонов WIQL."""
         self.tfs_template_combo.blockSignals(True)
         self.tfs_template_combo.clear()
         self.tfs_template_combo.addItem("— не выбрано —", "")
@@ -1349,9 +1503,7 @@ class MetadataDialog(QDialog):
         self.tfs_template_combo.blockSignals(False)
 
     def _load_tfs_projects(self, *, force: bool = False) -> None:
-        """Загружает список проектов TFS."""
         self.tfs_project_combo.blockSignals(True)
-
         current = self.tfs_project_combo.currentData() or ""
 
         while self.tfs_project_combo.count() > 1:
@@ -1380,12 +1532,10 @@ class MetadataDialog(QDialog):
         self.tfs_project_combo.blockSignals(False)
 
     def _on_tfs_template_changed(self, index: int) -> None:
-        """Показывает превью WIQL и пересобирает поля переменных."""
         name = self.tfs_template_combo.currentData() or ""
         if not name:
             self.tfs_wiql_preview.setVisible(False)
             self.tfs_wiql_preview.setText("")
-            # Пересобираем поля (их не будет).
             self._rebuild_tfs_variables_inputs()
             return
 
@@ -1401,11 +1551,9 @@ class MetadataDialog(QDialog):
         else:
             self.tfs_wiql_preview.setVisible(False)
 
-        # Пересобираем поля переменных под новый шаблон.
         self._rebuild_tfs_variables_inputs()
 
     def _on_tfs_save_toggled(self, enabled: bool) -> None:
-        """Включает/выключает поля выбора TFS."""
         for w in (
             self.tfs_project_combo,
             self.tfs_template_combo,
@@ -1413,12 +1561,9 @@ class MetadataDialog(QDialog):
         ):
             w.setEnabled(enabled)
 
-        # Поля переменных тоже.
         for line in self._tfs_variable_inputs.values():
             line.setEnabled(enabled)
 
-        # Если включили и есть непустой проект —
-        # автоматически включаем передачу в DeepSeek.
         if enabled:
             project = self.tfs_project_combo.currentData() or ""
             if project and hasattr(
@@ -1429,39 +1574,24 @@ class MetadataDialog(QDialog):
                 )
 
     def _collect_tfs_variable_values(self) -> Dict[str, str]:
-        """Собирает введённые значения переменных."""
         result: Dict[str, str] = {}
         for name, line in self._tfs_variable_inputs.items():
             result[name] = line.text().strip()
         return result
 
     def _on_skip_transcription_toggled(self, enabled: bool) -> None:
-        """Обновляет подсказку под чекбоксом «Выполнять
-        транскрибацию» и при необходимости блокирует
-        зависимые элементы управления."""
         if not hasattr(self, "skip_transcription_hint"):
             return
 
         if enabled:
             self.skip_transcription_hint.setText(
                 "<span style='color:#666'>"
-                "Запись будет обработана как обычно: "
-                "аудио → транскрибация → (опционально) "
-                "суммаризация → DeepSeek-промпт."
-                "</span>"
+                "Запись будет обработана как обычно.</span>"
             )
         else:
             self.skip_transcription_hint.setText(
                 "<span style='color:#B8860B'>"
-                "⚠ Транскрибация будет пропущена. "
-                "Сохранятся только исходное видео, "
-                "аудио и протокол (если прикреплён). "
-                "Стенограмма, summary и DeepSeek-промпт "
-                "формироваться не будут. "
-                "Позже можно включить транскрибацию и "
-                "перезапустить обработку через окно "
-                "«Записи»."
-                "</span>"
+                "⚠ Транскрибация будет пропущена.</span>"
             )
 
         for widget_name in (
@@ -1484,10 +1614,7 @@ class MetadataDialog(QDialog):
 
         info = QLabel(
             "Файлы, которые можно передать в суммаризацию "
-            "или включить в промпт DeepSeek. Текст будет "
-            "автоматически извлечён из <code>.txt</code>, "
-            "<code>.md</code>, <code>.docx</code>, "
-            "<code>.pdf</code>."
+            "или включить в промпт DeepSeek."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
@@ -1580,13 +1707,6 @@ class MetadataDialog(QDialog):
             self.tags_list.itemChanged.connect(
                 self._on_tag_item_changed
             )
-
-    def _on_context_enable_all(self) -> None:
-        self.include_name_check.setChecked(True)
-        self.include_project_check.setChecked(True)
-        self.include_comment_check.setChecked(True)
-        self.include_tags_check.setChecked(True)
-        log.info("Включены все чекбоксы контекста записи")
 
     # ------------------------------------------------------------------
     # Шаблоны названий
@@ -1698,10 +1818,6 @@ class MetadataDialog(QDialog):
             self, "Шаблон",
             f"Шаблон «{label}» сохранён.",
         )
-        log.info(
-            "Сохранён шаблон названия: label=%r, template=%r",
-            label, candidate,
-        )
 
     # ------------------------------------------------------------------
     # Скрам
@@ -1709,15 +1825,10 @@ class MetadataDialog(QDialog):
     def _on_scrum_toggled(self, checked: bool) -> None:
         if checked and not self.generate_deepseek_check.isChecked():
             self.generate_deepseek_check.setChecked(True)
-            log.info(
-                "Скрам включён — автоматически включено "
-                "формирование промпта для DeepSeek"
-            )
 
     def _update_scrum_visibility(self, checked: bool) -> None:
         for w in self._scrum_widgets:
             w.setEnabled(checked)
-        log.debug("Видимость скрам-полей: %s", checked)
 
     def _on_browse_protocol(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1728,12 +1839,9 @@ class MetadataDialog(QDialog):
         )
         if path:
             self.protocol_path_input.setText(path)
-            log.info("Выбран файл протокола: %s", path)
 
     def _on_clear_protocol(self) -> None:
-        old = self.protocol_path_input.text()
         self.protocol_path_input.setText("")
-        log.info("Файл протокола сброшен (был: %s)", old or "—")
 
     def _on_pick_from_session(self) -> None:
         if (not self._sessions_root
@@ -1785,9 +1893,7 @@ class MetadataDialog(QDialog):
             QMessageBox.information(
                 self, "Протокол",
                 "В папке сессий не найдено ни одного файла "
-                "протокола.\n\n"
-                "Поддерживаются: manual_protocol.*, "
-                "protocol.*, deepseek_prompt.*, video.txt.",
+                "протокола.",
             )
             return
 
@@ -1817,7 +1923,6 @@ class MetadataDialog(QDialog):
                 Qt.ItemDataRole.UserRole
             )
             self.protocol_path_input.setText(path)
-            log.info("Протокол выбран из записи: %s", path)
 
     # ------------------------------------------------------------------
     # Вложения
@@ -1829,10 +1934,6 @@ class MetadataDialog(QDialog):
             it.setToolTip(p)
             it.setData(Qt.ItemDataRole.UserRole, p)
             self.attachments_list.addItem(it)
-        log.debug(
-            "Список вложений обновлён: %d файлов",
-            len(self._attachments),
-        )
 
     def _on_add_attachment(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -1850,10 +1951,6 @@ class MetadataDialog(QDialog):
                 self._attachments.append(f)
                 added += 1
         if added:
-            log.info(
-                "Добавлено вложений: %d (всего %d)",
-                added, len(self._attachments),
-            )
             self._refresh_attachments_list()
 
     def _on_remove_attachment(self) -> None:
@@ -1867,10 +1964,6 @@ class MetadataDialog(QDialog):
             p for p in self._attachments if p not in to_remove
         ]
         self._refresh_attachments_list()
-        log.info(
-            "Удалено вложений: %d (осталось %d)",
-            len(to_remove), len(self._attachments),
-        )
 
     # ------------------------------------------------------------------
     # Заполнение
@@ -1878,7 +1971,6 @@ class MetadataDialog(QDialog):
     def _apply_initial(self) -> None:
         init = self._initial or {}
 
-        # --- Значения переменных TFS из initial ---
         raw_vars = init.get("tfs_variables") or {}
         if isinstance(raw_vars, dict):
             self._tfs_variable_values = {
@@ -1886,6 +1978,15 @@ class MetadataDialog(QDialog):
             }
         else:
             self._tfs_variable_values = {}
+
+        # --- Документы из initial ---
+        raw_docs = init.get("documents") or []
+        if isinstance(raw_docs, list):
+            self._documents = [
+                str(p) for p in raw_docs if p
+            ]
+        if self._allow_document_only:
+            self._refresh_documents_list()
 
         project = init.get("project", "")
         if project:
@@ -1935,11 +2036,7 @@ class MetadataDialog(QDialog):
             try:
                 y, m, d = date_str.split("-")
                 self.date_edit.setDate(QDate(int(y), int(m), int(d)))
-            except Exception as exc:
-                log.warning(
-                    "MetadataDialog: не удалось разобрать дату %r: %s",
-                    date_str, exc,
-                )
+            except Exception:
                 self.date_edit.setDate(QDate.currentDate())
         else:
             self.date_edit.setDate(QDate.currentDate())
@@ -1951,11 +2048,7 @@ class MetadataDialog(QDialog):
                 mm = int(parts[1]) if len(parts) > 1 else 0
                 ss = int(parts[2]) if len(parts) > 2 else 0
                 self.time_edit.setTime(QTime(hh, mm, ss))
-            except Exception as exc:
-                log.warning(
-                    "MetadataDialog: не удалось разобрать время %r: %s",
-                    time_str, exc,
-                )
+            except Exception:
                 self.time_edit.setTime(QTime.currentTime())
         else:
             self.time_edit.setTime(QTime.currentTime())
@@ -2038,7 +2131,7 @@ class MetadataDialog(QDialog):
         self.prompt_input.blockSignals(False)
         self._prompt_edited = False
 
-        # --- Контекст в промпт ---
+        # --- Контекст ---
         default_ctx = True
 
         if "include_name_in_prompt" in init:
@@ -2105,7 +2198,6 @@ class MetadataDialog(QDialog):
             idx = self.tfs_template_combo.findData(tfs_template)
             if idx >= 0:
                 self.tfs_template_combo.setCurrentIndex(idx)
-            # Строим поля переменных под выбранный шаблон.
             self._on_tfs_template_changed(
                 self.tfs_template_combo.currentIndex()
             )
@@ -2119,13 +2211,22 @@ class MetadataDialog(QDialog):
                 self._default_tfs_save_attachment
             )
 
-        log.debug(
-            "Начальные значения применены: project=%r, name=%r, "
-            "tfs_project=%r, tfs_template=%r, tfs_vars=%s",
-            project, init_name,
-            tfs_project, tfs_template,
-            list(self._tfs_variable_values.keys()),
-        )
+        # --- Опции обработки документов ---
+        if self._allow_document_only:
+            # Summary по умолчанию выключен (не дёргаем LiteLLM).
+            self.doc_generate_summary_check.setChecked(
+                bool(init.get("generate_summary", False))
+            )
+            # DeepSeek-промпт по умолчанию включён.
+            self.doc_generate_deepseek_check.setChecked(
+                bool(init.get("generate_deepseek_prompt", True))
+            )
+            self.doc_include_text_as_transcript_check.setChecked(
+                bool(init.get("document_save_transcript", True))
+            )
+            self.doc_send_to_deepseek_check.setChecked(
+                bool(init.get("document_to_deepseek", True))
+            )
 
     # ------------------------------------------------------------------
     # Промпт
@@ -2152,14 +2253,8 @@ class MetadataDialog(QDialog):
         self.prompt_input.setPlainText(text)
         self.prompt_input.blockSignals(False)
         self._prompt_edited = False
-        log.debug(
-            "Выбран промпт из библиотеки: %s (%d символов)",
-            name, len(text),
-        )
 
     def _on_prompt_edited(self) -> None:
-        if not self._prompt_edited:
-            log.debug("Промпт отредактирован вручную")
         self._prompt_edited = True
 
     def _on_reset_prompt(self) -> None:
@@ -2319,12 +2414,9 @@ class MetadataDialog(QDialog):
             and self.tfs_save_attachment_check.isEnabled()
         )
 
-        # --- Значения переменных TFS ---
         tfs_vars_collected = self._collect_tfs_variable_values()
 
-        # Проверяем: если шаблон использует переменные,
-        # для которых нет ни значения в поле, ни дефолта
-        # в шаблоне — не даём подтвердить при активной галочке.
+        # Валидация TFS-переменных.
         if tfs_template_value:
             wiql = ""
             template_defaults: Dict[str, str] = {}
@@ -2357,15 +2449,31 @@ class MetadataDialog(QDialog):
                     QMessageBox.warning(
                         self, "TFS",
                         f"В шаблоне «{tfs_template_value}» есть "
-                        f"переменные, для которых не заданы "
-                        f"ни значения, ни дефолты:\n\n  • "
-                        + "\n  • ".join(missing)
-                        + "\n\nЗаполните их, укажите дефолты "
-                        "(окно «Задачи TFS» → «Сохранить "
-                        "шаблон…») или снимите галочку "
-                        "«Сохранять выборку в вложения записи».",
+                        f"переменные без значений и без дефолтов:"
+                        f"\n\n  • " + "\n  • ".join(missing),
                     )
                     return
+
+        # --- Валидация документов ---
+        document_only = False
+        documents_collected: List[str] = []
+
+        if self._allow_document_only:
+            # Если создаём запись-документ, требуется хотя бы
+            # один документ ИЛИ вложение (на вкладке «Вложения»).
+            documents_collected = list(self._documents)
+
+            # Проверим, что все файлы существуют.
+            for p in documents_collected:
+                if not os.path.isfile(p):
+                    QMessageBox.warning(
+                        self, "Документы",
+                        f"Файл не найден:\n{p}\n\n"
+                        f"Уберите его из списка документов.",
+                    )
+                    return
+
+            document_only = bool(documents_collected)
 
         result: Dict[str, Any] = {
             "project": project,
@@ -2414,21 +2522,48 @@ class MetadataDialog(QDialog):
             "tfs_project": tfs_project_value,
             "tfs_template_name": tfs_template_value,
             "tfs_save_attachment": tfs_save_value,
-            # --- НОВОЕ: значения переменных ---
             "tfs_variables": dict(tfs_vars_collected),
+            # --- НОВОЕ: документы ---
+            "documents": documents_collected,
+            "document_only": document_only,
         }
+
+        # --- Опции обработки документов ---
+        if self._allow_document_only and document_only:
+            result["document_generate_summary"] = bool(
+                self.doc_generate_summary_check.isChecked()
+            )
+            result["document_generate_deepseek"] = bool(
+                self.doc_generate_deepseek_check.isChecked()
+            )
+            result["document_save_transcript"] = bool(
+                self.doc_include_text_as_transcript_check.isChecked()
+            )
+            result["document_to_deepseek"] = bool(
+                self.doc_send_to_deepseek_check.isChecked()
+            )
+
+            # Синхронизируем основные флаги с doc-опциями.
+            result["generate_summary"] = bool(
+                self.doc_generate_summary_check.isChecked()
+            )
+            result["generate_deepseek_prompt"] = bool(
+                self.doc_generate_deepseek_check.isChecked()
+            )
+            result["send_attachments_to_deepseek"] = bool(
+                self.doc_send_to_deepseek_check.isChecked()
+            )
+
         if "new_prompt" in self.result_data:
             result["new_prompt"] = self.result_data["new_prompt"]
 
         self.result_data = result
+
         log.info(
             "Метаданные подтверждены: project=%s, name=%s, "
-            "tfs_project=%r, tfs_template=%r, tfs_vars=%s, "
-            "tfs_save=%s",
-            project, final_name,
-            tfs_project_value, tfs_template_value,
-            list(tfs_vars_collected.keys()),
-            tfs_save_value,
+            "document_only=%s, documents=%d",
+            project, final_name, document_only,
+            len(documents_collected),
         )
         self.accept()
 

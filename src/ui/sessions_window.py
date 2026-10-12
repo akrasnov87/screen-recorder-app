@@ -223,12 +223,38 @@ class SessionsScanThread(QThread):
             meta_path = os.path.join(session_dir, "session.json")
             meta = read_json_file(meta_path) or {}
 
+            # --- Документная запись: без видео/аудио ---
+            document_only = bool(
+                meta.get("document_only", False)
+            ) or (meta.get("source") == "document")
+
             video_path = self._find_first_video(session_dir)
             has_video = bool(video_path)
             transcript_path = os.path.join(session_dir, "video.txt")
             has_transcript = os.path.exists(transcript_path)
             audio_path = self._find_first_audio(session_dir)
             has_audio = bool(audio_path)
+
+            # Считаем количество документов.
+            documents_count = 0
+            if document_only:
+                att_dir = os.path.join(
+                    session_dir, "attachments"
+                )
+                if os.path.isdir(att_dir):
+                    try:
+                        documents_count = sum(
+                            1 for n in os.listdir(att_dir)
+                            if os.path.isfile(
+                                os.path.join(att_dir, n)
+                            )
+                        )
+                    except OSError:
+                        documents_count = 0
+                elif isinstance(
+                    meta.get("documents"), list
+                ):
+                    documents_count = len(meta["documents"])
 
             task = (
                 tasks_index.get(os.path.abspath(video_path))
@@ -367,6 +393,8 @@ class SessionsScanThread(QThread):
                 "tags": tags,
                 "published": published,
                 "record_id": record_id,
+                "document_only": document_only,
+                "documents_count": documents_count,
                 # --- Флаг готовности к синхронизации ---
                 "sync_ready": sync_ready,
             })
@@ -3564,6 +3592,10 @@ class SessionsWindow(QDialog):
             return
 
         parts = [f"<b>{r['name']}</b>"]
+
+        # --- НОВОЕ: запись-документ ---
+        document_only = bool(r.get("document_only"))
+
         if r.get("project"):
             parts.append(f"проект: {r['project']}")
         if r.get("tags"):
@@ -3571,6 +3603,14 @@ class SessionsWindow(QDialog):
                 f"теги: {', '.join(r['tags'])}"
             )
         parts.append(f"статус: {r['status']}")
+
+        if document_only:
+            docs_n = int(r.get("documents_count") or 0)
+            parts.append(
+                f"<span style='color:#6A1B9A'>"
+                f"документ ({docs_n} шт.)</span>"
+            )
+
         if r.get("sync_ready"):
             parts.append("<span style='color:#2E7D32'>готово к синхр.</span>")
         if r.get("manual_protocol_path"):
@@ -3590,6 +3630,7 @@ class SessionsWindow(QDialog):
             parts.append(
                 f"на сервере: {r.get('record_id', '')[:8]}"
             )
+
         self.selection_label.setText(" | ".join(parts))
 
         self.sync_btn.setEnabled(bool(r.get("dir")))
@@ -3600,22 +3641,50 @@ class SessionsWindow(QDialog):
         else:
             self.sync_ready_btn.setText("Готово к синхронизации")
 
-        has_local_video = bool(r.get("has_video"))
-        has_local_audio = bool(r.get("has_audio"))
-        is_published = bool(r.get("published"))
+        # --- Запись-документ: видео/аудио недоступны ---
+        if document_only:
+            self.play_video_btn.setEnabled(False)
+            self.play_audio_btn.setEnabled(False)
+            self.play_video_btn.setToolTip(
+                "Это запись-документ — видео у неё нет.\n\n"
+                "Откройте папку записи, чтобы посмотреть "
+                "прикреплённые документы."
+            )
+            self.play_audio_btn.setToolTip(
+                "Это запись-документ — аудио у неё нет.\n\n"
+                "Откройте папку записи, чтобы посмотреть "
+                "прикреплённые документы."
+            )
+        else:
+            has_local_video = bool(r.get("has_video"))
+            has_local_audio = bool(r.get("has_audio"))
+            is_published = bool(r.get("published"))
+
+            self.play_video_btn.setEnabled(
+                has_local_video or is_published
+            )
+            self.play_audio_btn.setEnabled(
+                has_local_audio or is_published
+            )
+            # Возвращаем стандартные подсказки.
+            self.play_video_btn.setToolTip(
+                "Открыть видео во встроенном плеере.\n\n"
+                "Если файла нет локально, но он есть на сервере — "
+                "будет предложено скачать его."
+            )
+            self.play_audio_btn.setToolTip(
+                "Открыть аудио во встроенном плеере.\n\n"
+                "Если файла нет локально, но он есть на сервере — "
+                "будет предложено скачать его."
+            )
 
         if hasattr(self, "public_link_btn"):
-            self.public_link_btn.setEnabled(is_published)
+            self.public_link_btn.setEnabled(bool(r.get("published")))
         if hasattr(self, "copy_public_link_btn"):
-            self.copy_public_link_btn.setEnabled(is_published)
+            self.copy_public_link_btn.setEnabled(bool(r.get("published")))
 
-        self.play_video_btn.setEnabled(
-            has_local_video or is_published
-        )
-        self.play_audio_btn.setEnabled(
-            has_local_audio or is_published
-        )
-
+        # «Стенограмма» доступна, если есть video.txt (у документов
+        # он тоже создаётся, если включена опция сохранения).
         self.open_transcript_btn.setEnabled(
             bool(r.get("has_transcript"))
         )
@@ -3767,9 +3836,20 @@ class SessionsWindow(QDialog):
                 "record": "Запись",
                 "upload": "Загрузка",
                 "import": "Импорт",
+                "document": "Документ",
             }
             src = src_map.get(r["source"], r["source"] or "—")
-            self.table.setItem(row, 5, QTableWidgetItem(src))
+            src_item = QTableWidgetItem(src)
+
+            # Подсветка записей-документов.
+            if r.get("document_only"):
+                src_item.setForeground(QColor("#6A1B9A"))
+                docs_n = int(r.get("documents_count") or 0)
+                src_item.setToolTip(
+                    f"Запись создана из документов.\n\n"
+                    f"Документов в attachments/: {docs_n}"
+                )
+            self.table.setItem(row, 5, src_item)
             self.table.setItem(
                 row, 6,
                 QTableWidgetItem("да" if r["is_scrum"] else "—"),
@@ -4109,6 +4189,16 @@ class SessionsWindow(QDialog):
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        # --- Запись-документ: нет видео/аудио ---
+        if r.get("document_only"):
+            QMessageBox.information(
+                self, "Записи",
+                "Это запись-документ — видео и аудио у неё нет.\n\n"
+                "Используйте «Открыть папку записи», чтобы "
+                "посмотреть прикреплённые документы.",
+            )
             return
 
         local_path = ""
@@ -5995,20 +6085,99 @@ class SessionsWindow(QDialog):
                         "Не удалось удалить %s: %s", p, exc
                     )
 
+    def _remove_document_artifacts(self, session_dir: str) -> None:
+        """
+        Удаляет артефакты, которые формируются из документов.
+
+        Для записи-документа нет video.mp3, video.aac и т.п. —
+        удаляем только то, что реально создаётся:
+          • video.txt                — «стенограмма» из документов;
+          • video_summary.md         — summary (если было);
+          • deepseek_prompt.*        — промпт DeepSeek;
+          • action_items*.json/txt   — поручения и их промпт;
+          • action_items_prompt.*;
+          • action_items_request.txt;
+          • action_items_response_raw.txt.
+        """
+        patterns = [
+            "video.txt",
+            "video_summary.md",
+            "summary.md",
+            "deepseek_prompt.docx",
+            "deepseek_prompt.md",
+            "deepseek_prompt.txt",
+            "action_items.json",
+            "action_items_prompt.docx",
+            "action_items_prompt.md",
+            "action_items_prompt.txt",
+            "action_items_request.txt",
+            "action_items_response_raw.txt",
+        ]
+        for fname in patterns:
+            p = os.path.join(session_dir, fname)
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                    log.info(
+                        "Удалён документный артефакт: %s", p
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Не удалось удалить %s: %s", p, exc
+                    )
+
     def _enqueue_session(self, r: Dict[str, Any]) -> Optional[str]:
-        if not os.path.exists(r["video_path"]):
-            log.error("Видео не найдено: %s", r["video_path"])
-            return None
+        """
+        Ставит запись в очередь.
+
+        Для обычной записи — с путём к видео.
+        Для записи-документа — video_path пустой, флаг
+        document_only=True идёт в метаданных.
+        """
+        document_only = bool(r.get("document_only"))
+
+        if not document_only:
+            # Обычная запись — нужен видеофайл.
+            if not os.path.exists(r["video_path"]):
+                log.error(
+                    "Видео не найдено: %s", r["video_path"]
+                )
+                return None
+        else:
+            # Запись-документ — нужен хотя бы один файл.
+            documents = (
+                list(r.get("attachments") or [])
+                or list(r.get("documents") or [])
+            )
+            existing = [p for p in documents if os.path.isfile(p)]
+            if not existing:
+                log.error(
+                    "У записи-документа нет доступных файлов: %s",
+                    r["dir"],
+                )
+                return None
+
         meta = read_json_file(
             os.path.join(r["dir"], "session.json")
         ) or {}
-        meta["video_path"] = r["video_path"]
+
         meta["session_dir"] = r["dir"]
+        if document_only:
+            meta["video_path"] = ""
+            meta["document_only"] = True
+            meta.setdefault("documents", list(
+                meta.get("attachments") or []
+            ))
+        else:
+            meta["video_path"] = r["video_path"]
+
         meta.pop("task_id", None)
+
         try:
-            task_id = self.task_queue.add_task(
-                {"video_path": r["video_path"], "metadata": meta}
-            )
+            task_id = self.task_queue.add_task({
+                "video_path": r.get("video_path") or "",
+                "metadata": meta,
+            })
             # Сохраняем task_id в session.json.
             if task_id:
                 meta["task_id"] = task_id
@@ -6029,20 +6198,50 @@ class SessionsWindow(QDialog):
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
-        if not r["video_path"] or not os.path.exists(r["video_path"]):
-            QMessageBox.warning(
-                self, "Записи",
-                f"Видео не найдено:\n{r['video_path']}",
+
+        document_only = bool(r.get("document_only"))
+
+        if not document_only:
+            # Для обычных записей нужен видеофайл.
+            if not r["video_path"] or not os.path.exists(
+                r["video_path"]
+            ):
+                QMessageBox.warning(
+                    self, "Записи",
+                    f"Видео не найдено:\n"
+                    f"{r['video_path'] or '(путь не задан)'}",
+                )
+                return
+        else:
+            # Для записи-документа нужен хотя бы один документ.
+            documents = (
+                list(r.get("attachments") or [])
+                or list(r.get("documents") or [])
             )
-            return
+            existing = [p for p in documents if os.path.isfile(p)]
+            if not existing:
+                QMessageBox.warning(
+                    self, "Записи",
+                    "У записи-документа нет доступных файлов "
+                    "в attachments/.",
+                )
+                return
+
         if QMessageBox.question(
             self, "Перезапустить обработку",
             f"Запись «{r['name']}» будет обработана заново.",
         ) != QMessageBox.StandardButton.Yes:
             return
+
         if r["task_id"]:
             self._remove_from_queue(r["task_id"])
-        self._remove_processed_artifacts(r["dir"])
+
+        if document_only:
+            # Удаляем только «документные» артефакты.
+            self._remove_document_artifacts(r["dir"])
+        else:
+            self._remove_processed_artifacts(r["dir"])
+
         task_id = self._enqueue_session(r)
         if task_id:
             QMessageBox.information(
@@ -6062,15 +6261,33 @@ class SessionsWindow(QDialog):
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
 
-        if not r["video_path"] or not os.path.exists(
-            r["video_path"]
-        ):
-            QMessageBox.warning(
-                self, "Записи",
-                f"Видео не найдено:\n"
-                f"{r['video_path'] or '(путь не задан)'}",
+        document_only = bool(r.get("document_only"))
+
+        # --- Проверка исходных данных ---
+        if not document_only:
+            if not r["video_path"] or not os.path.exists(
+                r["video_path"]
+            ):
+                QMessageBox.warning(
+                    self, "Записи",
+                    f"Видео не найдено:\n"
+                    f"{r['video_path'] or '(путь не задан)'}",
+                )
+                return
+        else:
+            documents = (
+                list(r.get("attachments") or [])
+                or list(r.get("documents") or [])
             )
-            return
+            existing = [p for p in documents if os.path.isfile(p)]
+            if not existing:
+                QMessageBox.warning(
+                    self, "Записи",
+                    "У записи-документа нет доступных файлов "
+                    "в attachments/.\n\n"
+                    "Проверьте папку записи.",
+                )
+                return
 
         if self.config_manager is None:
             QMessageBox.warning(
@@ -6092,6 +6309,7 @@ class SessionsWindow(QDialog):
         if project and project not in projects:
             projects = [project] + projects
 
+        # --- Открываем диалог метаданных ---
         dlg = MetadataDialog(
             projects=projects,
             prompts=prompts,
@@ -6107,6 +6325,8 @@ class SessionsWindow(QDialog):
             tags=tags,
             on_save_tag=self._on_save_tag_to_config,
             get_tags=self.config_manager.get_tags,
+            # Для записей-документов показываем вкладку «Документ».
+            allow_document_only=document_only,
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -6117,24 +6337,37 @@ class SessionsWindow(QDialog):
         old_sync_ready = bool(meta.get("sync_ready", False))
         new_sync_ready = bool(new_meta.get("sync_ready", False))
 
-        # ВАЖНО: date/time НЕ сохраняем принудительно —
-        # пользователь мог изменить их в диалоге метаданных.
-        # Сохраняем только те поля, которые не редактируются
-        # в MetadataDialog.
+        # --- Служебные поля, которые не редактируются в диалоге ---
         for keep_key in (
             "monitor",
             "summary_bb",
             "manual_protocol_path",
             "source", "source_files",
-            "video_path", "session_dir",
+            "session_dir",
         ):
             if keep_key not in new_meta and keep_key in meta:
                 new_meta[keep_key] = meta[keep_key]
 
-        new_meta.setdefault("video_path", r["video_path"])
-        new_meta.setdefault("session_dir", r["dir"])
+        new_meta["session_dir"] = r["dir"]
         new_meta.pop("task_id", None)
 
+        if document_only:
+            new_meta["video_path"] = ""
+            new_meta["document_only"] = True
+            # Сохраняем актуальный список документов, если
+            # пользователь их не менял в диалоге.
+            if not new_meta.get("documents"):
+                new_meta["documents"] = list(
+                    meta.get("documents") or []
+                )
+            if not new_meta.get("attachments"):
+                new_meta["attachments"] = list(
+                    meta.get("attachments") or []
+                )
+        else:
+            new_meta.setdefault("video_path", r["video_path"])
+
+        # --- Подтверждение ---
         reply = QMessageBox.question(
             self,
             "Перезапустить обработку",
@@ -6154,7 +6387,58 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # --- Проверяем, есть ли уже стенограмма ---
+        # ------------------------------------------------------------------
+        # Для записей-документов — свой путь:
+        #  - не спрашиваем про стенограмму (она пересобирается
+        #    автоматически из документов);
+        #  - удаляем только документные артефакты.
+        # ------------------------------------------------------------------
+        if document_only:
+            if r["task_id"]:
+                self._remove_from_queue(r["task_id"])
+
+            self._remove_document_artifacts(r["dir"])
+
+            # Обновляем объект r в памяти (для _enqueue_session).
+            r["document_only"] = True
+            r["attachments"] = list(
+                new_meta.get("attachments") or []
+            )
+            r["documents"] = list(
+                new_meta.get("documents") or []
+            )
+            r["video_path"] = ""
+
+            task_id = self._enqueue_session(r)
+            if not task_id:
+                QMessageBox.critical(
+                    self, "Записи",
+                    "Метаданные сохранены, но не удалось поставить "
+                    "запись в очередь.",
+                )
+                return
+
+            QMessageBox.information(
+                self, "Записи",
+                f"Запись поставлена в очередь на обработку: "
+                f"{task_id}",
+            )
+            self.refresh()
+
+            # Авто-публикация, если флаг только что установлен.
+            if not old_sync_ready and new_sync_ready:
+                for row in self._rows:
+                    if row["dir"] == r["dir"]:
+                        row["sync_ready"] = True
+                        self._maybe_publish_after_sync_ready(
+                            row, was_ready=old_sync_ready,
+                        )
+                        break
+            return
+
+        # ------------------------------------------------------------------
+        # Обычная запись — прежняя логика со стенограммой.
+        # ------------------------------------------------------------------
         transcript_path = os.path.join(r["dir"], "video.txt")
         has_transcript = os.path.isfile(transcript_path)
         transcript_size = 0
@@ -6224,6 +6508,7 @@ class SessionsWindow(QDialog):
         task_id = self._enqueue_session({
             "video_path": r["video_path"],
             "dir": r["dir"],
+            "document_only": False,
         })
         if not task_id:
             QMessageBox.critical(

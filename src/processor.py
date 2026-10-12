@@ -1173,6 +1173,471 @@ class VideoProcessor(QObject):
         finally:
             self._cancel_events.pop(task_id, None)
 
+    async def process_document_record(
+        self,
+        video_path: str,
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Обрабатывает запись-документ (без видео).
+
+        Отличия от process_video:
+          • Не конвертирует видео, не вызывает сервис
+            транскрибации.
+          • Берёт текст из attachments/ (уже скопированных
+            туда при создании записи) и склеивает в один
+            документ.
+          • Опционально сохраняет этот текст как video.txt
+            (чтобы дальше работали существующие читатели).
+          • Формирует summary (через LiteLLM) и DeepSeek-промпт.
+          • Опционально выполняет TFS-выборку (по флагам записи).
+
+        Args:
+            video_path: пустая строка (оставлено для совместимости
+                        с сигнатурой process_video).
+            metadata:   метаданные записи (session.json).
+
+        Returns:
+            Результат — как у process_video, но без audio/transcript
+            от сервера транскрибации.
+        """
+        task_id = metadata.get("task_id", "")
+        session_dir = str(
+            metadata.get("session_dir") or ""
+        ).strip()
+
+        if not session_dir or not os.path.isdir(session_dir):
+            err = (
+                f"process_document_record: папка сессии не найдена: "
+                f"{session_dir or '(пусто)'}"
+            )
+            log.error(err)
+            if task_id:
+                self.task_queue.mark_failed(task_id, err)
+                self.task_failed.emit(task_id, err)
+            return {"error": err, "task_id": task_id}
+
+        log.info("=" * 60)
+        log.info(
+            "Начало обработки задачи-документа %s", task_id
+        )
+        log.info("Папка сессии: %s", session_dir)
+        log.info(
+            "Метаданные: project=%s, name=%s, "
+            "generate_summary=%s, generate_deepseek=%s",
+            metadata.get("project"), metadata.get("name"),
+            metadata.get("generate_summary"),
+            metadata.get("generate_deepseek_prompt"),
+        )
+
+        t0 = time.monotonic()
+
+        try:
+            self.task_started.emit(task_id)
+
+            # --- 1. Собираем документы ---
+            documents = list(metadata.get("documents") or [])
+            if not documents:
+                documents = list(
+                    metadata.get("attachments") or []
+                )
+
+            existing = [
+                p for p in documents if os.path.isfile(p)
+            ]
+            if not existing:
+                err = (
+                    "Нет ни одного доступного документа для "
+                    "обработки"
+                )
+                log.warning("[%s] %s", task_id, err)
+                self.task_queue.mark_failed(task_id, err)
+                self.task_failed.emit(task_id, err)
+                return {"error": err, "task_id": task_id}
+
+            log.info(
+                "[%s] Документов к обработке: %d",
+                task_id, len(existing),
+            )
+
+            self.task_progress.emit(
+                task_id, 20, "Чтение документов…"
+            )
+
+            # --- 2. Извлекаем текст ---
+            blocks: List[str] = []
+            for p in existing:
+                text = read_any_text(
+                    p, self._max_file_read_chars
+                )
+                if text and text.strip():
+                    blocks.append(
+                        f"### {os.path.basename(p)}\n\n"
+                        f"{text.strip()}"
+                    )
+                else:
+                    log.warning(
+                        "[%s] Документ пустой или нечитаемый: %s",
+                        task_id, p,
+                    )
+
+            if not blocks:
+                err = (
+                    "Не удалось извлечь текст ни из одного "
+                    "документа"
+                )
+                log.warning("[%s] %s", task_id, err)
+                self.task_queue.mark_failed(task_id, err)
+                self.task_failed.emit(task_id, err)
+                return {"error": err, "task_id": task_id}
+
+            combined_text = "\n\n---\n\n".join(blocks)
+
+            # --- 3. Сохраняем как «стенограмму» (video.txt) ---
+            transcript_path = os.path.join(
+                session_dir, "video.txt"
+            )
+            save_transcript = bool(
+                metadata.get("document_save_transcript", True)
+            )
+            if save_transcript:
+                try:
+                    await asyncio.to_thread(
+                        self._write_file,
+                        transcript_path,
+                        combined_text,
+                    )
+                    log.info(
+                        "[%s] Извлечённый текст сохранён как "
+                        "video.txt (%d символов)",
+                        task_id, len(combined_text),
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[%s] Не удалось сохранить video.txt: %s",
+                        task_id, exc,
+                    )
+
+            self.task_progress.emit(
+                task_id, 40, "Формирование summary…"
+            )
+
+            # --- 4. Summary через LiteLLM ---
+            sum_cfg = self.config.get("summarizer", {}) or {}
+            provider = str(
+                sum_cfg.get("provider", "server")
+            ).strip().lower()
+            if provider not in ("server", "litellm"):
+                provider = "server"
+
+            generate_summary = bool(
+                metadata.get("generate_summary", False)
+            )
+
+            summary_path = ""
+            summary_text = ""
+
+            if generate_summary and provider == "litellm":
+                prompt = (
+                    metadata.get("prompt")
+                    or self.config.get("metadata", {}).get(
+                        "default_prompt", ""
+                    )
+                )
+                ctx_header = self._build_context_header(
+                    metadata=metadata,
+                    include_name=bool(
+                        metadata.get("include_name_in_prompt")
+                    ),
+                    include_project=bool(
+                        metadata.get("include_project_in_prompt")
+                    ),
+                    include_comment=bool(
+                        metadata.get("include_comment_in_prompt")
+                    ),
+                )
+                if ctx_header:
+                    prompt = ctx_header + "\n\n" + prompt
+
+                # Глоссарий.
+                gl = self.config.get("glossary", {}) or {}
+                gl_terms = gl.get("terms", []) or []
+                gl_text = self._build_glossary_text(gl_terms)
+                gl_to_summarizer = bool(
+                    gl.get("send_to_summarizer", True)
+                )
+                if gl_to_summarizer and gl_text:
+                    prompt = (
+                        prompt
+                        + "\n\n===== ГЛОССАРИЙ =====\n\n"
+                        + gl_text
+                    )
+
+                self.task_queue.update_task_status(
+                    task_id, "summarizing", 60
+                )
+                self.task_progress.emit(
+                    task_id, 60, "summarizing"
+                )
+
+                try:
+                    summary_text = (
+                        await self._summarize_with_litellm(
+                            task_id=task_id,
+                            script=combined_text,
+                            user_prompt=prompt,
+                            video_title=str(
+                                metadata.get("name") or ""
+                            ),
+                        )
+                    )
+                    if summary_text:
+                        summary_path = os.path.join(
+                            session_dir, "video_summary.md"
+                        )
+                        await asyncio.to_thread(
+                            self._write_file,
+                            summary_path,
+                            summary_text,
+                        )
+                        log.info(
+                            "[%s] Summary сохранён: %s",
+                            task_id, summary_path,
+                        )
+                except LiteLLMError as exc:
+                    log.error(
+                        "[%s] Ошибка LiteLLM при создании summary: %s",
+                        task_id, exc,
+                    )
+            elif generate_summary:
+                log.info(
+                    "[%s] Провайдер суммаризации = server, но "
+                    "для записи-документа сервер транскрибации "
+                    "не вызывается — summary не будет сформирован. "
+                    "Используйте LiteLLM.",
+                    task_id,
+                )
+
+            self._raise_if_cancelled(task_id, asyncio.Event())
+
+            # --- 5. DeepSeek-промпт ---
+            self.task_progress.emit(
+                task_id, 75, "Формирование DeepSeek-промпта…"
+            )
+
+            generate_deepseek = bool(
+                metadata.get("generate_deepseek_prompt", True)
+            )
+            if generate_deepseek and transcript_path and os.path.isfile(
+                transcript_path
+            ):
+                try:
+                    manual_protocol_text = ""
+                    manual_protocol_path = str(
+                        metadata.get("manual_protocol_path") or ""
+                    ).strip()
+                    if manual_protocol_path and os.path.exists(
+                        manual_protocol_path
+                    ):
+                        manual_protocol_text = await asyncio.to_thread(
+                            read_any_text,
+                            manual_protocol_path,
+                            self._max_file_read_chars,
+                        )
+
+                    summary_for_deepseek = (
+                        summary_text.strip() if summary_text else ""
+                    )
+
+                    use_scrum = bool(
+                        metadata.get("is_scrum", False)
+                    )
+
+                    gl = self.config.get("glossary", {}) or {}
+                    gl_text = self._build_glossary_text(
+                        gl.get("terms", []) or []
+                    )
+                    gl_to_deepseek = bool(
+                        gl.get("send_to_deepseek", True)
+                    )
+
+                    prompt_path = await asyncio.to_thread(
+                        self._build_deepseek_prompt,
+                        session_dir,
+                        transcript_path,
+                        metadata.get("previous_protocol_path", ""),
+                        metadata.get("attachments", []) or [],
+                        bool(metadata.get(
+                            "send_attachments_to_deepseek", False
+                        )),
+                        use_scrum,
+                        str(metadata.get("prompt") or ""),
+                        gl_text if gl_to_deepseek else "",
+                        metadata,
+                        summary_for_deepseek,
+                        manual_protocol_text,
+                    )
+                    if prompt_path:
+                        log.info(
+                            "[%s] DeepSeek-промпт: %s",
+                            task_id, prompt_path,
+                        )
+                except Exception as exc:
+                    log.exception(
+                        "[%s] Не удалось собрать DeepSeek-промпт: %s",
+                        task_id, exc,
+                    )
+
+            # --- 6. TFS-выборка (если включена) ---
+            tfs_result = await self._maybe_fetch_tfs_work_items(
+                task_id=task_id,
+                session_dir=session_dir,
+                metadata=metadata,
+            )
+            if tfs_result and tfs_result.get("ok"):
+                new_files = list(tfs_result.get("files") or [])
+                if new_files:
+                    current_atts = list(
+                        metadata.get("attachments") or []
+                    )
+                    for p in new_files:
+                        if p not in current_atts:
+                            current_atts.append(p)
+                    metadata["attachments"] = current_atts
+
+                    try:
+                        session_json = os.path.join(
+                            session_dir, "session.json"
+                        )
+                        meta_saved = await asyncio.to_thread(
+                            self._read_json_safe, session_json
+                        ) or {}
+                        meta_saved["attachments"] = current_atts
+                        await asyncio.to_thread(
+                            self._write_json_safe,
+                            session_json, meta_saved,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "[%s] Не удалось сохранить обновлённый "
+                            "список вложений: %s",
+                            task_id, exc,
+                        )
+
+            # --- 7. Извлечение поручений (если включено) ---
+            scrum_cfg = self.config.get("scrum", {}) or {}
+            generate_action_items = bool(
+                scrum_cfg.get("generate_action_items", True)
+            )
+            if generate_action_items:
+                self.task_progress.emit(
+                    task_id, 92, "Извлечение поручений…"
+                )
+
+                protocol_text_for_llm = ""
+                try:
+                    protocol_text_for_llm, _ = (
+                        await asyncio.to_thread(
+                            read_protocol_text,
+                            session_dir,
+                            max_chars=self._max_file_read_chars,
+                        )
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[%s] Не удалось прочитать протокол: %s",
+                        task_id, exc,
+                    )
+
+                items = await self._extract_action_items_via_llm(
+                    task_id=task_id,
+                    session_dir=session_dir,
+                    transcript=combined_text,
+                    protocol_text=protocol_text_for_llm,
+                    session_name=str(metadata.get("name") or ""),
+                    session_date=str(metadata.get("date") or ""),
+                )
+
+                if items:
+                    try:
+                        from .tasks_manager import (
+                            load_action_items,
+                            save_action_items,
+                        )
+                        data = load_action_items(session_dir)
+                        data["session_name"] = (
+                            metadata.get("name") or ""
+                        )
+                        existing_ids = {
+                            it.get("id")
+                            for it in data.get("items", [])
+                        }
+                        added = 0
+                        for it in items:
+                            if it.get("id") not in existing_ids:
+                                data["items"].append(it)
+                                existing_ids.add(it.get("id"))
+                                added += 1
+                        save_action_items(
+                            session_dir, data,
+                            skip_normalize=True,
+                        )
+                        log.info(
+                            "[%s] Поручения сохранены: +%d "
+                            "(всего %d)",
+                            task_id, added,
+                            len(data["items"]),
+                        )
+                    except Exception as exc:
+                        log.exception(
+                            "[%s] Не удалось сохранить поручения: %s",
+                            task_id, exc,
+                        )
+
+            # --- Завершение ---
+            self.task_queue.update_task_status(
+                task_id, "completed", 100
+            )
+            self.task_progress.emit(task_id, 100, "completed")
+
+            result = {
+                "video": "",
+                "audio": "",
+                "transcript": (
+                    transcript_path
+                    if save_transcript
+                    and os.path.isfile(transcript_path)
+                    else ""
+                ),
+                "summary": summary_path,
+                "output_dir": session_dir,
+                "document_only": True,
+                "vm_session": None,
+            }
+            total = time.monotonic() - t0
+            log.info(
+                "[%s] Задача-документ завершена за %.1f с",
+                task_id, total,
+            )
+            log.info("=" * 60)
+            self.task_completed.emit(task_id, result)
+            return result
+
+        except Exception as exc:
+            total = time.monotonic() - t0
+            log.exception(
+                "[%s] Ошибка обработки документа (%.1f с): %s",
+                task_id, total, exc,
+            )
+            if task_id:
+                self.task_queue.mark_failed(task_id, str(exc))
+                self.task_failed.emit(task_id, str(exc))
+            return {"error": str(exc), "task_id": task_id}
+
+        finally:
+            if task_id:
+                self._cancel_events.pop(task_id, None)
+
     # ------------------------------------------------------------------
     # Шаги
     # ------------------------------------------------------------------
@@ -2730,10 +3195,17 @@ class VideoProcessor(QObject):
                     "Воркер взял задачу: %s", task.get("task_id")
                 )
                 try:
-                    await self.process_video(
-                        task["video_path"],
-                        task.get("metadata", {}),
-                    )
+                    meta = task.get("metadata", {}) or {}
+                    if meta.get("document_only"):
+                        await self.process_document_record(
+                            task.get("video_path", ""),
+                            meta,
+                        )
+                    else:
+                        await self.process_video(
+                            task["video_path"],
+                            meta,
+                        )
                 except Exception as exc:
                     log.exception("Ошибка в воркере: %s", exc)
                 continue
