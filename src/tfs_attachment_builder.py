@@ -15,9 +15,13 @@
   • колонки: ID, Тип, Заголовок, Статус, Исполнитель,
     Родитель, Оценка, Осталось, Выполнено, Итерация, Теги.
 
-Используется:
-  • из processor.py во время обработки скрам-записи;
-  • из sessions_window.py по кнопке «Обновить TFS-выборку».
+Изменения:
+  • Поддержка шаблонных переменных WIQL ({{Имя}}):
+      – функция принимает параметр variable_values: Dict[str, str];
+      – переменные подставляются в WIQL через
+        tfs_client.substitute_variables() перед выполнением;
+      – если переменные не заданы — возвращает ошибку с перечнем
+        недостающих переменных (без выполнения запроса).
 """
 from __future__ import annotations
 
@@ -27,7 +31,13 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .logger import get_logger
-from .tfs_client import TfsClient, TfsError
+from .tfs_client import (
+    TfsClient,
+    TfsError,
+    extract_variables,
+    substitute_variables,
+    validate_variables,
+)
 
 log = get_logger(__name__)
 
@@ -157,18 +167,24 @@ def fetch_and_save_tfs_work_items(
     templates: List[Dict[str, str]],
     fmt: str = "csv",
     max_items: int = 0,
+    variable_values: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Выполняет WIQL-шаблон и сохраняет результат в attachments/.
 
     Args:
-        session_dir:   папка сессии.
-        tfs_settings:  dict из ConfigManager.get_tfs_settings().
-        tfs_project:   имя проекта TFS (может быть пустым).
-        template_name: имя WIQL-шаблона (обязательно).
-        templates:     список шаблонов из config["tfs"]["wiql_templates"].
-        fmt:           "csv" | "md" | "both".
-        max_items:     максимум задач (0 — из tfs_settings["max_items"]).
+        session_dir:      папка сессии.
+        tfs_settings:     dict из ConfigManager.get_tfs_settings().
+        tfs_project:      имя проекта TFS (может быть пустым).
+        template_name:    имя WIQL-шаблона (обязательно).
+        templates:        список шаблонов.
+        fmt:              "csv" | "md" | "both".
+        max_items:        максимум задач (0 — из tfs_settings["max_items"]).
+        variable_values:  значения шаблонных переменных
+                          {имя: значение}. Если в шаблоне есть
+                          переменные, а значения не заданы —
+                          возвращается ошибка с перечнем
+                          недостающих.
 
     Returns:
         {
@@ -177,6 +193,7 @@ def fetch_and_save_tfs_work_items(
           "count": int,
           "kind": "flat" | "link" | "",
           "error": str,
+          "variables": [<имена переменных шаблона>],
         }
     """
     import asyncio
@@ -187,6 +204,7 @@ def fetch_and_save_tfs_work_items(
         "count": 0,
         "kind": "",
         "error": "",
+        "variables": [],
     }
 
     if not session_dir or not os.path.isdir(session_dir):
@@ -205,6 +223,28 @@ def fetch_and_save_tfs_work_items(
             f"WIQL-шаблон {template_name!r} не найден в настройках"
         )
         return result
+
+    # --- Работа с переменными ---
+    required_vars = extract_variables(wiql)
+    result["variables"] = required_vars
+
+    var_values = dict(variable_values or {})
+
+    if required_vars:
+        ok, missing = validate_variables(wiql, var_values)
+        if not ok:
+            result["error"] = (
+                f"В шаблоне {template_name!r} есть переменные, "
+                f"для которых не заданы значения: "
+                f"{', '.join(missing)}"
+            )
+            return result
+
+        wiql = substitute_variables(wiql, var_values)
+        log.info(
+            "TFS-выборка: в WIQL подставлены переменные %s",
+            ", ".join(required_vars),
+        )
 
     if max_items <= 0:
         max_items = int(tfs_settings.get("max_items", 200))
@@ -288,8 +328,9 @@ def fetch_and_save_tfs_work_items(
 
     log.info(
         "TFS-выборка сохранена: kind=%s, задач=%d, файлов=%d "
-        "(project=%r, template=%r)",
+        "(project=%r, template=%r, переменных=%d)",
         result["kind"], result["count"], len(saved),
         tfs_project or "—", template_name,
+        len(required_vars),
     )
     return result

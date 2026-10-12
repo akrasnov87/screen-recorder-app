@@ -1583,6 +1583,11 @@ class VideoProcessor(QObject):
         Если запись — скрам-митинг и указан TFS-шаблон —
         выполняет WIQL-запрос и сохраняет выборку в attachments/.
 
+        Поддерживаются шаблонные переменные WIQL: значения
+        берутся из metadata["tfs_variables"]. Если какая-то
+        переменная не задана — шаг пропускается с предупреждением
+        в лог (обработка записи продолжается).
+
         Возвращает dict результата или None, если шаг не нужен.
         """
         # --- Проверяем необходимость ---
@@ -1634,6 +1639,14 @@ class VideoProcessor(QObject):
             tfs_settings.get("wiql_templates") or []
         )
 
+        # --- Значения переменных ---
+        raw_vars = metadata.get("tfs_variables") or {}
+        if not isinstance(raw_vars, dict):
+            raw_vars = {}
+        tfs_variable_values = {
+            str(k): str(v) for k, v in raw_vars.items()
+        }
+
         # --- Формат и лимит ---
         app_cfg = self.config.get("app", {}) or {}
         fmt = str(
@@ -1649,9 +1662,10 @@ class VideoProcessor(QObject):
 
         log.info(
             "[%s] TFS-выборка: project=%r, template=%r, "
-            "fmt=%s, max_items=%d",
+            "fmt=%s, max_items=%d, variables=%s",
             task_id, tfs_project or "—", tfs_template,
             fmt, max_items,
+            list(tfs_variable_values.keys()) or "—",
         )
 
         try:
@@ -1664,6 +1678,7 @@ class VideoProcessor(QObject):
                 templates=templates,
                 fmt=fmt,
                 max_items=max_items,
+                variable_values=tfs_variable_values,
             )
         except Exception as exc:
             log.exception(

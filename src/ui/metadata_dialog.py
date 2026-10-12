@@ -2,21 +2,19 @@
 
 Изменения:
   • Интерфейс переделан на вкладки: «Основное», «Промпт»,
-    «Скрам и DeepSeek», «Вложения».
+    «Скрам и DeepSeek», «TFS», «Вложения».
+  • Блок «TFS-выборка» вынесен из вкладки «Скрам и DeepSeek»
+    в отдельную вкладку «TFS».
+  • На вкладке «TFS» добавлена поддержка шаблонных переменных
+    WIQL: если выбранный шаблон содержит {{Переменные}}, под
+    формой выбора появляются поля для их значений.
+    Значения сохраняются в метаданных записи и используются
+    при обработке без повторного запроса.
   • Добавлен блок «Теги» (на вкладке «Основное»).
   • Вкладка «Промпт» содержит библиотеку промптов и контекст
     записи в промпте.
-  • Чекбоксы контекста записи («Название», «Проект»,
-    «Комментарий», «Теги») включены по умолчанию.
-  • Если в initial нет prompt_name, но prompt/default_prompt
-    совпадает с одним из промптов библиотеки — этот промпт
-    автоматически выбирается в комбобоксе.
   • Добавлен блок «Синхронизация» на вкладке «Основное»:
     чекбокс «Готово к синхронизации с сервером» (sync_ready).
-    Пока галочка не стоит — запись считается черновиком:
-    автопубликация не запускается, фоновый pull не
-    перезаписывает локальные файлы, prune не удаляет
-    локальные артефакты.
 """
 from __future__ import annotations
 
@@ -29,12 +27,14 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
-    QPushButton, QTabWidget, QVBoxLayout, QWidget,
+    QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..logger import get_logger
+from ..tfs_client import extract_variables
 from .tooltips import attach_tooltip, make_info_icon, with_info
 
 log = get_logger(__name__)
@@ -80,10 +80,11 @@ def format_name_template(
 
 class MetadataDialog(QDialog):
     """
-    Окно ввода метаданных. Переделано на вкладки:
+    Окно ввода метаданных. Вкладки:
       • Основное
       • Промпт
       • Скрам и DeepSeek
+      • TFS
       • Вложения
 
     Возвращает self.result_data — тот же формат словаря,
@@ -115,7 +116,7 @@ class MetadataDialog(QDialog):
         get_tags: Optional[
             Callable[[], List[Dict[str, str]]]
         ] = None,
-        # --- НОВОЕ: TFS ---
+        # --- TFS ---
         tfs_settings: Optional[Dict[str, Any]] = None,
         tfs_templates: Optional[List[Dict[str, str]]] = None,
         on_request_tfs_projects: Optional[Callable[[], List[str]]] = None,
@@ -147,7 +148,7 @@ class MetadataDialog(QDialog):
         self._get_tags_cb = get_tags
         self._selected_tags: List[str] = []
 
-        # --- НОВОЕ: TFS (инициализация ДО _build_ui!) ---
+        # --- TFS ---
         self._tfs_settings: Dict[str, Any] = dict(tfs_settings or {})
         self._tfs_templates: List[Dict[str, str]] = list(
             tfs_templates or []
@@ -156,6 +157,15 @@ class MetadataDialog(QDialog):
         self._default_tfs_save_attachment = bool(
             default_tfs_save_attachment
         )
+
+        # --- Значения переменных TFS (последнее известное) ---
+        # Заполняется в _apply_initial из init["tfs_variables"].
+        # Обновляется в _on_tfs_template_changed / _on_accept.
+        self._tfs_variable_values: Dict[str, str] = {}
+
+        # Динамические поля ввода переменных (QLineEdit) —
+        # создаются/пересоздаются в _rebuild_tfs_variables_inputs().
+        self._tfs_variable_inputs: Dict[str, QLineEdit] = {}
 
         self.result_data: Dict[str, Any] = {}
         self._prompt_edited = False
@@ -190,6 +200,7 @@ class MetadataDialog(QDialog):
         self.tabs.addTab(
             self._build_scrum_tab(), "Скрам и DeepSeek"
         )
+        self.tabs.addTab(self._build_tfs_tab(), "TFS")
         self.tabs.addTab(
             self._build_attachments_tab(), "Вложения"
         )
@@ -229,7 +240,6 @@ class MetadataDialog(QDialog):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        # --- Проект ---
         self.project_combo = QComboBox()
         self.project_combo.setEditable(True)
         self.project_combo.addItems(self._projects)
@@ -239,7 +249,6 @@ class MetadataDialog(QDialog):
             with_info(self.project_combo, "meta_project"),
         )
 
-        # --- Название + шаблон ---
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText(
             "Например: Совещание по проекту X"
@@ -269,7 +278,6 @@ class MetadataDialog(QDialog):
 
         form.addRow("Название:", name_row)
 
-        # --- Превью итогового имени + кнопка сохранения шаблона ---
         self.name_preview_label = QLabel("")
         self.name_preview_label.setStyleSheet(
             "QLabel { color: #666; font-style: italic; }"
@@ -292,7 +300,6 @@ class MetadataDialog(QDialog):
         name_hint_row.addWidget(self.save_name_tpl_btn, 0)
         form.addRow("", self._wrap(name_hint_row))
 
-        # --- Комментарий ---
         self.comment_input = QPlainTextEdit()
         self.comment_input.setPlaceholderText(
             "Свободный комментарий…"
@@ -303,7 +310,6 @@ class MetadataDialog(QDialog):
             with_info(self.comment_input, "meta_comment"),
         )
 
-        # --- Дата и время записи ---
         from PySide6.QtCore import QDate, QTime
         from PySide6.QtWidgets import QDateEdit, QTimeEdit
 
@@ -352,10 +358,7 @@ class MetadataDialog(QDialog):
 
         layout.addLayout(form)
 
-        # --- Теги ---
         layout.addWidget(self._build_tags_section())
-
-        # --- Готовность к синхронизации ---
         layout.addWidget(self._build_sync_ready_section())
 
         layout.addStretch()
@@ -367,16 +370,8 @@ class MetadataDialog(QDialog):
         w.setLayout(layout)
         return w
 
-    # ------------------------------------------------------------------
-    # Дата и время записи
-    # ------------------------------------------------------------------
     def _on_set_now_datetime(self) -> None:
-        """
-        Устанавливает в поля даты/времени текущие значения.
-
-        Используется кнопкой «Сейчас» рядом с полями даты и
-        времени на вкладке «Основное».
-        """
+        """Устанавливает в поля даты/времени текущие значения."""
         from PySide6.QtCore import QDate, QTime
 
         if not hasattr(self, "date_edit") or not hasattr(
@@ -804,15 +799,17 @@ class MetadataDialog(QDialog):
         info = QLabel(
             "Управление генерацией итоговых документов: "
             "краткого содержания и файла-промпта для DeepSeek. "
-            "Здесь же — признак скрам-митинга, файл предыдущего "
-            "протокола и выборка задач из TFS."
+            "Здесь же — признак скрам-митинга и файл предыдущего "
+            "протокола.<br><br>"
+            "<span style='color:#666'>Настройки TFS-выборки — "
+            "на отдельной вкладке «TFS».</span>"
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
         layout.addWidget(info)
 
         # ==============================================================
-        # Блок «Транскрибация» — без изменений
+        # Блок «Транскрибация»
         # ==============================================================
         transcribe_header = QHBoxLayout()
         transcribe_header.addWidget(
@@ -851,7 +848,7 @@ class MetadataDialog(QDialog):
         layout.addSpacing(8)
 
         # ==============================================================
-        # Краткое содержание (summary) — без изменений
+        # Краткое содержание (summary)
         # ==============================================================
         summary_header = QHBoxLayout()
         summary_header.addWidget(
@@ -873,7 +870,7 @@ class MetadataDialog(QDialog):
         layout.addWidget(self.generate_summary_check)
 
         # ==============================================================
-        # Промпт для DeepSeek — без изменений
+        # Промпт для DeepSeek
         # ==============================================================
         deepseek_header = QHBoxLayout()
         deepseek_header.addWidget(
@@ -906,7 +903,7 @@ class MetadataDialog(QDialog):
         layout.addWidget(deepseek_hint)
 
         # ==============================================================
-        # Скрам-митинг — без изменений
+        # Скрам-митинг
         # ==============================================================
         scrum_header = QHBoxLayout()
         scrum_header.addWidget(QLabel("<b>Скрам-митинг</b>"))
@@ -977,25 +974,83 @@ class MetadataDialog(QDialog):
         )
         self._update_scrum_visibility(False)
 
-        # ==============================================================
-        # НОВОЕ: блок «TFS-выборка»
-        # ==============================================================
-        layout.addWidget(self._build_tfs_section())
-
         layout.addStretch()
         return w
 
     # ------------------------------------------------------------------
-    # НОВОЕ: блок TFS-выборки
+    # Вкладка «TFS»
+    # ------------------------------------------------------------------
+    def _build_tfs_tab(self) -> QWidget:
+        """
+        Отдельная вкладка «TFS» с блоком TFS-выборки и
+        полями значений шаблонных переменных.
+        """
+        # Оборачиваем в QScrollArea — при большом количестве
+        # переменных контент может не влезть.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        info_row = QHBoxLayout()
+        info = QLabel(
+            "Настройки выборки задач из <b>TFS / Azure DevOps "
+            "Server</b> для этой записи.<br><br>"
+            "Если отметить «Сохранять выборку» — во время обработки "
+            "записи будет выполнен WIQL-запрос к TFS, а результат "
+            "сохранён в <code>attachments/tfs_work_items.csv</code>. "
+            "Файл попадёт в промпт DeepSeek, если на вкладке "
+            "«Вложения» включено «Передавать вложения в промпт "
+            "DeepSeek».<br><br>"
+            "<span style='color:#666'><b>Шаблонные переменные.</b> "
+            "Если в выбранном шаблоне WIQL есть переменные вида "
+            "<code>{{Имя}}</code>, ниже появятся поля для их "
+            "значений. Значения сохранятся в метаданных записи и "
+            "будут использованы при обработке без повторного "
+            "запроса.<br><br>"
+            "Интеграция с TFS настраивается в Настройки → TFS. "
+            "Шаблоны WIQL — там же.</span>"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: #666; }")
+        info_row.addWidget(info, 1)
+
+        icon = make_info_icon("meta_tfs_tab_intro")
+        if icon is not None:
+            info_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+
+        layout.addLayout(info_row)
+
+        layout.addWidget(self._build_tfs_section())
+
+        # --- Блок переменных (создаётся динамически) ---
+        layout.addWidget(self._build_tfs_variables_section())
+
+        layout.addStretch()
+
+        scroll.setWidget(w)
+        return scroll
+
+    # ------------------------------------------------------------------
+    # Блок TFS-выборки
     # ------------------------------------------------------------------
     def _build_tfs_section(self) -> QWidget:
         """Блок выбора проекта и шаблона TFS."""
         box = QWidget()
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(0, 12, 0, 0)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        # --- Заголовок ---
         header = QHBoxLayout()
         header.addWidget(QLabel("<b>TFS-выборка</b>"))
         header.addStretch()
@@ -1004,7 +1059,6 @@ class MetadataDialog(QDialog):
             header.addWidget(icon)
         layout.addLayout(header)
 
-        # --- Подсказка ---
         hint = QLabel(
             "<span style='color:#666'>Если отметить — во время "
             "обработки записи будет выполнен WIQL-запрос к TFS, "
@@ -1016,7 +1070,6 @@ class MetadataDialog(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        # --- Чекбокс «Сохранять выборку» ---
         self.tfs_save_attachment_check = QCheckBox(
             "Сохранять выборку в вложения записи"
         )
@@ -1029,7 +1082,6 @@ class MetadataDialog(QDialog):
         )
         layout.addWidget(self.tfs_save_attachment_check)
 
-        # --- Форма выбора ---
         form = QFormLayout()
         form.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight
@@ -1129,10 +1181,8 @@ class MetadataDialog(QDialog):
             self.tfs_reload_projects_btn.setEnabled(False)
         else:
             self.tfs_status_label.setText("")
-            # Асинхронная загрузка проектов
             self._load_tfs_projects(force=False)
 
-        # --- Связь чекбокса «Сохранять» с активностью полей ---
         self.tfs_save_attachment_check.toggled.connect(
             self._on_tfs_save_toggled
         )
@@ -1142,6 +1192,118 @@ class MetadataDialog(QDialog):
 
         return box
 
+    # ------------------------------------------------------------------
+    # Блок переменных TFS
+    # ------------------------------------------------------------------
+    def _build_tfs_variables_section(self) -> QWidget:
+        """
+        Контейнер для полей ввода переменных выбранного шаблона.
+
+        Содержимое перестраивается динамически в
+        _rebuild_tfs_variables_inputs() — при смене шаблона.
+        """
+        self._tfs_variables_box = QWidget()
+        layout = QVBoxLayout(self._tfs_variables_box)
+        layout.setContentsMargins(0, 12, 0, 0)
+        layout.setSpacing(6)
+
+        # Заголовок
+        header = QHBoxLayout()
+        header.addWidget(
+            QLabel("<b>Переменные шаблона WIQL</b>")
+        )
+        header.addStretch()
+        icon = make_info_icon("meta_tfs_variables")
+        if icon is not None:
+            header.addWidget(icon)
+        layout.addLayout(header)
+
+        # Подсказка (статичная)
+        hint = QLabel(
+            "<span style='color:#666'>В выбранном шаблоне есть "
+            "шаблонные переменные. Укажите их значения — они "
+            "подставятся в запрос перед выполнением. Значения "
+            "сохранятся в метаданных записи.</span>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # Сюда будут добавляться поля ввода
+        self._tfs_variables_form = QFormLayout()
+        self._tfs_variables_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._tfs_variables_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+
+        form_container = QWidget()
+        form_container.setLayout(self._tfs_variables_form)
+        layout.addWidget(form_container)
+
+        # Пустая плашка на случай отсутствия переменных —
+        # весь блок скрыт по умолчанию.
+        self._tfs_variables_box.setVisible(False)
+
+        return self._tfs_variables_box
+
+    def _rebuild_tfs_variables_inputs(self) -> None:
+        """
+        Пересобирает поля ввода переменных под текущий шаблон.
+
+        Вызывается при смене шаблона TFS.
+        """
+        if not hasattr(self, "_tfs_variables_form"):
+            return
+
+        # Удаляем старые поля.
+        while self._tfs_variables_form.count() > 0:
+            item = self._tfs_variables_form.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._tfs_variable_inputs.clear()
+
+        # Получаем WIQL текущего шаблона.
+        template_name = self.tfs_template_combo.currentData() or ""
+        wiql = ""
+        for tpl in self._tfs_templates:
+            if (tpl.get("name") or "").strip() == template_name:
+                wiql = (tpl.get("wiql") or "").strip()
+                break
+
+        variables = extract_variables(wiql) if wiql else []
+
+        if not variables:
+            self._tfs_variables_box.setVisible(False)
+            return
+
+        self._tfs_variables_box.setVisible(True)
+
+        # Для каждой переменной — QLineEdit.
+        for name in variables:
+            line = QLineEdit()
+            line.setPlaceholderText(f"Значение для «{name}»…")
+            line.setText(self._tfs_variable_values.get(name, ""))
+            line.setToolTip(
+                f"Переменная шаблона WIQL: {name}\n\n"
+                f"Подставляется в запрос вместо "
+                f"конструкции {{{{{name}}}}}.\n\n"
+                f"Спецсимволы (одинарная кавычка) "
+                f"экранируются автоматически."
+            )
+            self._tfs_variable_inputs[name] = line
+            self._tfs_variables_form.addRow(f"{name}:", line)
+
+        log.debug(
+            "TFS-переменные шаблона %r: %s",
+            template_name, ", ".join(variables),
+        )
+
+    # ------------------------------------------------------------------
+    # Управление списком шаблонов
+    # ------------------------------------------------------------------
     def _populate_tfs_templates(self) -> None:
         """Заполняет выпадающий список шаблонов WIQL."""
         self.tfs_template_combo.blockSignals(True)
@@ -1155,19 +1317,11 @@ class MetadataDialog(QDialog):
         self.tfs_template_combo.blockSignals(False)
 
     def _load_tfs_projects(self, *, force: bool = False) -> None:
-        """
-        Загружает список проектов TFS.
-
-        Вызывается асинхронно через колбэк
-        on_request_tfs_projects, который передан из main.py.
-        Если колбэк не задан — заполняет только кэшем (или
-        «— без проекта —»).
-        """
+        """Загружает список проектов TFS."""
         self.tfs_project_combo.blockSignals(True)
 
         current = self.tfs_project_combo.currentData() or ""
 
-        # Очищаем, оставляя первый пункт.
         while self.tfs_project_combo.count() > 1:
             self.tfs_project_combo.removeItem(1)
 
@@ -1194,11 +1348,13 @@ class MetadataDialog(QDialog):
         self.tfs_project_combo.blockSignals(False)
 
     def _on_tfs_template_changed(self, index: int) -> None:
-        """Показывает превью WIQL выбранного шаблона."""
+        """Показывает превью WIQL и пересобирает поля переменных."""
         name = self.tfs_template_combo.currentData() or ""
         if not name:
             self.tfs_wiql_preview.setVisible(False)
             self.tfs_wiql_preview.setText("")
+            # Пересобираем поля (их не будет).
+            self._rebuild_tfs_variables_inputs()
             return
 
         wiql = ""
@@ -1213,6 +1369,9 @@ class MetadataDialog(QDialog):
         else:
             self.tfs_wiql_preview.setVisible(False)
 
+        # Пересобираем поля переменных под новый шаблон.
+        self._rebuild_tfs_variables_inputs()
+
     def _on_tfs_save_toggled(self, enabled: bool) -> None:
         """Включает/выключает поля выбора TFS."""
         for w in (
@@ -1221,6 +1380,10 @@ class MetadataDialog(QDialog):
             self.tfs_reload_projects_btn,
         ):
             w.setEnabled(enabled)
+
+        # Поля переменных тоже.
+        for line in self._tfs_variable_inputs.values():
+            line.setEnabled(enabled)
 
         # Если включили и есть непустой проект —
         # автоматически включаем передачу в DeepSeek.
@@ -1233,12 +1396,17 @@ class MetadataDialog(QDialog):
                     True
                 )
 
+    def _collect_tfs_variable_values(self) -> Dict[str, str]:
+        """Собирает введённые значения переменных."""
+        result: Dict[str, str] = {}
+        for name, line in self._tfs_variable_inputs.items():
+            result[name] = line.text().strip()
+        return result
+
     def _on_skip_transcription_toggled(self, enabled: bool) -> None:
-        """
-        Обновляет подсказку под чекбоксом «Выполнять
+        """Обновляет подсказку под чекбоксом «Выполнять
         транскрибацию» и при необходимости блокирует
-        зависимые элементы управления.
-        """
+        зависимые элементы управления."""
         if not hasattr(self, "skip_transcription_hint"):
             return
 
@@ -1264,8 +1432,6 @@ class MetadataDialog(QDialog):
                 "</span>"
             )
 
-        # При выключенной транскрибации зависимые элементы
-        # не имеют смысла — визуально гасим их.
         for widget_name in (
             "generate_summary_check",
             "generate_deepseek_check",
@@ -1383,9 +1549,6 @@ class MetadataDialog(QDialog):
                 self._on_tag_item_changed
             )
 
-    # ------------------------------------------------------------------
-    # Контекст в промпте
-    # ------------------------------------------------------------------
     def _on_context_enable_all(self) -> None:
         self.include_name_check.setChecked(True)
         self.include_project_check.setChecked(True)
@@ -1683,6 +1846,15 @@ class MetadataDialog(QDialog):
     def _apply_initial(self) -> None:
         init = self._initial or {}
 
+        # --- Значения переменных TFS из initial ---
+        raw_vars = init.get("tfs_variables") or {}
+        if isinstance(raw_vars, dict):
+            self._tfs_variable_values = {
+                str(k): str(v) for k, v in raw_vars.items()
+            }
+        else:
+            self._tfs_variable_values = {}
+
         project = init.get("project", "")
         if project:
             idx = self.project_combo.findText(project)
@@ -1722,7 +1894,6 @@ class MetadataDialog(QDialog):
             init.get("comment", "")
         )
 
-        # --- Дата и время записи ---
         from PySide6.QtCore import QDate, QTime
 
         date_str = str(init.get("date") or "").strip()
@@ -1771,14 +1942,10 @@ class MetadataDialog(QDialog):
         self._selected_tags = selected_tags
         self._populate_tags_list()
 
-        # --- Готовность к синхронизации ---
         self.sync_ready_check.setChecked(
             bool(init.get("sync_ready", False))
         )
 
-        # --- НОВОЕ: транскрибация ---
-        # По умолчанию True (текущее поведение — выполнять).
-        # Если в initial есть явное значение — используем его.
         if "skip_transcription" in init:
             do_transcribe = bool(init.get("skip_transcription"))
         else:
@@ -1789,7 +1956,6 @@ class MetadataDialog(QDialog):
         self.skip_transcription_check.blockSignals(False)
         self._on_skip_transcription_toggled(do_transcribe)
 
-        # --- Summary / DeepSeek ---
         self.generate_summary_check.blockSignals(True)
         self.generate_summary_check.setChecked(
             bool(init.get("generate_summary", False))
@@ -1802,9 +1968,7 @@ class MetadataDialog(QDialog):
             gen = True
         self.generate_deepseek_check.setChecked(gen)
 
-        # ------------------------------------------------------------------
-        # Промпт
-        # ------------------------------------------------------------------
+        # --- Промпт ---
         prompt_text = (
             init.get("prompt", "") or self._default_prompt
         )
@@ -1832,10 +1996,6 @@ class MetadataDialog(QDialog):
                 self.prompt_combo.blockSignals(True)
                 self.prompt_combo.setCurrentIndex(found_idx)
                 self.prompt_combo.blockSignals(False)
-                log.debug(
-                    "Промпт по умолчанию совпал с библиотечным: "
-                    "%r", self.prompt_combo.itemText(found_idx),
-                )
             else:
                 self.prompt_combo.blockSignals(True)
                 self.prompt_combo.setCurrentIndex(0)
@@ -1899,7 +2059,7 @@ class MetadataDialog(QDialog):
             bool(init.get("send_attachments_to_deepseek", False))
         )
 
-        # --- НОВОЕ: TFS-поля ---
+        # --- TFS ---
         tfs_project = str(init.get("tfs_project") or "").strip()
         if tfs_project:
             idx = self.tfs_project_combo.findData(tfs_project)
@@ -1913,6 +2073,7 @@ class MetadataDialog(QDialog):
             idx = self.tfs_template_combo.findData(tfs_template)
             if idx >= 0:
                 self.tfs_template_combo.setCurrentIndex(idx)
+            # Строим поля переменных под выбранный шаблон.
             self._on_tfs_template_changed(
                 self.tfs_template_combo.currentIndex()
             )
@@ -1928,27 +2089,10 @@ class MetadataDialog(QDialog):
 
         log.debug(
             "Начальные значения применены: project=%r, name=%r, "
-            "template=%r, abbr=%r, date=%s, time=%s, tags=%s, "
-            "sync_ready=%s, do_transcribe=%s, "
-            "generate_summary=%s, "
-            "prompt=%d символов (combo=%r), is_scrum=%s, "
-            "generate_deepseek=%s, ctx_name=%s, ctx_project=%s, "
-            "ctx_comment=%s, ctx_tags=%s, attachments=%d",
-            project, init_name, init_template, init_abbr,
-            self.date_edit.date().toString("yyyy-MM-dd"),
-            self.time_edit.time().toString("HH:mm:ss"),
-            self._selected_tags,
-            self.sync_ready_check.isChecked(),
-            do_transcribe,
-            self.generate_summary_check.isChecked(),
-            len(prompt_text),
-            self.prompt_combo.currentText(),
-            is_scrum, gen,
-            self.include_name_check.isChecked(),
-            self.include_project_check.isChecked(),
-            self.include_comment_check.isChecked(),
-            self.include_tags_check.isChecked(),
-            len(self._attachments),
+            "tfs_project=%r, tfs_template=%r, tfs_vars=%s",
+            project, init_name,
+            tfs_project, tfs_template,
+            list(self._tfs_variable_values.keys()),
         )
 
     # ------------------------------------------------------------------
@@ -1970,9 +2114,6 @@ class MetadataDialog(QDialog):
                 | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
-                log.debug(
-                    "Замена промпта отменена пользователем"
-                )
                 return
 
         self.prompt_input.blockSignals(True)
@@ -1998,16 +2139,12 @@ class MetadataDialog(QDialog):
                 self.prompt_input.setPlainText(text)
                 self.prompt_input.blockSignals(False)
                 self._prompt_edited = False
-                log.info(
-                    "Промпт сброшен к значению из библиотеки"
-                )
                 return
         if self._default_prompt:
             self.prompt_input.blockSignals(True)
             self.prompt_input.setPlainText(self._default_prompt)
             self.prompt_input.blockSignals(False)
             self._prompt_edited = False
-            log.info("Промпт сброшен к значению по умолчанию")
 
     def _refresh_prompts_list(
         self, selected_name: str = "",
@@ -2038,10 +2175,6 @@ class MetadataDialog(QDialog):
                 self.prompt_input.blockSignals(False)
                 self._prompt_edited = False
         self.prompt_combo.blockSignals(False)
-        log.debug(
-            "Список промптов обновлён: %d записей",
-            len(self._prompts),
-        )
 
     def _on_save_to_library(self) -> None:
         text = self.prompt_input.toPlainText().strip()
@@ -2058,11 +2191,6 @@ class MetadataDialog(QDialog):
         if not ok or not name.strip():
             return
         name = name.strip()
-
-        log.info(
-            "Сохранение промпта в библиотеку: name=%r, "
-            "%d символов", name, len(text),
-        )
 
         saved = False
         if self._on_save_prompt_cb is not None:
@@ -2084,10 +2212,6 @@ class MetadataDialog(QDialog):
             self.result_data["new_prompt"] = {
                 "name": name, "text": text,
             }
-            log.warning(
-                "Колбэк on_save_prompt не передан — "
-                "сохранение отложено до «Продолжить»"
-            )
 
         self._refresh_prompts_list(selected_name=name)
 
@@ -2095,7 +2219,6 @@ class MetadataDialog(QDialog):
             self, "Промпт",
             f"Промпт «{name}» сохранён в библиотеку.",
         )
-        log.info("Промпт «%s» сохранён в библиотеку", name)
 
     # ------------------------------------------------------------------
     # Кнопки
@@ -2143,18 +2266,16 @@ class MetadataDialog(QDialog):
             if name and name not in ordered_tags:
                 ordered_tags.append(name)
 
-        # --- Дата и время из полей ---
         qd = self.date_edit.date()
         qt = self.time_edit.time()
         date_out = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
         time_out = f"{qt.hour():02d}:{qt.minute():02d}:{qt.second():02d}"
 
-        # --- НОВОЕ: транскрибация ---
         do_transcribe = bool(
             self.skip_transcription_check.isChecked()
         )
 
-        # --- НОВОЕ: TFS ---
+        # --- TFS ---
         tfs_project_value = (
             self.tfs_project_combo.currentData() or ""
         )
@@ -2165,6 +2286,35 @@ class MetadataDialog(QDialog):
             self.tfs_save_attachment_check.isChecked()
             and self.tfs_save_attachment_check.isEnabled()
         )
+
+        # --- Значения переменных TFS ---
+        tfs_vars_collected = self._collect_tfs_variable_values()
+
+        # Проверяем: если шаблон использует переменные, но не все
+        # заполнены — не даём подтвердить.
+        if tfs_template_value:
+            wiql = ""
+            for tpl in self._tfs_templates:
+                if (tpl.get("name") or "").strip() == tfs_template_value:
+                    wiql = (tpl.get("wiql") or "").strip()
+                    break
+            required = extract_variables(wiql)
+            if required:
+                missing = [
+                    n for n in required
+                    if not tfs_vars_collected.get(n, "").strip()
+                ]
+                if missing and tfs_save_value:
+                    QMessageBox.warning(
+                        self, "TFS",
+                        f"В шаблоне «{tfs_template_value}» есть "
+                        f"переменные, для которых не заданы "
+                        f"значения:\n\n  • "
+                        + "\n  • ".join(missing)
+                        + "\n\nЗаполните их или снимите галочку "
+                        "«Сохранять выборку в вложения записи».",
+                    )
+                    return
 
         result: Dict[str, Any] = {
             "project": project,
@@ -2177,7 +2327,6 @@ class MetadataDialog(QDialog):
             "date": date_out,
             "time": time_out,
             "sync_ready": bool(self.sync_ready_check.isChecked()),
-            # --- НОВОЕ: флаг выполнения транскрибации ---
             "skip_transcription": do_transcribe,
             "prompt": prompt,
             "prompt_name": prompt_name,
@@ -2211,10 +2360,11 @@ class MetadataDialog(QDialog):
             "send_attachments_to_deepseek": bool(
                 self.send_attachments_to_deepseek_check.isChecked()
             ),
-            # --- НОВОЕ: TFS ---
             "tfs_project": tfs_project_value,
             "tfs_template_name": tfs_template_value,
             "tfs_save_attachment": tfs_save_value,
+            # --- НОВОЕ: значения переменных ---
+            "tfs_variables": dict(tfs_vars_collected),
         }
         if "new_prompt" in self.result_data:
             result["new_prompt"] = self.result_data["new_prompt"]
@@ -2222,34 +2372,12 @@ class MetadataDialog(QDialog):
         self.result_data = result
         log.info(
             "Метаданные подтверждены: project=%s, name=%s, "
-            "template=%r, abbr=%r, date=%s, time=%s, tags=%s, "
-            "sync_ready=%s, do_transcribe=%s, "
-            "prompt=%d символов (изменён: %s), "
-            "generate_summary=%s, is_scrum=%s, generate_deepseek=%s, "
-            "ctx_name=%s, ctx_project=%s, ctx_comment=%s, "
-            "ctx_tags=%s, protocol=%s, attachments=%d, "
-            "send_to_transcribe=%s, send_to_deepseek=%s, "
-            "tfs_project=%r, tfs_template=%r, tfs_save=%s",
-            project, final_name, template, abbr,
-            date_out, time_out, ordered_tags,
-            result["sync_ready"],
-            do_transcribe,
-            len(prompt),
-            result["prompt_edited"],
-            result["generate_summary"],
-            is_scrum,
-            result["generate_deepseek_prompt"],
-            result["include_name_in_prompt"],
-            result["include_project_in_prompt"],
-            result["include_comment_in_prompt"],
-            result["include_tags_in_prompt"],
-            os.path.basename(
-                result["previous_protocol_path"]
-            ) or "—",
-            len(self._attachments),
-            result["send_attachments_to_transcribe"],
-            result["send_attachments_to_deepseek"],
-            tfs_project_value, tfs_template_value, tfs_save_value,
+            "tfs_project=%r, tfs_template=%r, tfs_vars=%s, "
+            "tfs_save=%s",
+            project, final_name,
+            tfs_project_value, tfs_template_value,
+            list(tfs_vars_collected.keys()),
+            tfs_save_value,
         )
         self.accept()
 

@@ -27,9 +27,16 @@
   • Для link-запросов строится дерево по workItemRelations.
   • Добавлены колонки «Оценка» (OriginalEstimate) и
     «Осталось» (RemainingWork).
-  • Автоматическое разворачивание первого уровня дерева.
-  • Все прежние возможности (копирование ID/ссылки, контекстное
-    меню, сохранение шаблонов) сохранены.
+  • Все прежние возможности сохранены.
+
+  • ДОБАВЛЕНЫ ШАБЛОННЫЕ ПЕРЕМЕННЫЕ WIQL:
+      – при нажатии «Выполнить», если WIQL содержит {{Переменные}},
+        открывается диалог их ввода (TfsVariablesDialog);
+      – введённые значения хранятся в памяти окна — при повторном
+        «Выполнить» они подставляются автоматически (кнопка
+        «Изменить переменные…» позволяет их поправить);
+      – при выборе шаблона с переменными — значения также
+        можно задать заранее.
 """
 from __future__ import annotations
 
@@ -46,9 +53,10 @@ from PySide6.QtGui import (
     QAction, QDesktopServices, QGuiApplication, QKeySequence,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
     QSplitter, QTreeWidget, QTreeWidgetItem, QTextBrowser,
     QVBoxLayout, QWidget,
 )
@@ -58,6 +66,9 @@ from ..tfs_client import (
     TfsClient,
     TfsError,
     DEFAULT_WORK_ITEM_FIELDS,
+    extract_variables,
+    substitute_variables,
+    validate_variables,
 )
 from .tooltips import attach_tooltip, make_info_icon, with_info
 
@@ -65,16 +76,141 @@ log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Диалог ввода значений шаблонных переменных
+# ---------------------------------------------------------------------------
+class TfsVariablesDialog(QDialog):
+    """
+    Диалог ввода значений для шаблонных переменных WIQL.
+
+    Показывает по одному полю ввода на каждую переменную.
+    Используется и в окне «Задачи TFS», и (потенциально) в
+    других местах.
+    """
+
+    def __init__(
+        self,
+        variables: List[str],
+        *,
+        initial: Optional[Dict[str, str]] = None,
+        title: str = "Значения переменных WIQL",
+        description: str = "",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(540)
+
+        self._variables = list(variables or [])
+        self._initial = dict(initial or {})
+        self._inputs: Dict[str, QLineEdit] = {}
+        self._result: Dict[str, str] = {}
+
+        self._build_ui(description)
+
+    def _build_ui(self, description: str) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(8)
+
+        info_row = QHBoxLayout()
+        info_text = description or (
+            "В WIQL-запросе есть шаблонные переменные. "
+            "Укажите их значения — они будут подставлены перед "
+            "выполнением запроса.\n\n"
+            "Значения экранируются автоматически: одинарная "
+            "кавычка «'» внутри значения не сломает запрос."
+        )
+        info = QLabel(info_text)
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: #666; }")
+        info_row.addWidget(info, 1)
+
+        icon = make_info_icon("tfs_variables_dialog")
+        if icon is not None:
+            info_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+
+        root.addLayout(info_row)
+
+        # --- Форма ---
+        form = QFormLayout()
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+        form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+
+        for name in self._variables:
+            line = QLineEdit()
+            line.setPlaceholderText(f"Значение для «{name}»…")
+            line.setText(self._initial.get(name, ""))
+            line.setToolTip(
+                f"Переменная шаблона WIQL: {name}\n\n"
+                f"Значение подставляется в запрос вместо "
+                f"конструкции {{{{{name}}}}}.\n\n"
+                f"Спецсимволы (одинарная кавычка) экранируются "
+                f"автоматически."
+            )
+            self._inputs[name] = line
+            form.addRow(f"{name}:", line)
+
+        root.addLayout(form)
+
+        # --- Кнопки ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        ).setText("Выполнить")
+        buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        ).setText("Отмена")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        # Ставим фокус на первое поле.
+        if self._inputs:
+            first = next(iter(self._inputs.values()))
+            first.setFocus()
+            first.selectAll()
+
+    def _on_accept(self) -> None:
+        values: Dict[str, str] = {}
+        missing: List[str] = []
+
+        for name, field in self._inputs.items():
+            value = field.text().strip()
+            values[name] = value
+            if not value:
+                missing.append(name)
+
+        if missing:
+            names = ", ".join(missing)
+            QMessageBox.warning(
+                self, "Значения переменных",
+                f"Заполните все переменные.\n\n"
+                f"Пустые: {names}",
+            )
+            return
+
+        self._result = values
+        self.accept()
+
+    def result_values(self) -> Dict[str, str]:
+        return dict(self._result)
+
+
+# ---------------------------------------------------------------------------
 # Фоновый воркер
 # ---------------------------------------------------------------------------
 class _TfsWorker(QThread):
-    """
-    Универсальный воркер для операций с TFS.
-
-    Принимает корутину-фабрику, которая получает progress-callback
-    и возвращает результат. Все исключения TfsError транслируются
-    в сигнал failed.
-    """
+    """Универсальный воркер для операций с TFS."""
 
     finished_ok = Signal(object)
     failed = Signal(str)
@@ -130,12 +266,17 @@ class TfsWindow(QDialog):
         self._templates: List[Dict[str, str]] = []
         self._current_query_text: str = ""
 
+        # --- Значения шаблонных переменных ---
+        # Храним между вызовами «Выполнить», чтобы пользователь
+        # не вводил их повторно.
+        self._variable_values: Dict[str, str] = {}
+
         self.setWindowTitle("Задачи TFS")
         self.setMinimumSize(1400, 800)
         self.setModal(False)
 
-        self._load_settings()   # ← сначала загружаем настройки
-        self._build_ui()        # ← потом строим UI
+        self._load_settings()
+        self._build_ui()
         self._refresh_templates()
 
         # Автоматически загружаем проекты, если интеграция настроена.
@@ -195,7 +336,13 @@ class TfsWindow(QDialog):
             "так и запросы по связям (FROM WorkItemLinks) — во втором "
             "случае список отображается деревом. "
             "Двойной клик по строке — открыть задачу в браузере TFS. "
-            "Правый клик — контекстное меню."
+            "Правый клик — контекстное меню.<br><br>"
+            "<span style='color:#666'><b>Шаблонные переменные.</b> "
+            "В WIQL можно использовать переменные вида "
+            "<code>{{Имя}}</code>. Перед выполнением запроса "
+            "приложение попросит указать их значения. "
+            "Для литерала <code>{{</code> используйте "
+            "<code>{{{</code> (тройная скобка).</span>"
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
@@ -223,8 +370,6 @@ class TfsWindow(QDialog):
         attach_tooltip(self.project_combo, "tfs_window_project")
         row1.addWidget(self.project_combo)
 
-        # Предварительно ставим проект из настроек — до загрузки
-        # полного списка с сервера.
         default_project = str(
             self._cfg.get("default_project") or ""
         ).strip()
@@ -254,10 +399,26 @@ class TfsWindow(QDialog):
 
         row1.addStretch()
 
+        # --- Кнопка «Переменные…» ---
+        self.variables_btn = QPushButton("Переменные…")
+        self.variables_btn.setToolTip(
+            "Открыть диалог значений шаблонных переменных.\n\n"
+            "Кнопка активна только если текущий WIQL содержит "
+            "переменные вида {{Имя}}.\n\n"
+            "Значения подставляются в запрос перед выполнением."
+        )
+        self.variables_btn.clicked.connect(
+            self._on_edit_variables
+        )
+        self.variables_btn.setEnabled(False)
+        row1.addWidget(self.variables_btn)
+
         self.run_btn = QPushButton("Выполнить")
         self.run_btn.setDefault(True)
         self.run_btn.setToolTip(
-            "Выполнить текущий WIQL-запрос (Ctrl+Enter)"
+            "Выполнить текущий WIQL-запрос (Ctrl+Enter).\n\n"
+            "Если запрос содержит переменные {{…}} — приложение "
+            "сначала попросит их значения."
         )
         self.run_btn.clicked.connect(self._on_run)
         row1.addWidget(self.run_btn)
@@ -308,6 +469,21 @@ class TfsWindow(QDialog):
         )
         filters_layout.addWidget(self.wiql_edit)
 
+        # --- Плашка «Переменные в запросе» ---
+        self.variables_info_label = QLabel("")
+        self.variables_info_label.setWordWrap(True)
+        self.variables_info_label.setVisible(False)
+        self.variables_info_label.setStyleSheet(
+            "QLabel {"
+            "  background-color: #FFF8E1;"
+            "  border: 1px solid #FFE082;"
+            "  border-radius: 4px;"
+            "  padding: 6px 10px;"
+            "  color: #B8860B;"
+            "}"
+        )
+        filters_layout.addWidget(self.variables_info_label)
+
         root.addWidget(filters_box)
 
         # --- Прогресс ---
@@ -351,7 +527,7 @@ class TfsWindow(QDialog):
             left_header.addWidget(table_icon)
         left_layout.addLayout(left_header)
 
-        # --- Дерево задач (используется и для плоского списка) ---
+        # --- Дерево задач ---
         self.tree = QTreeWidget()
         self.tree.setColumnCount(11)
         self.tree.setHeaderLabels([
@@ -385,37 +561,37 @@ class TfsWindow(QDialog):
         hv = self.tree.header()
         hv.setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
-        )   # ID
+        )
         hv.setSectionResizeMode(
             1, QHeaderView.ResizeMode.ResizeToContents
-        )   # Тип
+        )
         hv.setSectionResizeMode(
             2, QHeaderView.ResizeMode.Stretch
-        )   # Заголовок (растягивается)
+        )
         hv.setSectionResizeMode(
             3, QHeaderView.ResizeMode.ResizeToContents
-        )   # Статус
+        )
         hv.setSectionResizeMode(
             4, QHeaderView.ResizeMode.ResizeToContents
-        )   # Исполнитель
+        )
         hv.setSectionResizeMode(
             5, QHeaderView.ResizeMode.ResizeToContents
-        )   # Effort
+        )
         hv.setSectionResizeMode(
             6, QHeaderView.ResizeMode.ResizeToContents
-        )   # Size
+        )
         hv.setSectionResizeMode(
             7, QHeaderView.ResizeMode.ResizeToContents
-        )   # Оценка
+        )
         hv.setSectionResizeMode(
             8, QHeaderView.ResizeMode.ResizeToContents
-        )   # Осталось
+        )
         hv.setSectionResizeMode(
             9, QHeaderView.ResizeMode.ResizeToContents
-        )   # Completed Work
+        )
         hv.setSectionResizeMode(
             10, QHeaderView.ResizeMode.ResizeToContents
-        )   # Work Date
+        )
 
         left_layout.addWidget(self.tree, 1)
         splitter.addWidget(left)
@@ -480,7 +656,6 @@ class TfsWindow(QDialog):
         self.copy_url_btn.clicked.connect(self._copy_url)
         bottom.addWidget(self.copy_url_btn)
 
-        # --- НОВОЕ: экспорт в CSV ---
         self.export_csv_btn = QPushButton("Экспорт в CSV…")
         self.export_csv_btn.setToolTip(
             "Сохранить все задачи из текущего результата "
@@ -520,11 +695,13 @@ class TfsWindow(QDialog):
         ).activated.connect(self.close)
 
     # ------------------------------------------------------------------
-    # Определение типа запроса
+    # Определение типа запроса и переменных
     # ------------------------------------------------------------------
     def _on_wiql_text_changed(self) -> None:
-        """Обновляет подпись с типом запроса."""
+        """Обновляет подписи про тип запроса и переменные."""
         wiql = self.wiql_edit.toPlainText()
+
+        # --- Тип запроса ---
         if TfsClient.is_link_query(wiql):
             self.query_kind_label.setText(
                 "Режим: дерево связей"
@@ -533,6 +710,134 @@ class TfsWindow(QDialog):
             self.query_kind_label.setText(
                 "Режим: плоский список"
             )
+
+        # --- Переменные ---
+        variables = extract_variables(wiql)
+        self._update_variables_info(variables)
+
+    def _update_variables_info(self, variables: List[str]) -> None:
+        """
+        Обновляет плашку «Переменные в запросе» и кнопку
+        «Переменные…».
+        """
+        if not hasattr(self, "variables_info_label"):
+            return
+
+        if not variables:
+            self.variables_info_label.setVisible(False)
+            self.variables_info_label.setText("")
+            if hasattr(self, "variables_btn"):
+                self.variables_btn.setEnabled(False)
+            return
+
+        # Показываем список переменных и их текущие значения
+        # (если уже вводились).
+        lines: List[str] = [
+            f"<b>В запросе используются переменные "
+            f"({len(variables)}):</b>"
+        ]
+        for name in variables:
+            value = self._variable_values.get(name, "")
+            if value:
+                short = value if len(value) <= 60 else value[:57] + "…"
+                lines.append(
+                    f"&nbsp;&nbsp;• <b>{name}</b> = "
+                    f"<code>{_html.escape(short)}</code>"
+                )
+            else:
+                lines.append(
+                    f"&nbsp;&nbsp;• <b>{name}</b> — "
+                    f"<i>значение не задано</i>"
+                )
+        lines.append(
+            "<br><span style='font-size:11px'>"
+            "Значения запрашиваются перед выполнением запроса. "
+            "Кнопка «Переменные…» позволяет задать их заранее."
+            "</span>"
+        )
+
+        self.variables_info_label.setText("<br>".join(lines))
+        self.variables_info_label.setVisible(True)
+
+        if hasattr(self, "variables_btn"):
+            self.variables_btn.setEnabled(True)
+
+    def _on_edit_variables(self) -> None:
+        """Открывает диалог ввода значений переменных."""
+        wiql = self.wiql_edit.toPlainText().strip()
+        if not wiql:
+            QMessageBox.information(
+                self, "Задачи TFS",
+                "Введите WIQL-запрос.",
+            )
+            return
+
+        variables = extract_variables(wiql)
+        if not variables:
+            QMessageBox.information(
+                self, "Задачи TFS",
+                "В текущем WIQL-запросе нет переменных.\n\n"
+                "Синтаксис переменной: {{ИмяПеременной}}",
+            )
+            return
+
+        dlg = TfsVariablesDialog(
+            variables,
+            initial=self._variable_values,
+            title="Значения переменных WIQL",
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._variable_values.update(dlg.result_values())
+        self._update_variables_info(variables)
+
+        log.info(
+            "TfsWindow: значения переменных обновлены: %s",
+            ", ".join(variables),
+        )
+
+    def _ensure_variables_values(self) -> Optional[Dict[str, str]]:
+        """
+        Гарантирует, что у всех переменных есть значения.
+
+        Возвращает dict со значениями или None, если пользователь
+        отменил ввод. Если переменных нет — возвращает {}.
+        """
+        wiql = self.wiql_edit.toPlainText()
+        variables = extract_variables(wiql)
+        if not variables:
+            return {}
+
+        ok, missing = validate_variables(
+            wiql, self._variable_values
+        )
+        if ok:
+            return dict(self._variable_values)
+
+        # Запрашиваем недостающие (и заодно правим имеющиеся).
+        dlg = TfsVariablesDialog(
+            variables,
+            initial=self._variable_values,
+            title="Значения переменных WIQL",
+            description=(
+                "В запросе есть переменные, которые нужно "
+                "заполнить перед выполнением. "
+                f"<br><br>Без значения остались: "
+                f"<b>{', '.join(missing)}</b>."
+            ),
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            log.info(
+                "TfsWindow: ввод переменных отменён пользователем"
+            )
+            return None
+
+        self._variable_values.update(dlg.result_values())
+        self._update_variables_info(variables)
+        return dict(self._variable_values)
 
     # ------------------------------------------------------------------
     # Настройки / шаблоны
@@ -651,6 +956,21 @@ class TfsWindow(QDialog):
             )
             return
 
+        # --- Переменные ---
+        variables_values = self._ensure_variables_values()
+        if variables_values is None:
+            # Пользователь отменил ввод.
+            return
+
+        # Подставляем переменные.
+        final_wiql = substitute_variables(wiql, variables_values)
+        if final_wiql != wiql:
+            log.info(
+                "TfsWindow: WIQL после подстановки переменных "
+                "(%d шт.): %d символов",
+                len(variables_values), len(final_wiql),
+            )
+
         project = self.project_combo.currentData() or ""
         max_items = int(self._cfg.get("max_items") or 0)
 
@@ -661,15 +981,16 @@ class TfsWindow(QDialog):
         connect_timeout = float(cfg.get("connect_timeout", 15))
         read_timeout = float(cfg.get("read_timeout", 60))
 
-        self._current_query_text = wiql
+        self._current_query_text = final_wiql
 
-        is_link = TfsClient.is_link_query(wiql)
+        is_link = TfsClient.is_link_query(final_wiql)
 
         log.info(
             "Запуск WIQL: type=%s, project=%r, max_items=%d, "
-            "%d символов",
+            "%d символов (переменных: %d)",
             "link" if is_link else "flat",
-            project or "<root>", max_items, len(wiql),
+            project or "<root>", max_items, len(final_wiql),
+            len(variables_values),
         )
 
         async def _factory(progress):
@@ -683,7 +1004,7 @@ class TfsWindow(QDialog):
                 if is_link:
                     progress("Выполнение link-запроса…")
                     result = await client.get_work_items_by_wiql_links(
-                        wiql, project
+                        final_wiql, project
                     )
                     return {
                         "kind": "link",
@@ -693,7 +1014,7 @@ class TfsWindow(QDialog):
                 else:
                     progress("Выполнение WIQL…")
                     items = await client.get_work_items_by_wiql(
-                        wiql, project,
+                        final_wiql, project,
                         max_items=max_items,
                     )
                     return {
@@ -743,12 +1064,8 @@ class TfsWindow(QDialog):
             self.project_combo.addItem("— без проекта —", "")
             for name in self._projects:
                 self.project_combo.addItem(name, name)
-            # Приоритеты:
-            #   1) текущий выбор пользователя (если был);
-            #   2) проект по умолчанию из настроек;
-            #   3) первый проект из списка.
-            idx = -1
 
+            idx = -1
             if current:
                 idx = self.project_combo.findData(current)
 
@@ -775,8 +1092,6 @@ class TfsWindow(QDialog):
                         )
 
             if idx < 0 and self._projects:
-                # Ставим первый реальный проект
-                # (индекс 0 — это "— без проекта —").
                 idx = 1
 
             if idx >= 0:
@@ -839,6 +1154,14 @@ class TfsWindow(QDialog):
         ):
             w.setEnabled(not busy)
 
+        # Кнопка «Переменные…» активна только когда не busy
+        # и есть переменные.
+        if hasattr(self, "variables_btn"):
+            has_vars = bool(
+                extract_variables(self.wiql_edit.toPlainText())
+            )
+            self.variables_btn.setEnabled(not busy and has_vars)
+
     def _on_progress(self, message: str) -> None:
         self.status_label.setText(message)
 
@@ -896,14 +1219,7 @@ class TfsWindow(QDialog):
         self,
         relations: List[Dict[str, Any]],
     ) -> None:
-        """
-        Строит дерево на основе workItemRelations.
-
-        Логика:
-          • source == null  → корневой элемент;
-          • source != null  → ребёнок элемента source;
-          • target всегда — сама задача.
-        """
+        """Строит дерево на основе workItemRelations."""
         self.tree.clear()
 
         roots: List[int] = []
@@ -930,7 +1246,6 @@ class TfsWindow(QDialog):
                     continue
                 children_map.setdefault(src_id, []).append(tgt_id)
 
-        # Защита от дублей в списке детей.
         for k in list(children_map.keys()):
             seen = set()
             unique: List[int] = []
@@ -953,7 +1268,6 @@ class TfsWindow(QDialog):
 
             data = self._items_by_id.get(item_id)
             if data is None:
-                # В дереве нет данных — рисуем заглушку.
                 placeholder = QTreeWidgetItem([
                     str(item_id), "", "(нет данных)",
                     "", "", "", "",
@@ -982,8 +1296,6 @@ class TfsWindow(QDialog):
             if item is not None:
                 root_items.append(item)
 
-        # Если корней не нашлось (все задачи — дети),
-        # показываем все узлы верхнего уровня.
         if not root_items:
             for item_id in children_map.keys():
                 item = _create(item_id)
@@ -991,8 +1303,6 @@ class TfsWindow(QDialog):
                     root_items.append(item)
 
         self.tree.addTopLevelItems(root_items)
-
-        # Автоматически раскрываем первый уровень.
         self.tree.expandToDepth(0)
 
         if root_items:
@@ -1008,43 +1318,22 @@ class TfsWindow(QDialog):
     def _make_tree_item(
         self, it: Dict[str, Any]
     ) -> QTreeWidgetItem:
-        """
-        Создаёт QTreeWidgetItem для одной задачи.
-
-        Колонки:
-          0  — ID
-          1  — Тип
-          2  — Заголовок
-          3  — Статус
-          4  — Исполнитель
-          5  — Effort
-          6  — Size
-          7  — Оценка (Original Estimate)
-          8  — Осталось (Remaining Work)
-          9  — Completed Work
-          10 — Work Date
-        """
-        # --- Effort ---
+        """Создаёт QTreeWidgetItem для одной задачи."""
         effort = it.get("effort") or 0
         effort_str = f"{effort:g}" if effort else "—"
 
-        # --- Size ---
         size = it.get("size") or 0
         size_str = f"{size:g}" if size else "—"
 
-        # --- Original Estimate ---
         estimate = it.get("original_estimate") or 0
         est_str = f"{estimate:g}" if estimate else "—"
 
-        # --- Remaining Work ---
         remaining = it.get("remaining_work") or 0
         rem_str = f"{remaining:g}" if remaining else "—"
 
-        # --- Completed Work ---
         completed = it.get("completed_work") or 0
         completed_str = f"{completed:g}" if completed else "—"
 
-        # --- Work Date (кастомное поле, лежит в it["fields"]) ---
         fields = it.get("fields") or {}
         wd_raw = str(
             fields.get("IServ.VSTS.Scheduling.WorkDate") or ""
@@ -1068,7 +1357,6 @@ class TfsWindow(QDialog):
             0, Qt.ItemDataRole.UserRole, int(it.get("id") or 0)
         )
 
-        # Цвет статуса.
         state = (it.get("state") or "").lower()
         if "done" in state or "closed" in state \
                 or "resolved" in state:
@@ -1078,7 +1366,6 @@ class TfsWindow(QDialog):
         elif "new" in state or "proposed" in state:
             item.setForeground(3, Qt.GlobalColor.darkBlue)
 
-        # Приоритет — в тултип.
         priority = it.get("priority") or 0
         if priority:
             item.setToolTip(0, f"Приоритет: {priority}")
@@ -1126,15 +1413,8 @@ class TfsWindow(QDialog):
             ("Исполнитель", _esc(it.get("assigned_to"))),
             ("Приоритет", str(it.get("priority") or "—")),
             ("Rating", _esc(it.get("rating"))),
-            # --- Оценки ---
-            (
-                "Effort",
-                self._fmt_hours(it.get("effort")),
-            ),
-            (
-                "Size",
-                self._fmt_hours(it.get("size")),
-            ),
+            ("Effort", self._fmt_hours(it.get("effort"))),
+            ("Size", self._fmt_hours(it.get("size"))),
             (
                 "Оценка (Original Estimate)",
                 self._fmt_hours(it.get("original_estimate")),
@@ -1211,16 +1491,11 @@ class TfsWindow(QDialog):
 
     @staticmethod
     def _short_date(raw: str) -> str:
-        """
-        '2026-10-09T12:34:56.789Z' → '2026-10-09 12:34'.
-
-        Возвращает '—' для пустого значения.
-        """
+        """'2026-10-09T12:34:56.789Z' → '2026-10-09 12:34'."""
         s = (raw or "").strip()
         if not s:
             return "—"
         try:
-            # Убираем миллисекунды и Z.
             if "." in s:
                 s = s.split(".", 1)[0]
             if s.endswith("Z"):
@@ -1232,13 +1507,7 @@ class TfsWindow(QDialog):
             return raw
 
     def _build_item_url(self, item_id: int) -> str:
-        """
-        Формирует прямую ссылку на задачу в веб-интерфейсе TFS.
-
-        Для on-premise: {base_url}/{project}/_workitems/edit/{id}
-        Если проект неизвестен — {base_url}/_workitems/edit/{id}
-        (TFS перенаправит).
-        """
+        """Формирует прямую ссылку на задачу в веб-интерфейсе TFS."""
         if not item_id:
             return ""
         base = (self._cfg.get("base_url") or "").rstrip("/")
@@ -1285,18 +1554,7 @@ class TfsWindow(QDialog):
         self.status_label.setText("Ссылка скопирована")
 
     def _export_csv(self) -> None:
-        """
-        Экспорт текущего результата (self._items) в CSV.
-
-        Особенности:
-          • кодировка UTF-8 с BOM (utf-8-sig) — Excel корректно
-            открывает кириллицу;
-          • разделитель «;» — стандарт для русской локали Excel;
-          • все значения экранируются через csv.writer;
-          • сортировка по ID (по возрастанию);
-          • экспортируются ВСЕ поля, включая те, что не видны
-            в дереве (Rating, Priority, Severity, Effort и т.д.).
-        """
+        """Экспорт текущего результата (self._items) в CSV."""
         if not self._items:
             QMessageBox.information(
                 self, "Экспорт в CSV",
@@ -1305,7 +1563,6 @@ class TfsWindow(QDialog):
             )
             return
 
-        # Имя по умолчанию: tfs_tasks_YYYY-MM-DD_HH-MM-SS.csv
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         default_name = f"tfs_tasks_{stamp}.csv"
         default_path = os.path.join(
@@ -1324,7 +1581,6 @@ class TfsWindow(QDialog):
         if not target.lower().endswith(".csv"):
             target += ".csv"
 
-        # Колонки CSV: ключ в объекте задачи → заголовок столбца
         columns: List[tuple] = [
             ("id",                 "ID"),
             ("work_item_type",     "Тип"),
@@ -1350,9 +1606,6 @@ class TfsWindow(QDialog):
             ("url",                "URL"),
         ]
 
-        # Дополнительные поля из it["fields"] — если их нет
-        # в списке columns, но они интересны. Например,
-        # кастомное IServ.VSTS.Scheduling.WorkDate.
         extra_fields: List[tuple] = [
             ("IServ.VSTS.Scheduling.WorkDate", "Work Date"),
         ]
@@ -1369,12 +1622,10 @@ class TfsWindow(QDialog):
                     quoting=csv.QUOTE_MINIMAL,
                 )
 
-                # Заголовки
                 header = [label for _, label in columns]
                 header += [label for _, label in extra_fields]
                 writer.writerow(header)
 
-                # Сортировка по ID.
                 items_sorted = sorted(
                     self._items,
                     key=lambda x: int(x.get("id") or 0),
@@ -1384,11 +1635,8 @@ class TfsWindow(QDialog):
                     row: List[Any] = []
                     for key, _label in columns:
                         v = it.get(key)
-                        row.append(
-                            _csv_cell(v, key)
-                        )
+                        row.append(_csv_cell(v, key))
 
-                    # Дополнительные кастомные поля
                     fields = it.get("fields") or {}
                     for ref_name, _label in extra_fields:
                         v = fields.get(ref_name)
@@ -1406,7 +1654,6 @@ class TfsWindow(QDialog):
                 f"Файл: {target}",
             )
 
-            # Спросим, открыть ли файл.
             reply = QMessageBox.question(
                 self, "Экспорт в CSV",
                 "Открыть папку с файлом?",
@@ -1457,24 +1704,15 @@ class TfsWindow(QDialog):
                 return
         event.accept()
 
-def _csv_cell(value: Any, key: str = "") -> str:
-    """
-    Приводит значение Work Item к строке для CSV.
 
-    • None → пустая строка
-    • Списки (например, tags) → разделённые запятой
-    • Дата/время (ключи *_date) → короткий формат YYYY-MM-DD HH:MM
-    • Числа → без .0 для целых
-    • Остальное → str()
-    """
+def _csv_cell(value: Any, key: str = "") -> str:
+    """Приводит значение Work Item к строке для CSV."""
     if value is None:
         return ""
 
-    # Списки — в строку через запятую.
     if isinstance(value, (list, tuple, set)):
         return ", ".join(str(x) for x in value)
 
-    # Даты — обрезаем ISO до минут.
     if key.endswith("_date") or key == "date":
         s = str(value).strip()
         if not s:
@@ -1487,7 +1725,6 @@ def _csv_cell(value: Any, key: str = "") -> str:
             s = s.replace("T", " ")
         return s[:16]
 
-    # Числа — без .0.
     if isinstance(value, float):
         if value == int(value):
             return str(int(value))

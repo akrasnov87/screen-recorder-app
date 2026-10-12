@@ -17,21 +17,24 @@
   • Добавлена поддержка link-запросов (FROM WorkItemLinks):
       – query_wiql_links() — возвращает workItemRelations + список ID;
       – get_work_items_batch() — пакетное получение через
-        POST /_apis/wit/workitemsbatch (обязательно для link-запросов,
-        т.к. GET /workitems не принимает $expand=relations).
-  • Добавлен авто-парсинг полей из SELECT WIQL (_parse_fields_from_wiql):
-    позволяет не дублировать список полей в настройках — какие поля
-    запрошены в WIQL, те и возвращаются.
-  • Расширен DEFAULT_WORK_ITEM_FIELDS: добавлены OriginalEstimate,
-    RemainingWork, CompletedWork, StoryPoints, Effort, TargetDate.
-  • В _normalize_work_item() добавлены шорткаты original_estimate,
-    remaining_work, completed_work, story_points, target_date, parent.
+        POST /_apis/wit/workitemsbatch.
+  • Добавлен авто-парсинг полей из SELECT WIQL (_parse_fields_from_wiql).
+  • Расширен DEFAULT_WORK_ITEM_FIELDS.
+
+  • ДОБАВЛЕНЫ ШАБЛОННЫЕ ПЕРЕМЕННЫЕ в WIQL:
+      – синтаксис {{ИмяПеременной}};
+      – экранирование тройной скобкой: {{{ — литерал {{;
+      – extract_variables() — находит все переменные в WIQL;
+      – substitute_variables() — подставляет значения;
+      – validate_variables() — проверяет, что все переменные
+        получили значения.
+    Макросы TFS (@Me, @Today, @project) не трогаются.
 """
 from __future__ import annotations
 
 import base64
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import aiohttp
@@ -42,8 +45,6 @@ log = get_logger(__name__)
 
 
 # Поля Work Item, которые имеет смысл запрашивать по умолчанию.
-# Используется, если в настройках не задан свой список и не удалось
-# автоматически извлечь поля из SELECT WIQL.
 DEFAULT_WORK_ITEM_FIELDS: List[str] = [
     "System.Id",
     "System.Title",
@@ -65,6 +66,23 @@ DEFAULT_WORK_ITEM_FIELDS: List[str] = [
     "Microsoft.VSTS.Scheduling.Effort",
     "Microsoft.VSTS.Scheduling.TargetDate",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Синтаксис шаблонных переменных в WIQL
+# ---------------------------------------------------------------------------
+# Основной синтаксис:  {{ИмяПеременной}}
+# Экранирование:       {{{ — литерал {{
+# Имя переменной:      буквы/цифры/подчёркивание/кириллица, начинается с буквы
+#
+# ВАЖНО: макросы TFS (@Me, @Today, @project, @CurrentIteration и т.п.)
+# НЕ являются переменными и остаются как есть — их подставляет сам TFS.
+_VAR_PATTERN = re.compile(
+    r"\{\{\s*([A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*)\s*\}\}"
+)
+
+# Маркер экранирования: {{{ → \x00{ (невалидный для регекспа)
+_ESCAPE_TOKEN = "\x00{ESC_OPEN\x00"
 
 
 class TfsError(RuntimeError):
@@ -90,6 +108,114 @@ def _basic_auth_header(pat: str) -> str:
     """
     token = base64.b64encode(f":{pat}".encode("utf-8")).decode("ascii")
     return f"Basic {token}"
+
+
+# ---------------------------------------------------------------------------
+# Публичные утилиты для работы с переменными WIQL
+# ---------------------------------------------------------------------------
+def extract_variables(wiql: str) -> List[str]:
+    """
+    Находит все шаблонные переменные в WIQL-запросе.
+
+    Возвращает список имён в порядке появления, без дубликатов.
+
+    Пример:
+        SELECT [System.Id] FROM WorkItems
+        WHERE [System.AreaPath] UNDER '{{Проект}}'
+        AND [System.ChangedDate] > '{{ДатаОт}}'
+        → ["Проект", "ДатаОт"]
+    """
+    if not wiql:
+        return []
+
+    # Защищаем экранированные тройные скобки, чтобы они не
+    # попали под основной регексп.
+    protected = wiql.replace("{{{", _ESCAPE_TOKEN)
+
+    result: List[str] = []
+    seen = set()
+    for m in _VAR_PATTERN.finditer(protected):
+        name = m.group(1)
+        if name not in seen:
+            result.append(name)
+            seen.add(name)
+
+    return result
+
+
+def substitute_variables(
+    wiql: str,
+    values: Dict[str, Any],
+) -> str:
+    """
+    Подставляет значения переменных в WIQL.
+
+    Аргументы:
+        wiql:   исходный запрос с {{Переменные}}.
+        values: {имя: значение}. Отсутствующие переменные
+                остаются как {{имя}} (для диагностики).
+
+    Особенности:
+      • Значения автоматически экранируются для WIQL: одинарная
+        кавычка ' → '' (удвоение, согласно T-SQL/WIQL).
+      • Экранированные тройные скобки {{{ восстанавливаются
+        как литерал {{ — но уже без интерпретации как переменной.
+
+    Returns:
+        Готовый WIQL.
+    """
+    if not wiql:
+        return ""
+
+    # Восстанавливаем экранированные тройные скобки как литералы,
+    # чтобы основной регексп их не тронул.
+    protected = wiql.replace("{{{", _ESCAPE_TOKEN)
+
+    def _replace(m: re.Match) -> str:
+        name = m.group(1)
+        if name in values:
+            raw = values[name]
+            return _wiql_escape(str(raw))
+        # Нет значения — оставляем как есть, чтобы TFS вернул
+        # понятную ошибку.
+        return m.group(0)
+
+    result = _VAR_PATTERN.sub(_replace, protected)
+
+    # Возвращаем экранированные скобки как литерал "{{".
+    result = result.replace(_ESCAPE_TOKEN, "{{")
+
+    return result
+
+
+def validate_variables(
+    wiql: str,
+    values: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
+    """
+    Проверяет, что все переменные из WIQL получили значения.
+
+    Returns:
+        (ok, missing) — ok=True если все переменные заданы;
+        missing — список имён без значений.
+    """
+    required = extract_variables(wiql)
+    missing = [
+        name for name in required
+        if name not in values or values[name] is None
+        or str(values[name]).strip() == ""
+    ]
+    return (len(missing) == 0, missing)
+
+
+def _wiql_escape(value: str) -> str:
+    """
+    Экранирует значение для WIQL-строки.
+
+    В WIQL (как и в T-SQL) одинарные кавычки внутри строковых
+    литералов удваиваются: ' → ''.
+    """
+    return value.replace("'", "''")
 
 
 class TfsClient:
@@ -157,14 +283,6 @@ class TfsClient:
         Для link-запросов дерево разворачивается в плоский
         список, а родитель каждого узла сохраняется в
         поле parent_id.
-
-        Returns:
-            {
-              "kind": "flat" | "link",
-              "items": [<нормализованные задачи>],
-              "relations": [...],   # только для link
-              "count": int,
-            }
         """
         if not wiql or not wiql.strip():
             return {
@@ -440,10 +558,8 @@ class TfsClient:
 
         Args:
             wiql:    текст запроса.
-            project: контекст проекта (если WIQL использует
-                     @project, иначе можно оставить пустым).
-            top:     ограничение на количество возвращаемых ID
-                     (0 — без ограничения).
+            project: контекст проекта.
+            top:     ограничение (0 — без ограничения).
 
         Returns:
             Список ID найденных work items.
@@ -495,16 +611,12 @@ class TfsClient:
         POST /{project}/_apis/wit/wiql — выполнить link-запрос.
 
         Link-запрос (FROM WorkItemLinks ... MODE (Recursive))
-        возвращает не плоский список задач, а список связей:
+        возвращает список связей:
             {"workItemRelations": [
                 {"source": null,      "target": {"id": 100}},
                 {"source": {"id": 100}, "target": {"id": 101}},
                 ...
             ]}
-
-        Args:
-            wiql:    текст link-запроса.
-            project: контекст проекта (@project).
 
         Returns:
             {
@@ -566,17 +678,7 @@ class TfsClient:
         """
         GET /_apis/wit/workitems — данные по списку ID.
 
-        Ограничение TFS: не более 200 ID за запрос. Поэтому
-        список автоматически разбивается на чанки.
-
-        Args:
-            ids:    список ID.
-            fields: список полей (System.Id и т.п.). Если None —
-                    берётся DEFAULT_WORK_ITEM_FIELDS.
-            chunk_size: размер чанка (не более 200).
-
-        Returns:
-            Список словарей-задач с полями из fields + поле "id".
+        Ограничение TFS: не более 200 ID за запрос.
         """
         if not ids:
             return []
@@ -631,17 +733,6 @@ class TfsClient:
     ) -> List[Dict[str, Any]]:
         """
         POST /_apis/wit/workitemsbatch — пакетное получение Work Items.
-
-        Этот метод рекомендуется для link-запросов: API принимает
-        до 200 ID за раз и корректно работает с полями.
-
-        Args:
-            ids:    список ID.
-            fields: список полей. Если None — DEFAULT_WORK_ITEM_FIELDS.
-            chunk_size: размер чанка (не более 200).
-
-        Returns:
-            Список нормализованных задач.
         """
         if not ids:
             return []
@@ -688,11 +779,7 @@ class TfsClient:
         item_id: int,
         fields: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        GET /_apis/wit/workitems/{id} — одна задача.
-
-        Возвращает словарь или None, если задачи нет.
-        """
+        """GET /_apis/wit/workitems/{id} — одна задача."""
         if fields is None:
             fields = DEFAULT_WORK_ITEM_FIELDS
 
@@ -727,25 +814,7 @@ class TfsClient:
         fields: Optional[List[str]] = None,
         max_items: int = 200,
     ) -> List[Dict[str, Any]]:
-        """
-        Удобная обёртка: выполнить плоский WIQL и сразу получить данные.
-
-        Если fields не передан явно — пытается извлечь список
-        полей из секции SELECT самого WIQL. Это избавляет от
-        необходимости дублировать поля в настройках: какие поля
-        запрошены в WIQL, те и вернутся.
-
-        Args:
-            wiql:      текст WIQL (FROM WorkItems).
-            project:   контекст проекта (может быть пустым).
-            fields:    список полей (None = извлечь из WIQL или
-                       использовать DEFAULT_WORK_ITEM_FIELDS).
-            max_items: ограничение на количество результатов
-                       (0 — без ограничения).
-
-        Returns:
-            Список нормализованных задач.
-        """
+        """Удобная обёртка: выполнить плоский WIQL и получить данные."""
         top = int(max_items) if max_items and max_items > 0 else 0
         ids = await self.query_wiql(wiql, project, top=top)
         if not ids:
@@ -759,10 +828,6 @@ class TfsClient:
                 )
                 fields = parsed
             else:
-                log.debug(
-                    "TFS: не удалось извлечь поля из WIQL, "
-                    "используем DEFAULT_WORK_ITEM_FIELDS"
-                )
                 fields = DEFAULT_WORK_ITEM_FIELDS
 
         return await self.get_work_items(ids, fields)
@@ -774,16 +839,7 @@ class TfsClient:
         *,
         fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """
-        Комбо для link-запроса: получить связи + данные задач.
-
-        Returns:
-            {
-              "relations": [...],   # исходные workItemRelations
-              "items": [...],       # нормализованные задачи
-              "items_by_id": {...}, # {id: item}
-            }
-        """
+        """Комбо для link-запроса: получить связи + данные задач."""
         links_data = await self.query_wiql_links(wiql, project)
         ids = links_data.get("ids") or []
         if not ids:
@@ -818,17 +874,7 @@ class TfsClient:
     # ------------------------------------------------------------------
     @staticmethod
     def _parse_fields_from_wiql(wiql: str) -> List[str]:
-        """
-        Извлекает список полей из секции SELECT WIQL.
-
-        Поддерживает:
-          • SELECT [Field1], [Field2] FROM ...
-          • многострочный SELECT
-
-        Возвращает список полей (например, System.Id,
-        Microsoft.VSTS.Scheduling.RemainingWork).
-        Пустой список, если извлечь не удалось.
-        """
+        """Извлекает список полей из секции SELECT WIQL."""
         if not wiql:
             return []
 
@@ -861,12 +907,7 @@ class TfsClient:
     def _normalize_work_item(
         item: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """
-        Приводит «сырую» задачу TFS к удобному словарю.
-
-        Поля, которых нет в fields, будут отсутствовать в
-        результате, за исключением id (он всегда есть).
-        """
+        """Приводит «сырую» задачу TFS к удобному словарю."""
         fields = item.get("fields") or {}
         result: Dict[str, Any] = {
             "id": int(item.get("id") or 0),
@@ -906,7 +947,6 @@ class TfsClient:
             fields.get("Microsoft.VSTS.Common.Rating") or ""
         )
 
-        # --- Scheduling (часы, оценка, оставшееся) ---
         result["original_estimate"] = _extract_number(
             fields.get(
                 "Microsoft.VSTS.Scheduling.OriginalEstimate"
@@ -961,7 +1001,6 @@ def _extract_number(value: Any) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        # Может быть float вроде "3.5" — попробуем округлить.
         try:
             return int(float(value))
         except (TypeError, ValueError):

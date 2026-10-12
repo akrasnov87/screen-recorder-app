@@ -3333,7 +3333,7 @@ class SessionsWindow(QDialog):
                 self, "TFS-выборка",
                 "В метаданных записи не выбран TFS-шаблон.\n\n"
                 "Откройте «Метаданные» (Ctrl+E) и выберите "
-                "шаблон на вкладке «Скрам и DeepSeek».",
+                "шаблон на вкладке «TFS».",
             )
             return
 
@@ -3361,6 +3361,52 @@ class SessionsWindow(QDialog):
             tfs_settings.get("wiql_templates") or []
         )
 
+        # --- Работа с переменными ---
+        from ..tfs_client import (
+            extract_variables,
+            validate_variables,
+        )
+        from .tfs_window import TfsVariablesDialog
+
+        wiql = ""
+        for tpl in templates:
+            if (tpl.get("name") or "").strip() == tfs_template:
+                wiql = (tpl.get("wiql") or "").strip()
+                break
+
+        required_vars = extract_variables(wiql) if wiql else []
+
+        # Значения уже сохранённые в session.json — приоритет.
+        meta_vars = meta.get("tfs_variables") or {}
+        if not isinstance(meta_vars, dict):
+            meta_vars = {}
+        variable_values: Dict[str, str] = {
+            str(k): str(v) for k, v in meta_vars.items()
+        }
+
+        if required_vars:
+            ok, missing = validate_variables(
+                wiql, variable_values
+            )
+            if not ok:
+                # Открываем диалог ввода.
+                dlg = TfsVariablesDialog(
+                    required_vars,
+                    initial=variable_values,
+                    title="Значения переменных WIQL",
+                    description=(
+                        "В шаблоне «"
+                        f"{tfs_template}» есть переменные. "
+                        "Укажите их значения для выполнения "
+                        "запроса. После успешного выполнения "
+                        "значения сохранятся в метаданных записи."
+                    ),
+                    parent=self,
+                )
+                if dlg.exec() != QDialog.DialogCode.Accepted:
+                    return
+                variable_values.update(dlg.result_values())
+
         # --- Подтверждение ---
         reply = QMessageBox.question(
             self, "TFS-выборка",
@@ -3369,8 +3415,12 @@ class SessionsWindow(QDialog):
             f"Проект TFS: "
             f"<code>{html.escape(tfs_project or '—')}</code><br>"
             f"Шаблон: "
-            f"<code>{html.escape(tfs_template)}</code><br><br>"
-            f"Файл <code>attachments/tfs_work_items.csv</code> "
+            f"<code>{html.escape(tfs_template)}</code><br>"
+            + (
+                f"Переменных: {len(required_vars)}<br>"
+                if required_vars else ""
+            )
+            + f"<br>Файл <code>attachments/tfs_work_items.csv</code> "
             f"будет перезаписан.<br><br>Продолжить?",
             QMessageBox.StandardButton.Yes
             | QMessageBox.StandardButton.No,
@@ -3404,6 +3454,7 @@ class SessionsWindow(QDialog):
                 templates=templates,
                 fmt=fmt,
                 max_items=max_items,
+                variable_values=variable_values,
             )
         except Exception as exc:
             log.exception("Ошибка TFS-выборки: %s", exc)
@@ -3411,13 +3462,16 @@ class SessionsWindow(QDialog):
         finally:
             QGuiApplication.restoreOverrideCursor()
 
-        # --- Обновляем attachments в session.json ---
+        # --- Обновляем attachments и tfs_variables в session.json ---
         if res.get("ok") and res.get("files"):
             current = list(meta.get("attachments") or [])
             for p in res["files"]:
                 if p not in current:
                     current.append(p)
             meta["attachments"] = current
+            # Сохраняем значения переменных — на будущее.
+            if required_vars:
+                meta["tfs_variables"] = dict(variable_values)
             self._write_json(session_json, meta)
             self.refresh()
 
