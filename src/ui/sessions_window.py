@@ -95,6 +95,7 @@ from ..platform_utils import (
     screen_recording_unavailable_reason,
 )
 from .tasks_editor_dialog import TasksEditorDialog
+from .scrum_window import ScrumWindow
 
 
 log = get_logger(__name__)
@@ -1764,6 +1765,16 @@ class SessionsWindow(QDialog):
         )
         bottom_actions.addWidget(self.relations_btn)
 
+        # --- НОВОЕ: кнопка «Скрам» ---
+        self.scrum_btn = QPushButton("Скрам")
+        self.scrum_btn.setToolTip(
+            "Открыть рабочее место скрам-митинга.\n\n"
+            "Доступно только для записей, помеченных как "
+            "скрам-митинг (is_scrum=true)."
+        )
+        self.scrum_btn.clicked.connect(self._open_scrum_window)
+        bottom_actions.addWidget(self.scrum_btn)
+
         self.close_btn = QPushButton("Закрыть")
         self.close_btn.clicked.connect(self.close)
         bottom_actions.addWidget(self.close_btn)
@@ -2835,6 +2846,34 @@ class SessionsWindow(QDialog):
         )
         m_relations.addAction(act_edit_relations)
 
+        # --- НОВОЕ: меню «Скрам» ---
+        self.m_scrum = bar.addMenu("Скрам")
+        self.m_scrum.setToolTipsVisible(True)
+
+        act_open_scrum = QAction(
+            "Открыть рабочее место скрам-митинга…", self
+        )
+        act_open_scrum.setToolTip(
+            "Открыть окно «Скрам»: поручения записи, задачи TFS "
+            "и протоколы за день.\n\n"
+            "Доступно только для записей, помеченных как "
+            "скрам-митинг."
+        )
+        act_open_scrum.triggered.connect(self._open_scrum_window)
+        self.m_scrum.addAction(act_open_scrum)
+
+        act_refresh_scrum = QAction(
+            "Обновить данные скрама", self
+        )
+        act_refresh_scrum.setToolTip(
+            "Пересобрать TFS-выборку и поручения для выбранной "
+            "скрам-записи."
+        )
+        act_refresh_scrum.triggered.connect(
+            self._refresh_scrum_data
+        )
+        self.m_scrum.addAction(act_refresh_scrum)
+
         m_protocol = bar.addMenu("Протокол")
 
         act_edit_protocol_md = QAction(
@@ -3385,6 +3424,11 @@ class SessionsWindow(QDialog):
                 self.copy_public_link_btn.setEnabled(False)
             if hasattr(self, "relations_btn"):
                 self.relations_btn.setEnabled(False)
+            # --- НОВОЕ ---
+            if hasattr(self, "m_scrum"):
+                self.m_scrum.setEnabled(False)
+            if hasattr(self, "scrum_btn"):
+                self.scrum_btn.setEnabled(False)
             return
 
         parts = [f"<b>{r['name']}</b>"]
@@ -3485,6 +3529,13 @@ class SessionsWindow(QDialog):
         # --- НОВОЕ: кнопка «Связи» ---
         if hasattr(self, "relations_btn"):
             self.relations_btn.setEnabled(bool(r.get("dir")))
+
+        # --- НОВОЕ: меню и кнопка «Скрам» ---
+        is_scrum = bool(r.get("is_scrum"))
+        if hasattr(self, "m_scrum"):
+            self.m_scrum.setEnabled(is_scrum)
+        if hasattr(self, "scrum_btn"):
+            self.scrum_btn.setEnabled(is_scrum)
 
     # ------------------------------------------------------------------
     # Обновление
@@ -3915,6 +3966,135 @@ class SessionsWindow(QDialog):
             QMessageBox.warning(
                 self, "Связи",
                 "Не удалось сохранить связи в session.json.",
+            )
+            
+    @staticmethod
+    def _activate_window(dlg) -> None:
+        """Аккуратно поднимает и активирует окно."""
+        try:
+            if dlg is None or not dlg.isVisible():
+                return
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception as exc:
+            log.debug(
+                "Не удалось активировать окно: %s", exc
+            )
+
+    # ------------------------------------------------------------------
+    # Окно «Скрам» (НОВОЕ)
+    # ------------------------------------------------------------------
+    def _open_scrum_window(self) -> None:
+        """Открывает окно «Скрам» для выбранной записи."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Скрам", "Выберите запись")
+            return
+
+        if not r.get("is_scrum"):
+            QMessageBox.information(
+                self, "Скрам",
+                f"Запись «{r.get('name')}» не помечена как "
+                f"скрам-митинг.\n\n"
+                f"Отметьте её как скрам-митинг в карточке "
+                f"метаданных (Метаданные → Изменить метаданные "
+                f"и перезапустить…).",
+            )
+            return
+
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "Скрам",
+                "Нет доступа к настройкам (ConfigManager).",
+            )
+            return
+
+        try:
+            employees = self.config_manager.get_employees()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать сотрудников: %s", exc
+            )
+            employees = []
+
+        try:
+            dlg = ScrumWindow(
+                session_dir=r.get("dir") or "",
+                session_name=r.get("name") or "",
+                all_rows_provider=lambda: self._all_rows,
+                employees=employees,
+                config_manager=self.config_manager,
+                parent=None,  # не привязываем к окну «Записи»,
+                              # чтобы окно не уходило за него
+            )
+            # Сохраняем ссылку, чтобы окно не было собрано GC.
+            self._scrum_windows = getattr(
+                self, "_scrum_windows", []
+            )
+            self._scrum_windows.append(dlg)
+
+            # Удаляем ссылку при закрытии — иначе будет утечка.
+            dlg.finished.connect(
+                lambda _result, w=dlg: self._scrum_windows.remove(w)
+                if w in self._scrum_windows else None
+            )
+
+            dlg.show()
+            # На GNOME + Wayland raise_/activateWindow могут
+            # игнорироваться. Пытаемся несколько раз — как
+            # сразу, так и с небольшой задержкой, чтобы
+            # попасть в момент окончательной отрисовки окна.
+            try:
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                pass
+
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(
+                0, lambda: self._activate_window(dlg)
+            )
+            QTimer.singleShot(
+                150, lambda: self._activate_window(dlg)
+            )
+            QTimer.singleShot(
+                500, lambda: self._activate_window(dlg)
+            )
+        except Exception as exc:
+            log.exception(
+                "Не удалось открыть окно «Скрам»: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Скрам",
+                f"Ошибка открытия окна:\n{exc}",
+            )
+
+    def _refresh_scrum_data(self) -> None:
+        """
+        Обновляет данные скрам-записи: TFS-выборку и поручения.
+
+        По сути — пересобирает action_items_prompt и TFS-выборку
+        для текущей записи. Использует существующие обработчики.
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Скрам", "Выберите запись")
+            return
+
+        if not r.get("is_scrum"):
+            QMessageBox.information(
+                self, "Скрам",
+                "Выбранная запись не является скрам-митингом.",
+            )
+            return
+
+        # Запускаем существующие обработчики обновления.
+        # Они уже реализованы в классе.
+        try:
+            self._regenerate_tfs_attachment()
+        except Exception as exc:
+            log.warning(
+                "Не удалось обновить TFS-выборку: %s", exc
             )
 
     # ------------------------------------------------------------------
@@ -6469,6 +6649,13 @@ class SessionsWindow(QDialog):
         act_edit_rel = menu.addAction(
             "Изменить связи…", self._edit_relations
         )
+
+        # --- НОВОЕ: скрам в контекстном меню ---
+        if r.get("is_scrum"):
+            menu.addSeparator()
+            act_scrum = menu.addAction(
+                "Открыть скрам…", self._open_scrum_window
+            )
 
         menu.addSeparator()
 

@@ -7,6 +7,12 @@
     get_tfs_wiql_templates(), add_tfs_wiql_template(),
     remove_tfs_wiql_template().
   • Сохранены все прежние ключи и методы без изменений.
+  • ДОБАВЛЕНО: настройки окна «Скрам» в config["app"]:
+      – scrum_window_width, scrum_window_height;
+      – scrum_protocol_tab_max_chars;
+      – scrum_day_tab_max_records;
+      – scrum_left_splitter_ratio;
+      – scrum_tfs_max_items.
 """
 from __future__ import annotations
 
@@ -127,18 +133,9 @@ DEFAULT_TFS_WIQL: str = (
 DEFAULT_CONFIG: Dict[str, Any] = {
     "yandex_vm": {
         "root_path": "",
-        # --- ВМ для транскрибации ---
-        # Имя подпапки в root_path, соответствующей ВМ, которая
-        # отвечает за сервис транскрибации. Если пусто — приложение
-        # НЕ управляет ВМ, транскрибация просто пропускается при
-        # недоступности сервиса.
         "transcribe_vm_name": "",
-        # Сколько секунд ждать запуска ВМ после продления расписания.
         "transcribe_vm_start_timeout": 600,
-        # Интервал опроса доступности сервиса транскрибации (сек).
         "transcribe_vm_check_interval": 10,
-        # На сколько минут продлевать расписание при старте, чтобы
-        # ВМ гарантированно запустилась и успела отработать.
         "transcribe_vm_schedule_extension_minutes": 30,
     },
     "projects": [
@@ -244,10 +241,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "scrum": {
         "prompt_template": DEFAULT_SCRUM_PROMPT,
-        # --- НОВОЕ: шаблон промпта для извлечения поручений ---
         "action_items_prompt_template": DEFAULT_ACTION_ITEMS_PROMPT,
         "export_format": "docx",
-        # Генерировать поручения автоматически после протокола
         "generate_action_items": False,
     },
     "summarizer": {
@@ -311,51 +306,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "send_media_to_server": False,
         "delete_local_media_after_media_upload": False,
         "use_hash_check": True,
-        # NEW: автоматически сжимать медиа, если оно превышает
-        # max_artifact_mb. Сжатие выполняется через ffmpeg,
-        # оригинал перезаписывается сжатой версией.
         "compress_media_if_too_large": True,
-        # NEW: минимальный видеобитрейт (kbps) при сжатии.
-        # Ниже — картинка рассыпается на квадраты.
         "compression_min_video_bitrate_kbps": 200,
-        # NEW: битрейт аудио (kbps) при сжатии.
         "compression_audio_bitrate_kbps": 96,
-        # NEW: пресет x264 при сжатии. Чем быстрее — тем
-        # меньше времени на сжатие, но больше размер при том
-        # же качестве. Допустимые значения: ultrafast, superfast,
-        # veryfast, faster, fast, medium, slow, slower, veryslow.
         "compression_preset": "veryfast",
         "retry_count": 3,
         "retry_delay": 2.0,
     },
-    # --- НОВОЕ: интеграция с TFS / Azure DevOps Server ---
     "tfs": {
-        # Включить интеграцию. Пока False — пункт меню в трее
-        # будет отключён, окно TFS покажет подсказку.
         "enabled": False,
-        # Базовый URL коллекции TFS.
-        # Примеры:
-        #   https://tfs.company.com/tfs/DefaultCollection
-        #   https://dev.azure.com/myorg
         "base_url": "",
-        # Personal Access Token. Хранится в зашифрованном виде
-        # (префикс "enc:"). При чтении автоматически расшифровывается.
         "api_key": "",
-        # Версия REST API. Для Azure DevOps Server 2022 — "7.0".
         "api_version": "7.0",
-        # Таймауты сетевых операций (сек).
         "connect_timeout": 15,
         "read_timeout": 60,
-        # WIQL-запрос по умолчанию.
         "default_wiql": DEFAULT_TFS_WIQL,
-        # Проект по умолчанию (пусто = без привязки к проекту).
         "default_project": "",
-        # Максимум задач в одном запросе. 0 = без ограничения.
         "max_items": 200,
-        # Время жизни локального кэша ответов (сек). 0 = без кэша.
         "cache_ttl_sec": 60,
-        # Список сохранённых WIQL-шаблонов:
-        # [{"name": "...", "wiql": "..."}]
         "wiql_templates": [],
     },
     "app": {
@@ -381,29 +349,48 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "search_default_max_prompt_hits": 100,
         "fuzzy_max_word_distance": 200,
         "search_cancel_wait_ms": 3000,
-        # --- встроенный плеер и скачивание медиа ---
         "media_prefer_builtin_player": True,
         "media_auto_download_from_server": True,
         "media_download_timeout": 600,
         "media_player_window_width": 960,
         "media_player_window_height": 640,
-        # --- Вложения: имя файла ---
         "attachment_name_max_chars": 50,
-        # --- Синхронизация: явный флаг готовности ---
         "sync_auto_publish_ready_only": True,
-        # --- Автопубликация при установке «Готово» ---
-        # Если True — при переключении sync_ready с false на true
-        # запись автоматически публикуется на сервер в фоне.
         "sync_publish_on_ready": True,
-        # --- TFS-выборка (attachments/tfs_work_items.csv) ---
-        "tfs_attachment_format": "csv",     # csv | md | both
-        "tfs_attachment_max_items": 0,      # 0 = взять из tfs.max_items
-        "tfs_projects_cache_ttl": 300,      # секунд, 0 = без кэша
-        "tfs_save_attachment": True,        # дефолт для новых записей
-        # --- Связи между записями ---
-        # Максимум связей, отображаемых в карточке метаданных
-        # на вкладке «Зависимости» (защита от гигантских списков).
+        "tfs_attachment_format": "csv",
+        "tfs_attachment_max_items": 0,
+        "tfs_projects_cache_ttl": 300,
+        "tfs_save_attachment": True,
         "relations_max_in_dialog": 200,
+
+        # --- НОВОЕ: окно «Скрам» ---
+        # Размеры окна «Скрам».
+        "scrum_window_width": 1600,
+        "scrum_window_height": 900,
+        # Ограничение размера текста протокола при выводе в превью
+        # (символов). Защита от подвисания при гигантских .docx.
+        "scrum_protocol_tab_max_chars": 500_000,
+        # Максимум записей за день, которые выводятся во вкладке
+        # «Записи за день». 0 = без ограничения.
+        "scrum_day_tab_max_records": 50,
+        # Соотношение левой/правой части в QSplitter окна «Скрам»
+        # (ширина левой части в пикселях).
+        "scrum_left_panel_width": 700,
+        # Соотношение верхней/нижней половины в левой части
+        # (высота верхней части в пикселях).
+        "scrum_tasks_panel_height": 380,
+        # Максимум задач, загружаемых в TFS-панели окна «Скрам».
+        "scrum_tfs_max_items": 200,
+        # Держать окно «Скрам» поверх остальных окон.
+        # Полезно, когда ведёшь митинг и переключаешься
+        # между окнами — «Скрам» всегда на виду.
+        "scrum_always_on_top": True,
+        # Режим отображения вкладки «Записи за день» окна
+        # «Скрам»:
+        #   • "summary"  — краткое описание (summary_bb) записи;
+        #   • "protocol" — полный протокол записи.
+        # По умолчанию — summary.
+        "scrum_day_view_mode": "summary",
     }
 }
 
@@ -526,22 +513,6 @@ class ConfigManager:
     ) -> Dict[str, Any]:
         """
         Возвращает кэшированный список проектов TFS.
-
-        Формат ответа:
-            {
-              "ok": bool,
-              "projects": [str, ...],
-              "cached_at": float,   # unix timestamp
-              "error": str,
-            }
-
-        Если TFS не настроен или кэш устарел — пытаемся
-        обновить. При ошибке возвращаем то, что было в кэше,
-        либо пустой список.
-
-        ВАЖНО: этот метод синхронный — дёргает asyncio.run().
-        Его нельзя вызывать из event loop. Используйте из UI
-        (QThread) или из processor через to_thread().
         """
         import time
 
@@ -801,19 +772,7 @@ class ConfigManager:
         }
 
     def get_transcribe_settings(self) -> Dict[str, Any]:
-        """
-        Возвращает настройки АКТИВНОГО сервиса транскрибации.
-
-        Формат возвращаемого словаря сохранён обратно совместимым
-        со старым API: url, access_key, connect_timeout,
-        read_timeout, max_wait.
-
-        Дополнительно добавлены поля:
-          • service_id   — id активного сервиса;
-          • service_name — человекочитаемое имя активного сервиса;
-          • services     — полный список сервисов (для UI и
-                           отладочных целей).
-        """
+        """Возвращает настройки АКТИВНОГО сервиса транскрибации."""
         cfg = self.config.get("transcribe", {}) or {}
 
         services = cfg.get("services") or []
@@ -822,8 +781,6 @@ class ConfigManager:
 
         active_id = str(cfg.get("active_service") or "").strip()
 
-        # --- Если список пуст — синтезируем один сервис из
-        #     старой структуры (миграция на лету). ---
         if not services:
             legacy_url = str(cfg.get("url") or "").strip()
             legacy_key = str(cfg.get("access_key") or "")
@@ -840,7 +797,6 @@ class ConfigManager:
             }]
             active_id = "default"
 
-        # --- Находим активный сервис ---
         active: Optional[Dict[str, Any]] = None
         for s in services:
             if not isinstance(s, dict):
@@ -850,7 +806,6 @@ class ConfigManager:
                 break
 
         if active is None:
-            # Активный id не найден — берём первый доступный.
             for s in services:
                 if isinstance(s, dict) and str(s.get("id") or ""):
                     active = s
@@ -858,7 +813,6 @@ class ConfigManager:
                     break
 
         if active is None:
-            # Совсем ничего нет — возвращаем пустой сервис.
             return {
                 "service_id": "",
                 "service_name": "",
@@ -904,25 +858,6 @@ class ConfigManager:
     def set_transcribe_settings(
         self, settings: Dict[str, Any]
     ) -> None:
-        """
-        Сохраняет список сервисов транскрибации и активный id.
-
-        Ожидаемый формат settings:
-          {
-            "active_service": "vnext",
-            "services": [
-              {"id": "...", "name": "...", "url": "...",
-               "access_key": "...", "connect_timeout": 15,
-               "read_timeout": 120, "max_wait": 7200},
-              ...
-            ]
-          }
-
-        Гарантирует уникальность id, отбрасывает пустые
-        сервисы (без url) и, если active_service не найден
-        среди services, ставит active_service = id первого
-        сервиса (или "" если список пуст).
-        """
         raw_services = settings.get("services") or []
         if not isinstance(raw_services, list):
             raw_services = []
@@ -937,12 +872,9 @@ class ConfigManager:
             name = str(s.get("name") or "").strip()
             url = str(s.get("url") or "").strip()
             if not url:
-                # Сервис без URL бесполезен — пропускаем.
                 continue
             if not sid:
-                # Генерируем id по индексу.
                 sid = f"service_{len(cleaned) + 1}"
-            # Уникальность id.
             base_id = sid
             n = 1
             while sid in seen_ids:
@@ -973,7 +905,6 @@ class ConfigManager:
 
         cfg = self.config.setdefault("transcribe", {})
 
-        # --- Удаляем legacy-поля, чтобы не путали ---
         for legacy in ("url", "access_key", "connect_timeout",
                        "read_timeout", "max_wait"):
             cfg.pop(legacy, None)
@@ -1042,12 +973,6 @@ class ConfigManager:
         return {k: a.get(k, v) for k, v in d.items()}
 
     def get_sessions_root(self) -> str:
-        """
-        Возвращает корневую папку всех сессий (sessions/).
-
-        Единая точка для всех модулей — чтобы путь не собирался
-        вручную в разных местах.
-        """
         temp_path = (
             self.config.get("storage", {}).get(
                 "temp_path", default_temp_dir()
@@ -1411,22 +1336,6 @@ class ConfigManager:
     # TFS / Azure DevOps Server
     # ------------------------------------------------------------------
     def get_tfs_settings(self) -> Dict[str, Any]:
-        """
-        Возвращает настройки интеграции с TFS.
-
-        PAT расшифровывается прозрачно (если хранится с
-        префиксом "enc:").
-
-        Каждый WIQL-шаблон имеет структуру:
-            {
-              "name": str,
-              "wiql": str,
-              "variables": {имя: значение-по-умолчанию},
-            }
-        где variables — значения по умолчанию для шаблонных
-        переменных WIQL ({{Имя}}). Могут быть переопределены
-        пользователем при выполнении запроса.
-        """
         cfg = self.config.get("tfs", {}) or {}
 
         raw_key = str(cfg.get("api_key", "") or "")
@@ -1448,7 +1357,6 @@ class ConfigManager:
             if not name or not wiql:
                 continue
 
-            # --- Значения переменных по умолчанию ---
             vars_raw = item.get("variables")
             variables: Dict[str, str] = {}
             if isinstance(vars_raw, dict):
@@ -1484,12 +1392,6 @@ class ConfigManager:
         }
 
     def set_tfs_settings(self, settings: Dict[str, Any]) -> None:
-        """
-        Сохраняет настройки TFS. PAT шифруется (префикс "enc:").
-
-        Каждый WIQL-шаблон может содержать поле "variables" —
-        словарь {имя: значение-по-умолчанию}.
-        """
         cfg = self.config.setdefault("tfs", {})
 
         api_key = str(settings.get("api_key", "") or "")
@@ -1518,7 +1420,6 @@ class ConfigManager:
                 if not name or not wiql:
                     continue
 
-                # --- Сохраняем дефолты переменных ---
                 vars_raw = item.get("variables")
                 variables: Dict[str, str] = {}
                 if isinstance(vars_raw, dict):
@@ -1556,7 +1457,6 @@ class ConfigManager:
         )
 
     def get_tfs_wiql_templates(self) -> List[Dict[str, str]]:
-        """Возвращает список сохранённых WIQL-шаблонов."""
         return self.get_tfs_settings().get("wiql_templates", [])
 
     def add_tfs_wiql_template(
@@ -1565,24 +1465,11 @@ class ConfigManager:
         wiql: str,
         variables: Optional[Dict[str, str]] = None,
     ) -> bool:
-        """
-        Добавляет или обновляет WIQL-шаблон по имени.
-
-        Args:
-            name:      имя шаблона.
-            wiql:      текст запроса.
-            variables: значения по умолчанию для шаблонных
-                       переменных {имя: значение}. Может быть
-                       None или пустым — тогда дефолтов нет.
-
-        Возвращает True при успехе.
-        """
         name = (name or "").strip()
         wiql = (wiql or "").strip()
         if not name or not wiql:
             return False
 
-        # Нормализуем дефолты.
         vars_clean: Dict[str, str] = {}
         if isinstance(variables, dict):
             for k, v in variables.items():
@@ -1630,20 +1517,6 @@ class ConfigManager:
         name: str,
         variables: Dict[str, str],
     ) -> bool:
-        """
-        Обновляет ТОЛЬКО значения по умолчанию у существующего
-        WIQL-шаблона (не меняя сам WIQL).
-
-        Используется, когда пользователь правит дефолты в UI,
-        не пересоздавая шаблон.
-
-        Args:
-            name:      имя шаблона.
-            variables: {имя: значение}.
-
-        Returns:
-            True, если шаблон найден и обновлён.
-        """
         name = (name or "").strip()
         if not name:
             return False
@@ -1665,7 +1538,6 @@ class ConfigManager:
             if not isinstance(item, dict):
                 continue
             if str(item.get("name") or "").strip() == name:
-                # Сохраняем name и wiql, обновляем только variables.
                 templates[i] = {
                     "name": item.get("name") or name,
                     "wiql": item.get("wiql") or "",
@@ -1686,7 +1558,6 @@ class ConfigManager:
         return False
 
     def remove_tfs_wiql_template(self, name: str) -> bool:
-        """Удаляет WIQL-шаблон по имени."""
         name = (name or "").strip()
         if not name:
             return False
