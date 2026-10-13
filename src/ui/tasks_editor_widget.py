@@ -25,6 +25,10 @@
   • НОВОЕ: компактные строки таблицы — уменьшены отступы
     в ячейках и вертикальная высота строки, чтобы визуально
     совпадать с деревом задач TFS.
+  • НОВОЕ: уменьшены вертикальные отступы между элементами
+    виджета — чтобы три блока (поручения / TFS / результат
+    анализа) помещались в левой части окна «Скрам» без
+    прокрутки.
 """
 from __future__ import annotations
 
@@ -139,11 +143,14 @@ class TasksEditorWidget(QWidget):
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        # Уменьшили вертикальные отступы: было (4, 4, 4, 4) spacing 4.
+        layout.setContentsMargins(2, 0, 2, 0)
+        layout.setSpacing(1)
 
-        # --- Заголовок ---
+        # --- Заголовок (компактный) ---
         header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
         header.addWidget(QLabel("<b>Поручения записи</b>"))
         header.addStretch()
         icon = make_info_icon("scrum_tasks_section")
@@ -160,8 +167,11 @@ class TasksEditorWidget(QWidget):
         self._dlg.table.setParent(self)
         layout.addWidget(self._dlg.table, 1)
 
-        # --- Счётчик ---
+        # --- Счётчик (компактный) ---
         self._dlg.stats_label.setParent(self)
+        self._dlg.stats_label.setStyleSheet(
+            "QLabel { color: #666; font-size: 9pt; padding: 0; }"
+        )
         layout.addWidget(self._dlg.stats_label)
 
         # --- Настраиваем видимость и ширину колонок таблицы ---
@@ -193,9 +203,6 @@ class TasksEditorWidget(QWidget):
         )
 
         # Двойной клик по строке открывает редактирование.
-        # В TasksEditorDialog уже есть такое подключение,
-        # но мы дублируем — на случай, если пользователь
-        # откроет панель без диалоговых обработчиков.
         table.itemDoubleClicked.connect(
             lambda _item: self._on_edit()
         )
@@ -249,11 +256,13 @@ class TasksEditorWidget(QWidget):
         """
         box = QWidget()
         outer = QVBoxLayout(box)
-        outer.setContentsMargins(0, 2, 0, 2)
-        outer.setSpacing(2)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
         # --- Заголовок строки ---
         header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
         header.addWidget(QLabel("<b>Фильтр по колонкам:</b>"))
         header.addStretch()
 
@@ -276,7 +285,8 @@ class TasksEditorWidget(QWidget):
 
         # --- Строка полей ---
         row = QHBoxLayout()
-        row.setSpacing(4)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(3)
 
         # №
         row.addWidget(QLabel("№:"))
@@ -623,14 +633,11 @@ class TasksEditorWidget(QWidget):
             )
 
         # --- 3. Компактные строки: уменьшаем высоту и padding ---
-        # Без этого строки таблицы поручений выглядели «разряженно»
-        # по сравнению с деревом задач TFS — из-за дефолтных
-        # QSS-отступов и большой высоты вертикального заголовка.
         try:
             vheader = table.verticalHeader()
             # Включаем фиксированную высоту строк — иначе Qt
             # растянет строки на всю высоту viewport, если строк
-            # мало (как в примере со 12 строками).
+            # мало.
             vheader.setSectionResizeMode(
                 vheader.ResizeMode.Fixed
             )
@@ -646,8 +653,6 @@ class TasksEditorWidget(QWidget):
             )
 
         # QSS для компактных отступов в ячейках.
-        # padding у QTableView::item уменьшен до минимума,
-        # чтобы текст не «плавал» в большой ячейке.
         compact_qss = (
             "QTableView::item {"
             "  padding: 1px 6px;"

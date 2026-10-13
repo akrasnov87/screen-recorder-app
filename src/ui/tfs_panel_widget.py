@@ -22,6 +22,10 @@
   • ИСПРАВЛЕНО: variables_info_label заменён на variables_panel
     (плашка переменных WIQL теперь сворачиваемая — см.
     tfs_window.py).
+  • НОВОЕ: уменьшены вертикальные отступы между элементами
+    виджета — чтобы три блока (поручения / TFS / результат
+    анализа) помещались в левой части окна «Скрам» без
+    прокрутки. Высота WIQL-поля уменьшена до 40–60 px.
 """
 from __future__ import annotations
 
@@ -109,8 +113,7 @@ class TfsPanelWidget(QWidget):
         self._build_ui()
 
         # Настраиваем колонки дерева — в панели «Скрама»
-        # показываем только 6 нужных колонок, а не все 11,
-        # как в отдельном окне «Задачи TFS».
+        # показываем только 6 нужных колонок, а не все 11.
         self._configure_tree_columns()
 
         # Прячем внутреннее окно — оно не должно показываться.
@@ -122,11 +125,14 @@ class TfsPanelWidget(QWidget):
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        # Уменьшили вертикальные отступы.
+        layout.setContentsMargins(2, 0, 2, 0)
+        layout.setSpacing(1)
 
-        # --- Заголовок ---
+        # --- Заголовок (компактный) ---
         header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
         header.addWidget(QLabel("<b>Задачи TFS</b>"))
         header.addStretch()
         icon = make_info_icon("scrum_tfs_section")
@@ -136,14 +142,15 @@ class TfsPanelWidget(QWidget):
 
         # --- Панель управления: проект + шаблон + переменные ---
         controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(4)
 
         controls.addWidget(QLabel("Проект:"))
-        # Забираем project_combo из внутреннего TfsWindow.
         self._win.project_combo.setParent(self)
         attach_tooltip(self._win.project_combo, "scrum_tfs_project")
         controls.addWidget(self._win.project_combo, 1)
 
-        controls.addSpacing(8)
+        controls.addSpacing(4)
         controls.addWidget(QLabel("Шаблон:"))
         self._win.template_combo.setParent(self)
         attach_tooltip(self._win.template_combo, "scrum_tfs_template")
@@ -165,14 +172,17 @@ class TfsPanelWidget(QWidget):
 
         layout.addLayout(controls)
 
-        # --- WIQL-превью (сворачиваемое) ---
+        # --- WIQL-превью (компактное) ---
         wiql_row = QHBoxLayout()
+        wiql_row.setContentsMargins(0, 0, 0, 0)
+        wiql_row.setSpacing(4)
         wiql_row.addWidget(QLabel("<b>WIQL:</b>"))
 
         # Забираем wiql_edit из TfsWindow.
         self._win.wiql_edit.setParent(self)
-        self._win.wiql_edit.setMinimumHeight(60)
-        self._win.wiql_edit.setMaximumHeight(90)
+        # Уменьшили высоту WIQL-поля: было min=60, max=90.
+        self._win.wiql_edit.setMinimumHeight(40)
+        self._win.wiql_edit.setMaximumHeight(60)
         wiql_row.addWidget(self._win.wiql_edit, 1)
         layout.addLayout(wiql_row)
 
@@ -193,16 +203,27 @@ class TfsPanelWidget(QWidget):
         self._win.tree.setParent(self)
         layout.addWidget(self._win.tree, 1)
 
-        # --- Статус ---
+        # --- Статус (компактный) ---
         status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(6)
         self._win.status_label.setParent(self)
+        self._win.status_label.setStyleSheet(
+            "QLabel { color: #666; font-size: 9pt; }"
+        )
         self._win.count_label.setParent(self)
+        self._win.count_label.setStyleSheet(
+            "QLabel { color: #444; font-weight: bold; "
+            "font-size: 9pt; }"
+        )
         status_row.addWidget(self._win.status_label, 1)
         status_row.addWidget(self._win.count_label, 0)
         layout.addLayout(status_row)
 
-        # --- Кнопки над деревом ---
+        # --- Кнопки над деревом (компактные) ---
         bottom = QHBoxLayout()
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.setSpacing(4)
 
         self.open_btn = QPushButton("Открыть")
         self.open_btn.clicked.connect(self._win._open_in_browser)
@@ -243,10 +264,12 @@ class TfsPanelWidget(QWidget):
         """
         box = QWidget()
         outer = QVBoxLayout(box)
-        outer.setContentsMargins(0, 2, 0, 2)
-        outer.setSpacing(2)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
         header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
         header.addWidget(QLabel("<b>Фильтр по колонкам:</b>"))
         header.addStretch()
 
@@ -268,7 +291,8 @@ class TfsPanelWidget(QWidget):
         outer.addLayout(header)
 
         row = QHBoxLayout()
-        row.setSpacing(4)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(3)
 
         # ID
         row.addWidget(QLabel("ID:"))

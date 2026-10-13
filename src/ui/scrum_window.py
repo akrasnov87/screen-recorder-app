@@ -16,6 +16,10 @@
   │  │  │ Задачи TFS       │  │ │  │ Записи за день         │  │ │
   │  │  │ (TfsPanel)       │  │ │  │                        │  │ │
   │  │  └──────────────────┘  │ │  └────────────────────────┘  │ │
+  │  │  ┌──────────────────┐  │ │                              │ │
+  │  │  │ Результат        │  │ │                              │ │
+  │  │  │ анализа          │  │ │                              │ │
+  │  │  └──────────────────┘  │ │                              │ │
   │  └────────────────────────┘ └──────────────────────────────┘ │
   └──────────────────────────────────────────────────────────────┘
 
@@ -29,13 +33,23 @@
   • НОВОЕ: вкладка «Записи за день» умеет показывать либо
     summary, либо протокол. Выбор сохраняется в настройках
     (app.scrum_day_view_mode).
-  • ИСПРАВЛЕНО: рендеринг summary во вкладке «Записи за день».
-    Раньше summary прогонялся через bbcode_to_html, который
-    не понимает Markdown — в результате **жирный** и списки
-    оставались «звёздочками». Теперь summary рендерится через
-    полноценный Markdown→HTML (QTextDocument.setMarkdown),
-    а BB-код используется только как fallback для очень старых
-    записей.
+  • ИСПРАВЛЕНО: рендеринг summary во вкладке «Записи за день»
+    (было — BB-код, стало — Markdown через QTextDocument.setMarkdown).
+  • НОВОЕ: кнопка «Анализ поручений и TFS…» — собирает данные
+    из таблицы поручений и дерева TFS, открывает диалог выбора
+    промпта из библиотеки и отправляет запрос к LLM (провайдер
+    LiteLLM из настроек «Суммаризация»).
+  • ИСПРАВЛЕНО: для кнопки анализа проверяется только провайдер
+    LiteLLM и Base URL — флаг «Формировать summary для новых
+    записей» игнорируется.
+  • НОВОЕ: методы _collect_tasks_text и _collect_tfs_text
+    учитывают активные фильтры — в промпт уходят только те
+    данные, что видны в таблице/дереве.
+  • ИЗМЕНЕНО: результат анализа теперь выводится НЕ в отдельном
+    модальном окне, а во встроенной панели AnalysisResultWidget
+    — в нижней части левого блока, после панели TFS. Панель
+    поддерживает сворачивание. Модальным остаётся только
+    короткий диалог ожидания (AnalysisWorkerDialog).
 """
 from __future__ import annotations
 
@@ -58,6 +72,9 @@ from ..bbcode_editor import bbcode_to_html
 from ..docx_to_html import docx_to_html
 from ..file_readers import read_any_text, read_json_file
 from ..logger import get_logger
+from .analysis_prompt_dialog import AnalysisPromptDialog
+from .analysis_result_widget import AnalysisResultWidget
+from .analysis_worker_dialog import AnalysisWorkerDialog
 from .tasks_editor_widget import TasksEditorWidget
 from .tfs_panel_widget import TfsPanelWidget
 from .tooltips import (
@@ -214,13 +231,6 @@ def _render_protocol_to_html_fragment(
 def _looks_like_markdown(text: str) -> bool:
     """
     Эвристика: похоже ли содержимое на Markdown.
-
-    Проверяем наличие типичных Markdown-конструкций:
-      • заголовки (# в начале строки);
-      • списки (-, *, + или 1. в начале строки);
-      • жирный/курсив (**текст**, *текст*);
-      • цитаты (> в начале строки);
-      • блоки кода (```).
     """
     if not text:
         return False
@@ -228,13 +238,13 @@ def _looks_like_markdown(text: str) -> bool:
     import re as _re
 
     patterns = [
-        r"(?m)^#{1,6}\s+\S",          # # Заголовок
-        r"(?m)^\s*[-*+]\s+\S",         # - пункт
-        r"(?m)^\s*\d+\.\s+\S",         # 1. пункт
-        r"\*\*[^*\n]+\*\*",            # **жирный**
-        r"(?<!\*)\*[^*\n]+\*(?!\*)",   # *курсив*
-        r"(?m)^>\s+\S",                # > цитата
-        r"```",                        # блок кода
+        r"(?m)^#{1,6}\s+\S",
+        r"(?m)^\s*[-*+]\s+\S",
+        r"(?m)^\s*\d+\.\s+\S",
+        r"\*\*[^*\n]+\*\*",
+        r"(?<!\*)\*[^*\n]+\*(?!\*)",
+        r"(?m)^>\s+\S",
+        r"```",
     ]
     for pat in patterns:
         if _re.search(pat, text):
@@ -246,28 +256,17 @@ def _render_summary_html_fragment(summary_text: str) -> str:
     """
     Рендерит summary в HTML-фрагмент.
 
-    ИСТОРИЯ ВОПРОСА. Раньше эта функция вызывала
-    bbcode_to_html() — конвертер BB-кода Bitrix24. Но в новых
-    записях summary хранится в поле summary_bb уже в формате
-    Markdown (поле сохранило историческое имя, но содержимое
-    давно Markdown). Из-за этого «**жирный**», «- список»
-    и «# заголовок» отображались «как есть» — без форматирования.
-
-    Теперь логика такая:
-      1. Если текст похож на Markdown (эвристика) — рендерим
-         через QTextDocument.setMarkdown() (полноценный
-         Markdown-парсер Qt).
-      2. Иначе — рендерим через bbcode_to_html() (для очень
-         старых записей, где summary действительно был в BB).
-      3. Если и то и другое упало — fallback на <pre> с
-         исходным текстом.
+    Логика:
+      1. Если текст похож на Markdown — рендерим через
+         QTextDocument.setMarkdown().
+      2. Иначе — через bbcode_to_html() (для старых записей).
+      3. Fallback — <pre> с исходным текстом.
     """
     if not summary_text or not summary_text.strip():
         return ""
 
     text = summary_text.strip()
 
-    # --- Вариант 1: Markdown (новые записи) ---
     if _looks_like_markdown(text):
         try:
             fragment = _markdown_to_html_fragment(text)
@@ -279,7 +278,6 @@ def _render_summary_html_fragment(summary_text: str) -> str:
                 exc,
             )
 
-    # --- Вариант 2: BB-код (старые записи) ---
     try:
         fragment = bbcode_to_html(text)
         if fragment:
@@ -289,7 +287,6 @@ def _render_summary_html_fragment(summary_text: str) -> str:
             "Не удалось отрендерить summary как BB-код: %s", exc
         )
 
-    # --- Вариант 3: fallback — plain text ---
     return (
         "<pre style='white-space:pre-wrap; "
         "font-family:Consolas, monospace; font-size:10pt;'>"
@@ -311,11 +308,6 @@ def _read_summary_bb(session_dir: str) -> str:
 class _ProtocolView(QWidget):
     """
     Универсальный просмотрщик одного протокола.
-
-    Все форматы рендерятся в QTextBrowser:
-      • .docx → HTML с сохранением форматирования;
-      • .md   → HTML через setMarkdown;
-      • .txt/.pdf → plain text в <pre>.
     """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -441,11 +433,6 @@ class _DayRecordsTab(QWidget):
     """
     Вкладка «Записи за день» — все записи за тот же день,
     кроме выбранной.
-
-    Для каждой записи можно показывать либо summary (по
-    умолчанию), либо прикреплённый протокол. Режим переключается
-    через QComboBox и сохраняется в настройках
-    (app.scrum_day_view_mode).
     """
 
     def __init__(
@@ -470,13 +457,10 @@ class _DayRecordsTab(QWidget):
         self._max_chars = int(max_chars)
         self._on_view_mode_changed = on_view_mode_changed
 
-        # Нормализуем начальный режим.
         if initial_view_mode not in _VIEW_MODES:
             initial_view_mode = VIEW_MODE_SUMMARY
         self._view_mode = initial_view_mode
 
-        # Флаг блокировки сигнала комбобокса при программной
-        # установке значения.
         self._suppress_combo_signal = False
 
         layout = QVBoxLayout(self)
@@ -499,14 +483,12 @@ class _DayRecordsTab(QWidget):
         )
         self.view_mode_combo.setMinimumWidth(220)
 
-        # Устанавливаем текущее значение без вызова обработчика.
         self._suppress_combo_signal = True
         idx = self.view_mode_combo.findData(self._view_mode)
         if idx >= 0:
             self.view_mode_combo.setCurrentIndex(idx)
         self._suppress_combo_signal = False
 
-        # Подключаем обработчик ПОСЛЕ установки значения.
         self.view_mode_combo.currentIndexChanged.connect(
             self._on_view_mode_index_changed
         )
@@ -516,7 +498,6 @@ class _DayRecordsTab(QWidget):
         )
         controls.addWidget(self.view_mode_combo)
 
-        # Иконка-подсказка рядом.
         icon = make_info_icon("scrum_day_view_mode")
         if icon is not None:
             controls.addWidget(icon)
@@ -532,7 +513,7 @@ class _DayRecordsTab(QWidget):
         )
         layout.addWidget(self.info_label)
 
-        # --- Единый QTextBrowser для вывода всех записей ---
+        # --- QTextBrowser для вывода всех записей ---
         self.browser = QTextBrowser()
         self.browser.setOpenExternalLinks(True)
         self.browser.setSizePolicy(
@@ -555,20 +536,13 @@ class _DayRecordsTab(QWidget):
         self.refresh()
 
     def set_view_mode(self, mode: str) -> None:
-        """
-        Программно меняет режим отображения.
-
-        Используется, например, при обновлении окна — чтобы
-        выставить сохранённый в настройках режим без сигнала
-        обратно в конфиг.
-        """
+        """Программно меняет режим отображения."""
         if mode not in _VIEW_MODES:
             mode = VIEW_MODE_SUMMARY
         if mode == self._view_mode:
             return
 
         self._view_mode = mode
-        # Синхронизируем комбобокс без вызова обработчика.
         self._suppress_combo_signal = True
         idx = self.view_mode_combo.findData(mode)
         if idx >= 0:
@@ -599,7 +573,6 @@ class _DayRecordsTab(QWidget):
             new_mode,
         )
 
-        # Сохраняем выбор в конфиг.
         if self._on_view_mode_changed is not None:
             try:
                 self._on_view_mode_changed(new_mode)
@@ -639,7 +612,6 @@ class _DayRecordsTab(QWidget):
 
             same_day.append(r)
 
-        # Сортировка по времени.
         same_day.sort(key=lambda r: r.get("datetime") or "")
 
         if self._max_records > 0:
@@ -658,7 +630,6 @@ class _DayRecordsTab(QWidget):
             )
             return
 
-        # Определяем, что показываем.
         mode = self._view_mode
 
         with_content = 0
@@ -673,7 +644,6 @@ class _DayRecordsTab(QWidget):
             project = r.get("project") or "—"
             session_dir = r.get("dir") or ""
 
-            # --- Достаём контент в зависимости от режима ---
             if mode == VIEW_MODE_SUMMARY:
                 summary_bb = _read_summary_bb(session_dir)
                 has_content = bool(summary_bb)
@@ -730,7 +700,6 @@ class _DayRecordsTab(QWidget):
                 parts.append("</div>")
                 continue
 
-            # Контент.
             if content_fragment:
                 parts.append(content_fragment)
             else:
@@ -741,7 +710,6 @@ class _DayRecordsTab(QWidget):
 
             parts.append("</div>")
 
-        # --- Итоговая строка ---
         mode_label = (
             "краткие описания"
             if mode == VIEW_MODE_SUMMARY
@@ -756,7 +724,6 @@ class _DayRecordsTab(QWidget):
             f"</span>"
         )
 
-        # --- Собираем единый HTML ---
         html_doc = (
             "<html><head>"
             "<style>"
@@ -797,7 +764,6 @@ class _DayRecordsTab(QWidget):
         )
         self.browser.setHtml(html_doc)
 
-        # Прокрутка — в начало.
         try:
             cursor = self.browser.textCursor()
             cursor.movePosition(cursor.MoveOperation.Start)
@@ -831,23 +797,9 @@ class ScrumWindow(QDialog):
         )
 
         # --- Модальное окно ---
-        # WindowModal блокирует только родителя («Записи») и НЕ
-        # блокирует остальные окна приложения. Под Wayland/GNOME
-        # композитор ОБЯЗАН поднимать модальные окна над родителем —
-        # это часть протокола xdg-shell.
-        #
-        # ВАЖНО: WindowStaysOnTopHint конфликтует с WindowModal под
-        # Wayland — композитор не может выполнить оба требования
-        # одновременно, и окно остаётся на заднем плане. Поэтому
-        # используется только модальность — никаких трюков с флагами.
         self.setModal(False)
 
         # --- Флаги окна ---
-        # НЕ используем WindowModal — под Wayland/GNOME модальность
-        # не поднимает окно над родителем (баг композитора Mutter).
-        # Вместо этого — обычное top-level окно с флагом
-        # WindowStaysOnTopHint, которое работает через XWayland
-        # (см. main.py — QT_QPA_PLATFORM=xcb).
         self.setWindowFlags(
             Qt.WindowType.Window
             | Qt.WindowType.WindowStaysOnTopHint
@@ -908,9 +860,6 @@ class ScrumWindow(QDialog):
         self._initial_day_view_mode = initial_mode
 
         # --- Начальный размер окна ---
-        # Используется ТОЛЬКО если пользователь снимет максимизацию
-        # (кнопкой «Свернуть»). При первом показе окно разворачивается
-        # на весь экран через showMaximized() — см. showEvent.
         from PySide6.QtGui import QGuiApplication
 
         desired_w = int(app_cfg.get("scrum_window_width", 1920))
@@ -972,8 +921,9 @@ class ScrumWindow(QDialog):
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
+        # Уменьшили внешние отступы и вертикальный зазор.
+        root.setContentsMargins(6, 4, 6, 4)
+        root.setSpacing(3)
 
         # --- Вводная плашка ---
         intro_row = QHBoxLayout()
@@ -997,9 +947,14 @@ class ScrumWindow(QDialog):
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(self.main_splitter, 1)
 
-        # --- Левая часть: поручения + TFS ---
+        # --- Левая часть: поручения + TFS + результат анализа ---
         self.left_splitter = QSplitter(Qt.Orientation.Vertical)
         self.left_splitter.setChildrenCollapsible(False)
+        # Компактный зазор между блоками в левой части.
+        self.left_splitter.setStyleSheet(
+            "QSplitter::handle { background: #ddd; }"
+            "QSplitter::handle:vertical { height: 2px; }"
+        )
 
         self.tasks_widget = TasksEditorWidget(
             session_dir=self._session_dir,
@@ -1017,9 +972,21 @@ class ScrumWindow(QDialog):
         )
         self.left_splitter.addWidget(self.tfs_widget)
 
-        self.left_splitter.setSizes(
-            [self._tasks_panel_height, self._tasks_panel_height]
+        # --- Встраиваемая панель результата анализа ---
+        self.analysis_widget = AnalysisResultWidget(parent=self)
+        self.analysis_widget.rerun_requested.connect(
+            self._on_run_analysis
         )
+        self.left_splitter.addWidget(self.analysis_widget)
+
+        # Порядок и пропорции: поручения, TFS, результат.
+        # Немного уменьшили доли каждого блока, чтобы всё
+        # поместилось в окне без прокрутки.
+        self.left_splitter.setSizes([
+            max(200, int(self._tasks_panel_height * 0.85)),
+            max(200, int(self._tasks_panel_height * 0.85)),
+            max(180, int(self._tasks_panel_height * 0.7)),
+        ])
 
         self.main_splitter.addWidget(self.left_splitter)
 
@@ -1067,6 +1034,28 @@ class ScrumWindow(QDialog):
 
         # --- Нижние кнопки ---
         bottom = QHBoxLayout()
+
+        # Кнопка «Анализ поручений и TFS» — открывает диалог
+        # выбора промпта и отправляет запрос к LLM.
+        self.analysis_btn = QPushButton(
+            "Анализ поручений и TFS…"
+        )
+        self.analysis_btn.setToolTip(
+            "Проанализировать данные поручений записи и задачи "
+            "TFS с помощью LLM.\n\n"
+            "Откроется диалог выбора промпта из библиотеки "
+            "(Настройки → Промпты и имена).\n\n"
+            "Результат появится в панели под задачами TFS.\n\n"
+            "Провайдер и модель — из Настройки → Суммаризация."
+        )
+        attach_tooltip(
+            self.analysis_btn, "scrum_analysis_button"
+        )
+        self.analysis_btn.clicked.connect(
+            self._on_run_analysis
+        )
+        bottom.addWidget(self.analysis_btn)
+
         bottom.addStretch()
 
         self.maximize_btn = QPushButton("Развернуть")
@@ -1239,6 +1228,537 @@ class ScrumWindow(QDialog):
             log.warning(
                 "Не удалось перезагрузить записи за день: %s", exc
             )
+
+    # ------------------------------------------------------------------
+    # Анализ поручений и TFS через LLM
+    # ------------------------------------------------------------------
+    def _on_run_analysis(self) -> None:
+        """
+        Запускает анализ поручений и задач TFS через LLM.
+
+        Шаги:
+          1. Проверяет, что суммаризация настроена (LiteLLM).
+          2. Загружает список промптов из библиотеки.
+          3. Собирает текст поручений и задач TFS.
+          4. Открывает диалог выбора промпта.
+          5. Открывает маленький модальный диалог ожидания
+             и по завершении показывает результат в
+             AnalysisResultWidget (встроенная панель под TFS).
+        """
+        if self._config_manager is None:
+            QMessageBox.warning(
+                self, "Анализ",
+                "Нет доступа к настройкам (ConfigManager).",
+            )
+            return
+
+        # --- 1. Проверка настроек суммаризации ---
+        # Флаг «enabled» (Формировать summary для новых записей)
+        # НЕ проверяем — он управляет автоматической суммаризацией
+        # при обработке новых записей.
+        try:
+            sum_cfg = self._config_manager.get_summarizer_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать настройки суммаризации: %s",
+                exc,
+            )
+            QMessageBox.critical(
+                self, "Анализ",
+                f"Не удалось прочитать настройки:\n{exc}",
+            )
+            return
+
+        provider = str(
+            sum_cfg.get("provider", "server")
+        ).strip().lower()
+        if provider != "litellm":
+            QMessageBox.information(
+                self, "Анализ",
+                "Для анализа требуется провайдер LiteLLM.\n\n"
+                "Сейчас выбран: "
+                f"«{provider}».\n\n"
+                "Переключите провайдер в Настройки → Суммаризация "
+                "на «LiteLLM (OpenAI-совместимый API)».",
+            )
+            return
+
+        lcfg = sum_cfg.get("litellm", {}) or {}
+        base_url = str(lcfg.get("base_url") or "").strip()
+        api_key = str(lcfg.get("api_key") or "")
+        model = str(lcfg.get("model") or "gpt-4o-mini")
+        temperature = float(lcfg.get("temperature", 0.25))
+        max_tokens = int(lcfg.get("max_tokens", 4000))
+        connect_timeout = float(lcfg.get("connect_timeout", 15))
+        read_timeout = float(lcfg.get("read_timeout", 600))
+        system_prompt = str(lcfg.get("system_prompt") or "").strip()
+
+        if not base_url:
+            QMessageBox.warning(
+                self, "Анализ",
+                "Не задан Base URL для LiteLLM.\n\n"
+                "Откройте Настройки → Суммаризация.",
+            )
+            return
+
+        # --- 2. Промпты из библиотеки ---
+        try:
+            prompts = self._config_manager.get_prompts()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать промпты: %s", exc
+            )
+            prompts = []
+
+        if not prompts:
+            QMessageBox.information(
+                self, "Анализ",
+                "Библиотека промптов пуста.\n\n"
+                "Добавьте хотя бы один промпт в "
+                "Настройки → Промпты и имена.",
+            )
+            return
+
+        # --- 3. Сбор данных ---
+        tasks_text = self._collect_tasks_text()
+        tfs_text = self._collect_tfs_text()
+
+        if not tasks_text.strip() and not tfs_text.strip():
+            QMessageBox.information(
+                self, "Анализ",
+                "Нет данных для анализа.\n\n"
+                "Убедитесь, что в таблице поручений есть записи "
+                "и/или в панели TFS загружены задачи.",
+            )
+            return
+
+        # --- 4. Диалог выбора промпта ---
+        prompt_dlg = AnalysisPromptDialog(
+            prompts=prompts,
+            parent=self,
+        )
+        if prompt_dlg.exec() != QDialog.DialogCode.Accepted:
+            log.info(
+                "ScrumWindow: выбор промпта отменён пользователем"
+            )
+            return
+
+        selected = prompt_dlg.selected_prompt()
+        if not selected:
+            return
+
+        prompt_name = selected.get("name") or ""
+        prompt_text = selected.get("text") or ""
+
+        # --- 5. Сборка итогового user-промпта ---
+        user_prompt = self._build_analysis_user_prompt(
+            prompt_text=prompt_text,
+            tasks_text=tasks_text,
+            tfs_text=tfs_text,
+        )
+
+        log.info(
+            "ScrumWindow: анализ — промпт=%r, "
+            "поручений=%d симв., TFS=%d симв., итог=%d симв.",
+            prompt_name, len(tasks_text), len(tfs_text),
+            len(user_prompt),
+        )
+
+        # --- 6. Показываем состояние ожидания в панели ---
+        try:
+            self.analysis_widget.browser.setHtml(
+                "<div style='font-family:sans-serif; font-size:11pt; "
+                "color:#666; padding:16px;'>"
+                f"<b style='color:#1565C0;'>"
+                f"Анализ выполняется…</b><br><br>"
+                f"Промпт: <b>{html.escape(prompt_name)}</b><br>"
+                f"Модель: <code>{html.escape(model)}</code><br><br>"
+                f"Пожалуйста, подождите."
+                "</div>"
+            )
+            self.analysis_widget._expanded = True
+            self.analysis_widget._refresh_header()
+            self.analysis_widget._apply_expanded_state()
+        except Exception as exc:
+            log.warning(
+                "Не удалось показать состояние ожидания: %s", exc,
+            )
+
+        # --- 7. Модальный диалог ожидания (маленький) ---
+        try:
+            worker_dlg = AnalysisWorkerDialog(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_name=prompt_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                parent=self,
+            )
+
+            # Подписываемся на сигналы ДО exec — иначе сигналы,
+            # эмитнутые в момент accept(), могут быть потеряны.
+            result_holder: Dict[str, Any] = {
+                "ok": False, "text": "", "error": "",
+            }
+
+            def _on_ok(text: str) -> None:
+                result_holder["ok"] = True
+                result_holder["text"] = text
+
+            def _on_fail(error: str) -> None:
+                result_holder["ok"] = False
+                result_holder["error"] = error
+
+            worker_dlg.finished_ok.connect(_on_ok)
+            worker_dlg.failed.connect(_on_fail)
+
+            worker_dlg.exec()
+
+            # --- 8. Отображаем результат в панели ---
+            if result_holder["ok"]:
+                self.analysis_widget.set_result(
+                    result_holder["text"],
+                    prompt_name=prompt_name,
+                )
+                # Прокрутить левый сплиттер так, чтобы панель
+                # результата была видна — но не раздувать её
+                # сверх меры.
+                try:
+                    self.left_splitter.setSizes([
+                        max(180, int(self._tasks_panel_height * 0.8)),
+                        max(180, int(self._tasks_panel_height * 0.8)),
+                        max(220, int(self._tasks_panel_height * 0.9)),
+                    ])
+                except Exception:
+                    pass
+            elif result_holder["error"]:
+                self.analysis_widget.set_error(
+                    result_holder["error"]
+                )
+            else:
+                # Пользователь отменил ожидание.
+                self.analysis_widget.browser.setHtml(
+                    "<p style='color:#666; padding:16px; "
+                    "font-style:italic;'>"
+                    "Анализ отменён пользователем.</p>"
+                )
+                self.analysis_widget._expanded = True
+                self.analysis_widget._refresh_header()
+                self.analysis_widget._apply_expanded_state()
+        except Exception as exc:
+            log.exception(
+                "Не удалось выполнить анализ: %s", exc
+            )
+            QMessageBox.critical(
+                self, "Анализ",
+                f"Ошибка выполнения:\n{exc}",
+            )
+
+    def _collect_tasks_text(self) -> str:
+        """
+        Возвращает текстовое представление поручений,
+        КОТОРЫЕ СЕЙЧАС ВИДНЫ в таблице — с учётом всех
+        активных фильтров (диалоговых и колоночных).
+
+        Логика:
+          1. Берём отфильтрованный список из внутреннего
+             TasksEditorDialog._filtered_items() — это уже
+             учитывает фильтры самого диалога (статус,
+             исполнитель, номер, поиск).
+          2. Поверх накладываем колоночные фильтры из
+             TasksEditorWidget — те, что в панели «Фильтр
+             по колонкам»: №, Статус, Текст, Исполнитель,
+             Комментарий.
+          3. Сверяем с таблицей — каждая строка, которая
+             не скрыта (setRowHidden(False)), попадает
+             в результат.
+
+        Формат — Markdown-таблица.
+        """
+        try:
+            widget = self.tasks_widget
+            dlg = getattr(widget, "_dlg", None)
+            if dlg is None:
+                return ""
+        except Exception as exc:
+            log.warning(
+                "Не удалось получить внутренний диалог поручений: %s",
+                exc,
+            )
+            return ""
+
+        # --- Список после фильтров самого диалога ---
+        try:
+            items_after_dlg = list(dlg._filtered_items())
+        except Exception as exc:
+            log.warning(
+                "Не удалось применить фильтры диалога поручений: %s",
+                exc,
+            )
+            items_after_dlg = list(dlg._data.get("items", []) or [])
+
+        # --- Отсеиваем те, что не проходят колоночные фильтры ---
+        items: List[Dict[str, Any]] = []
+        try:
+            for it in items_after_dlg:
+                if widget._matches_column_filters(it):
+                    items.append(it)
+        except Exception as exc:
+            log.warning(
+                "Не удалось применить колоночные фильтры "
+                "поручений: %s", exc,
+            )
+            items = items_after_dlg
+
+        # --- Дополнительная защита: сверяем со таблицей ---
+        try:
+            table = dlg.table
+            visible_ids: set = set()
+            for row in range(table.rowCount()):
+                if table.isRowHidden(row):
+                    continue
+                id_item = table.item(row, 6)  # колонка ID
+                if id_item:
+                    visible_ids.add(id_item.text())
+            if visible_ids:
+                filtered_by_table = [
+                    it for it in items
+                    if str(it.get("id") or "") in visible_ids
+                ]
+                if filtered_by_table:
+                    items = filtered_by_table
+        except Exception as exc:
+            log.debug(
+                "Не удалось сверить поручения с видимостью таблицы: %s",
+                exc,
+            )
+
+        if not items:
+            return ""
+
+        from ..tasks_manager import STATUS_LABELS
+
+        lines: List[str] = []
+        lines.append("## Поручения записи")
+        lines.append("")
+        lines.append(
+            "| № | Статус | Текст | Исполнитель | Срок | Комментарий |"
+        )
+        lines.append(
+            "| --- | --- | --- | --- | --- | --- |"
+        )
+
+        def _esc(v: Any) -> str:
+            s = str(v or "").strip()
+            return s.replace("|", "/").replace("\n", " ")
+
+        for it in items:
+            number = it.get("number") or 0
+            try:
+                number = int(number)
+            except (TypeError, ValueError):
+                number = 0
+            num_str = str(number) if number > 0 else "—"
+
+            status = it.get("status") or "created"
+            status_label = STATUS_LABELS.get(status, status)
+
+            text = _esc(it.get("text"))
+            assignee = _esc(it.get("assignee")) or "—"
+            due = _esc(it.get("due_date")) or "—"
+            comment = _esc(it.get("comment")) or ""
+
+            lines.append(
+                f"| {num_str} | {status_label} | {text} | "
+                f"{assignee} | {due} | {comment} |"
+            )
+
+        log.info(
+            "Сбор поручений для анализа: видимых=%d "
+            "(диалоговых=%d)",
+            len(items), len(items_after_dlg),
+        )
+
+        return "\n".join(lines)
+
+    def _collect_tfs_text(self) -> str:
+        """
+        Возвращает текстовое представление задач TFS,
+        КОТОРЫЕ СЕЙЧАС ВИДНЫ в дереве — с учётом всех
+        активных колоночных фильтров (ID, Тип, Заголовок,
+        Исполнитель).
+
+        Логика:
+          Рекурсивно обходим дерево. Каждый узел проверяем
+          через isHidden() — если скрыт, пропускаем. Если
+          виден — берём данные из _items_by_id.
+
+        Формат — Markdown-таблица.
+        """
+        try:
+            win = getattr(self.tfs_widget, "_win", None)
+            if win is None:
+                return ""
+            tree = win.tree
+            items_by_id = win._items_by_id
+        except Exception as exc:
+            log.warning(
+                "Не удалось получить дерево TFS: %s", exc
+            )
+            return ""
+
+        # --- Собираем ID всех видимых узлов ---
+        visible_ids: List[int] = []
+
+        def _walk(node) -> None:
+            """Рекурсивный обход дерева."""
+            if node is None:
+                return
+
+            # Проверяем видимость узла.
+            try:
+                if not node.isHidden():
+                    try:
+                        item_id = int(
+                            node.data(
+                                0, Qt.ItemDataRole.UserRole
+                            )
+                        )
+                        if item_id > 0:
+                            visible_ids.append(item_id)
+                    except (TypeError, ValueError):
+                        pass
+            except Exception:
+                pass
+
+            # Идём в потомков.
+            for i in range(node.childCount()):
+                _walk(node.child(i))
+
+        try:
+            for i in range(tree.topLevelItemCount()):
+                _walk(tree.topLevelItem(i))
+        except Exception as exc:
+            log.warning(
+                "Ошибка обхода дерева TFS: %s", exc
+            )
+
+        if not visible_ids:
+            log.info(
+                "Сбор TFS для анализа: видимых задач нет "
+                "(все скрыты фильтрами)"
+            )
+            return ""
+
+        # --- Собираем данные по видимым ID ---
+        items: List[Dict[str, Any]] = []
+        seen: set = set()
+        for item_id in visible_ids:
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            data = items_by_id.get(item_id)
+            if data is not None:
+                items.append(data)
+
+        if not items:
+            return ""
+
+        def _esc(v: Any) -> str:
+            s = str(v or "").strip()
+            return s.replace("|", "/").replace("\n", " ")
+
+        def _short_date(raw: Any) -> str:
+            s = str(raw or "").strip()
+            if not s:
+                return ""
+            if "." in s:
+                s = s.split(".", 1)[0]
+            if s.endswith("Z"):
+                s = s[:-1]
+            if "T" in s:
+                s = s.replace("T", " ")
+            return s[:16]
+
+        lines: List[str] = []
+        lines.append("## Задачи TFS")
+        lines.append("")
+        lines.append(
+            "| ID | Тип | Заголовок | Статус | "
+            "Исполнитель | Work Date |"
+        )
+        lines.append(
+            "| --- | --- | --- | --- | --- | --- |"
+        )
+
+        for it in items:
+            item_id = it.get("id") or ""
+            wtype = _esc(it.get("work_item_type"))
+            title = _esc(it.get("title"))
+            state = _esc(it.get("state"))
+            assignee = _esc(it.get("assigned_to")) or "—"
+
+            fields = it.get("fields") or {}
+            work_date = _short_date(
+                fields.get("IServ.VSTS.Scheduling.WorkDate")
+            ) or "—"
+
+            lines.append(
+                f"| {item_id} | {wtype} | {title} | "
+                f"{state} | {assignee} | {work_date} |"
+            )
+
+        log.info(
+            "Сбор TFS для анализа: видимых задач=%d "
+            "(всего в дереве=%d)",
+            len(items), len(items_by_id),
+        )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_analysis_user_prompt(
+        *,
+        prompt_text: str,
+        tasks_text: str,
+        tfs_text: str,
+    ) -> str:
+        """
+        Собирает итоговый user-промпт для LLM.
+
+        Структура:
+            === ЗАДАНИЕ ===
+            <выбранный промпт из библиотеки>
+
+            === ДАННЫЕ ===
+            <таблица поручений>
+
+            <таблица задач TFS>
+        """
+        parts: List[str] = []
+
+        parts.append("=== ЗАДАНИЕ ===")
+        parts.append("")
+        parts.append(prompt_text.strip() or "—")
+        parts.append("")
+
+        parts.append("=== ДАННЫЕ ===")
+        parts.append("")
+
+        if tasks_text.strip():
+            parts.append(tasks_text.strip())
+            parts.append("")
+
+        if tfs_text.strip():
+            parts.append(tfs_text.strip())
+            parts.append("")
+
+        return "\n".join(parts).strip()
 
     # ------------------------------------------------------------------
     # События
