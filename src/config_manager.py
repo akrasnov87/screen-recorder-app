@@ -400,6 +400,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "tfs_attachment_max_items": 0,      # 0 = взять из tfs.max_items
         "tfs_projects_cache_ttl": 300,      # секунд, 0 = без кэша
         "tfs_save_attachment": True,        # дефолт для новых записей
+        # --- Связи между записями ---
+        # Максимум связей, отображаемых в карточке метаданных
+        # на вкладке «Зависимости» (защита от гигантских списков).
+        "relations_max_in_dialog": 200,
     }
 }
 

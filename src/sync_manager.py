@@ -16,6 +16,9 @@
     запись помечена как черновик (sync_ready=false).
   • Локальный мьютекс на session_dir — publish и download для
     одной папки не выполняются одновременно.
+  • Связи между записями (relations) передаются на сервер и
+    подтягиваются обратно. Сервер — источник истины по составу
+    связей; локальные target_dir подтягиваются автоматически.
 
 Изменения:
   • Перед загрузкой медиа-файлов выполняется пакетная проверка
@@ -26,12 +29,15 @@
   • (КРИТИЧНО 3) Индекс record_id → session_dir в sync_state.json.
   • (КРИТИЧНО 4) JSON-конфиги в summary_bb с префиксом-маркером.
   • (КРИТИЧНО 5) Логирование skipped/uploaded артефактов.
-  • (НОВОЕ) Флаг sync_ready:
-      – build_payload_from_meta передаёт sync_ready на сервер;
-      – publish_session сохраняет sync_ready в sync_state.json;
-      – _prune_local_artifacts пропускается для черновиков;
-      – _apply_change игнорирует изменения для черновиков;
-      – локальный мьютекс на session_dir (asyncio.Lock).
+  • Флаг sync_ready (см. предыдущие версии).
+  • НОВОЕ: поддержка связей (relations) между записями:
+      – build_payload_from_meta передаёт relations в payload;
+      – _save_remote_meta подтягивает relations с сервера
+        и сливает с локальными (сохраняет target_dir);
+      – _apply_change обновляет метаданные при изменениях
+        артефактов (в т.ч. relations);
+      – добавлены хелперы _normalize_relations_for_payload
+        и _merge_relations_from_server.
 """
 from __future__ import annotations
 
@@ -50,6 +56,11 @@ from urllib.parse import quote
 
 from .file_readers import read_json_file
 from .logger import get_logger
+from .relations_manager import (
+    DEFAULT_RELATION_KIND,
+    RELATION_KINDS,
+    normalize_relation,
+)
 from .screc_client import ScrecClient, ScrecError
 from .video_compressor import (
     CompressionError,
@@ -80,7 +91,6 @@ CONFIG_JSON_PREFIX = "§CONFIG_JSON§\n"
 _CONFIG_JSON_PREFIX = CONFIG_JSON_PREFIX
 
 
-# Соответствие локальных файлов и kind на сервере.
 # Соответствие локальных файлов и kind на сервере.
 _ARTIFACT_KINDS: List[Tuple[str, str]] = [
     ("transcript", "video.txt"),
@@ -212,6 +222,190 @@ def _is_sync_ready(session_dir: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Связи (relations)
+# ---------------------------------------------------------------------------
+def _normalize_relations_for_payload(
+    meta: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """
+    Приводит relations из session.json к «серверному» виду.
+
+    В payload уходит список словарей:
+        [
+          {
+            "target_session_id": "...",
+            "target_record_id":  "...",   # может быть пустым
+            "target_name":       "...",
+            "kind":              "related" | "parent" | "child"
+          }
+        ]
+
+    Локальное поле target_dir НЕ отправляется — на сервере
+    оно бессмысленно (там другой путь). Для связи на другом
+    устройстве используется target_record_id.
+    """
+    raw = meta.get("relations")
+    if not isinstance(raw, list):
+        return []
+
+    result: List[Dict[str, str]] = []
+    seen: set = set()
+
+    for item in raw:
+        norm = normalize_relation(item)
+        if norm is None:
+            continue
+
+        key = (
+            norm["target_session_id"] or norm["target_record_id"],
+            norm["kind"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+
+        result.append({
+            "target_session_id": norm["target_session_id"],
+            "target_record_id": norm["target_record_id"],
+            "target_name": norm["target_name"],
+            "kind": norm["kind"],
+        })
+
+    return result
+
+
+def _merge_relations_from_server(
+    *,
+    local_relations: List[Dict[str, Any]],
+    server_relations: Any,
+    sessions_root: str,
+) -> List[Dict[str, str]]:
+    """
+    Объединяет локальные и серверные связи.
+
+    Логика:
+      • Если сервер вернул список (даже пустой) — считаем его
+        источником истины по составу и kind.
+      • Для каждой серверной связи:
+          – target_record_id берём с сервера;
+          – target_session_id, target_dir, target_name —
+            подтягиваем из локальной связи, если она есть
+            (совпадение по record_id или session_id);
+          – иначе пытаемся найти локальную папку по record_id
+            (в sessions_root/sync_state.json);
+      • target_dir заполняем по фактическому расположению
+        папки, если удалось найти.
+    """
+    # --- Индекс локальных связей для быстрого поиска ---
+    local_by_record: Dict[str, Dict[str, str]] = {}
+    local_by_session: Dict[str, Dict[str, str]] = {}
+    for r in (local_relations or []):
+        norm = normalize_relation(r)
+        if norm is None:
+            continue
+        if norm["target_record_id"]:
+            local_by_record[norm["target_record_id"]] = norm
+        if norm["target_session_id"]:
+            local_by_session[norm["target_session_id"]] = norm
+
+    # --- Индекс серверных record_id → локальный путь ---
+    # Используем sync_state.json, если он есть рядом.
+    record_to_dir: Dict[str, str] = {}
+    try:
+        state_path = os.path.join(
+            sessions_root, _SYNC_STATE_FILE
+        )
+        if os.path.isfile(state_path):
+            with open(state_path, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            idx = st.get("record_index") or {}
+            if isinstance(idx, dict):
+                for rid, path in idx.items():
+                    if rid and path and os.path.isdir(path):
+                        record_to_dir[str(rid)] = str(path)
+    except Exception as exc:
+        log.debug(
+            "Не удалось прочитать record_index для связей: %s", exc
+        )
+
+    # --- Обработка серверного списка ---
+    if not isinstance(server_relations, list):
+        # Если сервер не передал relations — оставляем локальные.
+        normalized: List[Dict[str, str]] = []
+        for r in (local_relations or []):
+            norm = normalize_relation(r)
+            if norm is not None:
+                normalized.append(norm)
+        return normalized
+
+    result: List[Dict[str, str]] = []
+    seen: set = set()
+
+    for item in server_relations:
+        if not isinstance(item, dict):
+            continue
+
+        rid = str(item.get("target_record_id") or "").strip()
+        sid = str(item.get("target_session_id") or "").strip()
+        name = str(item.get("target_name") or "").strip()
+        kind = str(
+            item.get("kind") or DEFAULT_RELATION_KIND
+        ).strip().lower()
+        if kind not in RELATION_KINDS:
+            kind = DEFAULT_RELATION_KIND
+
+        if not (rid or sid):
+            continue
+
+        # --- Пытаемся найти локальную связь по rid/sid ---
+        local = None
+        if rid and rid in local_by_record:
+            local = local_by_record[rid]
+        elif sid and sid in local_by_session:
+            local = local_by_session[sid]
+
+        target_dir = ""
+        if local:
+            target_dir = local.get("target_dir") or ""
+            if not sid:
+                sid = local.get("target_session_id") or ""
+            if not name:
+                name = local.get("target_name") or ""
+
+        # --- Если папки нет — ищем по record_id ---
+        if not target_dir and rid and rid in record_to_dir:
+            target_dir = record_to_dir[rid]
+
+        # --- Если нашли папку — сверим имя и session_id ---
+        if target_dir and os.path.isdir(target_dir):
+            tmeta = read_json_file(
+                os.path.join(target_dir, "session.json")
+            ) or {}
+            fresh_name = str(tmeta.get("name") or "").strip()
+            if fresh_name:
+                name = fresh_name
+            if not sid:
+                sid = os.path.basename(
+                    os.path.abspath(target_dir).rstrip("/")
+                )
+
+        key = (sid or rid, kind)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        result.append({
+            "target_session_id": sid,
+            "target_dir": target_dir,
+            "target_name": name,
+            "target_record_id": rid,
+            "kind": kind,
+        })
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Сборка payload
 # ---------------------------------------------------------------------------
 def build_payload_from_meta(
@@ -291,6 +485,14 @@ def build_payload_from_meta(
                     tags.append(name)
         if tags:
             payload["tags"] = tags
+
+    # --- Связи (relations) ---
+    # Если связей нет — поле НЕ передаём, чтобы не затирать
+    # серверное значение (сервер может воспринять пустой
+    # список как «удалить все связи»).
+    relations_payload = _normalize_relations_for_payload(meta)
+    if relations_payload:
+        payload["relations"] = relations_payload
 
     if send_video_link:
         video_path = (meta.get("video_path") or "").strip()
@@ -405,11 +607,10 @@ def collect_artifacts(
 
     return small, media
 
+
 # ---------------------------------------------------------------------------
 # Публичные ссылки на сервер (для браузера, /view/**)
 # ---------------------------------------------------------------------------
-# Допустимые блоки для /view/...?blocks=
-# Должны совпадать с DOCS.md §6.7.
 PUBLIC_VIEW_BLOCKS: Tuple[str, ...] = (
     "video",
     "audio",
@@ -438,14 +639,6 @@ def split_record_path(path: str) -> Tuple[str, str, str, str]:
     """
     Разбивает путь "project/year/month/folder_name" на
     4 компонента.
-
-    Учитывает, что folder_name может содержать пробелы и
-    кириллицу, но не содержит "/".
-
-    Returns:
-        (project, year, month, folder_name)
-        Все компоненты — строки. При ошибке разбора
-        возвращается ("", "", "", "").
     """
     if not path:
         return "", "", "", ""
@@ -470,20 +663,6 @@ def build_public_view_url(
 ) -> str:
     """
     Собирает публичную ссылку на HTML-страницу записи на сервере.
-
-    Args:
-        base_url:    базовый URL сервера (например,
-                     "http://localhost:8000").
-        record_path: путь "project/year/month/folder_name"
-                     (см. get_record_path).
-        record_id:   UUID записи на сервере.
-        blocks:      список блоков для отображения
-                     ("video", "audio", "transcript",
-                     "protocol", "summary"). None или пусто —
-                     не добавлять параметр (сервер покажет all).
-
-    Returns:
-        Готовая ссылка или "" если чего-то не хватает.
     """
     if not base_url or not record_path or not record_id:
         return ""
@@ -523,17 +702,6 @@ def build_public_artifact_url(
 ) -> str:
     """
     Собирает публичную ссылку на конкретный артефакт записи.
-
-    Args:
-        base_url:    базовый URL сервера.
-        record_path: путь "project/year/month/folder_name".
-        record_id:   UUID записи.
-        filename:    имя файла-артефакта (basename, как в
-                     _meta.json).
-        download:    если True — добавить &download=true.
-
-    Returns:
-        Готовая ссылка или "".
     """
     if not (base_url and record_path and record_id and filename):
         return ""
@@ -567,10 +735,6 @@ def build_public_url_for_session(
     Удобная обёртка: собирает публичную ссылку для сессии,
     читая base_url из sync_settings, path и record_id — из
     .sync_published.json.
-
-    Returns:
-        Готовая ссылка или "" (если запись не опубликована
-        или нет base_url).
     """
     base_url = str(
         (sync_settings or {}).get("base_url") or ""
@@ -590,6 +754,7 @@ def build_public_url_for_session(
         base_url, record_path, record_id, blocks=blocks,
     )
 
+
 # ---------------------------------------------------------------------------
 # Менеджер синхронизации
 # ---------------------------------------------------------------------------
@@ -602,15 +767,6 @@ class SyncManager:
     """
 
     # --- Локальные мьютексы на session_dir (publish vs download) ---
-    # Формат: {abspath(session_dir): (loop, asyncio.Lock)}
-    #
-    # ВАЖНО: asyncio.Lock привязывается к event loop при первом
-    # использовании. У нас операции синхронизации выполняются
-    # в разных loop'ах (фоновый loop приложения + отдельные loop'ы
-    # в QThread-воркерах), поэтому храним пару (loop, lock) и
-    # пересоздаём лок при смене loop'а.
-    # Для защиты самого словаря используем threading.Lock —
-    # asyncio.Lock здесь нельзя, он тоже привязывается к loop.
     _session_locks: Dict[str, tuple] = {}
     _session_locks_guard = threading.Lock()
 
@@ -987,7 +1143,7 @@ class SyncManager:
             "SyncManager.publish_session: session=%s, project=%r, "
             "folder=%r, sync_ready=%s, small_artifacts=%d, "
             "media_artifacts=%d (include_media=%s, max=%d МБ, "
-            "hashes=%d, compress=%s)",
+            "hashes=%d, compress=%s, relations=%d)",
             os.path.basename(session_dir),
             payload.get("project"), payload.get("folder_name"),
             meta.get("sync_ready", False),
@@ -995,6 +1151,7 @@ class SyncManager:
             include_media, max_artifact_mb,
             len(small_artifact_hashes),
             self._use_compression(),
+            len(payload.get("relations") or []),
         )
 
         if progress_cb:
@@ -1002,18 +1159,21 @@ class SyncManager:
             media_names = ", ".join(
                 a["kind"] for a in media_artifacts
             ) or "—"
+            relations_note = ""
+            rel_count = len(payload.get("relations") or [])
+            if rel_count:
+                relations_note = f"; связей: {rel_count}"
             progress_cb(
                 f"Отправка метаданных: {payload['folder_name']} "
                 f"(текстовых: {len(small_artifacts)}: {names}; "
-                f"медиа: {len(media_artifacts)}: {media_names})"
+                f"медиа: {len(media_artifacts)}: {media_names}"
+                f"{relations_note})"
             )
 
         media_uploaded: List[Dict[str, Any]] = []
         media_skipped: List[Dict[str, Any]] = []
         media_compressed: List[Dict[str, Any]] = []
 
-        # Сохраняем исходные размеры ДО сжатия — иначе
-        # int(size_mb * 1024 * 1024) даст потерю точности.
         original_sizes: Dict[str, int] = {}
         for item in media_artifacts:
             if item.get("needs_compression"):
@@ -1081,11 +1241,6 @@ class SyncManager:
             # ЗАЩИТА ОТ ДУБЛИРОВАНИЯ (шаг 1/2):
             # Сразу после создания/обновления записи на сервере
             # сохраняем record_id в .sync_published.json.
-            #
-            # Иначе фоновый pull_changes может получить наше же
-            # изменение action=create раньше, чем publish_session
-            # успеет записать record_id (загрузка больших медиа
-            # занимает минуты) — и создаст локальный дубликат.
             # --------------------------------------------------------
             if record_id:
                 early_state = _read_sync_state(session_dir)
@@ -1351,12 +1506,13 @@ class SyncManager:
             log.info(
                 "SyncManager: запись опубликована, record_id=%s "
                 "(revision=%s, action=%s, sync_ready=%s, "
-                "media_uploaded=%d, media_compressed=%d)",
+                "media_uploaded=%d, media_compressed=%d, relations=%d)",
                 record_id, result.get("revision"),
                 result.get("action"),
                 meta.get("sync_ready", False),
                 len(media_uploaded),
                 len(media_compressed),
+                len(payload.get("relations") or []),
             )
 
         if (self.settings.get("delete_local_media_after_media_upload")
@@ -1644,7 +1800,6 @@ class SyncManager:
                 self.settings.get("force_overwrite_on_download", False)
             )
 
-        # --- Определяем session_dir заранее, чтобы взять мьютекс ---
         if session_dir is None:
             session_dir = self._find_local_session(record_id, "")
 
@@ -2000,9 +2155,7 @@ class SyncManager:
         Удаляет локальные артефакты, которых нет на сервере.
 
         ВАЖНО: если запись не помечена как «готова к синхронизации»
-        (sync_ready=false) — prune пропускается. Это защищает
-        черновик от удаления локальных файлов, которые ещё не
-        публиковались.
+        (sync_ready=false) — prune пропускается.
         """
         if not _is_sync_ready(session_dir):
             log.info(
@@ -2095,6 +2248,15 @@ class SyncManager:
     def _save_remote_meta(
         session_dir: str, record: Dict[str, Any]
     ) -> None:
+        """
+        Сохраняет метаданные, полученные с сервера, в локальный
+        session.json.
+
+        Особенность: при сохранении связей (relations) НЕ теряем
+        локальные поля target_dir. Если связь уже есть локально,
+        обновляем только серверные поля (target_record_id,
+        target_name, kind), а target_dir оставляем как был.
+        """
         session_json = os.path.join(session_dir, "session.json")
         existing = read_json_file(session_json) or {}
 
@@ -2108,12 +2270,28 @@ class SyncManager:
             "generate_summary", "generate_deepseek_prompt",
             "include_name_in_prompt", "include_project_in_prompt",
             "include_comment_in_prompt", "include_tags_in_prompt",
-            # --- Флаг готовности к синхронизации ---
             "sync_ready",
         )
         for key in server_fields:
             if key in record:
                 new_meta[key] = record[key]
+
+        # --- Связи (relations) ---
+        if "relations" in record:
+            server_rels = record.get("relations")
+            new_meta["relations"] = _merge_relations_from_server(
+                local_relations=new_meta.get("relations") or [],
+                server_relations=server_rels,
+                sessions_root=os.path.dirname(
+                    os.path.abspath(session_dir).rstrip("/")
+                ),
+            )
+            log.info(
+                "SyncManager: relations из сервера применены к %s "
+                "(%d шт.)",
+                os.path.basename(session_dir),
+                len(new_meta["relations"]),
+            )
 
         new_meta["server_id"] = record.get("id", "")
         new_meta["server_revision"] = record.get("revision", 0)
@@ -2208,13 +2386,7 @@ class SyncManager:
 
         ВАЖНО: если локальная запись не помечена как
         «готова к синхронизации» (sync_ready=false), изменение
-        игнорируется. Это защищает черновик от перезаписи
-        серверной версией.
-
-        Дополнительная защита от дублирования: если локальная
-        папка не найдена по record_id, но существует папка
-        с таким же folder_name (name из session.json) —
-        скачиваем в неё, а не создаём новую.
+        игнорируется.
         """
         action = change.get("action")
         record_id = change.get("id") or ""
@@ -2231,7 +2403,6 @@ class SyncManager:
             )
             return
 
-        # --- Проверка флага sync_ready ---
         session_dir = self._find_local_session(record_id, path)
         if session_dir:
             meta = read_json_file(
@@ -2245,10 +2416,6 @@ class SyncManager:
                 )
                 return
         else:
-            # Fallback: возможно, это наша собственная только что
-            # созданная запись, у которой .sync_published.json
-            # ещё не записан, но локальная папка с таким же
-            # folder_name уже существует. Проверяем её sync_ready.
             same_folder = self._find_by_folder_name(path)
             if same_folder:
                 meta = read_json_file(
@@ -2313,6 +2480,7 @@ class SyncManager:
                     progress_cb=None,
                 )
 
+                # --- Обновляем метаданные (в т.ч. relations) ---
                 try:
                     record = await client.get_record(record_id)
                     self._save_remote_meta(session_dir, record)
@@ -2324,7 +2492,7 @@ class SyncManager:
             else:
                 log.info(
                     "apply_change: artifact_upload без filename — "
-                    "обновляю только метаданные записи"
+                    "обновляю метаданные записи (в т.ч. relations)"
                 )
                 try:
                     record = await client.get_record(record_id)
@@ -2343,10 +2511,6 @@ class SyncManager:
                     record_id, session_dir=session_dir
                 )
             else:
-                # --- Защита от дублирования собственной записи ---
-                # Если локальная папка не найдена по record_id,
-                # но существует папка с таким же folder_name —
-                # скачиваем в неё, не создавая новую.
                 same_folder = self._find_by_folder_name(path)
                 if same_folder:
                     log.info(
@@ -2392,10 +2556,7 @@ class SyncManager:
         Используется как защита от дублирования: серверная
         запись с path 'vNext/2026/10/FolderName' соответствует
         локальной папке, у которой session.json → name ==
-        FolderName (именно это значение уходит на сервер как
-        folder_name в payload).
-
-        Возвращает путь к папке или "" если не найдено.
+        FolderName.
         """
         if not path or not os.path.isdir(self.sessions_root):
             return ""
@@ -2496,10 +2657,7 @@ class SyncManager:
           2. Fallback: обход папок sessions/ и чтение
              .sync_published.json (поле record_id).
           3. Fallback: обход папок sessions/ и чтение
-             session.json (поле server_id). Это защищает от
-             дублирования, когда .sync_published.json ещё не
-             записан, но publish_session уже успел сохранить
-             server_id в session.json.
+             session.json (поле server_id).
           4. Fallback: поиск по basename(path) из change.
         """
         indexed = self._lookup_in_record_index(record_id)
@@ -2520,7 +2678,6 @@ class SyncManager:
             if not os.path.isdir(full):
                 continue
 
-            # --- .sync_published.json (record_id) ---
             marker = os.path.join(full, _SYNC_MARKER_FILE)
             if os.path.isfile(marker):
                 try:
@@ -2532,7 +2689,6 @@ class SyncManager:
                 except Exception:
                     pass
 
-            # --- session.json (server_id) ---
             session_json = os.path.join(full, "session.json")
             if os.path.isfile(session_json):
                 try:

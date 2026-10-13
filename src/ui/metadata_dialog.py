@@ -2,19 +2,12 @@
 
 Изменения:
   • Интерфейс переделан на вкладки: «Основное», «Документ»,
-    «Промпт», «Скрам и DeepSeek», «TFS», «Вложения».
+    «Промпт», «Скрам и DeepSeek», «TFS», «Зависимости», «Вложения».
   • Добавлена вкладка «Документ»: позволяет прикрепить один или
     несколько документов (.docx / .pdf / .txt / .md / .csv /
     .json / .xlsx и т.п.) и создать запись без видео.
-    При создании такой записи:
-      – файлы копируются в attachments/;
-      – session.json получает флаг document_only=True;
-      – в очередь ставится задача-документ (обрабатывается
-        отдельной веткой processor.process_document_record);
-      – если и summary, и deepseek_prompt отключены — запись
-        создаётся локально без очереди.
   • Блок «TFS-выборка» вынесен в отдельную вкладку «TFS».
-  • На вкладке «TFS» поддерживаются шаблонные переменные WIQL.
+  • Добавлена вкладка «Зависимости» — связи с другими записями.
   • Добавлен блок «Теги» (на вкладке «Основное»).
   • Добавлен блок «Синхронизация» на вкладке «Основное».
 """
@@ -23,19 +16,27 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
     QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
-    QTabWidget, QVBoxLayout, QWidget,
+    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
+from ..file_readers import read_json_file
 from ..logger import get_logger
+from ..relations_manager import (
+    DEFAULT_RELATION_KIND,
+    RELATION_KINDS,
+    list_all_sessions_except,
+)
 from ..tfs_client import extract_variables
 from .tooltips import attach_tooltip, make_info_icon, with_info
 
@@ -88,16 +89,227 @@ def format_name_template(
     return result.strip()
 
 
+# ===========================================================================
+# Диалог выбора связанных записей
+# ===========================================================================
+class _RelationPickerDialog(QDialog):
+    """
+    Диалог выбора одной или нескольких записей для связи.
+
+    Возвращает:
+      • selected_sessions() — список выбранных dict'ов
+        (session_dir, session_id, name, project, date);
+      • selected_kind() — вид связи (related / parent / child).
+    """
+
+    def __init__(
+        self,
+        candidates: List[Dict[str, Any]],
+        already_linked: Optional[set] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Выбор связанных записей")
+        self.setModal(True)
+        self.setMinimumSize(820, 620)
+
+        self._candidates = list(candidates or [])
+        self._already = set(already_linked or set())
+        self._selected: List[Dict[str, Any]] = []
+        self._check_items: List[Tuple[QTableWidgetItem, Dict[str, Any]]] = []
+
+        self._build_ui()
+        self._apply_filter()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        info = QLabel(
+            "Отметьте одну или несколько записей. Уже связанные "
+            "записи показаны серым и недоступны для выбора."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: #666; }")
+        root.addWidget(info)
+
+        # --- Фильтры ---
+        filters = QHBoxLayout()
+
+        filters.addWidget(QLabel("Вид связи:"))
+        self.kind_combo = QComboBox()
+        for key, label in RELATION_KINDS.items():
+            self.kind_combo.addItem(label, key)
+        self.kind_combo.setCurrentIndex(
+            list(RELATION_KINDS.keys()).index(DEFAULT_RELATION_KIND)
+        )
+        attach_tooltip(self.kind_combo, "meta_relations_kind")
+        filters.addWidget(self.kind_combo)
+
+        filters.addSpacing(12)
+        filters.addWidget(QLabel("Поиск:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText(
+            "Подстрока в названии, проекте, дате…"
+        )
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self._apply_filter)
+        filters.addWidget(self.search_input, 1)
+
+        root.addLayout(filters)
+
+        # --- Таблица ---
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels([
+            "✓", "Дата", "Название", "Проект", "Папка",
+        ])
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        hv = self.table.horizontalHeader()
+        hv.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        root.addWidget(self.table, 1)
+
+        # --- Счётчик ---
+        self.count_label = QLabel("Выбрано: 0")
+        self.count_label.setStyleSheet(
+            "QLabel { color: #444; font-weight: bold; }"
+        )
+        root.addWidget(self.count_label)
+
+        # --- Кнопки ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        ).setText("Добавить")
+        buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        ).setText("Отмена")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _apply_filter(self) -> None:
+        query = (self.search_input.text() or "").strip().lower()
+
+        self.table.setRowCount(0)
+        self._check_items = []
+
+        for c in self._candidates:
+            haystack = " ".join([
+                c.get("name") or "",
+                c.get("project") or "",
+                c.get("date") or "",
+                c.get("session_id") or "",
+            ]).lower()
+            if query and query not in haystack:
+                continue
+
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            already = c["session_id"] in self._already
+            check_item = QTableWidgetItem()
+            check_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            if already:
+                check_item.setCheckState(Qt.CheckState.Checked)
+                check_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            else:
+                check_item.setCheckState(Qt.CheckState.Unchecked)
+            check_item.stateChanged.connect(self._update_count)
+            self.table.setItem(row, 0, check_item)
+
+            self.table.setItem(
+                row, 1, QTableWidgetItem(c.get("date") or "—")
+            )
+            self.table.setItem(
+                row, 2,
+                QTableWidgetItem(c.get("name") or "—"),
+            )
+            self.table.setItem(
+                row, 3,
+                QTableWidgetItem(c.get("project") or "—"),
+            )
+            folder_item = QTableWidgetItem(c["session_id"])
+            folder_item.setToolTip(c["session_dir"])
+            self.table.setItem(row, 4, folder_item)
+
+            if already:
+                for col in range(5):
+                    cell = self.table.item(row, col)
+                    if cell:
+                        cell.setForeground(Qt.GlobalColor.gray)
+                        cell.setToolTip("Уже связано")
+            else:
+                self._check_items.append((check_item, c))
+
+        self._update_count()
+
+    def _update_count(self) -> None:
+        n = sum(
+            1 for ci, _ in self._check_items
+            if ci.checkState() == Qt.CheckState.Checked
+        )
+        self.count_label.setText(f"Выбрано: {n}")
+
+    def _on_accept(self) -> None:
+        self._selected = [
+            c for ci, c in self._check_items
+            if ci.checkState() == Qt.CheckState.Checked
+        ]
+        if not self._selected:
+            QMessageBox.information(
+                self, "Связи",
+                "Не выбрано ни одной записи.",
+            )
+            return
+        self.accept()
+
+    def selected_sessions(self) -> List[Dict[str, Any]]:
+        return list(self._selected)
+
+    def selected_kind(self) -> str:
+        return self.kind_combo.currentData() or DEFAULT_RELATION_KIND
+
+
+# ===========================================================================
+# Основной диалог метаданных
+# ===========================================================================
 class MetadataDialog(QDialog):
     """
     Окно ввода метаданных.
 
     Вкладки:
       • Основное
-      • Документ (новая)
+      • Документ (только в режиме allow_document_only)
       • Промпт
       • Скрам и DeepSeek
       • TFS
+      • Зависимости
       • Вложения
 
     Атрибут result_data содержит поле document_only=True,
@@ -132,8 +344,8 @@ class MetadataDialog(QDialog):
         tfs_templates: Optional[List[Dict[str, str]]] = None,
         on_request_tfs_projects: Optional[Callable[[], List[str]]] = None,
         default_tfs_save_attachment: bool = True,
-        # --- НОВОЕ: режим «документ» ---
         allow_document_only: bool = False,
+        relations_max_in_dialog: int = 0,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -177,16 +389,24 @@ class MetadataDialog(QDialog):
         self._allow_document_only = bool(allow_document_only)
         self._documents: List[str] = []
 
+        # --- Связи ---
+        self._relations: List[Dict[str, str]] = []
+        self._relations_max_in_dialog = int(
+            relations_max_in_dialog or 0
+        )
+
         self.result_data: Dict[str, Any] = {}
         self._prompt_edited = False
         self._attachments: List[str] = []
 
         log.debug(
             "MetadataDialog: title=%r, allow_document_only=%s, "
-            "projects=%d, prompts=%d, tags=%d, tfs_templates=%d",
+            "projects=%d, prompts=%d, tags=%d, tfs_templates=%d, "
+            "relations_max_in_dialog=%d",
             title, self._allow_document_only,
             len(self._projects), len(self._prompts),
             len(self._tags), len(self._tfs_templates),
+            self._relations_max_in_dialog,
         )
 
         self._build_ui()
@@ -205,8 +425,6 @@ class MetadataDialog(QDialog):
 
         self.tabs.addTab(self._build_main_tab(), "Основное")
 
-        # Вкладку «Документ» показываем только в режиме
-        # allow_document_only (создание записи без видео).
         if self._allow_document_only:
             self.tabs.addTab(
                 self._build_document_tab(), "Документ"
@@ -217,6 +435,10 @@ class MetadataDialog(QDialog):
             self._build_scrum_tab(), "Скрам и DeepSeek"
         )
         self.tabs.addTab(self._build_tfs_tab(), "TFS")
+        # --- НОВОЕ: вкладка «Зависимости» ---
+        self.tabs.addTab(
+            self._build_relations_tab(), "Зависимости"
+        )
         self.tabs.addTab(
             self._build_attachments_tab(), "Вложения"
         )
@@ -237,7 +459,7 @@ class MetadataDialog(QDialog):
         root.addWidget(buttons)
 
     # ------------------------------------------------------------------
-    # Вкладка «Основное»
+    # Вкладка «Основное» (без изменений)
     # ------------------------------------------------------------------
     def _build_main_tab(self) -> QWidget:
         w = QWidget()
@@ -336,8 +558,7 @@ class MetadataDialog(QDialog):
         self.date_edit.setToolTip(
             "Дата, к которой относится запись.\n\n"
             "По умолчанию — сегодняшняя дата. Измените, если "
-            "запись сделана не сегодня (например, при вводе "
-            "задним числом или при импорте)."
+            "запись сделана не сегодня."
         )
 
         self.time_edit = QTimeEdit()
@@ -345,8 +566,7 @@ class MetadataDialog(QDialog):
         self.time_edit.setTime(QTime.currentTime())
         self.time_edit.setToolTip(
             "Время, к которому относится запись.\n\n"
-            "По умолчанию — текущее время. Измените, если "
-            "запись сделана в другое время."
+            "По умолчанию — текущее время."
         )
 
         self.date_time_now_btn = QPushButton("Сейчас")
@@ -402,19 +622,16 @@ class MetadataDialog(QDialog):
         self.time_edit.setTime(QTime.currentTime())
 
     # ------------------------------------------------------------------
-    # Вкладка «Документ» (НОВАЯ)
+    # Вкладка «Документ» (без изменений)
     # ------------------------------------------------------------------
     def _build_document_tab(self) -> QWidget:
-        """
-        Вкладка «Документ» — прикрепить один или несколько
-        документов вместо видео.
-        """
+        """Вкладка «Документ» — прикрепить один или несколько
+        документов вместо видео."""
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        # --- Инфо-плашка ---
         info_row = QHBoxLayout()
         info = QLabel(
             "Создайте запись без видео — только из документов.<br><br>"
@@ -442,7 +659,6 @@ class MetadataDialog(QDialog):
 
         layout.addLayout(info_row)
 
-        # --- Заголовок списка ---
         header = QHBoxLayout()
         header.addWidget(QLabel("<b>Прикреплённые документы</b>"))
         header.addStretch()
@@ -453,14 +669,11 @@ class MetadataDialog(QDialog):
 
         hint = QLabel(
             "<span style='color:#666'>Отметьте один или несколько "
-            "файлов. Порядок в списке сохраняется — при извлечении "
-            "текста документы будут склеены в указанном порядке."
-            "</span>"
+            "файлов. Порядок в списке сохраняется.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        # --- Список документов ---
         self.documents_list = QListWidget()
         self.documents_list.setMinimumHeight(200)
         self.documents_list.setSelectionMode(
@@ -470,14 +683,11 @@ class MetadataDialog(QDialog):
         attach_tooltip(self.documents_list, "meta_documents_list")
         layout.addWidget(self.documents_list, 1)
 
-        # --- Кнопки ---
         doc_btns = QHBoxLayout()
 
         self.add_document_btn = QPushButton("Добавить файлы…")
         self.add_document_btn.setToolTip(
-            "Выбрать один или несколько документов.\n\n"
-            "Поддерживаются: docx, doc, odt, rtf, pdf, txt, "
-            "md, csv, json, xlsx, xls, pptx."
+            "Выбрать один или несколько документов."
         )
         self.add_document_btn.clicked.connect(
             self._on_add_document
@@ -486,8 +696,7 @@ class MetadataDialog(QDialog):
 
         self.remove_document_btn = QPushButton("Удалить выбранные")
         self.remove_document_btn.setToolTip(
-            "Убрать выбранные документы из записи (файлы "
-            "на диске не удаляются)."
+            "Убрать выбранные документы из записи."
         )
         self.remove_document_btn.clicked.connect(
             self._on_remove_document
@@ -495,20 +704,12 @@ class MetadataDialog(QDialog):
         doc_btns.addWidget(self.remove_document_btn)
 
         self.move_up_doc_btn = QPushButton("Вверх")
-        self.move_up_doc_btn.setToolTip(
-            "Поменять порядок: выбранный документ станет "
-            "выше в списке"
-        )
         self.move_up_doc_btn.clicked.connect(
             lambda: self._move_document(-1)
         )
         doc_btns.addWidget(self.move_up_doc_btn)
 
         self.move_down_doc_btn = QPushButton("Вниз")
-        self.move_down_doc_btn.setToolTip(
-            "Поменять порядок: выбранный документ станет "
-            "ниже в списке"
-        )
         self.move_down_doc_btn.clicked.connect(
             lambda: self._move_document(1)
         )
@@ -524,7 +725,6 @@ class MetadataDialog(QDialog):
 
         layout.addLayout(doc_btns)
 
-        # --- Что делать с документами ---
         layout.addWidget(self._build_document_options_section())
 
         return w
@@ -555,9 +755,7 @@ class MetadataDialog(QDialog):
 
         hint = QLabel(
             "<span style='color:#666'>Текст документов будет "
-            "извлечён и использован так же, как стенограмма. "
-            "Отметьте, что формировать при обработке записи."
-            "</span>"
+            "извлечён и использован так же, как стенограмма.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -609,7 +807,7 @@ class MetadataDialog(QDialog):
         return box
 
     # ------------------------------------------------------------------
-    # Работа с документами
+    # Работа с документами (без изменений)
     # ------------------------------------------------------------------
     def _refresh_documents_list(self) -> None:
         if not hasattr(self, "documents_list"):
@@ -626,11 +824,6 @@ class MetadataDialog(QDialog):
             self.documents_count_label.setText(
                 f"Документов: {len(self._documents)}"
             )
-
-        log.debug(
-            "Список документов обновлён: %d файлов",
-            len(self._documents),
-        )
 
     def _on_add_document(self) -> None:
         patterns = " ".join(f"*{ext}" for ext in _DOCUMENT_EXTS)
@@ -665,10 +858,6 @@ class MetadataDialog(QDialog):
             p for p in self._documents if p not in to_remove
         ]
         self._refresh_documents_list()
-        log.info(
-            "Удалено документов: %d (осталось %d)",
-            len(to_remove), len(self._documents),
-        )
 
     def _move_document(self, delta: int) -> None:
         row = self.documents_list.currentRow()
@@ -684,7 +873,7 @@ class MetadataDialog(QDialog):
         self.documents_list.setCurrentRow(new_row)
 
     # ------------------------------------------------------------------
-    # Блок тегов
+    # Блок тегов (без изменений)
     # ------------------------------------------------------------------
     def _build_tags_section(self) -> QWidget:
         box = QWidget()
@@ -702,9 +891,7 @@ class MetadataDialog(QDialog):
 
         hint = QLabel(
             "<span style='color:#666'>Отметьте один или несколько "
-            "тегов из справочника. Можно добавить новый тег — он "
-            "попадёт в справочник (Настройки → Теги). Снять все "
-            "теги — кнопкой «Снять все».</span>"
+            "тегов из справочника.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -722,9 +909,7 @@ class MetadataDialog(QDialog):
         btns = QHBoxLayout()
         self.add_tag_btn = QPushButton("Добавить новый тег…")
         self.add_tag_btn.setToolTip(
-            "Добавить тег, которого нет в справочнике.\n"
-            "После сохранения он появится в Настройки → Теги "
-            "и сразу будет отмечен у записи."
+            "Добавить тег, которого нет в справочнике."
         )
         self.add_tag_btn.clicked.connect(self._on_add_new_tag)
         btns.addWidget(self.add_tag_btn)
@@ -747,7 +932,7 @@ class MetadataDialog(QDialog):
         return box
 
     # ------------------------------------------------------------------
-    # Блок «Готовность к синхронизации»
+    # Блок «Готовность к синхронизации» (без изменений)
     # ------------------------------------------------------------------
     def _build_sync_ready_section(self) -> QWidget:
         box = QWidget()
@@ -765,10 +950,7 @@ class MetadataDialog(QDialog):
 
         hint = QLabel(
             "<span style='color:#666'>Пока галочка не стоит — "
-            "запись считается черновиком: автопубликация на "
-            "сервер не запускается, фоновый pull не "
-            "перезаписывает локальные файлы, локальные "
-            "артефакты не удаляются.</span>"
+            "запись считается черновиком.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -782,7 +964,7 @@ class MetadataDialog(QDialog):
         return box
 
     # ------------------------------------------------------------------
-    # Теги
+    # Теги (без изменений)
     # ------------------------------------------------------------------
     def _populate_tags_list(self) -> None:
         if not hasattr(self, "tags_list"):
@@ -920,9 +1102,324 @@ class MetadataDialog(QDialog):
         self._selected_tags = []
         self._populate_tags_list()
 
+    # ==================================================================
+    # Вкладка «Зависимости» (НОВАЯ)
+    # ==================================================================
+    def _build_relations_tab(self) -> QWidget:
+        """
+        Вкладка «Зависимости» — связи с другими записями.
+
+        Позволяет выбрать одну или несколько записей, указать
+        вид связи (related / parent / child) и сохранить их.
+        """
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        info_row = QHBoxLayout()
+        info = QLabel(
+            "Свяжите эту запись с другими записями.<br><br>"
+            "<b>Виды связи:</b><br>"
+            "  • <b>Связан</b> — простая двусторонняя связь "
+            "(по умолчанию);<br>"
+            "  • <b>Родитель</b> — эта запись является "
+            "родительской для указанной;<br>"
+            "  • <b>Дочерний</b> — эта запись является "
+            "дочерней для указанной.<br><br>"
+            "Связанные записи можно открыть через кнопку "
+            "<b>«Связи»</b> в окне «Записи».<br><br>"
+            "<span style='color:#888'>Связи сохраняются в "
+            "session.json и передаются на сервер синхронизации. "
+            "При публикации вместе с локальным session_id "
+            "сохраняется record_id с сервера — связь не "
+            "потеряется при переименовании папок.</span>"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("QLabel { color: #666; }")
+        info_row.addWidget(info, 1)
+        icon = make_info_icon("meta_relations_intro")
+        if icon is not None:
+            info_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(info_row)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Связанные записи</b>"))
+        header.addStretch()
+        layout.addLayout(header)
+
+        # --- Таблица связей ---
+        self.relations_table = QTableWidget(0, 4)
+        self.relations_table.setHorizontalHeaderLabels([
+            "Тип связи", "Название", "Проект", "Папка",
+        ])
+        self.relations_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.relations_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.relations_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        hv = self.relations_table.horizontalHeader()
+        hv.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        hv.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.relations_table.setMinimumHeight(220)
+        self.relations_table.itemDoubleClicked.connect(
+            lambda _it: self._on_edit_relation_kind()
+        )
+        layout.addWidget(self.relations_table)
+
+        # --- Кнопки ---
+        btns = QHBoxLayout()
+
+        self.relation_add_btn = QPushButton("Добавить связь…")
+        attach_tooltip(self.relation_add_btn, "meta_relations_add")
+        self.relation_add_btn.clicked.connect(
+            self._on_add_relation
+        )
+        btns.addWidget(self.relation_add_btn)
+
+        self.relation_kind_btn = QPushButton("Изменить тип")
+        attach_tooltip(self.relation_kind_btn, "meta_relations_kind")
+        self.relation_kind_btn.clicked.connect(
+            self._on_edit_relation_kind
+        )
+        btns.addWidget(self.relation_kind_btn)
+
+        self.relation_remove_btn = QPushButton("Удалить")
+        attach_tooltip(
+            self.relation_remove_btn, "meta_relations_remove"
+        )
+        self.relation_remove_btn.clicked.connect(
+            self._on_remove_relation
+        )
+        btns.addWidget(self.relation_remove_btn)
+
+        btns.addStretch()
+
+        self.relations_count_label = QLabel("Связей: 0")
+        self.relations_count_label.setStyleSheet(
+            "QLabel { color: #444; font-weight: bold; }"
+        )
+        btns.addWidget(self.relations_count_label)
+
+        layout.addLayout(btns)
+        layout.addStretch()
+
+        return w
+
     # ------------------------------------------------------------------
-    # Вкладка «Промпт»
+    # Операции со связями
     # ------------------------------------------------------------------
+    def _refresh_relations_table(self) -> None:
+        if not hasattr(self, "relations_table"):
+            return
+        self.relations_table.setRowCount(0)
+
+        for rel in self._relations:
+            row = self.relations_table.rowCount()
+            self.relations_table.insertRow(row)
+
+            kind_label = RELATION_KINDS.get(
+                rel["kind"], rel["kind"]
+            )
+            kind_item = QTableWidgetItem(kind_label)
+            kind_item.setData(
+                Qt.ItemDataRole.UserRole, rel["kind"]
+            )
+            self.relations_table.setItem(row, 0, kind_item)
+
+            name = rel.get("target_name") or ""
+            if not name:
+                tdir = rel.get("target_dir") or ""
+                if tdir and os.path.isdir(tdir):
+                    meta = read_json_file(
+                        os.path.join(tdir, "session.json")
+                    ) or {}
+                    name = str(meta.get("name") or "").strip()
+                if not name:
+                    name = (
+                        rel.get("target_session_id")
+                        or os.path.basename(tdir or "")
+                        or rel.get("target_record_id")
+                        or "(без названия)"
+                    )
+            name_item = QTableWidgetItem(name)
+            name_item.setToolTip(name)
+            self.relations_table.setItem(row, 1, name_item)
+
+            project = ""
+            tdir = rel.get("target_dir") or ""
+            if tdir and os.path.isdir(tdir):
+                meta = read_json_file(
+                    os.path.join(tdir, "session.json")
+                ) or {}
+                project = str(meta.get("project") or "")
+            self.relations_table.setItem(
+                row, 2, QTableWidgetItem(project or "—")
+            )
+
+            folder_label = (
+                rel.get("target_session_id")
+                or rel.get("target_record_id")
+                or "—"
+            )
+            folder_item = QTableWidgetItem(folder_label)
+            folder_item.setToolTip(
+                rel.get("target_dir") or "(папка не найдена)"
+            )
+            self.relations_table.setItem(row, 3, folder_item)
+
+        self.relations_count_label.setText(
+            f"Связей: {len(self._relations)}"
+        )
+
+    def _on_add_relation(self) -> None:
+        if not self._sessions_root or not os.path.isdir(
+            self._sessions_root
+        ):
+            QMessageBox.warning(
+                self, "Связи",
+                "Папка сессий не найдена — не из чего выбирать.",
+            )
+            return
+
+        current_dir = str(
+            self._initial.get("session_dir") or ""
+        ).strip()
+
+        candidates = list_all_sessions_except(
+            self._sessions_root, current_dir
+        )
+
+        # --- Лимит из настроек ---
+        limit = self._relations_max_in_dialog
+        if limit > 0 and len(candidates) > limit:
+            log.info(
+                "Связи: список кандидатов урезан с %d до %d "
+                "(app.relations_max_in_dialog)",
+                len(candidates), limit,
+            )
+            candidates = candidates[:limit]
+
+        if not candidates:
+            QMessageBox.information(
+                self, "Связи",
+                "В архиве нет других записей для связи.",
+            )
+            return
+
+        dlg = _RelationPickerDialog(
+            candidates=candidates,
+            already_linked={
+                r.get("target_session_id") or ""
+                for r in self._relations
+            },
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        chosen = dlg.selected_sessions()
+        if not chosen:
+            return
+
+        kind = dlg.selected_kind()
+        for c in chosen:
+            sid = c["session_id"]
+            if any(
+                r.get("target_session_id") == sid
+                for r in self._relations
+            ):
+                continue
+            self._relations.append({
+                "target_session_id": sid,
+                "target_dir": c["session_dir"],
+                "target_name": c["name"],
+                "target_record_id": c.get("record_id") or "",
+                "kind": kind,
+            })
+
+        self._refresh_relations_table()
+        log.info(
+            "MetadataDialog: добавлено связей: %d (kind=%s)",
+            len(chosen), kind,
+        )
+
+    def _on_edit_relation_kind(self) -> None:
+        row = self.relations_table.currentRow()
+        if row < 0 or row >= len(self._relations):
+            QMessageBox.information(
+                self, "Связи", "Выберите строку в таблице."
+            )
+            return
+
+        rel = self._relations[row]
+        current_kind = rel["kind"]
+
+        items = list(RELATION_KINDS.values())
+        keys = list(RELATION_KINDS.keys())
+        try:
+            current_idx = keys.index(current_kind)
+        except ValueError:
+            current_idx = 0
+
+        new_label, ok = QInputDialog.getItem(
+            self,
+            "Вид связи",
+            "Выберите вид связи:",
+            items, current_idx, False,
+        )
+        if not ok or not new_label:
+            return
+
+        try:
+            new_kind = keys[items.index(new_label)]
+        except (ValueError, IndexError):
+            return
+
+        rel["kind"] = new_kind
+        self._refresh_relations_table()
+
+    def _on_remove_relation(self) -> None:
+        row = self.relations_table.currentRow()
+        if row < 0 or row >= len(self._relations):
+            QMessageBox.information(
+                self, "Связи", "Выберите строку в таблице."
+            )
+            return
+
+        rel = self._relations[row]
+        name = (
+            rel.get("target_name")
+            or rel.get("target_session_id")
+            or rel.get("target_record_id")
+            or ""
+        )
+        reply = QMessageBox.question(
+            self, "Удалить связь",
+            f"Удалить связь с записью «{name}»?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        del self._relations[row]
+        self._refresh_relations_table()
+
+    # ==================================================================
+    # Вкладка «Промпт» (без изменений)
+    # ==================================================================
     def _build_prompt_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -931,9 +1428,7 @@ class MetadataDialog(QDialog):
 
         info = QLabel(
             "Промпт — инструкция, которая используется при "
-            "суммаризации и при формировании файла DeepSeek. "
-            "Можно выбрать готовый из библиотеки или написать "
-            "свой."
+            "суммаризации и при формировании файла DeepSeek."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
@@ -999,9 +1494,7 @@ class MetadataDialog(QDialog):
 
         hint = QLabel(
             "<span style='color:#666'>Выберите, что из карточки "
-            "записи добавить в промпт. Информация добавляется "
-            "отдельным блоком «КОНТЕКСТ ЗАПИСИ» перед инструкцией."
-            "</span>"
+            "записи добавить в промпт.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1068,9 +1561,9 @@ class MetadataDialog(QDialog):
         self.include_comment_check.setChecked(True)
         self.include_tags_check.setChecked(True)
 
-    # ------------------------------------------------------------------
-    # Вкладка «Скрам и DeepSeek»
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Вкладка «Скрам и DeepSeek» (без изменений)
+    # ==================================================================
     def _build_scrum_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -1085,7 +1578,6 @@ class MetadataDialog(QDialog):
         info.setStyleSheet("QLabel { color: #666; }")
         layout.addWidget(info)
 
-        # --- Транскрибация ---
         transcribe_header = QHBoxLayout()
         transcribe_header.addWidget(
             QLabel("<b>Транскрибация</b>")
@@ -1122,7 +1614,6 @@ class MetadataDialog(QDialog):
 
         layout.addSpacing(8)
 
-        # --- Summary ---
         summary_header = QHBoxLayout()
         summary_header.addWidget(
             QLabel("<b>Краткое содержание (summary)</b>")
@@ -1142,7 +1633,6 @@ class MetadataDialog(QDialog):
         self.generate_summary_check.setChecked(False)
         layout.addWidget(self.generate_summary_check)
 
-        # --- DeepSeek ---
         deepseek_header = QHBoxLayout()
         deepseek_header.addWidget(
             QLabel("<b>Промпт для DeepSeek</b>")
@@ -1160,7 +1650,6 @@ class MetadataDialog(QDialog):
         self.generate_deepseek_check.setChecked(True)
         layout.addWidget(self.generate_deepseek_check)
 
-        # --- Скрам ---
         scrum_header = QHBoxLayout()
         scrum_header.addWidget(QLabel("<b>Скрам-митинг</b>"))
         scrum_header.addStretch()
@@ -1230,9 +1719,9 @@ class MetadataDialog(QDialog):
         layout.addStretch()
         return w
 
-    # ------------------------------------------------------------------
-    # Вкладка «TFS»
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Вкладка «TFS» (без изменений)
+    # ==================================================================
     def _build_tfs_tab(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1418,8 +1907,7 @@ class MetadataDialog(QDialog):
 
         hint = QLabel(
             "<span style='color:#666'>В выбранном шаблоне есть "
-            "шаблонные переменные. Укажите их значения — они "
-            "подставятся в запрос перед выполнением.</span>"
+            "шаблонные переменные. Укажите их значения.</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1603,9 +2091,9 @@ class MetadataDialog(QDialog):
             if widget is not None:
                 widget.setEnabled(enabled)
 
-    # ------------------------------------------------------------------
-    # Вкладка «Вложения»
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Вкладка «Вложения» (без изменений)
+    # ==================================================================
     def _build_attachments_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -1681,7 +2169,7 @@ class MetadataDialog(QDialog):
         return w
 
     # ------------------------------------------------------------------
-    # Подключение сигналов
+    # Подключение сигналов (без изменений)
     # ------------------------------------------------------------------
     def _connect_signals(self) -> None:
         self.prompt_combo.currentIndexChanged.connect(
@@ -1709,7 +2197,7 @@ class MetadataDialog(QDialog):
             )
 
     # ------------------------------------------------------------------
-    # Шаблоны названий
+    # Шаблоны названий (без изменений)
     # ------------------------------------------------------------------
     def _populate_name_templates(self) -> None:
         self.name_combo.blockSignals(True)
@@ -1820,7 +2308,7 @@ class MetadataDialog(QDialog):
         )
 
     # ------------------------------------------------------------------
-    # Скрам
+    # Скрам (без изменений)
     # ------------------------------------------------------------------
     def _on_scrum_toggled(self, checked: bool) -> None:
         if checked and not self.generate_deepseek_check.isChecked():
@@ -1925,7 +2413,7 @@ class MetadataDialog(QDialog):
             self.protocol_path_input.setText(path)
 
     # ------------------------------------------------------------------
-    # Вложения
+    # Вложения (без изменений)
     # ------------------------------------------------------------------
     def _refresh_attachments_list(self) -> None:
         self.attachments_list.clear()
@@ -2211,13 +2699,38 @@ class MetadataDialog(QDialog):
                 self._default_tfs_save_attachment
             )
 
+        # --- НОВОЕ: связи ---
+        raw_rels = init.get("relations") or []
+        self._relations = []
+        if isinstance(raw_rels, list):
+            for r in raw_rels:
+                if not isinstance(r, dict):
+                    continue
+                sid = str(r.get("target_session_id") or "").strip()
+                tdir = str(r.get("target_dir") or "").strip()
+                tname = str(r.get("target_name") or "").strip()
+                trid = str(r.get("target_record_id") or "").strip()
+                kind = str(
+                    r.get("kind") or DEFAULT_RELATION_KIND
+                ).strip().lower()
+                if kind not in RELATION_KINDS:
+                    kind = DEFAULT_RELATION_KIND
+                if not (sid or tdir or trid):
+                    continue
+                self._relations.append({
+                    "target_session_id": sid,
+                    "target_dir": tdir,
+                    "target_name": tname,
+                    "target_record_id": trid,
+                    "kind": kind,
+                })
+        self._refresh_relations_table()
+
         # --- Опции обработки документов ---
         if self._allow_document_only:
-            # Summary по умолчанию выключен (не дёргаем LiteLLM).
             self.doc_generate_summary_check.setChecked(
                 bool(init.get("generate_summary", False))
             )
-            # DeepSeek-промпт по умолчанию включён.
             self.doc_generate_deepseek_check.setChecked(
                 bool(init.get("generate_deepseek_prompt", True))
             )
@@ -2229,7 +2742,7 @@ class MetadataDialog(QDialog):
             )
 
     # ------------------------------------------------------------------
-    # Промпт
+    # Промпт (без изменений)
     # ------------------------------------------------------------------
     def _on_prompt_selected(self, index: int) -> None:
         if index < 0:
@@ -2459,11 +2972,8 @@ class MetadataDialog(QDialog):
         documents_collected: List[str] = []
 
         if self._allow_document_only:
-            # Если создаём запись-документ, требуется хотя бы
-            # один документ ИЛИ вложение (на вкладке «Вложения»).
             documents_collected = list(self._documents)
 
-            # Проверим, что все файлы существуют.
             for p in documents_collected:
                 if not os.path.isfile(p):
                     QMessageBox.warning(
@@ -2474,6 +2984,11 @@ class MetadataDialog(QDialog):
                     return
 
             document_only = bool(documents_collected)
+
+        # --- Связи ---
+        relations_out = [
+            dict(r) for r in getattr(self, "_relations", [])
+        ]
 
         result: Dict[str, Any] = {
             "project": project,
@@ -2523,9 +3038,10 @@ class MetadataDialog(QDialog):
             "tfs_template_name": tfs_template_value,
             "tfs_save_attachment": tfs_save_value,
             "tfs_variables": dict(tfs_vars_collected),
-            # --- НОВОЕ: документы ---
             "documents": documents_collected,
             "document_only": document_only,
+            # --- НОВОЕ: связи ---
+            "relations": relations_out,
         }
 
         # --- Опции обработки документов ---
@@ -2543,7 +3059,6 @@ class MetadataDialog(QDialog):
                 self.doc_send_to_deepseek_check.isChecked()
             )
 
-            # Синхронизируем основные флаги с doc-опциями.
             result["generate_summary"] = bool(
                 self.doc_generate_summary_check.isChecked()
             )
@@ -2561,9 +3076,10 @@ class MetadataDialog(QDialog):
 
         log.info(
             "Метаданные подтверждены: project=%s, name=%s, "
-            "document_only=%s, documents=%d",
+            "document_only=%s, documents=%d, relations=%d",
             project, final_name, document_only,
             len(documents_collected),
+            len(relations_out),
         )
         self.accept()
 

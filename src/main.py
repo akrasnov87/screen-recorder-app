@@ -1,11 +1,10 @@
 """Точка входа приложения Screen Recorder & Transcriber.
 
 Изменения:
-  • Добавлена интеграция с TFS / Azure DevOps Server:
-      – импорт TfsWindow;
-      – поле self.tfs_window;
-      – обработчик _open_tfs();
-      – подключение сигнала open_tfs_requested.
+  • Добавлена интеграция с TFS / Azure DevOps Server.
+  • В _ask_metadata() добавлена передача relations_max_in_dialog
+    из app-настроек и session_dir в initial.
+  • В _build_default_meta() добавлено поле relations.
 """
 from __future__ import annotations
 
@@ -37,7 +36,6 @@ if __package__ in (None, ""):
     from src.ui.tray_manager import TrayManager
     from src.ui.yandex_vm_window import YandexVMDialog
     from src.ui.tasks_window import TasksWindow
-    # --- НОВОЕ: TFS ---
     from src.ui.tfs_window import TfsWindow
     from src.logger import (
         get_logger,
@@ -79,7 +77,6 @@ else:
     from .ui.tray_manager import TrayManager
     from .ui.yandex_vm_window import YandexVMDialog
     from .ui.tasks_window import TasksWindow
-    # --- НОВОЕ: TFS ---
     from .ui.tfs_window import TfsWindow
     from .logger import (
         get_logger,
@@ -164,7 +161,6 @@ class ScreenRecorderApp(QObject):
         self.library_window: Optional[LibraryWindow] = None
         self.sync_window: Optional[SyncWindow] = None
         self.tasks_window: Optional[TasksWindow] = None
-        # --- НОВОЕ: TFS ---
         self.tfs_window: Optional[TfsWindow] = None
 
         self.hotkey_manager = GlobalHotkeyManager(
@@ -241,11 +237,9 @@ class ScreenRecorderApp(QObject):
         self.tray_manager.open_sync_requested.connect(
             self._open_sync
         )
-        # --- НОВОЕ: TFS ---
         self.tray_manager.open_tfs_requested.connect(
             self._open_tfs
         )
-        # --- НОВОЕ: создание записи-документа ---
         self.tray_manager.create_document_requested.connect(
             self._create_document_record
         )
@@ -315,7 +309,6 @@ class ScreenRecorderApp(QObject):
     # Фоновый воркер синхронизации
     # ------------------------------------------------------------------
     def _maybe_start_sync_puller(self) -> None:
-        """Запускает фоновый дельта-синк, если он включён в настройках."""
         try:
             cfg = self.config_manager.get_sync_settings()
         except Exception as exc:
@@ -380,14 +373,6 @@ class ScreenRecorderApp(QObject):
     # Метаданные
     # ------------------------------------------------------------------
     def _resolve_default_project(self) -> str:
-        """
-        Возвращает проект для новых записей.
-
-        Приоритеты:
-          1) config.default_project, если он есть в списке проектов;
-          2) первый проект из get_project_names();
-          3) "Default".
-        """
         projects = self.config_manager.get_project_names()
         default_project = (
             self.config_manager.get_default_project()
@@ -453,6 +438,11 @@ class ScreenRecorderApp(QObject):
                 )
                 return []
 
+        # --- НОВОЕ: лимит связей в диалоге ---
+        relations_max = int(
+            self.app_cfg.get("relations_max_in_dialog", 0) or 0
+        )
+
         dlg = MetadataDialog(
             projects=projects,
             prompts=prompts,
@@ -474,8 +464,9 @@ class ScreenRecorderApp(QObject):
             default_tfs_save_attachment=bool(
                 self.app_cfg.get("tfs_save_attachment", True)
             ),
-            # --- НОВОЕ ---
             allow_document_only=allow_document_only,
+            # --- НОВОЕ ---
+            relations_max_in_dialog=relations_max,
             parent=None,
         )
         if dlg.exec() == dlg.DialogCode.Accepted:
@@ -486,21 +477,16 @@ class ScreenRecorderApp(QObject):
                     new_prompt.get("name", ""),
                     new_prompt.get("text", ""),
                 )
-            log.info("Диалог метаданных завершён: Продолжить")
+            log.info(
+                "Диалог метаданных завершён: Продолжить "
+                "(relations=%d)",
+                len(result.get("relations") or []),
+            )
             return result
         log.info("Диалог метаданных завершён: Пропустить")
         return None
 
     def _build_default_meta(self) -> Dict[str, Any]:
-        """
-        Формирует метаданные по умолчанию.
-
-        По умолчанию sync_ready=False — запись считается
-        черновиком, пока пользователь явно не поставит галочку.
-
-        По умолчанию skip_transcription=True — транскрибация
-        выполняется как обычно.
-        """
         default_project = self._resolve_default_project()
         now = datetime.now()
         now_str = f"{now:%Y-%m-%d %H-%M}"
@@ -516,12 +502,9 @@ class ScreenRecorderApp(QObject):
             "name_abbr": "",
             "comment": "",
             "tags": [],
-            # --- Дата и время записи ---
             "date": now.strftime("%Y-%m-%d"),
             "time": now.strftime("%H:%M:%S"),
-            # --- Флаг готовности к синхронизации ---
             "sync_ready": False,
-            # --- НОВОЕ: выполнять ли транскрибацию ---
             "skip_transcription": True,
             "prompt": self.config_manager.get_default_prompt(),
             "prompt_name": "",
@@ -537,24 +520,20 @@ class ScreenRecorderApp(QObject):
             "attachments": [],
             "send_attachments_to_transcribe": False,
             "send_attachments_to_deepseek": False,
-            # --- НОВОЕ: TFS ---
             "tfs_project": "",
             "tfs_template_name": "",
             "tfs_save_attachment": bool(
                 self.app_cfg.get("tfs_save_attachment", True)
             ),
+            # --- НОВОЕ: связи ---
+            "relations": [],
         }
         log.debug(
             "Сформированы метаданные по умолчанию: project=%r, "
             "date=%s, time=%s, sync_ready=False, "
-            "do_transcribe=True, "
-            "ctx: name=%s project=%s comment=%s tags=%s",
+            "do_transcribe=True, relations=0",
             default_project,
             meta["date"], meta["time"],
-            meta["include_name_in_prompt"],
-            meta["include_project_in_prompt"],
-            meta["include_comment_in_prompt"],
-            meta["include_tags_in_prompt"],
         )
         return meta
 
@@ -602,7 +581,6 @@ class ScreenRecorderApp(QObject):
             log.exception("Ошибка сохранения шаблона имени: %s", exc)
 
     def _add_tag_to_library(self, name: str, color: str = "") -> None:
-        """Сохраняет новый тег в справочник config["tags"]."""
         try:
             name = (name or "").strip()
             if not name:
@@ -682,7 +660,6 @@ class ScreenRecorderApp(QObject):
 
     @staticmethod
     def _read_session_meta(session_dir: str) -> Dict[str, Any]:
-        """Читает session.json. Возвращает {} при ошибке."""
         path = os.path.join(session_dir, "session.json")
         if not os.path.isfile(path):
             return {}
@@ -872,6 +849,9 @@ class ScreenRecorderApp(QObject):
         meta["source_file"] = src_abs
         meta.pop("task_id", None)
 
+        # --- relations переносим, если пользователь их задал ---
+        meta.setdefault("relations", [])
+
         self._copy_attachments_to_session(meta, session_dir)
         self._save_session_metadata(meta, session_dir)
 
@@ -895,30 +875,6 @@ class ScreenRecorderApp(QObject):
 
     @Slot()
     def _create_document_record(self) -> None:
-        """
-        Создаёт запись без видео — только из документов.
-
-        Что делает:
-          1. Открывает диалог метаданных в режиме
-             allow_document_only=True.
-          2. Пользователь выбирает документы на вкладке «Документ».
-          3. Создаётся папка сессии, файлы копируются в
-             attachments/.
-          4. Формируется запись с флагами:
-               • skip_transcription=False  — транскрибация
-                 выключена (для документа не имеет смысла);
-               • generate_summary=False    — summary не
-                 формируется (обращение к LiteLLM не требуется);
-               • generate_deepseek_prompt=True — формируется
-                 только файл промпта для DeepSeek;
-               • document_only=True.
-          5. Если generate_deepseek_prompt=True — задача ставится
-             в очередь (обрабатывается processor.process_document_record).
-          6. Если false — запись просто сохраняется локально.
-
-        Пользователь может изменить эти флаги в карточке
-        метаданных вручную.
-        """
         log.info("Запрос на создание записи-документа")
 
         initial: Dict[str, Any] = {
@@ -926,14 +882,9 @@ class ScreenRecorderApp(QObject):
             "include_project_in_prompt": True,
             "include_comment_in_prompt": True,
             "include_tags_in_prompt": True,
-            # --- НОВОЕ: для документа ---
-            # Транскрибация не имеет смысла.
             "skip_transcription": False,
-            # Summary не формируем — не дёргаем LiteLLM.
             "generate_summary": False,
-            # Формируем только файл промпта для DeepSeek.
             "generate_deepseek_prompt": True,
-            # Опции обработки документов.
             "document_save_transcript": True,
             "document_to_deepseek": True,
         }
@@ -951,8 +902,6 @@ class ScreenRecorderApp(QObject):
 
         documents = list(meta.get("documents") or [])
         if not documents:
-            # Если документы не выбраны, но есть вложения —
-            # используем их как документы.
             attachments = list(meta.get("attachments") or [])
             if attachments:
                 log.info(
@@ -976,7 +925,6 @@ class ScreenRecorderApp(QObject):
 
         session_dir = self._new_session_dir()
 
-        # --- Копируем документы в attachments/ ---
         att_dir = os.path.join(session_dir, "attachments")
         os.makedirs(att_dir, exist_ok=True)
 
@@ -1017,7 +965,6 @@ class ScreenRecorderApp(QObject):
             )
             return
 
-        # --- Обновляем метаданные ---
         meta["attachments"] = copied
         meta["documents"] = copied
         meta["session_dir"] = session_dir
@@ -1025,9 +972,8 @@ class ScreenRecorderApp(QObject):
         meta["source"] = "document"
         meta["document_only"] = True
         meta.pop("task_id", None)
+        meta.setdefault("relations", [])
 
-        # --- Флаги обработки по умолчанию для документа ---
-        # (могли быть переопределены пользователем в диалоге).
         meta.setdefault("skip_transcription", False)
         meta.setdefault("generate_summary", False)
         meta.setdefault("generate_deepseek_prompt", True)
@@ -1041,9 +987,6 @@ class ScreenRecorderApp(QObject):
 
         self._save_session_metadata(meta, session_dir)
 
-        # --- Ставим задачу в очередь, если нужно что-то генерировать ---
-        # Для документа — только DeepSeek-промпт (summary
-        # отключён по умолчанию).
         need_processing = bool(
             meta.get("generate_deepseek_prompt")
             or meta.get("generate_summary")
@@ -1075,7 +1018,6 @@ class ScreenRecorderApp(QObject):
                 )
                 return
 
-        # --- Итог ---
         if task_id:
             self._notify(
                 "Запись-документ",
@@ -1089,7 +1031,6 @@ class ScreenRecorderApp(QObject):
                 f"({len(copied)} док.) без обработки",
             )
 
-        # --- Открыть папку ---
         try:
             QDesktopServices.openUrl(
                 QUrl.fromLocalFile(session_dir)
@@ -1255,6 +1196,8 @@ class ScreenRecorderApp(QObject):
             "tfs_project": "",
             "tfs_template_name": "",
             "tfs_save_attachment": False,
+            # --- НОВОЕ: связи ---
+            "relations": [],
         }
 
         self._save_session_metadata(meta, session_dir)
@@ -1417,6 +1360,7 @@ class ScreenRecorderApp(QObject):
         meta["video_path"] = path
         meta["source"] = "record"
         meta.pop("task_id", None)
+        meta.setdefault("relations", [])
 
         self._copy_attachments_to_session(meta, session_dir)
         self._save_session_metadata(meta, session_dir)
@@ -1470,9 +1414,6 @@ class ScreenRecorderApp(QObject):
             self._finish_vm_session(vm_info)
 
     def _finish_vm_session(self, vm_info: dict) -> None:
-        """
-        Спрашивает пользователя, отключить ли ВМ после обработки.
-        """
         vm_name = vm_info.get("vm_name", "")
         schedule_path = vm_info.get("schedule_path", "")
 
@@ -1505,9 +1446,7 @@ class ScreenRecorderApp(QObject):
                 f"ВМ «{vm_name}» была временно включена для "
                 f"транскрибации.<br><br>"
                 f"<b>Отключить ВМ сейчас?</b><br>"
-                f"Если да — расписание будет восстановлено, "
-                f"и ВМ выключится при следующем запуске "
-                f"vm_manager.py.<br><br>"
+                f"Если да — расписание будет восстановлено.<br><br>"
                 f"Если нет — ВМ будет работать до "
                 f"<b>{next_stop}</b>."
             )
@@ -1547,10 +1486,7 @@ class ScreenRecorderApp(QObject):
                 QMessageBox.information(
                     None, "ВМ Yandex",
                     f"ВМ «{vm_name}» продолжит работу до "
-                    f"{next_stop}.\n\n"
-                    f"Отключить её позже можно через окно "
-                    f"«ВМ Yandex» (трей) — вручную поправить "
-                    f"schedule.cron.",
+                    f"{next_stop}.",
                 )
             else:
                 QMessageBox.information(
@@ -1600,9 +1536,7 @@ class ScreenRecorderApp(QObject):
             if not meta.get("sync_ready", False):
                 log.info(
                     "Автопубликация пропущена: запись %s не помечена "
-                    "как «готова к синхронизации» (sync_ready=false). "
-                    "Поставьте галочку в карточке метаданных или в "
-                    "окне «Записи».",
+                    "как «готова к синхронизации» (sync_ready=false).",
                     task_id,
                 )
                 return
@@ -1711,7 +1645,6 @@ class ScreenRecorderApp(QObject):
             )
 
     def _open_tasks_window(self) -> None:
-        """Открывает сводное окно «Поручения»."""
         try:
             self.tasks_window = TasksWindow(
                 sessions_root=self._sessions_root(),
@@ -1728,9 +1661,7 @@ class ScreenRecorderApp(QObject):
                 f"Не удалось открыть окно поручений:\n{exc}",
             )
 
-    # --- НОВОЕ: TFS ---
     def _open_tfs(self) -> None:
-        """Открывает окно «Задачи TFS»."""
         try:
             self.tfs_window = TfsWindow(
                 config_manager=self.config_manager,
@@ -1747,7 +1678,6 @@ class ScreenRecorderApp(QObject):
             )
 
     def _open_yandex_vm(self) -> None:
-        """Открывает окно «ВМ Yandex»."""
         yandex_cfg = self.config_manager.get_yandex_vm_settings()
         root_path = yandex_cfg.get("root_path", "")
 

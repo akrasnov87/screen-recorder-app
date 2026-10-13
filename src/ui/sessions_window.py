@@ -10,37 +10,23 @@
       – кнопка «Синхронизировать…» на нижней панели;
       – контекстное меню с «Синхронизировать…»;
       – колонка «Синхр.»;
-      – диалог SyncOneRecordDialog с выбором передавать ли медиа,
-        ссылку file://, удалять ли локальные медиа после загрузки.
-  • Добавлен встроенный медиаплеер (см. media_player.py).
+      – диалог SyncOneRecordDialog.
+  • Добавлен встроенный медиаплеер.
   • Пути из QFileDialog нормализуются через safe_local_path().
   • Добавлен просмотр стенограммы (video.txt).
   • Добавлен просмотр протокола (.docx).
-  • Добавлен флаг «готово к синхронизации» (sync_ready):
-      – колонка «Синхр.» показывает «да» / «готово» / «черновик»;
-      – пункт контекстного меню «Отметить как готово к синхронизации»
-        / «Снять отметку»;
-      – кнопка «Готово к синхронизации» на нижней панели;
-      – метод _toggle_sync_ready.
-  • Добавлена колонка «Поручения» с количеством поручений
-    (из action_items.json).
-  • Добавлена панель фильтров над таблицей:
-      – фильтр по проекту (выпадающий список);
-      – фильтр по периоду (дата с/по + чекбокс «Ограничить»);
-      – текстовый поиск по названию, проекту, тегам, дате;
-      – кнопка «Сбросить фильтры»;
-      – счётчик «Показано: N из M».
+  • Добавлен флаг «готово к синхронизации» (sync_ready).
+  • Добавлена колонка «Поручения».
+  • Добавлена панель фильтров над таблицей.
   • Метод «Выборка» позволяет фильтровать записи
     по проектам.
-  • Пропуск транскрибации при наличии video.txt: диалог
-    с выбором «сохранить стенограмму / пересобрать».
-  • НОВОЕ: По умолчанию фильтр по датам включён и показывает
-    записи за последние 31 день.
-  • НОВОЕ: Панель статистики теперь содержит два блока:
-      – «Записи» — итоги по обработанным/ошибкам и т.п.;
-      – «Записей по тегам» — горизонтально прокручиваемые
-        цветные чипы тегов с количеством записей.
-        Клик по чипу применяет фильтр по тегу.
+  • Пропуск транскрибации при наличии video.txt.
+  • НОВОЕ: кнопка «Связи» — открывает окно «Записи» с фильтром
+    по связанным записям.
+  • НОВОЕ: метод set_relation_filter() — программная установка
+    фильтра по связям.
+  • НОВОЕ: сохранение relations при редактировании метаданных
+    и тегов.
 """
 from __future__ import annotations
 
@@ -67,6 +53,9 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from ..action_items_prompt_builder import (
+    regenerate_action_items_prompt,
+)
 from ..daily_digest import (
     build_digest_prompt,
     collect_digest_entries,
@@ -75,7 +64,14 @@ from ..daily_digest import (
 from ..file_readers import read_any_text, read_json_file
 from ..logger import get_logger
 from ..markdown_docx import markdown_to_docx
-from ..markdown_to_bitrix import markdown_to_plain, markdown_to_plain_with_bb
+from ..markdown_to_bitrix import (
+    markdown_to_plain, markdown_to_plain_with_bb,
+)
+from ..relations_manager import (
+    RELATION_KINDS,
+    find_related_sessions,
+    save_relations,
+)
 from ..screc_client import ScrecClient, ScrecError
 from ..sync_manager import (
     SyncManager,
@@ -99,9 +95,7 @@ from ..platform_utils import (
     screen_recording_unavailable_reason,
 )
 from .tasks_editor_dialog import TasksEditorDialog
-from ..action_items_prompt_builder import (
-    regenerate_action_items_prompt,
-)
+
 
 log = get_logger(__name__)
 
@@ -198,6 +192,21 @@ class SessionsScanThread(QThread):
                     seen.add(name)
         return result
 
+    @staticmethod
+    def _count_relations(meta: Dict[str, Any]) -> int:
+        raw = meta.get("relations")
+        if not isinstance(raw, list):
+            return 0
+        n = 0
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            if (r.get("target_session_id")
+                    or r.get("target_dir")
+                    or r.get("target_record_id")):
+                n += 1
+        return n
+
     def _collect(
         self,
         sessions_root: str,
@@ -223,7 +232,6 @@ class SessionsScanThread(QThread):
             meta_path = os.path.join(session_dir, "session.json")
             meta = read_json_file(meta_path) or {}
 
-            # --- Документная запись: без видео/аудио ---
             document_only = bool(
                 meta.get("document_only", False)
             ) or (meta.get("source") == "document")
@@ -235,7 +243,6 @@ class SessionsScanThread(QThread):
             audio_path = self._find_first_audio(session_dir)
             has_audio = bool(audio_path)
 
-            # Считаем количество документов.
             documents_count = 0
             if document_only:
                 att_dir = os.path.join(
@@ -334,10 +341,8 @@ class SessionsScanThread(QThread):
             published = is_record_published(session_dir)
             record_id = get_record_id(session_dir)
 
-            # --- Флаг готовности к синхронизации ---
             sync_ready = bool(meta.get("sync_ready", False))
 
-            # --- Поручения: разбивка по статусам из action_items.json ---
             action_items_total = 0
             action_items_by_status: Dict[str, int] = {}
             try:
@@ -364,6 +369,9 @@ class SessionsScanThread(QThread):
                     "Не удалось прочитать поручения из %s: %s",
                     session_dir, exc,
                 )
+
+            # --- Связи ---
+            relations_count = self._count_relations(meta)
 
             rows.append({
                 "action_items_total": action_items_total,
@@ -395,8 +403,9 @@ class SessionsScanThread(QThread):
                 "record_id": record_id,
                 "document_only": document_only,
                 "documents_count": documents_count,
-                # --- Флаг готовности к синхронизации ---
                 "sync_ready": sync_ready,
+                # --- НОВОЕ: связи ---
+                "relations_count": relations_count,
             })
 
         rows.sort(key=lambda r: r["datetime"], reverse=True)
@@ -512,9 +521,7 @@ class _MediaDownloadWorker(QThread):
 # Диалог синхронизации одной записи
 # ---------------------------------------------------------------------------
 class SyncOneRecordDialog(QDialog):
-    """
-    Диалог настройки публикации одной записи на сервер.
-    """
+    """Диалог настройки публикации одной записи на сервер."""
 
     def __init__(
         self,
@@ -595,10 +602,7 @@ class SyncOneRecordDialog(QDialog):
         )
         self.send_media_check.setToolTip(
             "Если включено — видео и аудио уйдут на сервер "
-            "как артефакты (kind=video / kind=audio).\n\n"
-            "Если выключено — на сервер уйдут только метаданные "
-            "и текстовые артефакты (стенограмма, протокол, "
-            "summary, промпт, вложения)."
+            "как артефакты (kind=video / kind=audio)."
         )
         self.send_media_check.setChecked(
             bool(self._sync_settings.get("send_media_to_server", False))
@@ -610,9 +614,7 @@ class SyncOneRecordDialog(QDialog):
         )
         self.send_video_link_check.setToolTip(
             "Сохраняет в метаданных записи на сервере ссылку "
-            "file:///путь/к/video.mp4. На другом устройстве "
-            "ссылка не откроется, но она документирует, где "
-            "изначально лежал файл."
+            "file:///путь/к/video.mp4."
         )
         self.send_video_link_check.setChecked(
             bool(self._sync_settings.get("send_video_link", True))
@@ -624,10 +626,7 @@ class SyncOneRecordDialog(QDialog):
             "на сервер"
         )
         self.delete_after_check.setToolTip(
-            "Работает только если включена передача медиа.\n\n"
-            "После успешной загрузки видео/аудио на сервер "
-            "локальная копия удаляется. Файл можно будет "
-            "скачать обратно через окно «Синхронизация»."
+            "Работает только если включена передача медиа."
         )
         self.delete_after_check.setChecked(
             bool(
@@ -650,8 +649,7 @@ class SyncOneRecordDialog(QDialog):
         )
         limit_label = QLabel(
             f"<span style='color:#666'>Максимальный размер "
-            f"одного артефакта: <b>{max_mb} МБ</b>. Файлы больше "
-            f"лимита будут пропущены.</span>"
+            f"одного артефакта: <b>{max_mb} МБ</b>.</span>"
         )
         limit_label.setWordWrap(True)
         root.addWidget(limit_label)
@@ -741,6 +739,15 @@ class SyncOneRecordDialog(QDialog):
             except OSError:
                 pass
 
+        # --- Связи (только информационно) ---
+        rel_count = int(self._row.get("relations_count") or 0)
+        if rel_count:
+            lines.append("")
+            lines.append(
+                f"  [relations]  Связей: {rel_count} "
+                f"(информация о связях передаётся с записью)"
+            )
+
         if not lines:
             lines = ["  (нет локальных файлов)"]
 
@@ -766,21 +773,7 @@ class SyncOneRecordDialog(QDialog):
 # Диалог выбора периода для «Свода за день»
 # ---------------------------------------------------------------------------
 class DailyDigestDialog(QDialog):
-    """
-    Диалог формирования свода за период.
-
-    Позволяет выбрать:
-      • период (с / по);
-      • проекты (один, несколько или все);
-      • промпт из библиотеки (с возможностью редактирования);
-      • включать ли краткое описание (summary) каждой записи;
-      • формат сохранения (docx / md / txt).
-
-    После подтверждения:
-      1. Отбирает записи за период и по выбранным проектам.
-      2. Собирает промпт через daily_digest.
-      3. Сохраняет файл в папку «Загрузки».
-    """
+    """Диалог формирования свода за период."""
 
     def __init__(
         self,
@@ -800,32 +793,25 @@ class DailyDigestDialog(QDialog):
         self._result_path: str = ""
         self._result_count: int = 0
 
-        # Список проектов, выбранных пользователем (пусто = все).
         self._selected_projects: List[str] = []
 
         self._build_ui()
         self._load_projects()
         self._apply_initial_prompt()
 
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
 
-        # --- Инфо ---
         info = QLabel(
             "Формируется единый промпт из протоколов всех записей "
-            "за выбранный период. Промпт можно отредактировать "
-            "и сохранить в папку «Загрузки»."
+            "за выбранный период."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
         root.addWidget(info)
 
-        # --- Период ---
         period_row = QHBoxLayout()
         period_row.addWidget(QLabel("Период:"))
 
@@ -845,10 +831,6 @@ class DailyDigestDialog(QDialog):
 
         self.single_day_check = QCheckBox("Один день")
         self.single_day_check.setChecked(True)
-        self.single_day_check.setToolTip(
-            "Если включено — дата «по» совпадает с датой «с», "
-            "формируется свод за один день."
-        )
         self.single_day_check.toggled.connect(
             self._on_single_day_toggled
         )
@@ -860,10 +842,6 @@ class DailyDigestDialog(QDialog):
             "Включать краткое описание (summary)"
         )
         self.include_summary_check.setChecked(False)
-        self.include_summary_check.setToolTip(
-            "Если включено — в промпт также попадут краткие "
-            "описания записей (summary_bb из session.json)."
-        )
         period_row.addWidget(self.include_summary_check)
 
         period_row.addSpacing(12)
@@ -877,10 +855,8 @@ class DailyDigestDialog(QDialog):
         period_row.addStretch()
         root.addLayout(period_row)
 
-        # --- Блок выбора проектов ---
         root.addWidget(self._build_projects_section())
 
-        # --- Промпт ---
         prompt_header = QHBoxLayout()
         prompt_header.addWidget(QLabel("<b>Промпт</b>"))
         prompt_header.addSpacing(12)
@@ -891,9 +867,6 @@ class DailyDigestDialog(QDialog):
         prompt_header.addSpacing(8)
 
         self.reset_prompt_btn = QPushButton("Сбросить правку")
-        self.reset_prompt_btn.setToolTip(
-            "Вернуть текст промпта к значению из библиотеки."
-        )
         self.reset_prompt_btn.clicked.connect(
             self._reset_prompt_from_library
         )
@@ -903,14 +876,11 @@ class DailyDigestDialog(QDialog):
 
         self.prompt_edit = QPlainTextEdit()
         self.prompt_edit.setPlaceholderText(
-            "Введите инструкцию для ИИ. Например:\n"
-            "«Составь сводку по дню: ключевые решения, риски, "
-            "поручения. Укажи ответственных и сроки.»"
+            "Введите инструкцию для ИИ."
         )
         self.prompt_edit.setMinimumHeight(260)
         root.addWidget(self.prompt_edit, 1)
 
-        # --- Статус ---
         self.status_label = QLabel("")
         self.status_label.setStyleSheet(
             "QLabel { color: #666; }"
@@ -918,7 +888,6 @@ class DailyDigestDialog(QDialog):
         self.status_label.setWordWrap(True)
         root.addWidget(self.status_label)
 
-        # --- Кнопки ---
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel,
@@ -934,14 +903,7 @@ class DailyDigestDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-    # ------------------------------------------------------------------
-    # Блок выбора проектов
-    # ------------------------------------------------------------------
     def _build_projects_section(self) -> QWidget:
-        """
-        Блок выбора проектов: список с чекбоксами, кнопки
-        «Выбрать все» / «Снять все» и счётчик выбранных.
-        """
         box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 6, 0, 0)
@@ -952,8 +914,7 @@ class DailyDigestDialog(QDialog):
         header.addSpacing(8)
         hint = QLabel(
             "<span style='color:#666'>Если ничего не отмечено — "
-            "свод строится по всем проектам за выбранный "
-            "период.</span>"
+            "свод строится по всем проектам.</span>"
         )
         hint.setWordWrap(True)
         header.addWidget(hint, 1)
@@ -997,10 +958,6 @@ class DailyDigestDialog(QDialog):
         return box
 
     def _load_projects(self) -> None:
-        """
-        Заполняет список проектов уникальными значениями из
-        всех записей в sessions_root.
-        """
         projects_set: set = set()
         if os.path.isdir(self._sessions_root):
             try:
@@ -1095,11 +1052,7 @@ class DailyDigestDialog(QDialog):
                 f"Выбрано: {n} из {total}"
             )
 
-    # ------------------------------------------------------------------
-    # Промпт
-    # ------------------------------------------------------------------
     def _apply_initial_prompt(self) -> None:
-        """Заполняет выпадающий список промптов и ставит дефолт."""
         if self._config_manager is None:
             return
 
@@ -1138,22 +1091,12 @@ class DailyDigestDialog(QDialog):
         index = self.prompt_combo.currentIndex()
         self._on_prompt_selected(index)
 
-    # ------------------------------------------------------------------
-    # Период
-    # ------------------------------------------------------------------
     def _on_single_day_toggled(self, checked: bool) -> None:
         if checked:
             self.date_to.setDate(self.date_from.date())
         self.date_to.setEnabled(not checked)
 
-    # ------------------------------------------------------------------
-    # Отбор сессий за период
-    # ------------------------------------------------------------------
     def _collect_sessions_for_period(self) -> List[str]:
-        """
-        Возвращает список папок сессий за выбранный период
-        с учётом выбранных проектов.
-        """
         qd_from = self.date_from.date()
         qd_to = (
             qd_from if self.single_day_check.isChecked()
@@ -1168,7 +1111,6 @@ class DailyDigestDialog(QDialog):
         if not os.path.isdir(self._sessions_root):
             return []
 
-        # --- Фильтр по проектам ---
         selected_projects_set = set(self._selected_projects)
 
         result: List[str] = []
@@ -1194,7 +1136,6 @@ class DailyDigestDialog(QDialog):
                 os.path.join(session_dir, "session.json")
             ) or {}
 
-            # --- Фильтр по проектам ---
             if selected_projects_set:
                 project = (meta.get("project") or "").strip()
                 if project not in selected_projects_set:
@@ -1220,9 +1161,6 @@ class DailyDigestDialog(QDialog):
 
         return result
 
-    # ------------------------------------------------------------------
-    # Подтверждение
-    # ------------------------------------------------------------------
     def _on_accept(self) -> None:
         instruction = self.prompt_edit.toPlainText().strip()
         if not instruction:
@@ -1247,7 +1185,6 @@ class DailyDigestDialog(QDialog):
             )
             return
 
-        # --- Сбор данных ---
         QGuiApplication.setOverrideCursor(
             Qt.CursorShape.WaitCursor
         )
@@ -1263,7 +1200,6 @@ class DailyDigestDialog(QDialog):
             )
             return
 
-        # --- Метка периода ---
         if self.single_day_check.isChecked():
             period_label = entries[0]["date"]
         else:
@@ -1273,7 +1209,6 @@ class DailyDigestDialog(QDialog):
             else:
                 period_label = "—"
 
-        # --- Сборка промпта ---
         prompt_text = build_digest_prompt(
             entries,
             user_instruction=instruction,
@@ -1288,7 +1223,6 @@ class DailyDigestDialog(QDialog):
             )
             return
 
-        # --- Папка «Загрузки» ---
         downloads = self._downloads_dir()
         if not os.path.isdir(downloads):
             QMessageBox.warning(
@@ -1324,7 +1258,6 @@ class DailyDigestDialog(QDialog):
             path,
         )
 
-        # --- Итог ---
         protocol_count = sum(
             1 for e in entries if e.get("protocol_text")
         )
@@ -1368,7 +1301,6 @@ class DailyDigestDialog(QDialog):
 
     @staticmethod
     def _make_base_name(period_label: str) -> str:
-        """Формирует безопасное имя файла по метке периода."""
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         safe = period_label.replace("…", "").replace(" ", "_")
         safe = "".join(
@@ -1379,7 +1311,6 @@ class DailyDigestDialog(QDialog):
 
     @staticmethod
     def _downloads_dir() -> str:
-        """Возвращает путь к папке «Загрузки»."""
         try:
             import subprocess
             out = subprocess.check_output(
@@ -1398,9 +1329,6 @@ class DailyDigestDialog(QDialog):
                 return p
         return home
 
-    # ------------------------------------------------------------------
-    # Результат
-    # ------------------------------------------------------------------
     def result_path(self) -> str:
         return self._result_path
 
@@ -1412,13 +1340,7 @@ class DailyDigestDialog(QDialog):
 # Диалог публичной ссылки на запись
 # ---------------------------------------------------------------------------
 class PublicLinkDialog(QDialog):
-    """
-    Диалог с публичной ссылкой на запись.
-
-    Позволяет выбрать блоки (video, audio, transcript, protocol,
-    summary), увидеть итоговую ссылку, скопировать её или
-    открыть в браузере.
-    """
+    """Диалог с публичной ссылкой на запись."""
 
     def __init__(
         self,
@@ -1445,13 +1367,10 @@ class PublicLinkDialog(QDialog):
         self._refresh()
 
     def _build_ui(self) -> None:
-        from PySide6.QtWidgets import QDialogButtonBox
-
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
 
-        # --- Инфо ---
         info = QLabel(
             f"<b>{html.escape(self._record_name)}</b><br>"
             f"<span style='color:#666'>Путь на сервере:</span> "
@@ -1464,14 +1383,11 @@ class PublicLinkDialog(QDialog):
 
         hint = QLabel(
             "<span style='color:#666'>Ссылка ведёт на публичную "
-            "HTML-страницу записи на сервере. Открывается в "
-            "браузере без авторизации — можно отправить коллеге. "
-            "Выберите, какие блоки показывать.</span>"
+            "HTML-страницу записи.</span>"
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
 
-        # --- Блоки ---
         blocks_header = QLabel("<b>Блоки на странице</b>")
         root.addWidget(blocks_header)
 
@@ -1502,7 +1418,6 @@ class PublicLinkDialog(QDialog):
 
         root.addLayout(blocks_row)
 
-        # --- Ссылка ---
         link_label = QLabel("<b>Итоговая ссылка</b>")
         root.addWidget(link_label)
 
@@ -1522,7 +1437,6 @@ class PublicLinkDialog(QDialog):
 
         root.addLayout(link_row)
 
-        # --- Кнопки ---
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Close,
             parent=self,
@@ -1546,8 +1460,6 @@ class PublicLinkDialog(QDialog):
 
     def _refresh(self) -> None:
         blocks = self._selected_blocks()
-        # Если все включены — не добавляем параметр (сервер
-        # покажет all).
         if set(blocks) == set(self._block_checkboxes.keys()):
             blocks_arg = None
         else:
@@ -1599,10 +1511,9 @@ class SessionsWindow(QDialog):
         self.processor = processor
         self.config_manager = config_manager
         self.setWindowTitle("Записи")
-        self.setMinimumSize(1600, 800)
+        self.setMinimumSize(1700, 800)
         self.setModal(False)
         self._rows: List[Dict[str, Any]] = []
-        # Полный список записей (до фильтрации).
         self._all_rows: List[Dict[str, Any]] = []
         self._thread: Optional[SessionsScanThread] = None
         self._sync_worker: Optional[_OneSyncWorker] = None
@@ -1611,8 +1522,11 @@ class SessionsWindow(QDialog):
         self._media_progress_dlg: Optional[QProgressDialog] = None
         self._pending_media_request: Optional[Dict[str, Any]] = None
 
-        # Ссылки на активные чипы тегов (для подсветки выбранного).
         self._active_tag_chips: Dict[str, QPushButton] = {}
+
+        # --- НОВОЕ: фильтр по связям ---
+        self._relation_filter_source_name: str = ""
+        self._relation_filter_dirs: set = set()
 
         self._app_cfg: Dict[str, Any] = {}
         if config_manager is not None:
@@ -1641,18 +1555,15 @@ class SessionsWindow(QDialog):
         root.setContentsMargins(8, 4, 8, 8)
         root.setSpacing(6)
 
-        # --- Панель статистики: Записи + Теги ---
         root.addWidget(self._build_stats_bar())
-
-        # --- Панель фильтров ---
         root.addWidget(self._build_filters_bar())
 
-        self.table = QTableWidget(0, 13)
+        self.table = QTableWidget(0, 14)
         self.table.setHorizontalHeaderLabels([
             "Дата и время", "Название", "Проект", "Теги",
             "Статус", "Источник", "Скрам", "Вложения",
-            "Поручения", "Summary", "Синхр.", "Task ID",
-            "Папка",
+            "Поручения", "Связи", "Summary", "Синхр.",
+            "Task ID", "Папка",
         ])
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -1667,7 +1578,6 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
-        # Название — тянется на всё свободное место.
         hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(
             2, QHeaderView.ResizeMode.ResizeToContents
@@ -1687,11 +1597,9 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             7, QHeaderView.ResizeMode.ResizeToContents
         )
-        # Поручения — по ширине текста.
         hv.setSectionResizeMode(
             8, QHeaderView.ResizeMode.ResizeToContents
         )
-        # Summary — по ширине текста.
         hv.setSectionResizeMode(
             9, QHeaderView.ResizeMode.ResizeToContents
         )
@@ -1704,8 +1612,11 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             12, QHeaderView.ResizeMode.ResizeToContents
         )
-        # Скрываем колонку «Папка» (индекс 12).
-        self.table.setColumnHidden(12, True)
+        hv.setSectionResizeMode(
+            13, QHeaderView.ResizeMode.ResizeToContents
+        )
+        # Скрываем колонку «Папка» (индекс 13).
+        self.table.setColumnHidden(13, True)
         self.table.itemSelectionChanged.connect(
             self._on_selection_changed
         )
@@ -1719,9 +1630,6 @@ class SessionsWindow(QDialog):
 
         root.addWidget(self._build_legend())
 
-        # ------------------------------------------------------------------
-        # Нижняя панель — ДВА РЯДА кнопок.
-        # ------------------------------------------------------------------
         bottom_content = QHBoxLayout()
         bottom_content.setSpacing(6)
 
@@ -1736,9 +1644,7 @@ class SessionsWindow(QDialog):
 
         self.play_audio_btn = QPushButton("Прослушать аудио")
         self.play_audio_btn.setToolTip(
-            "Открыть аудио во встроенном плеере.\n\n"
-            "Если файла нет локально, но он есть на сервере — "
-            "будет предложено скачать его."
+            "Открыть аудио во встроенном плеере."
         )
         self.play_audio_btn.clicked.connect(self._open_audio)
         bottom_content.addWidget(self.play_audio_btn)
@@ -1764,7 +1670,6 @@ class SessionsWindow(QDialog):
         bottom_content.addStretch()
         root.addLayout(bottom_content)
 
-        # --- Ряд 2: сервер и сервисные действия ---
         bottom_actions = QHBoxLayout()
         bottom_actions.setSpacing(6)
 
@@ -1779,23 +1684,14 @@ class SessionsWindow(QDialog):
         self.sync_btn.setToolTip(
             "Опубликовать выбранную запись на сервер "
             "синхронизации.\n\n"
-            "Откроется диалог, где можно выбрать:\n"
-            "  • передавать ли медиа (видео и аудио);\n"
-            "  • передавать ли ссылку file://;\n"
-            "  • удалять ли локальные медиа после загрузки.\n\n"
             "Горячая клавиша: Ctrl+Shift+S"
         )
         self.sync_btn.clicked.connect(self._sync_one_record)
         bottom_actions.addWidget(self.sync_btn)
 
-        # --- Публичная ссылка на сервер ---
         self.public_link_btn = QPushButton("Открыть в браузере")
         self.public_link_btn.setToolTip(
-            "Открыть публичную HTML-страницу записи на сервере "
-            "синхронизации (без авторизации).\n\n"
-            "Работает, только если запись опубликована и задан "
-            "base_url (Настройки → Синхронизация).\n\n"
-            "Горячая клавиша: Ctrl+Shift+U"
+            "Открыть публичную HTML-страницу записи на сервере."
         )
         self.public_link_btn.clicked.connect(
             self._open_public_link_dialog
@@ -1818,9 +1714,7 @@ class SessionsWindow(QDialog):
         )
         self.regen_action_prompt_btn.setToolTip(
             "Пересобрать action_items_prompt.<ext> на основе "
-            "текущего протокола записи.\n\n"
-            "Полезно после ручной правки протокола — не нужно "
-            "перезапускать всю обработку."
+            "текущего протокола записи."
         )
         self.regen_action_prompt_btn.clicked.connect(
             self._regenerate_action_prompt
@@ -1830,12 +1724,7 @@ class SessionsWindow(QDialog):
         self.regen_tfs_btn = QPushButton("Обновить TFS-выборку")
         self.regen_tfs_btn.setToolTip(
             "Пересобрать attachments/tfs_work_items.csv "
-            "для выбранной скрам-записи.\n\n"
-            "Читает из session.json параметры tfs_project и "
-            "tfs_template_name, выполняет WIQL к TFS и "
-            "перезаписывает файл выборки.\n\n"
-            "Полезно, когда задачи в TFS обновились после "
-            "обработки записи."
+            "для выбранной скрам-записи."
         )
         self.regen_tfs_btn.clicked.connect(
             self._regenerate_tfs_attachment
@@ -1851,9 +1740,7 @@ class SessionsWindow(QDialog):
         self.daily_digest_btn = QPushButton("Выборка")
         self.daily_digest_btn.setToolTip(
             "Сформировать единый промпт из протоколов всех "
-            "записей за выбранный период.\n\n"
-            "Результат сохраняется в папку «Загрузки» в формате "
-            "DOCX / Markdown / TXT."
+            "записей за выбранный период."
         )
         self.daily_digest_btn.clicked.connect(
             self._open_daily_digest
@@ -1862,12 +1749,20 @@ class SessionsWindow(QDialog):
 
         self.tasks_btn = QPushButton("Поручения")
         self.tasks_btn.setToolTip(
-            "Открыть редактор поручений выбранной записи.\n\n"
-            "Поручения хранятся в action_items.json и передаются "
-            "на сервер синхронизации."
+            "Открыть редактор поручений выбранной записи."
         )
         self.tasks_btn.clicked.connect(self._open_tasks_editor)
         bottom_actions.addWidget(self.tasks_btn)
+
+        # --- НОВОЕ: кнопка «Связи» ---
+        self.relations_btn = QPushButton("Связи")
+        attach_tooltip(
+            self.relations_btn, "sess_relations_button"
+        )
+        self.relations_btn.clicked.connect(
+            self._show_related_sessions
+        )
+        bottom_actions.addWidget(self.relations_btn)
 
         self.close_btn = QPushButton("Закрыть")
         self.close_btn.clicked.connect(self.close)
@@ -1876,21 +1771,9 @@ class SessionsWindow(QDialog):
         root.addLayout(bottom_actions)
 
     # ------------------------------------------------------------------
-    # Панель статистики (Записи + Теги)
+    # Панель статистики
     # ------------------------------------------------------------------
     def _build_stats_bar(self) -> QWidget:
-        """
-        Панель статистики: сводка по записям + счётчики по тегам.
-
-        Левая часть — итоги по записям (всего/обработано/…).
-        Правая часть — горизонтально прокручиваемый список
-        цветных чипов тегов с количеством записей у каждого.
-
-        При клике по чипу тега — применяется фильтр по этому
-        тегу (см. _on_tag_chip_clicked).
-
-        Внизу — индикатор выбранной записи и статус сканирования.
-        """
         box = QFrame()
         box.setFrameShape(QFrame.Shape.StyledPanel)
         box.setObjectName("statsBar")
@@ -1906,13 +1789,9 @@ class SessionsWindow(QDialog):
         outer.setContentsMargins(10, 6, 10, 6)
         outer.setSpacing(4)
 
-        # ============================================================
-        # Верхний ряд: записи (слева) + теги (справа, со скроллом)
-        # ============================================================
         top_row = QHBoxLayout()
         top_row.setSpacing(16)
 
-        # --- Блок «Записи» ---
         records_col = QVBoxLayout()
         records_col.setContentsMargins(0, 0, 0, 0)
         records_col.setSpacing(2)
@@ -1930,18 +1809,14 @@ class SessionsWindow(QDialog):
 
         records_widget = QWidget()
         records_widget.setLayout(records_col)
-        # Ограничиваем ширину блока записей, чтобы теги
-        # получали больше места.
         records_widget.setMaximumWidth(620)
         top_row.addWidget(records_widget, 0)
 
-        # Разделитель
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setFrameShadow(QFrame.Shadow.Sunken)
         top_row.addWidget(sep)
 
-        # --- Блок «Теги» ---
         tags_col = QVBoxLayout()
         tags_col.setContentsMargins(0, 0, 0, 0)
         tags_col.setSpacing(2)
@@ -1988,7 +1863,6 @@ class SessionsWindow(QDialog):
 
         tags_col.addLayout(tags_header)
 
-        # Горизонтальный скролл с чипами тегов.
         self.tag_stats_scroll = QScrollArea()
         self.tag_stats_scroll.setWidgetResizable(True)
         self.tag_stats_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -2024,9 +1898,6 @@ class SessionsWindow(QDialog):
 
         outer.addLayout(top_row)
 
-        # ============================================================
-        # Нижний ряд: выбранная запись + индикатор сканирования
-        # ============================================================
         bottom_row = QHBoxLayout()
         bottom_row.setContentsMargins(0, 0, 0, 0)
         bottom_row.setSpacing(8)
@@ -2049,19 +1920,6 @@ class SessionsWindow(QDialog):
         return box
 
     def _rebuild_tag_stats(self) -> None:
-        """
-        Пересобирает чипы тегов в панели статистики.
-
-        Считает количество записей по каждому тегу на основе
-        self._all_rows (полный список, без учёта фильтров).
-        Цвет чипа берётся из справочника тегов
-        (config_manager.get_tags()).
-
-        Если тегов нет — показывает серую надпись «нет тегов».
-        Клик по чипу устанавливает фильтр по тегу.
-        """
-        # --- Очищаем прежние чипы ---
-        # Удаляем все виджеты, оставляя stretch в конце.
         self._active_tag_chips.clear()
         while self.tag_stats_layout.count() > 1:
             item = self.tag_stats_layout.takeAt(0)
@@ -2069,7 +1927,6 @@ class SessionsWindow(QDialog):
             if w is not None:
                 w.deleteLater()
 
-        # --- Считаем статистику ---
         counts: Dict[str, int] = {}
         untagged_count = 0
 
@@ -2084,7 +1941,6 @@ class SessionsWindow(QDialog):
                     continue
                 counts[t] = counts.get(t, 0) + 1
 
-        # --- Цвета из справочника ---
         tag_colors: Dict[str, str] = {}
         if self.config_manager is not None:
             try:
@@ -2098,7 +1954,6 @@ class SessionsWindow(QDialog):
                     "Не удалось прочитать справочник тегов: %s", exc
                 )
 
-        # --- Сортировка: по убыванию количества, затем по имени ---
         sorted_tags = sorted(
             counts.items(), key=lambda kv: (-kv[1], kv[0].lower())
         )
@@ -2111,7 +1966,6 @@ class SessionsWindow(QDialog):
             self.tag_stats_layout.insertWidget(0, placeholder)
             return
 
-        # --- Активный фильтр по тегу (подсветка) ---
         active_tag = ""
         active_untagged = False
         if hasattr(self, "filter_tag_enabled") and \
@@ -2122,7 +1976,6 @@ class SessionsWindow(QDialog):
             else:
                 active_tag = str(data).strip()
 
-        # --- Создаём чипы тегов ---
         for name, cnt in sorted_tags:
             chip = self._make_tag_chip(
                 name=name,
@@ -2136,7 +1989,6 @@ class SessionsWindow(QDialog):
             )
             self._active_tag_chips[name] = chip
 
-        # --- Чип «без тега» (серый) ---
         if untagged_count > 0:
             chip = self._make_tag_chip(
                 name="— без тега —",
@@ -2151,7 +2003,6 @@ class SessionsWindow(QDialog):
             )
             self._active_tag_chips["__untagged__"] = chip
 
-        # --- Показ/скрытие кнопки сброса ---
         if hasattr(self, "tag_reset_btn"):
             self.tag_reset_btn.setVisible(
                 bool(active_tag) or active_untagged
@@ -2167,19 +2018,6 @@ class SessionsWindow(QDialog):
         is_active: bool = False,
         is_untagged: bool = False,
     ) -> QPushButton:
-        """
-        Создаёт «чип» тега: [Имя · N].
-
-        Args:
-            name:        название тега.
-            count:       количество записей с этим тегом.
-            color:       HEX-цвет тега (или "" — серый).
-            clickable:   если True — при клике применяется
-                         фильтр по тегу.
-            is_active:   True — этот тег сейчас активен
-                         как фильтр (подсветить).
-            is_untagged: True для чипа «— без тега —».
-        """
         chip = QPushButton()
         chip.setCursor(
             Qt.CursorShape.PointingHandCursor
@@ -2189,7 +2027,6 @@ class SessionsWindow(QDialog):
         chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         chip.setMinimumHeight(28)
 
-        # --- Цвета чипа ---
         if is_untagged or not color:
             base_color = QColor("#9E9E9E")
         else:
@@ -2198,7 +2035,6 @@ class SessionsWindow(QDialog):
                 base_color = QColor("#4a90d9")
 
         if is_active:
-            # Активный — плотный фон с белым текстом.
             bg_rgba = (
                 f"rgba({base_color.red()}, {base_color.green()}, "
                 f"{base_color.blue()}, 230)"
@@ -2207,7 +2043,6 @@ class SessionsWindow(QDialog):
             border_rgba = base_color.name()
             font_weight = "bold"
         else:
-            # Обычный — светлый фон с тёмным текстом.
             bg_rgba = (
                 f"rgba({base_color.red()}, {base_color.green()}, "
                 f"{base_color.blue()}, 45)"
@@ -2222,7 +2057,6 @@ class SessionsWindow(QDialog):
             )
             font_weight = "normal"
 
-        # --- Текст ---
         display_name = name if not is_untagged else "— без тега —"
         chip.setText(f"{display_name} · {count}")
 
@@ -2271,12 +2105,6 @@ class SessionsWindow(QDialog):
         return chip
 
     def _on_tag_chip_clicked(self, tag_name: str) -> None:
-        """
-        Обрабатывает клик по чипу тега.
-
-        Если этот тег уже активен как фильтр — снимает фильтр.
-        Иначе — включает фильтр по этому тегу.
-        """
         if not hasattr(self, "filter_tag_enabled"):
             return
 
@@ -2289,14 +2117,12 @@ class SessionsWindow(QDialog):
         )
 
         if is_active:
-            # Снимаем фильтр по тегу.
             self.filter_tag_enabled.setChecked(False)
             log.info(
                 "Записи: фильтр по тегу снят (повторный клик по «%s»)",
                 tag_name,
             )
         else:
-            # Устанавливаем фильтр по тегу.
             self.filter_tag_enabled.blockSignals(True)
             self.filter_tag_enabled.setChecked(True)
             self.filter_tag_enabled.blockSignals(False)
@@ -2310,12 +2136,10 @@ class SessionsWindow(QDialog):
                 "Записи: фильтр по тегу «%s»", tag_name,
             )
 
-        # Применяем фильтры и перерисовываем чипы (для подсветки).
         self._apply_filters()
         self._rebuild_tag_stats()
 
     def _on_tag_reset_clicked(self) -> None:
-        """Сбрасывает активный фильтр по тегу."""
         if not hasattr(self, "filter_tag_enabled"):
             return
         self.filter_tag_enabled.blockSignals(True)
@@ -2333,18 +2157,15 @@ class SessionsWindow(QDialog):
         self._rebuild_tag_stats()
         log.info("Записи: фильтр по тегу сброшен")
 
+    # ------------------------------------------------------------------
+    # Панель фильтров
+    # ------------------------------------------------------------------
     def _build_filters_bar(self) -> QWidget:
-        """
-        Панель фильтров над таблицей: проект, период, тег,
-        текстовый поиск. Все фильтры применяются к уже
-        загруженному списку записей (self._all_rows) без
-        повторного сканирования.
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(4)
 
-        Изменения:
-          • Чекбокс «Ограничить по датам» включён по умолчанию.
-          • Дата «с» по умолчанию — текущая минус 31 день.
-          • Добавлен фильтр по тегу.
-        """
         box = QFrame()
         box.setFrameShape(QFrame.Shape.StyledPanel)
         box.setStyleSheet(
@@ -2355,7 +2176,6 @@ class SessionsWindow(QDialog):
         row.setContentsMargins(10, 6, 10, 6)
         row.setSpacing(8)
 
-        # --- Проект ---
         row.addWidget(QLabel("Проект:"))
         self.filter_project_combo = QComboBox()
         self.filter_project_combo.setMinimumWidth(180)
@@ -2370,10 +2190,8 @@ class SessionsWindow(QDialog):
 
         row.addSpacing(12)
 
-        # --- Период: с ---
         row.addWidget(QLabel("Период с:"))
 
-        # По умолчанию — текущая дата минус 31 день.
         default_from = QDate.currentDate().addDays(-31)
 
         self.filter_date_from = QDateEdit()
@@ -2386,7 +2204,6 @@ class SessionsWindow(QDialog):
         )
         row.addWidget(self.filter_date_from)
 
-        # --- Период: по ---
         row.addWidget(QLabel("по:"))
         self.filter_date_to = QDateEdit()
         self.filter_date_to.setCalendarPopup(True)
@@ -2398,38 +2215,31 @@ class SessionsWindow(QDialog):
         )
         row.addWidget(self.filter_date_to)
 
-        # --- Чекбокс «Ограничить по датам» ---
-        # Включён по умолчанию.
         self.filter_date_enabled = QCheckBox("Ограничить по датам")
         self.filter_date_enabled.setChecked(True)
         self.filter_date_enabled.setToolTip(
-            "Если снять галочку — период игнорируется, "
-            "показываются все записи."
+            "Если снять галочку — период игнорируется."
         )
         self.filter_date_enabled.toggled.connect(
             self._on_date_filter_toggled
         )
         row.addWidget(self.filter_date_enabled)
 
-        # --- Кнопка «Сбросить фильтры» ---
         self.filter_reset_btn = QPushButton("Сбросить фильтры")
         self.filter_reset_btn.setToolTip(
-            "Убрать все фильтры (проект, даты, тег, поиск)."
+            "Убрать все фильтры (проект, даты, тег, поиск, связи)."
         )
         self.filter_reset_btn.clicked.connect(self._reset_filters)
         row.addWidget(self.filter_reset_btn)
 
         row.addStretch()
 
-        # --- Фильтр по тегу ---
         row.addWidget(QLabel("Тег:"))
 
         self.filter_tag_enabled = QCheckBox()
         self.filter_tag_enabled.setChecked(False)
         self.filter_tag_enabled.setToolTip(
             "Включить фильтр по тегу.\n\n"
-            "После включения выберите тег в выпадающем списке "
-            "справа.\n\n"
             "«— без тега —» оставляет только записи без тегов."
         )
         self.filter_tag_enabled.toggled.connect(
@@ -2445,12 +2255,10 @@ class SessionsWindow(QDialog):
             self._on_tag_filter_changed
         )
         self.filter_tag_combo.setToolTip(
-            "Выберите тег.\n\n"
-            "«— без тега —» оставляет только записи без тегов."
+            "Выберите тег."
         )
         row.addWidget(self.filter_tag_combo)
 
-        # --- Текстовый поиск ---
         row.addWidget(QLabel("Поиск:"))
         self.filter_search_input = QLineEdit()
         self.filter_search_input.setPlaceholderText(
@@ -2462,12 +2270,10 @@ class SessionsWindow(QDialog):
             self._apply_filters
         )
         self.filter_search_input.setToolTip(
-            "Поиск по подстроке без учёта регистра в названии, "
-            "тегах, проекте, дате, имени папки."
+            "Поиск по подстроке без учёта регистра."
         )
         row.addWidget(self.filter_search_input)
 
-        # --- Счётчик показанных записей ---
         self.filter_count_label = QLabel("")
         self.filter_count_label.setStyleSheet(
             "QLabel { color: #444; font-weight: bold; }"
@@ -2479,24 +2285,36 @@ class SessionsWindow(QDialog):
         )
         row.addWidget(self.filter_count_label)
 
-        # --- Начальное состояние ---
-        # Чекбокс «Ограничить по датам» включён → поля активны.
         self.filter_date_from.setEnabled(True)
         self.filter_date_to.setEnabled(True)
 
-        return box
+        outer_layout.addWidget(box)
+
+        # --- НОВОЕ: плашка активного фильтра по связям ---
+        self.relation_filter_label = QLabel("")
+        self.relation_filter_label.setWordWrap(True)
+        self.relation_filter_label.setVisible(False)
+        self.relation_filter_label.setStyleSheet(
+            "QLabel {"
+            "  background-color: #E3F2FD;"
+            "  border: 1px solid #90CAF9;"
+            "  border-radius: 4px;"
+            "  padding: 6px 10px;"
+            "  color: #0D47A1;"
+            "}"
+        )
+        outer_layout.addWidget(self.relation_filter_label)
+
+        return outer
 
     def _on_tag_filter_toggled(self, enabled: bool) -> None:
-        """Включает/выключает выпадающий список тегов."""
         if hasattr(self, "filter_tag_combo"):
             self.filter_tag_combo.setEnabled(enabled)
         self._apply_filters()
-        # Обновляем подсветку чипов.
         if hasattr(self, "tag_stats_layout"):
             self._rebuild_tag_stats()
 
     def _on_tag_filter_changed(self, _index: int) -> None:
-        """Реагирует на смену тега в фильтре."""
         self._apply_filters()
         if hasattr(self, "tag_stats_layout"):
             self._rebuild_tag_stats()
@@ -2507,15 +2325,12 @@ class SessionsWindow(QDialog):
         self._apply_filters()
 
     def _reset_filters(self) -> None:
-        """
-        Сбрасывает фильтры.
+        # --- Снимаем фильтр по связям ---
+        self._relation_filter_dirs = set()
+        self._relation_filter_source_name = ""
+        if hasattr(self, "relation_filter_label"):
+            self.relation_filter_label.setVisible(False)
 
-        Изменения:
-          • Чекбокс «Ограничить по датам» остаётся включённым.
-          • Дата «с» — текущая минус 31 день.
-          • Дата «по» — текущая.
-          • Фильтр по тегу снимается.
-        """
         self.filter_project_combo.blockSignals(True)
         self.filter_project_combo.setCurrentIndex(0)
         self.filter_project_combo.blockSignals(False)
@@ -2534,11 +2349,9 @@ class SessionsWindow(QDialog):
         self.filter_date_to.setDate(QDate.currentDate())
         self.filter_date_to.blockSignals(False)
 
-        # Принудительно включаем поля дат, так как чекбокс включён.
         self.filter_date_from.setEnabled(True)
         self.filter_date_to.setEnabled(True)
 
-        # --- Сброс фильтра по тегу ---
         if hasattr(self, "filter_tag_enabled"):
             self.filter_tag_enabled.blockSignals(True)
             self.filter_tag_enabled.setChecked(False)
@@ -2560,14 +2373,10 @@ class SessionsWindow(QDialog):
 
         log.info(
             "Записи: фильтры сброшены (период: последние 31 день, "
-            "ограничение по датам включено, тег снят)"
+            "ограничение по датам включено, тег снят, связи сняты)"
         )
 
     def _refresh_project_filter(self) -> None:
-        """
-        Заполняет выпадающий список проектов уникальными
-        значениями из self._all_rows.
-        """
         if not hasattr(self, "filter_project_combo"):
             return
 
@@ -2590,19 +2399,11 @@ class SessionsWindow(QDialog):
         self.filter_project_combo.blockSignals(False)
 
     def _refresh_tag_filter(self) -> None:
-        """
-        Заполняет выпадающий список тегов.
-
-        Объединяет справочник тегов из настроек и теги,
-        реально встречающиеся в self._all_rows. Теги из
-        записей идут после справочника.
-        """
         if not hasattr(self, "filter_tag_combo"):
             return
 
         current = self.filter_tag_combo.currentData() or ""
 
-        # --- Теги из справочника ---
         tags_from_config: List[str] = []
         if self.config_manager is not None:
             try:
@@ -2613,7 +2414,6 @@ class SessionsWindow(QDialog):
                     exc,
                 )
 
-        # --- Теги из записей ---
         tags_from_sessions: List[str] = []
         seen = set()
         for r in self._all_rows:
@@ -2623,7 +2423,6 @@ class SessionsWindow(QDialog):
                     tags_from_sessions.append(t)
                     seen.add(t)
 
-        # --- Объединение с сохранением порядка ---
         merged: List[str] = []
         seen = set()
         for t in tags_from_config + tags_from_sessions:
@@ -2649,14 +2448,8 @@ class SessionsWindow(QDialog):
         self.filter_tag_combo.blockSignals(False)
 
     def _apply_filters(self) -> None:
-        """
-        Применяет фильтры (проект, период, тег, поиск) к
-        self._all_rows и обновляет self._rows + таблицу.
-        """
         if not hasattr(self, "filter_project_combo"):
             return
-        # Таблица ещё не создана — фильтры применим позже,
-        # при первом заполнении через _on_scan_finished.
         if not hasattr(self, "table"):
             return
 
@@ -2668,7 +2461,6 @@ class SessionsWindow(QDialog):
             self.filter_search_input.text().strip().lower()
         )
 
-        # --- Фильтр по тегу ---
         tag_filter = ""
         tag_only_untagged = False
         if (hasattr(self, "filter_tag_enabled")
@@ -2695,7 +2487,16 @@ class SessionsWindow(QDialog):
 
         filtered: List[Dict[str, Any]] = []
 
+        # --- Фильтр по связям (наивысший приоритет) ---
+        relation_dirs = getattr(self, "_relation_filter_dirs", set())
+
         for r in self._all_rows:
+            # --- Фильтр по связям ---
+            if relation_dirs:
+                row_abs = os.path.abspath(r.get("dir") or "")
+                if row_abs not in relation_dirs:
+                    continue
+
             # --- Фильтр по проекту ---
             if project_filter:
                 if (r.get("project") or "") != project_filter:
@@ -2755,6 +2556,50 @@ class SessionsWindow(QDialog):
                     f"Показано: {shown} из {total}"
                 )
 
+    # ------------------------------------------------------------------
+    # Программный фильтр по связям
+    # ------------------------------------------------------------------
+    def set_relation_filter(
+        self,
+        source_name: str,
+        related_dirs: List[str],
+    ) -> None:
+        """
+        Программно включает фильтр по связям.
+
+        Показывает ТОЛЬКО записи из related_dirs.
+        """
+        self._relation_filter_source_name = source_name
+        self._relation_filter_dirs = {
+            os.path.abspath(d) for d in (related_dirs or [])
+        }
+
+        if hasattr(self, "relation_filter_label"):
+            if self._relation_filter_dirs:
+                self.relation_filter_label.setText(
+                    f"<b>Фильтр по связям:</b> показаны записи, "
+                    f"связанные с «{html.escape(source_name)}» "
+                    f"({len(self._relation_filter_dirs)} шт.). "
+                    f"<a href='#reset'>Сбросить фильтр</a>"
+                )
+                self.relation_filter_label.setVisible(True)
+                # Ссылка для сброса.
+                self.relation_filter_label.setOpenExternalLinks(False)
+                try:
+                    self.relation_filter_label.linkActivated.disconnect()
+                except Exception:
+                    pass
+                self.relation_filter_label.linkActivated.connect(
+                    lambda _url: self._reset_filters()
+                )
+            else:
+                self.relation_filter_label.setVisible(False)
+
+        self._apply_filters()
+
+    # ------------------------------------------------------------------
+    # Меню
+    # ------------------------------------------------------------------
     def _build_menu_bar(self) -> None:
         bar = QMenuBar(self)
         _MENU_QSS = (
@@ -2815,10 +2660,6 @@ class SessionsWindow(QDialog):
 
         act_sync = QAction("Синхронизация с сервером…", self)
         act_sync.setShortcut(QKeySequence("Ctrl+Shift+Y"))
-        act_sync.setToolTip(
-            "Открыть окно синхронизации: публикация, скачивание, "
-            "дельта-синхронизация"
-        )
         act_sync.triggered.connect(self._open_sync_window)
         m_file.addAction(act_sync)
 
@@ -2826,19 +2667,11 @@ class SessionsWindow(QDialog):
             "Синхронизировать выбранную запись…", self
         )
         act_sync_record.setShortcut(QKeySequence("Ctrl+Shift+S"))
-        act_sync_record.setToolTip(
-            "Опубликовать выбранную запись на сервер "
-            "с выбором параметров (медиа, ссылка, удаление)"
-        )
         act_sync_record.triggered.connect(self._sync_one_record)
         m_file.addAction(act_sync_record)
 
         act_sync_pull = QAction(
             "Подтянуть изменения с сервера", self
-        )
-        act_sync_pull.setToolTip(
-            "Запросить /sync/changes и применить изменения "
-            "локально"
         )
         act_sync_pull.triggered.connect(self._pull_changes)
         m_file.addAction(act_sync_pull)
@@ -2849,10 +2682,6 @@ class SessionsWindow(QDialog):
             "Открыть ссылку на сервере…", self
         )
         act_public_link.setShortcut(QKeySequence("Ctrl+Shift+U"))
-        act_public_link.setToolTip(
-            "Открыть публичную HTML-страницу записи на сервере "
-            "синхронизации"
-        )
         act_public_link.triggered.connect(
             self._open_public_link_dialog
         )
@@ -2860,9 +2689,6 @@ class SessionsWindow(QDialog):
 
         act_copy_public_link = QAction(
             "Скопировать ссылку на сервер", self
-        )
-        act_copy_public_link.setToolTip(
-            "Скопировать публичную ссылку на запись в буфер обмена"
         )
         act_copy_public_link.triggered.connect(
             self._copy_public_link
@@ -2878,21 +2704,11 @@ class SessionsWindow(QDialog):
 
         act_open_video = QAction("Смотреть видео", self)
         act_open_video.setShortcut(QKeySequence("Ctrl+Shift+V"))
-        act_open_video.setToolTip(
-            "Открыть видео во встроенном плеере.\n"
-            "Если файла нет локально, но он есть на сервере — "
-            "будет предложено скачать его."
-        )
         act_open_video.triggered.connect(self._open_video)
         m_file.addAction(act_open_video)
 
         act_open_audio = QAction("Прослушать аудио", self)
         act_open_audio.setShortcut(QKeySequence("Ctrl+Shift+A"))
-        act_open_audio.setToolTip(
-            "Открыть аудио во встроенном плеере.\n"
-            "Если файла нет локально, но он есть на сервере — "
-            "будет предложено скачать его."
-        )
         act_open_audio.triggered.connect(self._open_audio)
         m_file.addAction(act_open_audio)
 
@@ -2908,12 +2724,6 @@ class SessionsWindow(QDialog):
 
         act_view_protocol = QAction("Просмотреть протокол", self)
         act_view_protocol.setShortcut(QKeySequence("Ctrl+Shift+R"))
-        act_view_protocol.setToolTip(
-            "Открыть прикреплённый протокол (.docx) во встроенном "
-            "просмотрщике с поиском.\n\n"
-            "Поиск файла выполняется в корне папки записи и в "
-            "подпапке attachments."
-        )
         act_view_protocol.triggered.connect(
             self._view_manual_protocol
         )
@@ -3000,6 +2810,31 @@ class SessionsWindow(QDialog):
         )
         m_meta.addAction(act_status_error)
 
+        # --- Меню «Связи» (НОВОЕ) ---
+        m_relations = bar.addMenu("Связи")
+
+        act_show_relations = QAction(
+            "Показать связанные записи", self
+        )
+        act_show_relations.setToolTip(
+            "Открыть окно «Записи» с фильтром по связанным."
+        )
+        act_show_relations.triggered.connect(
+            self._show_related_sessions
+        )
+        m_relations.addAction(act_show_relations)
+
+        act_edit_relations = QAction(
+            "Изменить связи…", self
+        )
+        act_edit_relations.setToolTip(
+            "Открыть карточку метаданных на вкладке «Зависимости»."
+        )
+        act_edit_relations.triggered.connect(
+            self._edit_relations
+        )
+        m_relations.addAction(act_edit_relations)
+
         m_protocol = bar.addMenu("Протокол")
 
         act_edit_protocol_md = QAction(
@@ -3026,12 +2861,6 @@ class SessionsWindow(QDialog):
 
         act_view_protocol_menu = QAction(
             "Просмотреть прикреплённый протокол", self
-        )
-        act_view_protocol_menu.setToolTip(
-            "Открыть протокол (.docx) во встроенном просмотрщике "
-            "с поиском.\n\n"
-            "Поиск файла выполняется в корне папки записи и в "
-            "подпапке attachments."
         )
         act_view_protocol_menu.triggered.connect(
             self._view_manual_protocol
@@ -3103,20 +2932,10 @@ class SessionsWindow(QDialog):
             "Редактор поручений текущей записи…", self
         )
         act_tasks_editor.setShortcut(QKeySequence("Ctrl+Shift+K"))
-        act_tasks_editor.setToolTip(
-            "Открыть редактор поручений (action_items.json) для "
-            "выбранной записи.\n\n"
-            "В редакторе можно создавать, редактировать, удалять "
-            "поручения, импортировать и экспортировать JSON."
-        )
         act_tasks_editor.triggered.connect(self._open_tasks_editor)
         m_tasks.addAction(act_tasks_editor)
 
         act_view_tasks = QAction("Сводное окно «Поручения»…", self)
-        act_view_tasks.setToolTip(
-            "Открыть сводную таблицу всех поручений по всем записям.\n"
-            "Горячая клавиша: Ctrl+Shift+L"
-        )
         act_view_tasks.setShortcut(QKeySequence("Ctrl+Shift+L"))
         act_view_tasks.triggered.connect(self._open_tasks_window)
         m_tasks.addAction(act_view_tasks)
@@ -3177,10 +2996,6 @@ class SessionsWindow(QDialog):
         m_help.addAction(act_shortcuts)
 
         act_player_info = QAction("Статус встроенного плеера…", self)
-        act_player_info.setToolTip(
-            "Показать информацию о доступности встроенного плеера "
-            "(Qt Multimedia)"
-        )
         act_player_info.triggered.connect(self._show_player_info)
         m_help.addAction(act_player_info)
 
@@ -3198,16 +3013,10 @@ class SessionsWindow(QDialog):
                 self, "Встроенный плеер",
                 f"{status}\n\n"
                 "Медиафайлы будут открываться системным "
-                "приложением (xdg-open). Для работы встроенного "
-                "плеера установите пакет PySide6-Addons и "
-                "необходимые GStreamer-плагины:\n\n"
-                "sudo apt install python3-pyside6.qmultimedia "
-                "gstreamer1.0-plugins-good gstreamer1.0-plugins-bad "
-                "gstreamer1.0-libav",
+                "приложением (xdg-open).",
             )
 
     def _open_daily_digest(self) -> None:
-        """Открывает диалог формирования «Свода за день»."""
         try:
             dlg = DailyDigestDialog(
                 sessions_root=self.sessions_root,
@@ -3225,7 +3034,6 @@ class SessionsWindow(QDialog):
             )
 
     def _regenerate_action_prompt(self) -> None:
-        """Пересобирает action_items_prompt для выбранной записи."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(
@@ -3241,7 +3049,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # --- Формат и шаблон из конфига ---
         fmt = "docx"
         template = ""
         if self.config_manager is not None:
@@ -3315,7 +3122,6 @@ class SessionsWindow(QDialog):
             )
 
     def _regenerate_tfs_attachment(self) -> None:
-        """Пересобирает TFS-выборку для выбранной записи."""
         r = self._selected_row()
         if not r:
             QMessageBox.warning(
@@ -3338,7 +3144,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # --- Читаем session.json ---
         session_json = os.path.join(session_dir, "session.json")
         meta = read_json_file(session_json) or {}
 
@@ -3365,7 +3170,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # --- Проверяем TFS ---
         try:
             tfs_settings = self.config_manager.get_tfs_settings()
         except Exception as exc:
@@ -3389,7 +3193,6 @@ class SessionsWindow(QDialog):
             tfs_settings.get("wiql_templates") or []
         )
 
-        # --- Работа с переменными ---
         from ..tfs_client import (
             extract_variables,
             validate_variables,
@@ -3404,7 +3207,6 @@ class SessionsWindow(QDialog):
 
         required_vars = extract_variables(wiql) if wiql else []
 
-        # Значения уже сохранённые в session.json — приоритет.
         meta_vars = meta.get("tfs_variables") or {}
         if not isinstance(meta_vars, dict):
             meta_vars = {}
@@ -3417,7 +3219,6 @@ class SessionsWindow(QDialog):
                 wiql, variable_values
             )
             if not ok:
-                # Открываем диалог ввода.
                 dlg = TfsVariablesDialog(
                     required_vars,
                     initial=variable_values,
@@ -3426,8 +3227,7 @@ class SessionsWindow(QDialog):
                         "В шаблоне «"
                         f"{tfs_template}» есть переменные. "
                         "Укажите их значения для выполнения "
-                        "запроса. После успешного выполнения "
-                        "значения сохранятся в метаданных записи."
+                        "запроса."
                     ),
                     parent=self,
                 )
@@ -3435,7 +3235,6 @@ class SessionsWindow(QDialog):
                     return
                 variable_values.update(dlg.result_values())
 
-        # --- Подтверждение ---
         reply = QMessageBox.question(
             self, "TFS-выборка",
             f"<b>Пересобрать TFS-выборку?</b><br><br>"
@@ -3457,8 +3256,7 @@ class SessionsWindow(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # --- Формат и лимит ---
-        app_cfg = self.app_cfg or {}
+        app_cfg = self._app_cfg or {}
         fmt = str(
             app_cfg.get("tfs_attachment_format", "csv")
         ).lower()
@@ -3466,7 +3264,6 @@ class SessionsWindow(QDialog):
             app_cfg.get("tfs_attachment_max_items", 0)
         )
 
-        # --- Запускаем в отдельном потоке ---
         QGuiApplication.setOverrideCursor(
             Qt.CursorShape.WaitCursor
         )
@@ -3490,20 +3287,17 @@ class SessionsWindow(QDialog):
         finally:
             QGuiApplication.restoreOverrideCursor()
 
-        # --- Обновляем attachments и tfs_variables в session.json ---
         if res.get("ok") and res.get("files"):
             current = list(meta.get("attachments") or [])
             for p in res["files"]:
                 if p not in current:
                     current.append(p)
             meta["attachments"] = current
-            # Сохраняем значения переменных — на будущее.
             if required_vars:
                 meta["tfs_variables"] = dict(variable_values)
             self._write_json(session_json, meta)
             self.refresh()
 
-        # --- Результат ---
         if res.get("ok"):
             QMessageBox.information(
                 self, "TFS-выборка",
@@ -3589,11 +3383,12 @@ class SessionsWindow(QDialog):
                 self.public_link_btn.setEnabled(False)
             if hasattr(self, "copy_public_link_btn"):
                 self.copy_public_link_btn.setEnabled(False)
+            if hasattr(self, "relations_btn"):
+                self.relations_btn.setEnabled(False)
             return
 
         parts = [f"<b>{r['name']}</b>"]
 
-        # --- НОВОЕ: запись-документ ---
         document_only = bool(r.get("document_only"))
 
         if r.get("project"):
@@ -3624,6 +3419,13 @@ class SessionsWindow(QDialog):
                 f"<span style='color:#1565C0'>"
                 f"поручений: {ai_done}/{ai_total}</span>"
             )
+        # --- Связи ---
+        rel_count = int(r.get("relations_count") or 0)
+        if rel_count > 0:
+            parts.append(
+                f"<span style='color:#00695C'>"
+                f"связей: {rel_count}</span>"
+            )
         if r.get("has_transcript"):
             parts.append("стенограмма: есть")
         if r.get("published"):
@@ -3641,19 +3443,14 @@ class SessionsWindow(QDialog):
         else:
             self.sync_ready_btn.setText("Готово к синхронизации")
 
-        # --- Запись-документ: видео/аудио недоступны ---
         if document_only:
             self.play_video_btn.setEnabled(False)
             self.play_audio_btn.setEnabled(False)
             self.play_video_btn.setToolTip(
-                "Это запись-документ — видео у неё нет.\n\n"
-                "Откройте папку записи, чтобы посмотреть "
-                "прикреплённые документы."
+                "Это запись-документ — видео у неё нет."
             )
             self.play_audio_btn.setToolTip(
-                "Это запись-документ — аудио у неё нет.\n\n"
-                "Откройте папку записи, чтобы посмотреть "
-                "прикреплённые документы."
+                "Это запись-документ — аудио у неё нет."
             )
         else:
             has_local_video = bool(r.get("has_video"))
@@ -3666,16 +3463,11 @@ class SessionsWindow(QDialog):
             self.play_audio_btn.setEnabled(
                 has_local_audio or is_published
             )
-            # Возвращаем стандартные подсказки.
             self.play_video_btn.setToolTip(
-                "Открыть видео во встроенном плеере.\n\n"
-                "Если файла нет локально, но он есть на сервере — "
-                "будет предложено скачать его."
+                "Открыть видео во встроенном плеере."
             )
             self.play_audio_btn.setToolTip(
-                "Открыть аудио во встроенном плеере.\n\n"
-                "Если файла нет локально, но он есть на сервере — "
-                "будет предложено скачать его."
+                "Открыть аудио во встроенном плеере."
             )
 
         if hasattr(self, "public_link_btn"):
@@ -3683,14 +3475,16 @@ class SessionsWindow(QDialog):
         if hasattr(self, "copy_public_link_btn"):
             self.copy_public_link_btn.setEnabled(bool(r.get("published")))
 
-        # «Стенограмма» доступна, если есть video.txt (у документов
-        # он тоже создаётся, если включена опция сохранения).
         self.open_transcript_btn.setEnabled(
             bool(r.get("has_transcript"))
         )
 
         protocol_path = self._find_manual_protocol_path(r)
         self.open_protocol_btn.setEnabled(bool(protocol_path))
+
+        # --- НОВОЕ: кнопка «Связи» ---
+        if hasattr(self, "relations_btn"):
+            self.relations_btn.setEnabled(bool(r.get("dir")))
 
     # ------------------------------------------------------------------
     # Обновление
@@ -3723,18 +3517,14 @@ class SessionsWindow(QDialog):
         self._thread.start()
 
     def _on_scan_finished(self, rows: list) -> None:
-        # Сохраняем полный список — фильтры работают по нему.
         self._all_rows = list(rows or [])
 
-        # Обновляем списки в фильтрах.
         self._refresh_project_filter()
         self._refresh_tag_filter()
 
-        # Пересобираем чипы тегов в статистике.
         if hasattr(self, "tag_stats_layout"):
             self._rebuild_tag_stats()
 
-        # Применяем фильтры.
         self._apply_filters()
 
     def _on_scan_failed(self, error: str) -> None:
@@ -3768,7 +3558,6 @@ class SessionsWindow(QDialog):
             1 for r in rows if r.get("sync_ready") and not r.get("published")
         )
 
-        # Показываем итоги по отфильтрованному списку.
         all_total = len(self._all_rows)
         if all_total != total:
             total_text = f"Всего: {total} из {all_total}"
@@ -3810,8 +3599,6 @@ class SessionsWindow(QDialog):
                     "Теги записи: " + ", ".join(tags)
                 )
 
-                # Цвет ячейки берём из первого тега,
-                # у которого задан color в справочнике.
                 tag_color = self._resolve_first_tag_color(tags)
                 if tag_color is not None:
                     qcolor = QColor(tag_color)
@@ -3841,7 +3628,6 @@ class SessionsWindow(QDialog):
             src = src_map.get(r["source"], r["source"] or "—")
             src_item = QTableWidgetItem(src)
 
-            # Подсветка записей-документов.
             if r.get("document_only"):
                 src_item.setForeground(QColor("#6A1B9A"))
                 docs_n = int(r.get("documents_count") or 0)
@@ -3863,7 +3649,6 @@ class SessionsWindow(QDialog):
                 ),
             )
 
-            # --- Поручения: «выполнено/всего» + разбивка по статусам ---
             ai_total = int(r.get("action_items_total") or 0)
             ai_by_status: Dict[str, int] = (
                 r.get("action_items_by_status") or {}
@@ -3874,12 +3659,9 @@ class SessionsWindow(QDialog):
                 ai_cancelled = int(ai_by_status.get("cancelled", 0))
 
                 ai_item = QTableWidgetItem(f"{ai_done}/{ai_total}")
-                # Подсветка: если все выполнены — зелёный, если есть
-                # отменённые — учитываем их отдельно.
                 if ai_done == ai_total:
                     ai_item.setForeground(Qt.GlobalColor.darkGreen)
                 elif ai_done + ai_cancelled == ai_total:
-                    # Все закрыты (выполнены или отменены).
                     ai_item.setForeground(Qt.GlobalColor.darkGray)
                 elif ai_done > 0:
                     ai_item.setForeground(Qt.GlobalColor.darkBlue)
@@ -3891,7 +3673,6 @@ class SessionsWindow(QDialog):
                     | Qt.AlignmentFlag.AlignVCenter
                 )
 
-                # --- Подробный tooltip с разбивкой по статусам ---
                 status_order = (
                     ("created",     "Создан"),
                     ("in_progress", "В работе"),
@@ -3916,9 +3697,6 @@ class SessionsWindow(QDialog):
                     "(Ctrl+Shift+K)."
                 )
 
-                # QTableWidgetItem.setToolTip по умолчанию трактует
-                # строку как plain text; для <br>/<b> нужно явно
-                # обернуть в HTML.
                 ai_item.setToolTip(
                     "<html><body style='white-space:pre-wrap;'>"
                     + "<br>".join(tooltip_lines)
@@ -3928,13 +3706,35 @@ class SessionsWindow(QDialog):
                 ai_item = QTableWidgetItem("—")
                 ai_item.setForeground(Qt.GlobalColor.gray)
                 ai_item.setToolTip(
-                    "У этой записи нет поручений "
-                    "(action_items.json отсутствует или пуст)."
+                    "У этой записи нет поручений."
                 )
 
             self.table.setItem(row, 8, ai_item)
 
-            # --- Summary: только наличие (да / —) ---
+            # --- НОВОЕ: колонка «Связи» ---
+            rel_count = int(r.get("relations_count") or 0)
+            if rel_count > 0:
+                rel_item = QTableWidgetItem(str(rel_count))
+                rel_item.setForeground(QColor("#00695C"))
+                rel_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight
+                    | Qt.AlignmentFlag.AlignVCenter
+                )
+                rel_item.setToolTip(
+                    f"Связей: {rel_count}\n\n"
+                    f"Кнопка «Связи» на нижней панели — показать "
+                    f"связанные записи."
+                )
+            else:
+                rel_item = QTableWidgetItem("—")
+                rel_item.setForeground(Qt.GlobalColor.gray)
+                rel_item.setToolTip(
+                    "У этой записи нет связей.\n\n"
+                    "Добавить можно в карточке метаданных на "
+                    "вкладке «Зависимости»."
+                )
+            self.table.setItem(row, 9, rel_item)
+
             summary_bb = (r.get("summary_bb") or "").strip()
             if summary_bb:
                 summary_item = QTableWidgetItem("да")
@@ -3954,9 +3754,8 @@ class SessionsWindow(QDialog):
                 summary_item.setToolTip(
                     "У этой записи нет краткого описания."
                 )
-            self.table.setItem(row, 9, summary_item)
+            self.table.setItem(row, 10, summary_item)
 
-            # --- Колонка «Синхр.» ---
             published = bool(r.get("published"))
             sync_ready = bool(r.get("sync_ready"))
 
@@ -3969,62 +3768,159 @@ class SessionsWindow(QDialog):
                     f"к синхронизации».\n\n"
                     f"Record ID: {r.get('record_id', '')}"
                 )
-
             elif published and not sync_ready:
                 sync_text = "да?"
                 sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.darkYellow)
                 sync_item.setToolTip(
                     f"Опубликовано, но <b>признак «готово "
-                    f"к синхронизации» не выставлен</b> "
-                    f"(sync_ready=false).\n\n"
-                    f"Запись считается черновиком:\n"
-                    f"  • автопубликация повторно не запускается;\n"
-                    f"  • фоновый pull игнорирует эту запись;\n"
-                    f"  • локальные артефакты не удаляются.\n\n"
-                    f"Поставьте галочку «Готово к синхронизации» "
-                    f"в карточке метаданных или в окне «Записи», "
-                    f"чтобы разрешить фоновую синхронизацию.\n\n"
-                    f"Record ID: {r.get('record_id', '')}"
+                    f"к синхронизации» не выставлен</b>."
                 )
-
             elif not published and sync_ready:
                 sync_text = "готово"
                 sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.darkYellow)
                 sync_item.setToolTip(
-                    "Запись помечена как «готова к синхронизации». "
-                    "Можно публиковать на сервер, фоновый pull "
-                    "будет её учитывать."
+                    "Запись помечена как «готова к синхронизации»."
                 )
-
             else:
                 sync_text = "черновик"
                 sync_item = QTableWidgetItem(sync_text)
                 sync_item.setForeground(Qt.GlobalColor.gray)
                 sync_item.setToolTip(
-                    "Запись — черновик (sync_ready=false). "
-                    "Автопубликация не запускается, фоновый "
-                    "pull игнорирует, локальные артефакты "
-                    "не удаляются."
+                    "Запись — черновик (sync_ready=false)."
                 )
-
-            self.table.setItem(row, 10, sync_item)
+            self.table.setItem(row, 11, sync_item)
 
             self.table.setItem(
-                row, 11,
+                row, 12,
                 QTableWidgetItem(r["task_id"] or "—"),
             )
-            self.table.setItem(row, 12, QTableWidgetItem(r["dir"]))
+            self.table.setItem(row, 13, QTableWidgetItem(r["dir"]))
+
+    # ------------------------------------------------------------------
+    # Связи (НОВОЕ)
+    # ------------------------------------------------------------------
+    def _show_related_sessions(self) -> None:
+        """
+        Открывает окно «Записи» с фильтром по связанным
+        с выбранной записи.
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Связи", "Выберите запись")
+            return
+
+        session_dir = r.get("dir") or ""
+        if not session_dir:
+            return
+
+        related = find_related_sessions(
+            self.sessions_root, session_dir
+        )
+        if not related:
+            QMessageBox.information(
+                self, "Связи",
+                f"У записи «{r.get('name')}» нет связанных записей.\n\n"
+                f"Добавить связи можно в карточке метаданных "
+                f"(Метаданные → Изменить метаданные) на вкладке "
+                f"«Зависимости».",
+            )
+            return
+
+        new_window = SessionsWindow(
+            sessions_root=self.sessions_root,
+            task_queue=self.task_queue,
+            processor=self.processor,
+            config_manager=self.config_manager,
+            parent=self,
+        )
+        new_window.set_relation_filter(
+            source_name=r.get("name") or "",
+            related_dirs=[
+                item["session_dir"] for item in related
+            ],
+        )
+        new_window.setWindowTitle(
+            f"Записи — связи с «{r.get('name')}»"
+        )
+        new_window.show()
+
+    def _edit_relations(self) -> None:
+        """Открывает карточку метаданных на вкладке «Зависимости»."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Связи", "Выберите запись")
+            return
+
+        if self.config_manager is None:
+            QMessageBox.warning(
+                self, "Связи",
+                "Нет доступа к настройкам.",
+            )
+            return
+
+        session_json = os.path.join(r["dir"], "session.json")
+        meta = read_json_file(session_json) or {}
+
+        projects = self.config_manager.get_project_names()
+        prompts = self.config_manager.get_prompts()
+        default_prompt = self.config_manager.get_default_prompt()
+        name_templates = self.config_manager.get_name_templates()
+        tags = self.config_manager.get_tags()
+
+        project = meta.get("project")
+        if project and project not in projects:
+            projects = [project] + projects
+
+        init = dict(meta)
+        init["session_dir"] = r["dir"]
+
+        dlg = MetadataDialog(
+            projects=projects,
+            prompts=prompts,
+            title=f"Связи записи — {r['name']}",
+            initial=init,
+            default_prompt=default_prompt,
+            sessions_root=self.sessions_root,
+            on_save_prompt=self._on_save_prompt_to_config,
+            get_prompts=self.config_manager.get_prompts,
+            name_templates=name_templates,
+            on_save_name_template=self._on_save_name_template,
+            get_name_templates=self.config_manager.get_name_templates,
+            tags=tags,
+            on_save_tag=self._on_save_tag_to_config,
+            get_tags=self.config_manager.get_tags,
+            relations_max_in_dialog=int(
+                self._app_cfg.get(
+                    "relations_max_in_dialog", 0
+                )
+            ),
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_meta = dlg.result_data
+
+        # --- Сохраняем связи ---
+        relations = list(new_meta.get("relations") or [])
+        if save_relations(r["dir"], relations):
+            log.info(
+                "Связи записи «%s» обновлены: %d шт.",
+                r["name"], len(relations),
+            )
+            self.refresh()
+        else:
+            QMessageBox.warning(
+                self, "Связи",
+                "Не удалось сохранить связи в session.json.",
+            )
 
     # ------------------------------------------------------------------
     # Готовность к синхронизации
     # ------------------------------------------------------------------
     def _toggle_sync_ready(self) -> None:
-        """
-        Переключает флаг sync_ready в session.json для выбранной
-        записи. Показывается диалог подтверждения.
-        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Записи", "Выберите запись")
@@ -4075,13 +3971,11 @@ class SessionsWindow(QDialog):
 
         self.refresh()
 
-        # --- Если запись опубликована — уведомляем сервер ---
         if r.get("published") and r.get("record_id"):
             self._patch_sync_ready_on_server(
                 r["record_id"], new_value,
             )
 
-        # --- Авто-публикация при установке «Готово» ---
         if new_value:
             r["sync_ready"] = True
             self._maybe_publish_after_sync_ready(r, was_ready=current)
@@ -4091,34 +3985,21 @@ class SessionsWindow(QDialog):
     def _notify_sync_ready(
         self, r: Dict[str, Any], ready: bool,
     ) -> None:
-        """Показывает уведомление после смены флага."""
         if ready:
             QMessageBox.information(
                 self, "Синхронизация",
                 f"Запись «{r['name']}» помечена как «готова "
-                f"к синхронизации».\n\n"
-                f"Теперь её можно публиковать на сервер "
-                f"(вручную или автоматически) и разрешить "
-                f"фоновую синхронизацию.",
+                f"к синхронизации».",
             )
         else:
             QMessageBox.information(
                 self, "Синхронизация",
-                f"Запись «{r['name']}» снова стала черновиком.\n\n"
-                f"Автопубликация не запускается, фоновый pull "
-                f"не перезаписывает локальные файлы, локальные "
-                f"артефакты не удаляются.",
+                f"Запись «{r['name']}» снова стала черновиком.",
             )
 
     def _patch_sync_ready_on_server(
         self, record_id: str, sync_ready: bool,
     ) -> None:
-        """
-        Уведомляет сервер о смене флага sync_ready.
-
-        Выполняется в фоне, не блокирует UI. Если запись
-        не опубликована — метод не вызывается.
-        """
         if self.config_manager is None:
             return
 
@@ -4191,13 +4072,10 @@ class SessionsWindow(QDialog):
             QMessageBox.warning(self, "Записи", "Выберите запись")
             return
 
-        # --- Запись-документ: нет видео/аудио ---
         if r.get("document_only"):
             QMessageBox.information(
                 self, "Записи",
-                "Это запись-документ — видео и аудио у неё нет.\n\n"
-                "Используйте «Открыть папку записи», чтобы "
-                "посмотреть прикреплённые документы.",
+                "Это запись-документ — видео и аудио у неё нет.",
             )
             return
 
@@ -4214,11 +4092,8 @@ class SessionsWindow(QDialog):
         if not r.get("published") or not r.get("record_id"):
             QMessageBox.information(
                 self, "Записи",
-                f"Локальный файл {'видео' if kind == 'video' else 'аудио'}"
-                f" не найден, и запись не опубликована на сервере.\n\n"
-                f"Опубликуйте запись через «Файл → Синхронизировать "
-                f"выбранную запись…» — и, если включена передача медиа "
-                f"на сервер, файл можно будет скачать.",
+                f"Локальный файл не найден, и запись не "
+                f"опубликована на сервере.",
             )
             return
 
@@ -4229,21 +4104,13 @@ class SessionsWindow(QDialog):
         if not auto_download:
             reply = QMessageBox.question(
                 self, "Записи",
-                f"Локального файла нет, но запись опубликована "
-                f"на сервере.\n\n"
-                f"Скачать {'видео' if kind == 'video' else 'аудио'} "
-                f"с сервера?",
+                f"Скачать медиа с сервера?",
                 QMessageBox.StandardButton.Yes
                 | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-        else:
-            log.info(
-                "Записи: авто-скачивание медиа (%s) для %s",
-                kind, r["name"],
-            )
 
         self._download_and_play_media(r, kind)
 
@@ -4260,8 +4127,7 @@ class SessionsWindow(QDialog):
         if self._media_worker is not None and self._media_worker.isRunning():
             QMessageBox.information(
                 self, "Записи",
-                "Скачивание медиа уже выполняется. "
-                "Дождитесь завершения.",
+                "Скачивание медиа уже выполняется.",
             )
             return
 
@@ -4270,8 +4136,7 @@ class SessionsWindow(QDialog):
                 and cfg.get("api_key")):
             QMessageBox.warning(
                 self, "Записи",
-                "Синхронизация не настроена.\n\n"
-                "Откройте Настройки → Синхронизация.",
+                "Синхронизация не настроена.",
             )
             return
 
@@ -4372,21 +4237,12 @@ class SessionsWindow(QDialog):
                 QMessageBox.warning(
                     self, "Записи",
                     f"Не удалось получить медиа с сервера.\n\n"
-                    f"Возможные причины:\n"
-                    f"  • медиа не было передано на сервер "
-                    f"(включите «Передавать видео и аудио на сервер» "
-                    f"в Настройки → Синхронизация);\n"
-                    f"  • файл удалён с сервера.\n\n"
                     + (f"Дополнительно: {reason}" if reason else ""),
                 )
             else:
                 QMessageBox.warning(
                     self, "Записи",
-                    "Не удалось найти скачанный медиафайл.\n\n"
-                    "Возможно, на сервере нет видео/аудио для этой "
-                    "записи — включите передачу медиа в "
-                    "Настройки → Синхронизация и синхронизируйте "
-                    "запись заново.",
+                    "Не удалось найти скачанный медиафайл.",
                 )
             self.refresh()
             return
@@ -4453,9 +4309,7 @@ class SessionsWindow(QDialog):
             QMessageBox.information(
                 self, "Записи",
                 "Встроенный плеер недоступен — файл открыт "
-                "системным приложением.\n\n"
-                "Установите PySide6-Addons и GStreamer-плагины "
-                "для встроенного воспроизведения.",
+                "системным приложением.",
             )
 
     # ------------------------------------------------------------------
@@ -4484,11 +4338,7 @@ class SessionsWindow(QDialog):
         if not transcript_path:
             QMessageBox.information(
                 self, "Записи",
-                "У этой записи нет стенограммы (video.txt) ни в "
-                "корне папки, ни в папке attachments.\n\n"
-                "Стенограмма создаётся при обработке, если задан "
-                "URL сервера транскрибации "
-                "(Настройки → Транскрибация).",
+                "У этой записи нет стенограммы (video.txt).",
             )
             return
 
@@ -4502,8 +4352,6 @@ class SessionsWindow(QDialog):
                 self, "Стенограмма",
                 f"Файл стенограммы очень большой: "
                 f"{size_bytes / 1024 / 1024:.1f} МБ.\n\n"
-                f"Открытие может занять время и замедлить "
-                f"интерфейс.\n\n"
                 f"Открыть всё равно?",
                 QMessageBox.StandardButton.Yes
                 | QMessageBox.StandardButton.No,
@@ -4542,11 +4390,6 @@ class SessionsWindow(QDialog):
             default_save_name="video.txt",
         )
         dlg.exec()
-
-        log.info(
-            "Записи: просмотр стенограммы для «%s» (%d символов, файл=%s)",
-            r["name"], len(text), transcript_path,
-        )
 
     # ------------------------------------------------------------------
     # Просмотр протокола
@@ -4620,16 +4463,7 @@ class SessionsWindow(QDialog):
         if not protocol_path:
             QMessageBox.information(
                 self, "Записи",
-                "У этой записи нет протокола (.docx) ни по пути из "
-                "session.json, ни в корне папки, ни в папке "
-                "attachments.\n\n"
-                "Протокол можно:\n"
-                "  • сформировать автоматически при обработке "
-                "(если включена суммаризация);\n"
-                "  • создать вручную: «Протокол → "
-                "Создать/редактировать протокол (Markdown)…»;\n"
-                "  • прикрепить готовый файл: «Протокол → "
-                "Прикрепить файл протокола…».",
+                "У этой записи нет протокола (.docx).",
             )
             return
 
@@ -4670,9 +4504,7 @@ class SessionsWindow(QDialog):
                 and cfg.get("api_key")):
             QMessageBox.warning(
                 self, "Синхронизация",
-                "Синхронизация не настроена.\n\n"
-                "Откройте Настройки → Синхронизация, "
-                "укажите Base URL и API-ключ.",
+                "Синхронизация не настроена.",
             )
             return
 
@@ -4722,15 +4554,12 @@ class SessionsWindow(QDialog):
         )
         self._sync_worker.start()
 
-    # ------------------------------------------------------------------
-    # Авто-публикация при установке «Готово к синхронизации»
-    # ------------------------------------------------------------------
     def _publish_after_ready(self, r: Dict[str, Any]) -> None:
         if not self._app_cfg.get("sync_publish_on_ready", True):
             log.info(
                 "Авто-публикация при отметке «Готово» выключена "
-                "в настройках — запись %s останется локальной "
-                "до ручной синхронизации", r["name"],
+                "в настройках — запись %s останется локальной",
+                r["name"],
             )
             return
 
@@ -4747,18 +4576,10 @@ class SessionsWindow(QDialog):
 
         if not (cfg.get("enabled") and cfg.get("base_url")
                 and cfg.get("api_key")):
-            log.info(
-                "Авто-публикация пропущена: синхронизация не "
-                "настроена (запись %s)", r["name"],
-            )
             return
 
         if (self._sync_worker is not None
                 and self._sync_worker.isRunning()):
-            log.info(
-                "Авто-публикация отложена: уже выполняется "
-                "синхронизация другой записи"
-            )
             self._notify_ready_no_publish(r, reason="busy")
             return
 
@@ -4776,12 +4597,6 @@ class SessionsWindow(QDialog):
             cfg.get(
                 "delete_local_media_after_media_upload", False
             )
-        )
-
-        log.info(
-            "Авто-публикация записи «%s» после отметки «Готово» "
-            "(медиа=%s, ссылка=%s, удалять после загрузки=%s)",
-            r["name"], include_media, send_video_link, delete_after,
         )
 
         self._sync_progress_dlg = QProgressDialog(
@@ -4837,16 +4652,7 @@ class SessionsWindow(QDialog):
                 f"Запись «{r['name']}» помечена как «готова к "
                 f"синхронизации».\n\n"
                 f"Авто-публикация не запущена: уже выполняется "
-                f"синхронизация другой записи. Опубликуйте эту "
-                f"запись вручную через «Синхронизировать…».",
-            )
-        else:
-            QMessageBox.information(
-                self, "Готово к синхронизации",
-                f"Запись «{r['name']}» помечена как «готова к "
-                f"синхронизации».\n\n"
-                f"Авто-публикация не запущена. Опубликуйте запись "
-                f"через «Синхронизировать…» (Ctrl+Shift+S).",
+                f"синхронизация другой записи.",
             )
 
     def _on_sync_progress(self, message: str) -> None:
@@ -4869,33 +4675,14 @@ class SessionsWindow(QDialog):
         lines.append(f"Действие: <b>{action}</b><br>")
         lines.append(f"Record ID: <code>{record_id}</code><br>")
         lines.append(f"Ревизия: {revision}<br>")
-        lines.append(
-            f"Передача медиа: "
-            f"{'да' if result.get('include_media') else 'нет'}<br>"
-        )
-        lines.append(
-            f"Ссылка file://: "
-            f"{'да' if result.get('send_video_link') else 'нет'}<br>"
-        )
-        if result.get("include_media"):
+
+        if media_up:
             lines.append(f"<br>Медиа загружено: {len(media_up)}<br>")
-            for m in media_up:
-                size_mb = int(m.get("size_bytes") or 0) / 1024 / 1024
-                lines.append(
-                    f"&nbsp;&nbsp;• {m['filename']} "
-                    f"({m['kind']}, {size_mb:.1f} МБ)<br>"
-                )
-            if media_skip:
-                lines.append(
-                    f"<br><span style='color:#c62828'>"
-                    f"Медиа пропущено: {len(media_skip)}</span><br>"
-                )
-                for m in media_skip:
-                    reason = m.get("reason") or "—"
-                    lines.append(
-                        f"&nbsp;&nbsp;• {m['filename']} — "
-                        f"{reason[:80]}<br>"
-                    )
+        if media_skip:
+            lines.append(
+                f"<br><span style='color:#c62828'>"
+                f"Медиа пропущено: {len(media_skip)}</span><br>"
+            )
 
         QMessageBox.information(
             self, "Синхронизация", "".join(lines),
@@ -5008,9 +4795,7 @@ class SessionsWindow(QDialog):
         if not record_id:
             QMessageBox.information(
                 self, "Ссылка на сервер",
-                "Запись ещё не опубликована на сервере.\n\n"
-                "Опубликуйте её через «Синхронизировать…» "
-                "(Ctrl+Shift+S), затем повторите.",
+                "Запись ещё не опубликована на сервере.",
             )
             return
 
@@ -5018,9 +4803,7 @@ class SessionsWindow(QDialog):
         if not record_path:
             QMessageBox.information(
                 self, "Ссылка на сервер",
-                "В .sync_published.json нет поля path — "
-                "возможно, запись публиковалась старой версией "
-                "клиента. Опубликуйте её заново.",
+                "В .sync_published.json нет поля path.",
             )
             return
 
@@ -5043,9 +4826,7 @@ class SessionsWindow(QDialog):
         if not link:
             QMessageBox.information(
                 self, "Ссылка на сервер",
-                "Ссылка недоступна:\n"
-                "  • запись не опубликована на сервере;\n"
-                "  • не задан base_url в Настройки → Синхронизация.",
+                "Ссылка недоступна.",
             )
             return
 
@@ -5069,8 +4850,7 @@ class SessionsWindow(QDialog):
                 and cfg.get("api_key")):
             QMessageBox.warning(
                 self, "Синхронизация",
-                "Синхронизация не настроена.\n\n"
-                "Настройки → Синхронизация.",
+                "Синхронизация не настроена.",
             )
             return
 
@@ -5110,8 +4890,7 @@ class SessionsWindow(QDialog):
         if self.config_manager is None:
             QMessageBox.warning(
                 self, "Bitrix24",
-                "Нет доступа к настройкам — ConfigManager "
-                "не передан.",
+                "Нет доступа к настройкам.",
             )
             return
 
@@ -5119,48 +4898,26 @@ class SessionsWindow(QDialog):
         if not bitrix_cfg.get("enabled"):
             QMessageBox.information(
                 self, "Bitrix24",
-                "Интеграция с Bitrix24 отключена.\n\n"
-                "Включите её в Настройки → Bitrix24.",
+                "Интеграция с Bitrix24 отключена.",
             )
             return
 
         chat_id = self.config_manager.get_default_chat_id()
         project = r.get("project") or ""
 
-        if chat_id:
-            log.info(
-                "Bitrix24: используется чат по умолчанию из настроек "
-                "(%s) вместо чата проекта %r",
-                chat_id, project or "—",
-            )
-        else:
+        if not chat_id:
             chat_id = self.config_manager.get_project_chat_id(project)
-            if chat_id:
-                log.info(
-                    "Bitrix24: используется чат проекта «%s» (%s)",
-                    project, chat_id,
-                )
 
         protocol_path = self._find_manual_protocol_path(r)
-        protocol_label = (
-            os.path.basename(protocol_path) if protocol_path else ""
-        )
-
-        log.info(
-            "Bitrix24: отправка записи «%s» — протокол=%r, "
-            "summary=%d символов, session_dir=%s",
-            r.get("name"),
-            protocol_path or "не найден",
-            len(r.get("summary_bb") or ""),
-            r.get("dir") or "—",
-        )
 
         session_info = {
             "name": r.get("name") or "",
             "project": project,
             "date": r.get("datetime") or "",
             "protocol_path": protocol_path,
-            "protocol_label": protocol_label,
+            "protocol_label": (
+                os.path.basename(protocol_path) if protocol_path else ""
+            ),
             "summary_bb": r.get("summary_bb") or "",
             "comment": "",
             "session_dir": r.get("dir") or "",
@@ -5229,11 +4986,14 @@ class SessionsWindow(QDialog):
         if project and project not in projects:
             projects = [project] + projects
 
+        init = dict(meta)
+        init["session_dir"] = r["dir"]
+
         dlg = MetadataDialog(
             projects=projects,
             prompts=prompts,
             title=f"Теги записи — {r['name']}",
-            initial=meta,
+            initial=init,
             default_prompt=default_prompt,
             sessions_root=self.sessions_root,
             on_save_prompt=self._on_save_prompt_to_config,
@@ -5244,6 +5004,11 @@ class SessionsWindow(QDialog):
             tags=tags,
             on_save_tag=self._on_save_tag_to_config,
             get_tags=self.config_manager.get_tags,
+            relations_max_in_dialog=int(
+                self._app_cfg.get(
+                    "relations_max_in_dialog", 0
+                )
+            ),
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -5252,6 +5017,10 @@ class SessionsWindow(QDialog):
         new_meta = dlg.result_data
         meta["tags"] = list(new_meta.get("tags", []))
         meta["sync_ready"] = bool(new_meta.get("sync_ready", False))
+
+        # --- НОВОЕ: связи ---
+        meta["relations"] = list(new_meta.get("relations") or [])
+
         if not self._write_json(session_json, meta):
             QMessageBox.critical(
                 self, "Теги",
@@ -5260,8 +5029,10 @@ class SessionsWindow(QDialog):
             return
 
         log.info(
-            "Теги записи «%s» обновлены: %s (sync_ready=%s)",
+            "Теги записи «%s» обновлены: %s (sync_ready=%s, "
+            "relations=%d)",
             r["name"], meta["tags"], meta["sync_ready"],
+            len(meta["relations"]),
         )
         self.refresh()
 
@@ -5337,9 +5108,7 @@ class SessionsWindow(QDialog):
         QMessageBox.information(
             self, "Протокол",
             f"Протокол сохранён и прикреплён к записи:\n"
-            f"{md_path}\n\n"
-            "Чтобы получить .docx для отправки в чат — "
-            "используйте «Протокол → Экспорт протокола в DOCX…».",
+            f"{md_path}",
         )
 
     def _export_protocol_docx(self) -> None:
@@ -5715,8 +5484,7 @@ class SessionsWindow(QDialog):
         if not candidates:
             QMessageBox.information(
                 self, "DeepSeek",
-                "Для этой записи промпт не сформирован.\n\n"
-                "Промпт создаётся при обработке.",
+                "Для этой записи промпт не сформирован.",
             )
             return
 
@@ -6023,10 +5791,6 @@ class SessionsWindow(QDialog):
             return False
 
     def _delete_processed_files(self, session_dir: str) -> None:
-        """
-        Удаляет результаты обработки при сбросе статуса
-        в «Сохранено». Исходное видео и вложения не трогает.
-        """
         for fname in (
             "video.mp3", "video.txt",
             "video.aac", "video.wav", "video.opus",
@@ -6057,13 +5821,6 @@ class SessionsWindow(QDialog):
         *,
         keep_transcript: bool = False,
     ) -> None:
-        """
-        Удаляет результаты обработки.
-
-        Args:
-            keep_transcript: если True — файл video.txt НЕ удаляется
-                             (транскрибация будет пропущена).
-        """
         patterns = [
             "video.mp3", "video.aac", "video.wav", "video.opus",
             "video.ogg", "video.m4a",
@@ -6086,19 +5843,6 @@ class SessionsWindow(QDialog):
                     )
 
     def _remove_document_artifacts(self, session_dir: str) -> None:
-        """
-        Удаляет артефакты, которые формируются из документов.
-
-        Для записи-документа нет video.mp3, video.aac и т.п. —
-        удаляем только то, что реально создаётся:
-          • video.txt                — «стенограмма» из документов;
-          • video_summary.md         — summary (если было);
-          • deepseek_prompt.*        — промпт DeepSeek;
-          • action_items*.json/txt   — поручения и их промпт;
-          • action_items_prompt.*;
-          • action_items_request.txt;
-          • action_items_response_raw.txt.
-        """
         patterns = [
             "video.txt",
             "video_summary.md",
@@ -6127,24 +5871,15 @@ class SessionsWindow(QDialog):
                     )
 
     def _enqueue_session(self, r: Dict[str, Any]) -> Optional[str]:
-        """
-        Ставит запись в очередь.
-
-        Для обычной записи — с путём к видео.
-        Для записи-документа — video_path пустой, флаг
-        document_only=True идёт в метаданных.
-        """
         document_only = bool(r.get("document_only"))
 
         if not document_only:
-            # Обычная запись — нужен видеофайл.
             if not os.path.exists(r["video_path"]):
                 log.error(
                     "Видео не найдено: %s", r["video_path"]
                 )
                 return None
         else:
-            # Запись-документ — нужен хотя бы один файл.
             documents = (
                 list(r.get("attachments") or [])
                 or list(r.get("documents") or [])
@@ -6178,7 +5913,6 @@ class SessionsWindow(QDialog):
                 "video_path": r.get("video_path") or "",
                 "metadata": meta,
             })
-            # Сохраняем task_id в session.json.
             if task_id:
                 meta["task_id"] = task_id
                 self._write_json(
@@ -6202,7 +5936,6 @@ class SessionsWindow(QDialog):
         document_only = bool(r.get("document_only"))
 
         if not document_only:
-            # Для обычных записей нужен видеофайл.
             if not r["video_path"] or not os.path.exists(
                 r["video_path"]
             ):
@@ -6213,7 +5946,6 @@ class SessionsWindow(QDialog):
                 )
                 return
         else:
-            # Для записи-документа нужен хотя бы один документ.
             documents = (
                 list(r.get("attachments") or [])
                 or list(r.get("documents") or [])
@@ -6237,7 +5969,6 @@ class SessionsWindow(QDialog):
             self._remove_from_queue(r["task_id"])
 
         if document_only:
-            # Удаляем только «документные» артефакты.
             self._remove_document_artifacts(r["dir"])
         else:
             self._remove_processed_artifacts(r["dir"])
@@ -6263,7 +5994,6 @@ class SessionsWindow(QDialog):
 
         document_only = bool(r.get("document_only"))
 
-        # --- Проверка исходных данных ---
         if not document_only:
             if not r["video_path"] or not os.path.exists(
                 r["video_path"]
@@ -6284,8 +6014,7 @@ class SessionsWindow(QDialog):
                 QMessageBox.warning(
                     self, "Записи",
                     "У записи-документа нет доступных файлов "
-                    "в attachments/.\n\n"
-                    "Проверьте папку записи.",
+                    "в attachments/.",
                 )
                 return
 
@@ -6309,12 +6038,40 @@ class SessionsWindow(QDialog):
         if project and project not in projects:
             projects = [project] + projects
 
-        # --- Открываем диалог метаданных ---
+        # --- НОВОЕ: передаём session_dir в initial ---
+        init = dict(meta)
+        init["session_dir"] = r["dir"]
+
+        # --- TFS-настройки ---
+        try:
+            tfs_settings = self.config_manager.get_tfs_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать TFS-настройки: %s", exc
+            )
+            tfs_settings = {"enabled": False}
+
+        tfs_templates = list(
+            tfs_settings.get("wiql_templates") or []
+        )
+
+        def _on_request_tfs_projects() -> List[str]:
+            try:
+                res = (
+                    self.config_manager.get_tfs_projects_cached()
+                )
+                return list(res.get("projects") or [])
+            except Exception as exc:
+                log.warning(
+                    "Не удалось получить проекты TFS: %s", exc
+                )
+                return []
+
         dlg = MetadataDialog(
             projects=projects,
             prompts=prompts,
             title=f"Метаданные записи — {r['name']}",
-            initial=meta,
+            initial=init,
             default_prompt=default_prompt,
             sessions_root=self.sessions_root,
             on_save_prompt=self._on_save_prompt_to_config,
@@ -6325,8 +6082,18 @@ class SessionsWindow(QDialog):
             tags=tags,
             on_save_tag=self._on_save_tag_to_config,
             get_tags=self.config_manager.get_tags,
-            # Для записей-документов показываем вкладку «Документ».
+            tfs_settings=tfs_settings,
+            tfs_templates=tfs_templates,
+            on_request_tfs_projects=_on_request_tfs_projects,
+            default_tfs_save_attachment=bool(
+                self._app_cfg.get("tfs_save_attachment", True)
+            ),
             allow_document_only=document_only,
+            relations_max_in_dialog=int(
+                self._app_cfg.get(
+                    "relations_max_in_dialog", 0
+                )
+            ),
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -6337,7 +6104,6 @@ class SessionsWindow(QDialog):
         old_sync_ready = bool(meta.get("sync_ready", False))
         new_sync_ready = bool(new_meta.get("sync_ready", False))
 
-        # --- Служебные поля, которые не редактируются в диалоге ---
         for keep_key in (
             "monitor",
             "summary_bb",
@@ -6351,11 +6117,16 @@ class SessionsWindow(QDialog):
         new_meta["session_dir"] = r["dir"]
         new_meta.pop("task_id", None)
 
+        # --- НОВОЕ: relations ---
+        new_meta["relations"] = list(
+            new_meta.get("relations")
+            or meta.get("relations")
+            or []
+        )
+
         if document_only:
             new_meta["video_path"] = ""
             new_meta["document_only"] = True
-            # Сохраняем актуальный список документов, если
-            # пользователь их не менял в диалоге.
             if not new_meta.get("documents"):
                 new_meta["documents"] = list(
                     meta.get("documents") or []
@@ -6367,7 +6138,6 @@ class SessionsWindow(QDialog):
         else:
             new_meta.setdefault("video_path", r["video_path"])
 
-        # --- Подтверждение ---
         reply = QMessageBox.question(
             self,
             "Перезапустить обработку",
@@ -6387,19 +6157,15 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # ------------------------------------------------------------------
-        # Для записей-документов — свой путь:
-        #  - не спрашиваем про стенограмму (она пересобирается
-        #    автоматически из документов);
-        #  - удаляем только документные артефакты.
-        # ------------------------------------------------------------------
+        # --- relations сохраняем отдельно, чтобы обновить кэш ---
+        save_relations(r["dir"], new_meta.get("relations") or [])
+
         if document_only:
             if r["task_id"]:
                 self._remove_from_queue(r["task_id"])
 
             self._remove_document_artifacts(r["dir"])
 
-            # Обновляем объект r в памяти (для _enqueue_session).
             r["document_only"] = True
             r["attachments"] = list(
                 new_meta.get("attachments") or []
@@ -6425,7 +6191,6 @@ class SessionsWindow(QDialog):
             )
             self.refresh()
 
-            # Авто-публикация, если флаг только что установлен.
             if not old_sync_ready and new_sync_ready:
                 for row in self._rows:
                     if row["dir"] == r["dir"]:
@@ -6436,9 +6201,6 @@ class SessionsWindow(QDialog):
                         break
             return
 
-        # ------------------------------------------------------------------
-        # Обычная запись — прежняя логика со стенограммой.
-        # ------------------------------------------------------------------
         transcript_path = os.path.join(r["dir"], "video.txt")
         has_transcript = os.path.isfile(transcript_path)
         transcript_size = 0
@@ -6481,20 +6243,9 @@ class SessionsWindow(QDialog):
 
             clicked = box.clickedButton()
             if clicked is cancel_btn:
-                log.info(
-                    "Перезапуск отменён пользователем на этапе "
-                    "выбора стенограммы"
-                )
                 return
             keep_transcript = (clicked is keep_btn)
 
-            log.info(
-                "Перезапуск «%s»: стенограмма %s",
-                r["name"],
-                "сохраняется" if keep_transcript else "пересобирается",
-            )
-
-        # --- Удаляем артефакты ---
         if keep_transcript:
             self._remove_processed_artifacts(
                 r["dir"], keep_transcript=True,
@@ -6524,7 +6275,6 @@ class SessionsWindow(QDialog):
         )
         self.refresh()
 
-        # --- Авто-публикация, если флаг только что установлен ---
         if not old_sync_ready and new_sync_ready:
             for row in self._rows:
                 if row["dir"] == r["dir"]:
@@ -6661,22 +6411,12 @@ class SessionsWindow(QDialog):
         act_play_video.setEnabled(
             bool(r.get("has_video")) or bool(r.get("published"))
         )
-        act_play_video.setToolTip(
-            "Открыть видео во встроенном плеере.\n"
-            "Если файла нет локально, но он есть на сервере — "
-            "будет предложено скачать."
-        )
 
         act_play_audio = menu.addAction(
             "Прослушать аудио", self._open_audio
         )
         act_play_audio.setEnabled(
             bool(r.get("has_audio")) or bool(r.get("published"))
-        )
-        act_play_audio.setToolTip(
-            "Открыть аудио во встроенном плеере.\n"
-            "Если файла нет локально, но он есть на сервере — "
-            "будет предложено скачать."
         )
 
         act_open_transcript = menu.addAction(
@@ -6685,24 +6425,12 @@ class SessionsWindow(QDialog):
         act_open_transcript.setEnabled(
             bool(r.get("has_transcript")) or bool(r.get("published"))
         )
-        act_open_transcript.setToolTip(
-            "Открыть стенограмму (video.txt) во встроенном "
-            "просмотрщике с поиском (Ctrl+F, F3 / Shift+F3).\n\n"
-            "Поиск файла выполняется в корне папки записи и в "
-            "подпапке attachments."
-        )
 
         act_view_protocol = menu.addAction(
             "Просмотреть протокол", self._view_manual_protocol
         )
         protocol_path = self._find_manual_protocol_path(r)
         act_view_protocol.setEnabled(bool(protocol_path))
-        act_view_protocol.setToolTip(
-            "Открыть прикреплённый протокол (.docx) во встроенном "
-            "просмотрщике с поиском (Ctrl+F, F3 / Shift+F3).\n\n"
-            "Поиск файла выполняется в корне папки записи и в "
-            "подпапке attachments."
-        )
 
         menu.addSeparator()
 
@@ -6714,20 +6442,9 @@ class SessionsWindow(QDialog):
         act_sync_ready = menu.addAction(
             sync_ready_text, self._toggle_sync_ready
         )
-        act_sync_ready.setToolTip(
-            "Переключить флаг sync_ready.\n\n"
-            "Пока флаг не выставлен — запись считается черновиком: "
-            "автопубликация не запускается, фоновый pull не "
-            "перезаписывает локальные файлы, локальные артефакты "
-            "не удаляются."
-        )
 
         act_sync = menu.addAction(
             "Синхронизировать…", self._sync_one_record
-        )
-        act_sync.setToolTip(
-            "Опубликовать выбранную запись на сервер "
-            "с выбором параметров (медиа, ссылка, удаление)"
         )
 
         is_published = bool(r.get("published"))
@@ -6736,17 +6453,21 @@ class SessionsWindow(QDialog):
             self._open_public_link_dialog,
         )
         act_public.setEnabled(is_published)
-        act_public.setToolTip(
-            "Открыть публичную HTML-страницу записи на сервере"
-        )
         act_copy_public = menu.addAction(
             "Скопировать ссылку на сервер",
             self._copy_public_link,
         )
         act_copy_public.setEnabled(is_published)
-        act_copy_public.setToolTip(
-            "Скопировать публичную ссылку на запись "
-            "в буфер обмена"
+
+        menu.addSeparator()
+
+        # --- НОВОЕ: связи в контекстном меню ---
+        act_show_rel = menu.addAction(
+            "Показать связанные записи",
+            self._show_related_sessions,
+        )
+        act_edit_rel = menu.addAction(
+            "Изменить связи…", self._edit_relations
         )
 
         menu.addSeparator()
@@ -7083,7 +6804,6 @@ class SessionsWindow(QDialog):
             )
             return
 
-        # --- Справочник сотрудников для выпадающего списка ---
         employees: List[Dict[str, str]] = []
         if self.config_manager is not None:
             try:
