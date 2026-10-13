@@ -365,8 +365,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
         # --- НОВОЕ: окно «Скрам» ---
         # Размеры окна «Скрам».
-        "scrum_window_width": 1600,
-        "scrum_window_height": 900,
+        "scrum_window_width": 1920,
+        "scrum_window_height": 1024,
         # Ограничение размера текста протокола при выводе в превью
         # (символов). Защита от подвисания при гигантских .docx.
         "scrum_protocol_tab_max_chars": 500_000,

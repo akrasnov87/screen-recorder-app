@@ -6,13 +6,18 @@
   • есть метод apply_session_defaults() для автозаполнения
     проекта/шаблона из метаданных записи;
   • размеры по умолчанию меньше — панель рассчитана на
-    встраивание в нижнюю половину левой части окна.
+    встраивание в нижнюю половину левой части окна;
+  • в дереве задач показываются только ключевые колонки
+    (см. _SCRUM_VISIBLE_COLUMNS), остальные скрыты.
 
 Реализация: композиция — инкапсулирует TfsWindow, забирает из
 него ключевые виджеты и переносит их в свой layout.
 
 Изменения:
   • Модуль создан.
+  • ДОБАВЛЕНО: настройка видимых колонок дерева — в панели
+    «Скрама» показываем только ID, Тип, Заголовок, Исполнитель,
+    Completed Work, Work Date (см. _configure_tree_columns).
 """
 from __future__ import annotations
 
@@ -41,6 +46,27 @@ class TfsPanelWidget(QWidget):
     компактный UI без диалоговой обвязки.
     """
 
+    # ------------------------------------------------------------------
+    # Настройка колонок дерева
+    # ------------------------------------------------------------------
+    # В панели «Скрама» показываем только ключевые колонки —
+    # чтобы таблица была компактной и не уезжала по горизонтали
+    # в узкой нижней половине левой части окна.
+    #
+    # Оставляем: ID, Тип, Заголовок, Исполнитель,
+    # Completed Work, Work Date.
+    #
+    # ВАЖНО: названия должны точно совпадать с теми, что
+    # установлены в TfsWindow._build_ui() (см. setHeaderLabels).
+    _SCRUM_VISIBLE_COLUMNS: tuple = (
+        "ID",
+        "Тип",
+        "Заголовок",
+        "Исполнитель",
+        "Completed Work",
+        "Work Date",
+    )
+
     def __init__(
         self,
         *,
@@ -61,6 +87,11 @@ class TfsPanelWidget(QWidget):
         )
 
         self._build_ui()
+
+        # Настраиваем колонки дерева — в панели «Скрама»
+        # показываем только 6 нужных колонок, а не все 11,
+        # как в отдельном окне «Задачи TFS».
+        self._configure_tree_columns()
 
         # Прячем внутреннее окно — оно не должно показываться.
         self._win.hide()
@@ -174,6 +205,105 @@ class TfsPanelWidget(QWidget):
 
         bottom.addStretch()
         layout.addLayout(bottom)
+
+    # ------------------------------------------------------------------
+    # Настройка колонок дерева
+    # ------------------------------------------------------------------
+    def _configure_tree_columns(self) -> None:
+        """
+        Скрывает лишние колонки в дереве задач.
+
+        TfsWindow строит дерево с 11 колонками (ID, Тип,
+        Заголовок, Статус, Исполнитель, Effort, Size, Оценка,
+        Осталось, Completed Work, Work Date). В панели «Скрама»
+        такое количество избыточно — нижняя половина левой
+        части окна слишком узкая, приходится постоянно
+        скроллить по горизонтали.
+
+        Метод оставляет только колонки из
+        _SCRUM_VISIBLE_COLUMNS, остальные скрывает через
+        setColumnHidden().
+
+        Также настраивает ширину колонок:
+          • «Заголовок» — растягивается на всё свободное место;
+          • остальные — по содержимому.
+
+        Данные в скрытых колонках остаются доступны программно
+        (по индексу), поэтому никакие кнопки, меню и обработчики
+        не ломаются: они работают через _selected_item(),
+        который читает UserRole, а не номер колонки.
+        """
+        try:
+            tree = self._win.tree
+        except AttributeError:
+            log.warning(
+                "TfsPanelWidget: не удалось получить tree "
+                "из внутреннего TfsWindow"
+            )
+            return
+
+        # Получаем названия всех колонок.
+        try:
+            headers = [
+                tree.headerItem().text(i)
+                for i in range(tree.columnCount())
+            ]
+        except Exception as exc:
+            log.warning(
+                "TfsPanelWidget: не удалось прочитать заголовки "
+                "колонок tree: %s", exc,
+            )
+            return
+
+        visible_set = set(self._SCRUM_VISIBLE_COLUMNS)
+
+        hidden_indices: List[int] = []
+        for idx, name in enumerate(headers):
+            if name in visible_set:
+                tree.setColumnHidden(idx, False)
+            else:
+                tree.setColumnHidden(idx, True)
+                hidden_indices.append(idx)
+
+        log.info(
+            "TfsPanelWidget: колонки tree настроены — "
+            "показаны: %s; скрыто: %d",
+            ", ".join(self._SCRUM_VISIBLE_COLUMNS),
+            len(hidden_indices),
+        )
+
+        # --- Настраиваем ширину колонок ---
+        try:
+            from PySide6.QtWidgets import QHeaderView
+
+            header = tree.header()
+
+            # Отключаем автоматическое растягивание последней
+            # колонки: иначе Qt растянет последнюю видимую
+            # («Work Date»), а «Заголовок» останется узким.
+            header.setStretchLastSection(False)
+
+            for idx, name in enumerate(headers):
+                if name == "Заголовок":
+                    header.setSectionResizeMode(
+                        idx, QHeaderView.ResizeMode.Stretch
+                    )
+                elif name in (
+                    "ID",
+                    "Тип",
+                    "Исполнитель",
+                    "Completed Work",
+                    "Work Date",
+                ):
+                    header.setSectionResizeMode(
+                        idx,
+                        QHeaderView.ResizeMode.ResizeToContents,
+                    )
+        except Exception as exc:
+            log.warning(
+                "TfsPanelWidget: не удалось настроить "
+                "QHeaderView: %s", exc,
+            )
 
     # ------------------------------------------------------------------
     # Действия

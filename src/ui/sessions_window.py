@@ -3970,12 +3970,30 @@ class SessionsWindow(QDialog):
             
     @staticmethod
     def _activate_window(dlg) -> None:
-        """Аккуратно поднимает и активирует окно."""
+        """
+        Аккуратно поднимает и активирует окно.
+
+        Под Wayland/GNOME методы raise_/activateWindow иногда
+        игнорируются композитором. Поэтому дополнительно
+        используется QWindow.requestActivate() — низкоуровневый
+        запрос фокуса ввода.
+
+        Безопасно вызывать многократно: если окно уже закрыто
+        или не показано — просто ничего не делаем.
+        """
         try:
             if dlg is None or not dlg.isVisible():
                 return
             dlg.raise_()
             dlg.activateWindow()
+
+            # QWindow.requestActivate() — более надёжный способ
+            # запросить фокус ввода, чем activateWindow().
+            # Под Wayland композитор может его выполнить, тогда
+            # как activateWindow() часто игнорируется.
+            handle = dlg.windowHandle()
+            if handle is not None:
+                handle.requestActivate()
         except Exception as exc:
             log.debug(
                 "Не удалось активировать окно: %s", exc
@@ -3985,7 +4003,16 @@ class SessionsWindow(QDialog):
     # Окно «Скрам» (НОВОЕ)
     # ------------------------------------------------------------------
     def _open_scrum_window(self) -> None:
-        """Открывает окно «Скрам» для выбранной записи."""
+        """
+        Открывает окно «Скрам» для выбранной записи.
+
+        Окно модальное над окном «Записи» (WindowModal) —
+        композитор под Wayland/GNOME обязан поднять его над
+        родителем. Никакие трюки с raise_/activateWindow не нужны.
+
+        Дополнительно: окно сразу разворачивается на весь экран
+        (см. ScrumWindow.showEvent), чтобы гарантированно поместиться.
+        """
         r = self._selected_row()
         if not r:
             QMessageBox.warning(self, "Скрам", "Выберите запись")
@@ -4024,9 +4051,9 @@ class SessionsWindow(QDialog):
                 all_rows_provider=lambda: self._all_rows,
                 employees=employees,
                 config_manager=self.config_manager,
-                parent=None,  # не привязываем к окну «Записи»,
-                              # чтобы окно не уходило за него
+                parent=self,
             )
+
             # Сохраняем ссылку, чтобы окно не было собрано GC.
             self._scrum_windows = getattr(
                 self, "_scrum_windows", []
@@ -4039,27 +4066,9 @@ class SessionsWindow(QDialog):
                 if w in self._scrum_windows else None
             )
 
+            # Просто показываем — модальность + showMaximized
+            # сделают всё сами.
             dlg.show()
-            # На GNOME + Wayland raise_/activateWindow могут
-            # игнорироваться. Пытаемся несколько раз — как
-            # сразу, так и с небольшой задержкой, чтобы
-            # попасть в момент окончательной отрисовки окна.
-            try:
-                dlg.raise_()
-                dlg.activateWindow()
-            except Exception:
-                pass
-
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(
-                0, lambda: self._activate_window(dlg)
-            )
-            QTimer.singleShot(
-                150, lambda: self._activate_window(dlg)
-            )
-            QTimer.singleShot(
-                500, lambda: self._activate_window(dlg)
-            )
         except Exception as exc:
             log.exception(
                 "Не удалось открыть окно «Скрам»: %s", exc
@@ -4643,7 +4652,12 @@ class SessionsWindow(QDialog):
         if not protocol_path:
             QMessageBox.information(
                 self, "Записи",
-                "У этой записи нет протокола (.docx).",
+                "У этой записи нет протокола.\n\n"
+                "Поддерживаются форматы: DOCX, Markdown, TXT, PDF.\n"
+                "Прикрепите файл через меню "
+                "«Протокол → Прикрепить файл протокола…» или создайте "
+                "через «Протокол → Создать/редактировать протокол "
+                "(Markdown)…».",
             )
             return
 
@@ -4652,11 +4666,15 @@ class SessionsWindow(QDialog):
         except OSError:
             size_bytes = 0
 
+        ext = os.path.splitext(protocol_path)[1].lower() or "?"
         log.info(
-            "Записи: просмотр протокола для «%s» (%s, %.1f КБ)",
-            r["name"], protocol_path, size_bytes / 1024,
+            "Записи: просмотр протокола для «%s» (%s, формат %s, %.1f КБ)",
+            r["name"], protocol_path, ext, size_bytes / 1024,
         )
 
+        # DocxViewerDialog (несмотря на имя) поддерживает
+        # и .docx, и .md, и .txt, и .pdf — формат определяется
+        # по расширению внутри диалога.
         dlg = DocxViewerDialog(
             docx_path=protocol_path,
             title=f"Протокол — {r['name']}",

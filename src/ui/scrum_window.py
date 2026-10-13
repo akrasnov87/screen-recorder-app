@@ -759,9 +759,25 @@ class ScrumWindow(QDialog):
             f"Скрам — "
             f"{session_name or os.path.basename(session_dir)}"
         )
+
+        # --- Модальное окно ---
+        # WindowModal блокирует только родителя («Записи») и НЕ
+        # блокирует остальные окна приложения. Под Wayland/GNOME
+        # композитор ОБЯЗАН поднимать модальные окна над родителем —
+        # это часть протокола xdg-shell.
+        #
+        # ВАЖНО: WindowStaysOnTopHint конфликтует с WindowModal под
+        # Wayland — композитор не может выполнить оба требования
+        # одновременно, и окно остаётся на заднем плане. Поэтому
+        # используется только модальность — никаких трюков с флагами.
         self.setModal(False)
 
-        # --- Флаги окна: разворот/сворачивание + поверх ---
+        # --- Флаги окна ---
+        # НЕ используем WindowModal — под Wayland/GNOME модальность
+        # не поднимает окно над родителем (баг композитора Mutter).
+        # Вместо этого — обычное top-level окно с флагом
+        # WindowStaysOnTopHint, которое работает через XWayland
+        # (см. main.py — QT_QPA_PLATFORM=xcb).
         self.setWindowFlags(
             Qt.WindowType.Window
             | Qt.WindowType.WindowStaysOnTopHint
@@ -769,8 +785,11 @@ class ScrumWindow(QDialog):
             | Qt.WindowType.WindowMaximizeButtonHint
             | Qt.WindowType.WindowCloseButtonHint
         )
-        self.setWindowFlag(
-            Qt.WindowType.WindowMaximizeButtonHint, True
+
+        # Под Wayland окно по умолчанию может быть показано без
+        # активации. Явно требуем активацию при показе.
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_ShowWithoutActivating, False
         )
 
         self._session_dir = session_dir
@@ -818,10 +837,43 @@ class ScrumWindow(QDialog):
             initial_mode = VIEW_MODE_SUMMARY
         self._initial_day_view_mode = initial_mode
 
-        width = int(app_cfg.get("scrum_window_width", 1600))
-        height = int(app_cfg.get("scrum_window_height", 900))
-        self.setMinimumSize(1200, 700)
+        # --- Начальный размер окна ---
+        # Используется ТОЛЬКО если пользователь снимет максимизацию
+        # (кнопкой «Свернуть»). При первом показе окно разворачивается
+        # на весь экран через showMaximized() — см. showEvent.
+        from PySide6.QtGui import QGuiApplication
+
+        desired_w = int(app_cfg.get("scrum_window_width", 1920))
+        desired_h = int(app_cfg.get("scrum_window_height", 1024))
+
+        screen = QGuiApplication.primaryScreen()
+        avail_w = 1920
+        avail_h = 1080
+        if screen is not None:
+            try:
+                geo = screen.availableGeometry()
+                avail_w = max(800, geo.width())
+                avail_h = max(600, geo.height())
+            except Exception:
+                pass
+
+        _margin = 40
+        max_w = max(800, avail_w - _margin)
+        max_h = max(600, avail_h - _margin)
+
+        width = min(desired_w, max_w)
+        height = min(desired_h, max_h)
+
+        min_w = min(1200, int(avail_w * 0.9))
+        min_h = min(700, int(avail_h * 0.9))
+        self.setMinimumSize(min_w, min_h)
         self.resize(width, height)
+
+        log.debug(
+            "ScrumWindow: начальный размер %dx%d "
+            "(доступно %dx%d, min %dx%d)",
+            width, height, avail_w, avail_h, min_w, min_h,
+        )
 
         self._build_ui()
 
@@ -840,34 +892,10 @@ class ScrumWindow(QDialog):
     # Показ окна
     # ------------------------------------------------------------------
     def showEvent(self, event) -> None:
-        """
-        Гарантирует, что окно появится поверх и получит фокус.
-        """
         super().showEvent(event)
-
-        try:
-            self.raise_()
-            self.activateWindow()
-        except Exception:
-            pass
-
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self._force_activate)
-        QTimer.singleShot(150, self._force_activate)
-        QTimer.singleShot(500, self._force_activate)
-
-    def _force_activate(self) -> None:
-        """Принудительно поднимает и активирует окно."""
-        if not self.isVisible():
-            return
-        try:
-            self.raise_()
-            self.activateWindow()
-            self.setFocus()
-        except Exception as exc:
-            log.debug(
-                "ScrumWindow._force_activate: %s", exc
-            )
+        if not getattr(self, "_first_show_done", False):
+            self._first_show_done = True
+            self.showMaximized()
 
     # ------------------------------------------------------------------
     # UI

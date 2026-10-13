@@ -1,11 +1,14 @@
-"""Просмотрщик DOCX-файлов (только чтение) с поиском.
+"""Просмотрщик протоколов (DOCX / Markdown / TXT / PDF) с поиском.
 
 Отличия от MarkdownViewerDialog:
-  • работает с .docx через python-docx;
+  • для .docx используется docx_to_html — сохраняется
+    форматирование (заголовки, списки, таблицы, bold/italic);
+  • для .md используется встроенный рендер Qt (setMarkdown);
+  • для .txt / .pdf — plain text;
   • read-only, без редактирования;
   • встроенный поиск с подсветкой всех совпадений;
-  • опционально — кнопка «Сохранить как…» (копия файла);
-  • опционально — кнопка «Открыть внешним приложением».
+  • кнопка «Сохранить копию…» (копия исходного файла);
+  • кнопка «Открыть внешним приложением».
 
 Использование:
     dlg = DocxViewerDialog(
@@ -16,19 +19,22 @@
     dlg.exec()
 
 Изменения:
-  • Модуль создан.
+  • Модуль больше не завязан только на .docx: если прикреплён
+    .md / .txt / .pdf — рендерятся соответствующим образом.
+  • QPlainTextEdit заменён на QTextBrowser — теперь можно
+    отображать HTML.
+  • Подсветка совпадений работает через QTextEdit.ExtraSelection
+    по QTextDocument, а не по «сырой» строке — позиции совпадают
+    независимо от формата входа.
+  • Подсказки у кнопок «Скопировать всё», «Сохранить копию…»,
+    «Открыть внешне» — обновлены и унифицированы.
 """
 from __future__ import annotations
 
+import html as _html
 import os
 import shutil
 from typing import List, Optional, Tuple
-
-import html as _html
-from PySide6.QtWidgets import QApplication
-from ..action_items_prompt_builder import (
-    regenerate_action_items_prompt,
-)
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import (
@@ -37,11 +43,15 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
-    QVBoxLayout, QWidget,
+    QLineEdit, QMessageBox, QPushButton,
+    QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from ..file_readers import read_docx_file
+from ..action_items_prompt_builder import (
+    regenerate_action_items_prompt,
+)
+from ..docx_to_html import docx_to_html
+from ..file_readers import read_any_text, read_docx_file
 from ..logger import get_logger
 from ..utils import safe_local_path
 from .tooltips import attach_tooltip, make_info_icon
@@ -58,17 +68,26 @@ _HIGHLIGHT_COLOR = QColor("#FFEB3B")
 _HIGHLIGHT_ALPHA = 140
 
 
+# Расширения, которые рендерятся через docx_to_html
+_DOCX_EXTS = (".docx",)
+# Расширения, которые рендерятся через setMarkdown
+_MD_EXTS = (".md", ".markdown")
+# Расширения, которые читаются как plain text
+_PLAIN_EXTS = (".txt", ".pdf", ".log", ".csv")
+
+
 class DocxViewerDialog(QDialog):
     """
-    Модальный read-only просмотрщик .docx с поиском.
+    Модальный read-only просмотрщик протокола.
 
     Возможности:
-      • извлекает текст из .docx через python-docx;
-      • моноширинный шрифт;
+      • .docx   → HTML с форматированием (docx_to_html);
+      • .md     → Markdown (встроенный рендер Qt);
+      • .txt/.pdf → plain text;
       • поиск по тексту (Ctrl+F) с подсветкой всех совпадений;
       • переход между совпадениями (F3 / Shift+F3);
-      • сохранение копии исходного .docx через «Сохранить как…»;
-      • открытие исходного .docx системным приложением.
+      • сохранение копии исходного файла;
+      • открытие исходного файла системным приложением.
     """
 
     def __init__(
@@ -83,14 +102,20 @@ class DocxViewerDialog(QDialog):
         self.setMinimumSize(1000, 700)
 
         self._docx_path = docx_path or ""
+        # self._text — plain-представление содержимого, взятое
+        # из QTextDocument ПОСЛЕ рендера. Именно по нему идёт
+        # поиск, потому что позиции совпадают с реальными
+        # позициями в документе.
         self._text = ""
+        # Определяется в _detect_format().
+        self._format = ""
 
         # Список позиций совпадений (начало, конец).
         self._matches: List[Tuple[int, int]] = []
         self._current_match: int = -1
 
         self._build_ui()
-        self._load_docx()
+        self._load_file()
         self._update_stats()
         self._refresh_action_buttons()
 
@@ -105,9 +130,10 @@ class DocxViewerDialog(QDialog):
         # --- Вводная плашка ---
         intro_row = QHBoxLayout()
         intro = QLabel(
-            "Просмотр протокола (.docx) в режиме «только чтение». "
-            "Чтобы изменить — сохраните копию и откройте её во "
-            "внешнем редакторе (или используйте пункт меню "
+            "Просмотр протокола в режиме «только чтение». "
+            "Поддерживаются DOCX (с форматированием), Markdown, "
+            "TXT и PDF. Чтобы изменить — сохраните копию и откройте "
+            "её во внешнем редакторе (или используйте пункт меню "
             "«Протокол → Создать/редактировать протокол (Markdown)»)."
         )
         intro.setWordWrap(True)
@@ -122,20 +148,21 @@ class DocxViewerDialog(QDialog):
         root.addWidget(self._build_search_bar())
 
         # --- Текст ---
-        self.editor = QPlainTextEdit()
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        self.browser.setReadOnly(True)
+        # Моноширинный шрифт оставляем — удобно для стенограмм и
+        # длинных протоколов; HTML-разметка внутри переопределяет
+        # шрифты своими стилями.
         mono = QFont("Monospace")
         mono.setStyleHint(QFont.StyleHint.TypeWriter)
         mono.setPointSize(11)
-        self.editor.setFont(mono)
-        self.editor.setReadOnly(True)
-        self.editor.setLineWrapMode(
-            QPlainTextEdit.LineWrapMode.WidgetWidth
-        )
-        self.editor.setTextInteractionFlags(
+        self.browser.setFont(mono)
+        self.browser.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
-        root.addWidget(self.editor, 1)
+        root.addWidget(self.browser, 1)
 
         # --- Нижняя панель ---
         bottom = QHBoxLayout()
@@ -153,17 +180,18 @@ class DocxViewerDialog(QDialog):
         self.copy_all_btn.clicked.connect(self._copy_all)
         bottom.addWidget(self.copy_all_btn)
 
-        self.save_as_btn = QPushButton("Сохранить копию .docx…")
+        self.save_as_btn = QPushButton("Сохранить копию…")
         self.save_as_btn.setToolTip(
-            "Сохранить копию исходного .docx-файла в любое место."
+            "Сохранить копию исходного файла в любое место."
         )
         self.save_as_btn.clicked.connect(self._save_copy)
         bottom.addWidget(self.save_as_btn)
 
         self.open_external_btn = QPushButton("Открыть внешне")
         self.open_external_btn.setToolTip(
-            "Открыть исходный .docx системным приложением "
-            "(LibreOffice Writer, MS Word и т.п.)."
+            "Открыть исходный файл системным приложением "
+            "(LibreOffice Writer, MS Word, редактор Markdown "
+            "и т.п.)."
         )
         self.open_external_btn.clicked.connect(self._open_external)
         bottom.addWidget(self.open_external_btn)
@@ -256,47 +284,176 @@ class DocxViewerDialog(QDialog):
         return box
 
     # ------------------------------------------------------------------
-    # Загрузка DOCX
+    # Определение формата и загрузка
     # ------------------------------------------------------------------
-    def _load_docx(self) -> None:
+    @staticmethod
+    def _detect_format(path: str) -> str:
+        """
+        Определяет формат по расширению.
+
+        Возвращает одно из:
+          • "docx"  — .docx;
+          • "md"    — .md / .markdown;
+          • "plain" — .txt / .pdf / прочее.
+        """
+        if not path:
+            return ""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _DOCX_EXTS:
+            return "docx"
+        if ext in _MD_EXTS:
+            return "md"
+        return "plain"
+
+    def _load_file(self) -> None:
+        """Загружает файл и рендерит его с учётом формата."""
         if not self._docx_path:
-            self._text = ""
-            self.editor.setPlainText(
-                "Путь к файлу не задан."
-            )
+            self._format = ""
+            self.browser.setPlainText("Путь к файлу не задан.")
+            self._capture_plain_text()
             return
 
         if not os.path.isfile(self._docx_path):
-            self._text = ""
-            self.editor.setPlainText(
+            self._format = ""
+            self.browser.setPlainText(
                 f"Файл не найден:\n{self._docx_path}"
+            )
+            self._capture_plain_text()
+            return
+
+        self._format = self._detect_format(self._docx_path)
+
+        if self._format == "docx":
+            self._render_docx()
+        elif self._format == "md":
+            self._render_markdown()
+        else:
+            self._render_plain()
+
+        # Перемещаем курсор в начало и сбрасываем прокрутку.
+        cursor = self.browser.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        self.browser.setTextCursor(cursor)
+
+        # Забираем plain-представление документа — оно
+        # используется для поиска. Это критично: позиции в
+        # QTextDocument и в исходной строке могут отличаться
+        # после HTML-рендера.
+        self._capture_plain_text()
+
+    def _capture_plain_text(self) -> None:
+        """
+        Сохраняет plain-представление содержимого документа.
+
+        Для поиска используется именно оно — потому что
+        QTextCursor работает с позициями в QTextDocument, а не
+        в исходной строке.
+        """
+        try:
+            self._text = self.browser.document().toPlainText()
+        except Exception as exc:
+            log.warning(
+                "Не удалось получить plain-текст документа: %s", exc
+            )
+            self._text = ""
+
+    def _render_docx(self) -> None:
+        """Рендерит .docx через docx_to_html."""
+        try:
+            fragment = docx_to_html(self._docx_path)
+        except Exception as exc:
+            log.exception(
+                "Не удалось отрендерить DOCX %s: %s",
+                self._docx_path, exc,
+            )
+            fragment = ""
+
+        if not fragment:
+            # Fallback на plain text, чтобы пользователь
+            # хоть что-то увидел.
+            log.warning(
+                "docx_to_html вернул пустой результат для %s — "
+                "используем plain text", self._docx_path,
+            )
+            try:
+                text = read_docx_file(self._docx_path) or ""
+            except Exception:
+                text = ""
+            if text.strip():
+                self.browser.setPlainText(text)
+            else:
+                self.browser.setPlainText(
+                    "(Документ пустой или текст не извлекается.)"
+                )
+            return
+
+        # docx_to_html возвращает фрагмент (со <style> внутри,
+        # но без <html>/<body>). Оборачиваем в полноценный
+        # документ, чтобы Qt корректно применил стили.
+        full_html = (
+            "<html><head><meta charset='utf-8'></head><body>"
+            + fragment
+            + "</body></html>"
+        )
+        self.browser.setHtml(full_html)
+
+    def _render_markdown(self) -> None:
+        """Рендерит .md через встроенный Markdown-парсер Qt."""
+        try:
+            with open(
+                self._docx_path, "r",
+                encoding="utf-8", errors="replace",
+            ) as f:
+                md_text = f.read()
+        except Exception as exc:
+            log.exception(
+                "Не удалось прочитать Markdown %s: %s",
+                self._docx_path, exc,
+            )
+            md_text = ""
+
+        if not md_text.strip():
+            self.browser.setPlainText(
+                "(Документ пустой или текст не извлекается.)"
             )
             return
 
         try:
-            self._text = read_docx_file(self._docx_path) or ""
+            self.browser.setMarkdown(md_text)
         except Exception as exc:
             log.exception(
-                "Не удалось прочитать DOCX %s: %s",
+                "Не удалось отрендерить Markdown: %s", exc
+            )
+            self.browser.setPlainText(md_text)
+
+    def _render_plain(self) -> None:
+        """Рендерит .txt / .pdf / прочее как plain text."""
+        try:
+            text = read_any_text(self._docx_path) or ""
+        except Exception as exc:
+            log.exception(
+                "Не удалось прочитать %s: %s",
                 self._docx_path, exc,
             )
-            self._text = ""
-            self.editor.setPlainText(
-                f"Не удалось прочитать файл:\n{exc}"
-            )
-            return
+            text = ""
 
-        if not self._text.strip():
-            self.editor.setPlainText(
+        if not text.strip():
+            self.browser.setPlainText(
                 "(Документ пустой или текст не извлекается.)"
             )
         else:
-            self.editor.setPlainText(self._text)
+            self.browser.setPlainText(text)
 
-        cursor = self.editor.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.Start)
-        self.editor.setTextCursor(cursor)
+    # ------------------------------------------------------------------
+    # Загрузка DOCX (устаревший приватный метод)
+    # ------------------------------------------------------------------
+    def _load_docx(self) -> None:
+        """Совместимость: делегирует в _load_file()."""
+        self._load_file()
 
+    # ------------------------------------------------------------------
+    # Статистика и кнопки
+    # ------------------------------------------------------------------
     def _update_stats(self) -> None:
         chars = len(self._text)
         lines = self._text.count("\n") + 1 if self._text else 0
@@ -349,7 +506,7 @@ class DocxViewerDialog(QDialog):
         self._current_match = -1
 
         if not query:
-            self.editor.setExtraSelections([])
+            self.browser.setExtraSelections([])
             self.matches_label.setText("")
             return
 
@@ -384,12 +541,12 @@ class DocxViewerDialog(QDialog):
 
         cur = self._current_match
         for i, (start, end) in enumerate(self._matches):
-            cursor = QTextCursor(self.editor.document())
+            cursor = QTextCursor(self.browser.document())
             cursor.setPosition(start)
             cursor.setPosition(
                 end, QTextCursor.MoveMode.KeepAnchor
             )
-            sel = QPlainTextEdit.ExtraSelection()
+            sel = QTextBrowser.ExtraSelection()
             sel.cursor = cursor
             if i == cur:
                 cur_fmt = QTextCharFormat()
@@ -400,7 +557,7 @@ class DocxViewerDialog(QDialog):
                 sel.format = fmt
             selections.append(sel)
 
-        self.editor.setExtraSelections(selections)
+        self.browser.setExtraSelections(selections)
 
     def _find_next(self) -> None:
         if not self._matches:
@@ -425,11 +582,11 @@ class DocxViewerDialog(QDialog):
             self._current_match = 0
         start, end = self._matches[self._current_match]
 
-        cursor = QTextCursor(self.editor.document())
+        cursor = QTextCursor(self.browser.document())
         cursor.setPosition(start)
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        self.editor.setTextCursor(cursor)
-        self.editor.ensureCursorVisible()
+        self.browser.setTextCursor(cursor)
+        self.browser.ensureCursorVisible()
 
         self._apply_highlights()
 
@@ -442,7 +599,7 @@ class DocxViewerDialog(QDialog):
         self.search_input.clear()
         self._matches.clear()
         self._current_match = -1
-        self.editor.setExtraSelections([])
+        self.browser.setExtraSelections([])
         self.matches_label.setText("")
 
     # ------------------------------------------------------------------
@@ -465,23 +622,43 @@ class DocxViewerDialog(QDialog):
         if not self._docx_path or not os.path.isfile(self._docx_path):
             QMessageBox.warning(
                 self, "Сохранение",
-                "Исходный .docx-файл не найден.",
+                "Исходный файл не найден.",
             )
             return
 
         base_name = os.path.basename(self._docx_path)
+        ext = os.path.splitext(base_name)[1].lower() or ".bin"
+
+        # Формируем фильтр по расширению — чтобы пользователь
+        # не потерял формат.
+        if ext == ".docx":
+            file_filter = (
+                "Документы Word (*.docx);;"
+                "Markdown (*.md);;"
+                "Текстовые файлы (*.txt);;"
+                "Все файлы (*)"
+            )
+        elif ext in (".md", ".markdown"):
+            file_filter = (
+                "Markdown (*.md *.markdown);;"
+                "Текстовые файлы (*.txt);;"
+                "Все файлы (*)"
+            )
+        else:
+            file_filter = "Все файлы (*)"
+
         target, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить копию протокола",
             os.path.join(os.path.expanduser("~"), base_name),
-            "Документы Word (*.docx);;Все файлы (*)",
+            file_filter,
         )
         if not target:
             return
         target = safe_local_path(target)
 
-        if not target.lower().endswith(".docx"):
-            target += ".docx"
+        if not target.lower().endswith(ext):
+            target += ext
 
         try:
             shutil.copy2(self._docx_path, target)
@@ -507,7 +684,7 @@ class DocxViewerDialog(QDialog):
         if not self._docx_path or not os.path.isfile(self._docx_path):
             QMessageBox.warning(
                 self, "Открытие",
-                "Исходный .docx-файл не найден.",
+                "Исходный файл не найден.",
             )
             return
         log.info(
@@ -592,7 +769,7 @@ class DocxViewerDialog(QDialog):
                 "Не удалось прочитать настройки: %s", exc
             )
 
-        # --- Запускаем ---
+        # --- Запускаем ---        
         QApplication.setOverrideCursor(
             Qt.CursorShape.WaitCursor
         )
@@ -633,7 +810,7 @@ class DocxViewerDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Хелпер: открыть .docx из файла
+# Хелпер: открыть протокол из файла
 # ---------------------------------------------------------------------------
 def open_docx_file(
     path: str,
@@ -642,7 +819,9 @@ def open_docx_file(
     parent: Optional[QWidget] = None,
 ) -> bool:
     """
-    Открывает .docx во встроенном просмотрщике.
+    Открывает протокол во встроенном просмотрщике.
+
+    Поддерживаются .docx (с форматированием), .md, .txt, .pdf.
 
     Возвращает True, если файл открыт, False — если не удалось.
     """

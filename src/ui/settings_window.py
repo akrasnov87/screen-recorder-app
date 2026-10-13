@@ -57,7 +57,7 @@ from ..utils import get_system_monitors, safe_local_path
 from .. import __version__
 from .media_player import probe_media_support      # ui → ui
 from .sync_window import SyncWindow                # ui → ui
-from .tooltips import attach_tooltip, make_info_icon, with_info  # ui → ui
+from .tooltips import attach_tooltip, make_info_icon, with_info
 from ..platform_utils import (
     IS_LINUX,
     IS_WINDOWS,
@@ -3279,6 +3279,63 @@ class SettingsWindow(QDialog):
         layout.addWidget(info)
 
         # ==============================================================
+        # Блок 0: размеры окна «Скрам»
+        # ==============================================================
+        size_header = QHBoxLayout()
+        size_header.addWidget(
+            QLabel("<b>Размер окна «Скрам»</b>")
+        )
+        size_header.addStretch()
+        size_icon = make_info_icon("app_scrum_window_width")
+        if size_icon is not None:
+            size_header.addWidget(size_icon)
+        layout.addLayout(size_header)
+
+        size_hint = QLabel(
+            "<span style='color:#666'>"
+            "Окно «Скрам» открывается как модальное над окном "
+            "«Записи» — это гарантирует его поднятие на передний "
+            "план под Wayland/GNOME.</span>"
+        )
+        size_hint.setWordWrap(True)
+        layout.addWidget(size_hint)
+
+        size_form = QFormLayout()
+        size_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.scrum_window_width_spin = QSpinBox()
+        self.scrum_window_width_spin.setRange(1200, 7680)
+        self.scrum_window_width_spin.setSingleStep(100)
+        self.scrum_window_width_spin.setSuffix(" px")
+        self.scrum_window_width_spin.setValue(1920)
+        size_form.addRow(
+            "Ширина окна:",
+            with_info(
+                self.scrum_window_width_spin,
+                "app_scrum_window_width",
+            ),
+        )
+
+        self.scrum_window_height_spin = QSpinBox()
+        self.scrum_window_height_spin.setRange(700, 4320)
+        self.scrum_window_height_spin.setSingleStep(100)
+        self.scrum_window_height_spin.setSuffix(" px")
+        self.scrum_window_height_spin.setValue(1024)
+        size_form.addRow(
+            "Высота окна:",
+            with_info(
+                self.scrum_window_height_spin,
+                "app_scrum_window_height",
+            ),
+        )
+
+        layout.addLayout(size_form)
+        layout.addSpacing(12)
+
+        # ==============================================================
         # Блок 1: шаблон промпта для протокола (был раньше)
         # ==============================================================
         scrum_header = QHBoxLayout()
@@ -3943,6 +4000,14 @@ class SettingsWindow(QDialog):
         if i >= 0:
             self.scrum_format_combo.setCurrentIndex(i)
 
+        # --- Размеры окна «Скрам» ---
+        self.scrum_window_width_spin.setValue(
+            int(app_cfg.get("scrum_window_width", 1920))
+        )
+        self.scrum_window_height_spin.setValue(
+            int(app_cfg.get("scrum_window_height", 1024))
+        )
+
         # --- ВМ Yandex ---
         ycfg = cfg.get("yandex_vm", {}) or {}
         self.yandex_vm_root_input.setText(
@@ -4473,6 +4538,12 @@ class SettingsWindow(QDialog):
         )
         app_cfg["media_player_window_height"] = int(
             self.media_player_height.value()
+        )
+        app_cfg["scrum_window_width"] = int(
+            self.scrum_window_width_spin.value()
+        )
+        app_cfg["scrum_window_height"] = int(
+            self.scrum_window_height_spin.value()
         )
 
         return cfg

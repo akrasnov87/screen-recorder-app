@@ -10,6 +10,10 @@
 
 Изменения:
   • Модуль создан.
+  • ДОБАВЛЕНО: настройка видимых колонок таблицы поручений —
+    в панели «Скрама» скрываем колонки «Срок» и «ID», чтобы
+    таблица была компактной. Колонка «Текст» растягивается
+    на всю оставшуюся ширину.
 """
 from __future__ import annotations
 
@@ -42,6 +46,26 @@ class TasksEditorWidget(QWidget):
     # Сигнал: список поручений изменился (для обновления других
     # блоков при необходимости).
     items_changed = Signal()
+
+    # ------------------------------------------------------------------
+    # Настройка колонок таблицы
+    # ------------------------------------------------------------------
+    # В панели «Скрама» таблица поручений узкая (нижняя половина
+    # левой части окна). Колонки «Срок» и «ID» в ней избыточны:
+    #   • «Срок» дублируется в тексте поручения и в редакторе;
+    #   • «ID» — служебная, нужна только для выбора элемента.
+    #
+    # Скрываем их через setColumnHidden — данные остаются
+    # доступны программно, индексы НЕ сдвигаются, поэтому
+    # TasksEditorDialog._selected_item() (читает id из колонки 6)
+    # продолжает работать без изменений.
+    _SCRUM_HIDDEN_COLUMNS: tuple = (
+        4,   # Срок
+        6,   # ID (уже скрыта в TasksEditorDialog — дублируем)
+    )
+
+    # Индекс колонки «Текст» — она растягивается на всю ширину.
+    _SCRUM_STRETCH_COLUMN: int = 2
 
     def __init__(
         self,
@@ -149,6 +173,89 @@ class TasksEditorWidget(QWidget):
         # --- Счётчик ---
         self._dlg.stats_label.setParent(self)
         layout.addWidget(self._dlg.stats_label)
+
+        # --- Настраиваем видимость и ширину колонок таблицы ---
+        self._configure_table_columns()
+
+    # ------------------------------------------------------------------
+    # Настройка колонок таблицы
+    # ------------------------------------------------------------------
+    def _configure_table_columns(self) -> None:
+        """
+        Скрывает лишние колонки и настраивает ширину.
+
+        Что делает:
+          1. Скрывает колонки из _SCRUM_HIDDEN_COLUMNS
+             («Срок», «ID»).
+          2. Отключает stretchLastSection — иначе Qt растянул
+             бы последнюю видимую колонку («Комментарий»),
+             а «Текст» остался бы узким.
+          3. Включает ResizeMode.Stretch для колонки «Текст» —
+             она займёт всю оставшуюся ширину.
+          4. Для остальных видимых колонок — ResizeToContents.
+
+        Данные в скрытых колонках остаются доступны программно
+        (по индексу). Индексы НЕ сдвигаются, поэтому
+        TasksEditorDialog._selected_item() продолжает читать
+        ID из колонки 6 — код не ломается.
+        """
+        try:
+            table = self._dlg.table
+        except AttributeError:
+            log.warning(
+                "TasksEditorWidget: не удалось получить table "
+                "из внутреннего TasksEditorDialog"
+            )
+            return
+
+        # --- 1. Скрываем колонки ---
+        for col in self._SCRUM_HIDDEN_COLUMNS:
+            try:
+                table.setColumnHidden(col, True)
+            except Exception as exc:
+                log.warning(
+                    "TasksEditorWidget: не удалось скрыть "
+                    "колонку %d: %s", col, exc,
+                )
+
+        # --- 2. Настраиваем ширину ---
+        try:
+            from PySide6.QtWidgets import QHeaderView
+
+            header = table.horizontalHeader()
+
+            # Отключаем автоматическое растягивание последней
+            # колонки. Иначе Qt растянет последнюю видимую
+            # («Комментарий»), а «Текст» останется узким.
+            header.setStretchLastSection(False)
+
+            total_cols = table.columnCount()
+            for idx in range(total_cols):
+                if idx in self._SCRUM_HIDDEN_COLUMNS:
+                    continue
+                if idx == self._SCRUM_STRETCH_COLUMN:
+                    # «Текст» — растягивается на всё свободное.
+                    header.setSectionResizeMode(
+                        idx, QHeaderView.ResizeMode.Stretch
+                    )
+                else:
+                    # Остальные — по содержимому, не тянутся.
+                    header.setSectionResizeMode(
+                        idx,
+                        QHeaderView.ResizeMode.ResizeToContents,
+                    )
+        except Exception as exc:
+            log.warning(
+                "TasksEditorWidget: не удалось настроить "
+                "QHeaderView: %s", exc,
+            )
+
+        log.info(
+            "TasksEditorWidget: колонки таблицы настроены — "
+            "скрыты: %s; растягивается: колонка %d (Текст)",
+            ", ".join(str(c) for c in self._SCRUM_HIDDEN_COLUMNS),
+            self._SCRUM_STRETCH_COLUMN,
+        )
 
     # ------------------------------------------------------------------
     # Действия
