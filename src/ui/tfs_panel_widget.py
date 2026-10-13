@@ -18,16 +18,21 @@
   • ДОБАВЛЕНО: настройка видимых колонок дерева — в панели
     «Скрама» показываем только ID, Тип, Заголовок, Исполнитель,
     Completed Work, Work Date (см. _configure_tree_columns).
+  • НОВОЕ: панель фильтров по колонкам дерева TFS.
+  • ИСПРАВЛЕНО: variables_info_label заменён на variables_panel
+    (плашка переменных WIQL теперь сворачиваемая — см.
+    tfs_window.py).
 """
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
-    QWidget,
+    QComboBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..logger import get_logger
@@ -67,6 +72,15 @@ class TfsPanelWidget(QWidget):
         "Work Date",
     )
 
+    # Индекс колонки «Заголовок» — растягивается на всю ширину.
+    _SCRUM_STRETCH_COLUMN: int = 2
+
+    # Индексы колонок для фильтрации (в исходном TfsWindow).
+    _COL_ID: int = 0
+    _COL_TYPE: int = 1
+    _COL_TITLE: int = 2
+    _COL_ASSIGNEE: int = 4
+
     def __init__(
         self,
         *,
@@ -78,6 +92,12 @@ class TfsPanelWidget(QWidget):
 
         self._config_manager = config_manager
         self._max_items = int(max_items)
+
+        # Поля фильтров (создаются в _build_ui).
+        self._filter_id: Optional[QLineEdit] = None
+        self._filter_type: Optional[QLineEdit] = None
+        self._filter_title: Optional[QLineEdit] = None
+        self._filter_assignee: Optional[QLineEdit] = None
 
         # Внутренний TfsWindow — используем как движок.
         # НЕ показываем.
@@ -156,13 +176,18 @@ class TfsPanelWidget(QWidget):
         wiql_row.addWidget(self._win.wiql_edit, 1)
         layout.addLayout(wiql_row)
 
-        # Плашка переменных (из TfsWindow).
-        self._win.variables_info_label.setParent(self)
-        layout.addWidget(self._win.variables_info_label)
+        # --- Сворачиваемая плашка переменных WIQL ---
+        # (из TfsWindow; теперь это variables_panel, а не
+        # variables_info_label — плашка стала сворачиваемой).
+        self._win.variables_panel.setParent(self)
+        layout.addWidget(self._win.variables_panel)
 
         # Прогресс (из TfsWindow).
         self._win.progress.setParent(self)
         layout.addWidget(self._win.progress)
+
+        # --- Панель фильтров по колонкам ---
+        layout.addWidget(self._build_column_filters())
 
         # --- Дерево задач ---
         self._win.tree.setParent(self)
@@ -205,6 +230,268 @@ class TfsPanelWidget(QWidget):
 
         bottom.addStretch()
         layout.addLayout(bottom)
+
+    # ------------------------------------------------------------------
+    # Панель фильтров по колонкам
+    # ------------------------------------------------------------------
+    def _build_column_filters(self) -> QWidget:
+        """
+        Панель фильтров по колонкам дерева задач TFS.
+
+        Работает по уже загруженному дереву — не делает новых
+        запросов к TFS. Фильтры применяются мгновенно.
+        """
+        box = QWidget()
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(0, 2, 0, 2)
+        outer.setSpacing(2)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Фильтр по колонкам:</b>"))
+        header.addStretch()
+
+        self.filter_reset_btn = QPushButton("Сбросить")
+        self.filter_reset_btn.setToolTip(
+            "Очистить все фильтры по колонкам задач TFS."
+        )
+        attach_tooltip(
+            self.filter_reset_btn, "scrum_tfs_filter_reset"
+        )
+        self.filter_reset_btn.clicked.connect(
+            self._on_reset_column_filters
+        )
+        header.addWidget(self.filter_reset_btn)
+
+        icon = make_info_icon("scrum_tfs_filter_intro")
+        if icon is not None:
+            header.addWidget(icon)
+        outer.addLayout(header)
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+
+        # ID
+        row.addWidget(QLabel("ID:"))
+        self._filter_id = QLineEdit()
+        self._filter_id.setPlaceholderText("1505 или 1500-1510")
+        self._filter_id.setMaximumWidth(140)
+        self._filter_id.setClearButtonEnabled(True)
+        attach_tooltip(
+            self._filter_id, "scrum_tfs_filter_id"
+        )
+        self._filter_id.textChanged.connect(
+            self._on_filter_changed
+        )
+        row.addWidget(self._filter_id)
+
+        # Тип
+        row.addWidget(QLabel("Тип:"))
+        self._filter_type = QLineEdit()
+        self._filter_type.setPlaceholderText("Bug, Task…")
+        self._filter_type.setMaximumWidth(120)
+        self._filter_type.setClearButtonEnabled(True)
+        attach_tooltip(
+            self._filter_type, "scrum_tfs_filter_type"
+        )
+        self._filter_type.textChanged.connect(
+            self._on_filter_changed
+        )
+        row.addWidget(self._filter_type)
+
+        # Заголовок
+        row.addWidget(QLabel("Заголовок:"))
+        self._filter_title = QLineEdit()
+        self._filter_title.setPlaceholderText("подстрока…")
+        self._filter_title.setClearButtonEnabled(True)
+        attach_tooltip(
+            self._filter_title, "scrum_tfs_filter_title"
+        )
+        self._filter_title.textChanged.connect(
+            self._on_filter_changed
+        )
+        row.addWidget(self._filter_title, 2)
+
+        # Исполнитель
+        row.addWidget(QLabel("Исполнитель:"))
+        self._filter_assignee = QLineEdit()
+        self._filter_assignee.setPlaceholderText("часть имени…")
+        self._filter_assignee.setClearButtonEnabled(True)
+        attach_tooltip(
+            self._filter_assignee, "scrum_tfs_filter_assignee"
+        )
+        self._filter_assignee.textChanged.connect(
+            self._on_filter_changed
+        )
+        row.addWidget(self._filter_assignee, 2)
+
+        outer.addLayout(row)
+        return box
+
+    # ------------------------------------------------------------------
+    # Логика фильтрации
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_id_filter(raw: str) -> Optional[set]:
+        """
+        Разбирает строку фильтра по ID.
+
+        Поддерживает: «1505», «1500-1510», «1, 3, 5-7».
+        """
+        s = (raw or "").strip()
+        if not s:
+            return None
+
+        result: set = set()
+        for chunk in re.split(r"[,;]+", s):
+            chunk = chunk.strip().replace(" ", "")
+            if not chunk:
+                continue
+
+            m = re.match(r"^(\d+)\s*-\s*(\d+)$", chunk)
+            if m:
+                try:
+                    a = int(m.group(1))
+                    b = int(m.group(2))
+                except ValueError:
+                    continue
+                if a > b:
+                    a, b = b, a
+                if b - a > 10000:
+                    b = a + 10000
+                result.update(range(a, b + 1))
+                continue
+
+            if chunk.isdigit():
+                try:
+                    result.add(int(chunk))
+                except ValueError:
+                    continue
+
+        return result if result else None
+
+    def _matches_column_filters(
+        self, item: QTreeWidgetItem
+    ) -> bool:
+        """Проверяет, удовлетворяет ли узел колоночным фильтрам."""
+        # ID
+        if self._filter_id is not None:
+            ids = self._parse_id_filter(self._filter_id.text())
+            if ids is not None:
+                raw_id = item.text(self._COL_ID)
+                try:
+                    n = int(raw_id)
+                except (TypeError, ValueError):
+                    n = 0
+                if n not in ids:
+                    return False
+
+        # Тип
+        if self._filter_type is not None:
+            q = self._filter_type.text().strip().lower()
+            if q:
+                if q not in item.text(self._COL_TYPE).lower():
+                    return False
+
+        # Заголовок
+        if self._filter_title is not None:
+            q = self._filter_title.text().strip().lower()
+            if q:
+                if q not in item.text(self._COL_TITLE).lower():
+                    return False
+
+        # Исполнитель
+        if self._filter_assignee is not None:
+            q = self._filter_assignee.text().strip().lower()
+            if q:
+                if q not in item.text(self._COL_ASSIGNEE).lower():
+                    return False
+
+        return True
+
+    def _any_filter_active(self) -> bool:
+        """Есть ли хотя бы один активный колоночный фильтр."""
+        for f in (
+            self._filter_id,
+            self._filter_type,
+            self._filter_title,
+            self._filter_assignee,
+        ):
+            if f is not None and f.text().strip():
+                return True
+        return False
+
+    def _apply_column_filters(self) -> None:
+        """
+        Применяет колоночные фильтры к дереву.
+
+        Логика:
+          • Обходим все узлы рекурсивно.
+          • Для каждого узла проверяем, проходит ли он фильтр.
+          • Узел виден, если:
+              – сам проходит фильтр, ИЛИ
+              – хотя бы один из его потомков проходит фильтр
+                (иначе при фильтрации по имени родитель
+                 «исчезнет», и потомки тоже пропадут из виду).
+          • Узлы без активных фильтров всегда видны.
+
+        Скрываем через setHidden(True) — данные и связи дерева
+        остаются нетронутыми.
+        """
+        tree = self._win.tree
+        active = self._any_filter_active()
+
+        if not active:
+            # Все видимы.
+            def _show_all(it: QTreeWidgetItem) -> None:
+                it.setHidden(False)
+                for i in range(it.childCount()):
+                    _show_all(it.child(i))
+
+            for i in range(tree.topLevelItemCount()):
+                _show_all(tree.topLevelItem(i))
+            return
+
+        def _walk(it: QTreeWidgetItem) -> bool:
+            """
+            Рекурсивно обходит поддерево и возвращает True,
+            если узел сам или хотя бы один из потомков виден.
+            """
+            children_visible = False
+            for i in range(it.childCount()):
+                child = it.child(i)
+                child_vis = _walk(child)
+                if child_vis:
+                    children_visible = True
+
+            self_visible = self._matches_column_filters(it)
+            visible = self_visible or children_visible
+
+            it.setHidden(not visible)
+            return visible
+
+        for i in range(tree.topLevelItemCount()):
+            _walk(tree.topLevelItem(i))
+
+    def _on_filter_changed(self) -> None:
+        """Реакция на изменение любого колоночного фильтра."""
+        self._apply_column_filters()
+
+    def _on_reset_column_filters(self) -> None:
+        """Сбрасывает все колоночные фильтры."""
+        for f in (
+            self._filter_id,
+            self._filter_type,
+            self._filter_title,
+            self._filter_assignee,
+        ):
+            if f is None:
+                continue
+            f.blockSignals(True)
+            f.clear()
+            f.blockSignals(False)
+
+        self._apply_column_filters()
+        log.debug("Колоночные фильтры TFS сброшены")
 
     # ------------------------------------------------------------------
     # Настройка колонок дерева

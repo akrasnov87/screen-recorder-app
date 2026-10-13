@@ -29,6 +29,13 @@
   • НОВОЕ: вкладка «Записи за день» умеет показывать либо
     summary, либо протокол. Выбор сохраняется в настройках
     (app.scrum_day_view_mode).
+  • ИСПРАВЛЕНО: рендеринг summary во вкладке «Записи за день».
+    Раньше summary прогонялся через bbcode_to_html, который
+    не понимает Markdown — в результате **жирный** и списки
+    оставались «звёздочками». Теперь summary рендерится через
+    полноценный Markdown→HTML (QTextDocument.setMarkdown),
+    а BB-код используется только как fallback для очень старых
+    записей.
 """
 from __future__ import annotations
 
@@ -204,28 +211,91 @@ def _render_protocol_to_html_fragment(
     return _plain_text_html(path, max_chars)
 
 
-def _render_summary_html_fragment(summary_bb: str) -> str:
+def _looks_like_markdown(text: str) -> bool:
     """
-    Рендерит summary (BB-код) в HTML-фрагмент.
+    Эвристика: похоже ли содержимое на Markdown.
 
-    В session.json поле summary_bb хранится в BB-коде
-    (Bitrix-разметка) — конвертируем через bbcode_to_html.
+    Проверяем наличие типичных Markdown-конструкций:
+      • заголовки (# в начале строки);
+      • списки (-, *, + или 1. в начале строки);
+      • жирный/курсив (**текст**, *текст*);
+      • цитаты (> в начале строки);
+      • блоки кода (```).
     """
-    if not summary_bb or not summary_bb.strip():
+    if not text:
+        return False
+
+    import re as _re
+
+    patterns = [
+        r"(?m)^#{1,6}\s+\S",          # # Заголовок
+        r"(?m)^\s*[-*+]\s+\S",         # - пункт
+        r"(?m)^\s*\d+\.\s+\S",         # 1. пункт
+        r"\*\*[^*\n]+\*\*",            # **жирный**
+        r"(?<!\*)\*[^*\n]+\*(?!\*)",   # *курсив*
+        r"(?m)^>\s+\S",                # > цитата
+        r"```",                        # блок кода
+    ]
+    for pat in patterns:
+        if _re.search(pat, text):
+            return True
+    return False
+
+
+def _render_summary_html_fragment(summary_text: str) -> str:
+    """
+    Рендерит summary в HTML-фрагмент.
+
+    ИСТОРИЯ ВОПРОСА. Раньше эта функция вызывала
+    bbcode_to_html() — конвертер BB-кода Bitrix24. Но в новых
+    записях summary хранится в поле summary_bb уже в формате
+    Markdown (поле сохранило историческое имя, но содержимое
+    давно Markdown). Из-за этого «**жирный**», «- список»
+    и «# заголовок» отображались «как есть» — без форматирования.
+
+    Теперь логика такая:
+      1. Если текст похож на Markdown (эвристика) — рендерим
+         через QTextDocument.setMarkdown() (полноценный
+         Markdown-парсер Qt).
+      2. Иначе — рендерим через bbcode_to_html() (для очень
+         старых записей, где summary действительно был в BB).
+      3. Если и то и другое упало — fallback на <pre> с
+         исходным текстом.
+    """
+    if not summary_text or not summary_text.strip():
         return ""
 
+    text = summary_text.strip()
+
+    # --- Вариант 1: Markdown (новые записи) ---
+    if _looks_like_markdown(text):
+        try:
+            fragment = _markdown_to_html_fragment(text)
+            if fragment:
+                return fragment
+        except Exception as exc:
+            log.warning(
+                "Не удалось отрендерить summary как Markdown: %s",
+                exc,
+            )
+
+    # --- Вариант 2: BB-код (старые записи) ---
     try:
-        return bbcode_to_html(summary_bb)
+        fragment = bbcode_to_html(text)
+        if fragment:
+            return fragment
     except Exception as exc:
         log.warning(
-            "Не удалось отрендерить summary (BB): %s", exc
+            "Не удалось отрендерить summary как BB-код: %s", exc
         )
-        return (
-            "<pre style='white-space:pre-wrap; "
-            "font-family:Consolas, monospace; font-size:10pt;'>"
-            + html.escape(summary_bb)
-            + "</pre>"
-        )
+
+    # --- Вариант 3: fallback — plain text ---
+    return (
+        "<pre style='white-space:pre-wrap; "
+        "font-family:Consolas, monospace; font-size:10pt;'>"
+        + html.escape(text)
+        + "</pre>"
+    )
 
 
 def _read_summary_bb(session_dir: str) -> str:

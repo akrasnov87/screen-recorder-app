@@ -37,6 +37,11 @@
         «Изменить переменные…» позволяет их поправить);
       – при выборе шаблона с переменными — значения также
         можно задать заранее.
+
+  • НОВОЕ: плашка «Переменные в запросе» стала сворачиваемой.
+    По умолчанию она свёрнута — показывает одну компактную
+    строку с именами переменных. Клик по заголовку разворачивает
+    её — видны все переменные с их значениями.
 """
 from __future__ import annotations
 
@@ -320,6 +325,10 @@ class TfsWindow(QDialog):
         # не вводил их повторно.
         self._variable_values: Dict[str, str] = {}
 
+        # --- Состояние сворачиваемой плашки переменных ---
+        # По умолчанию свёрнута (одна компактная строка).
+        self._variables_panel_expanded: bool = False
+
         self.setWindowTitle("Задачи TFS")
         self.setMinimumSize(1400, 800)
         self.setModal(False)
@@ -518,20 +527,71 @@ class TfsWindow(QDialog):
         )
         filters_layout.addWidget(self.wiql_edit)
 
-        # --- Плашка «Переменные в запросе» ---
-        self.variables_info_label = QLabel("")
-        self.variables_info_label.setWordWrap(True)
-        self.variables_info_label.setVisible(False)
-        self.variables_info_label.setStyleSheet(
-            "QLabel {"
+        # --- Сворачиваемая плашка «Переменные в запросе» ---
+        # Плашка занимает много места, если переменных несколько.
+        # Делаем её сворачиваемой: по клику на заголовок
+        # показываем/скрываем подробный список переменных.
+        self.variables_panel = QWidget()
+        self.variables_panel.setVisible(False)
+        self.variables_panel.setStyleSheet(
+            "QWidget#variablesPanel {"
             "  background-color: #FFF8E1;"
             "  border: 1px solid #FFE082;"
             "  border-radius: 4px;"
-            "  padding: 6px 10px;"
-            "  color: #B8860B;"
             "}"
         )
-        filters_layout.addWidget(self.variables_info_label)
+        self.variables_panel.setObjectName("variablesPanel")
+
+        vp_layout = QVBoxLayout(self.variables_panel)
+        vp_layout.setContentsMargins(8, 4, 8, 4)
+        vp_layout.setSpacing(2)
+
+        # Заголовок-переключатель (кликабельный).
+        self.variables_header_btn = QPushButton()
+        self.variables_header_btn.setFlat(True)
+        self.variables_header_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.variables_header_btn.setFocusPolicy(
+            Qt.FocusPolicy.NoFocus
+        )
+        self.variables_header_btn.setStyleSheet(
+            "QPushButton {"
+            "  text-align: left;"
+            "  border: none;"
+            "  background: transparent;"
+            "  color: #B8860B;"
+            "  font-weight: bold;"
+            "  padding: 2px 0;"
+            "}"
+            "QPushButton:hover { color: #8B6914; }"
+        )
+        self.variables_header_btn.clicked.connect(
+            self._toggle_variables_panel
+        )
+        attach_tooltip(
+            self.variables_header_btn,
+            "scrum_tfs_variables_panel",
+        )
+        vp_layout.addWidget(self.variables_header_btn)
+
+        # Разворачиваемое содержимое.
+        self.variables_body_label = QLabel("")
+        self.variables_body_label.setWordWrap(True)
+        self.variables_body_label.setTextFormat(
+            Qt.TextFormat.RichText
+        )
+        self.variables_body_label.setStyleSheet(
+            "QLabel { color: #6B5B0B; padding: 0; }"
+        )
+        self.variables_body_label.setVisible(False)
+        vp_layout.addWidget(self.variables_body_label)
+
+        filters_layout.addWidget(self.variables_panel)
+
+        # Обратная совместимость: старое имя атрибута
+        # (используется в tfs_panel_widget.py).
+        self.variables_info_label = self.variables_panel
 
         root.addWidget(filters_box)
 
@@ -766,50 +826,119 @@ class TfsWindow(QDialog):
 
     def _update_variables_info(self, variables: List[str]) -> None:
         """
-        Обновляет плашку «Переменные в запросе» и кнопку
-        «Переменные…».
+        Обновляет сворачиваемую плашку «Переменные в запросе»
+        и кнопку «Переменные…».
+
+        Плашка состоит из:
+          • заголовка-переключателя (кликабельный), в котором
+            кратко перечислены имена переменных;
+          • сворачиваемого тела с полным списком и значениями.
+
+        По умолчанию плашка свёрнута — видно только одну
+        компактную строку. Клик по заголовку разворачивает её.
         """
-        if not hasattr(self, "variables_info_label"):
+        if not hasattr(self, "variables_panel"):
             return
 
         if not variables:
-            self.variables_info_label.setVisible(False)
-            self.variables_info_label.setText("")
+            self.variables_panel.setVisible(False)
+            self.variables_header_btn.setText("")
+            self.variables_body_label.setText("")
+            self.variables_body_label.setVisible(False)
+            self._variables_panel_expanded = False
             if hasattr(self, "variables_btn"):
                 self.variables_btn.setEnabled(False)
             return
 
-        # Показываем список переменных и их текущие значения
-        # (если уже вводились).
-        lines: List[str] = [
-            f"<b>В запросе используются переменные "
-            f"({len(variables)}):</b>"
-        ]
+        # --- Заголовок-переключатель ---
+        # Краткий список имён переменных (до 3 — полностью,
+        # иначе «первые 2 … +N»).
+        marker = "▼" if self._variables_panel_expanded else "▶"
+
+        if len(variables) <= 3:
+            names_preview = ", ".join(variables)
+        else:
+            names_preview = (
+                ", ".join(variables[:2])
+                + f" … ещё {len(variables) - 2}"
+            )
+
+        self.variables_header_btn.setText(
+            f"{marker}  В запросе используются переменные "
+            f"({len(variables)}): {names_preview}"
+        )
+        self.variables_header_btn.setToolTip(
+            "Клик — развернуть или свернуть список переменных "
+            "с их значениями."
+        )
+
+        # --- Тело (разворачиваемая часть) ---
+        body_lines: List[str] = []
         for name in variables:
             value = self._variable_values.get(name, "")
             if value:
-                short = value if len(value) <= 60 else value[:57] + "…"
-                lines.append(
+                short = (
+                    value if len(value) <= 60
+                    else value[:57] + "…"
+                )
+                body_lines.append(
                     f"&nbsp;&nbsp;• <b>{name}</b> = "
                     f"<code>{_html.escape(short)}</code>"
                 )
             else:
-                lines.append(
+                body_lines.append(
                     f"&nbsp;&nbsp;• <b>{name}</b> — "
                     f"<i>значение не задано</i>"
                 )
-        lines.append(
+
+        body_lines.append(
             "<br><span style='font-size:11px'>"
             "Значения запрашиваются перед выполнением запроса. "
             "Кнопка «Переменные…» позволяет задать их заранее."
             "</span>"
         )
 
-        self.variables_info_label.setText("<br>".join(lines))
-        self.variables_info_label.setVisible(True)
+        self.variables_body_label.setText("<br>".join(body_lines))
+        self.variables_body_label.setVisible(
+            self._variables_panel_expanded
+        )
+
+        self.variables_panel.setVisible(True)
 
         if hasattr(self, "variables_btn"):
             self.variables_btn.setEnabled(True)
+
+    def _toggle_variables_panel(self) -> None:
+        """
+        Разворачивает/сворачивает тело плашки переменных.
+
+        Состояние хранится в self._variables_panel_expanded
+        и сохраняется при обновлении содержимого — если
+        пользователь развернул плашку, она останется
+        развёрнутой до конца сессии.
+        """
+        self._variables_panel_expanded = (
+            not self._variables_panel_expanded
+        )
+
+        # Обновляем стрелку в заголовке.
+        text = self.variables_header_btn.text()
+        if text:
+            if self._variables_panel_expanded:
+                text = text.replace("▶", "▼", 1)
+            else:
+                text = text.replace("▼", "▶", 1)
+            self.variables_header_btn.setText(text)
+
+        self.variables_body_label.setVisible(
+            self._variables_panel_expanded
+        )
+
+        log.debug(
+            "Плашка переменных WIQL: %s",
+            "развёрнута" if self._variables_panel_expanded
+            else "свёрнута",
+        )
 
     def _on_edit_variables(self) -> None:
         """Открывает диалог ввода значений переменных."""
