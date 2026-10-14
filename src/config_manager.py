@@ -13,6 +13,10 @@
       – scrum_day_tab_max_records;
       – scrum_left_splitter_ratio;
       – scrum_tfs_max_items.
+  • ДОБАВЛЕНО: app.scrum_analysis_collapsed_by_default —
+    панель результата анализа (AnalysisResultWidget) в окне
+    «Скрам» по умолчанию свёрнута. Это освобождает место
+    для блоков «Поручения» и «Задачи TFS».
 """
 from __future__ import annotations
 
@@ -391,6 +395,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         #   • "protocol" — полный протокол записи.
         # По умолчанию — summary.
         "scrum_day_view_mode": "summary",
+        # --- НОВОЕ: панель результата анализа ---
+        # Панель результата анализа (AnalysisResultWidget) в окне
+        # «Скрам» по умолчанию СВЁРНУТА — так она не отнимает
+        # место у блоков «Поручения» и «Задачи TFS».
+        # Пользователь разворачивает её кликом по заголовку.
+        # Если поставить False — панель будет всегда развёрнута
+        # (старое поведение).
+        "scrum_analysis_collapsed_by_default": True,
     }
 }
 

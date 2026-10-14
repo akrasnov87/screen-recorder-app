@@ -25,6 +25,11 @@
     перенесено туда же — оно логически связано с автосжатием.
     На «Синхронизации» остались только параметры подключения
     и передачи данных.
+  • НОВОЕ: на вкладке «Скрам» добавлен блок «Панель результата
+    анализа» — чекбокс app.scrum_analysis_collapsed_by_default.
+    Панель результата анализа (AnalysisResultWidget) в окне
+    «Скрам» по умолчанию свёрнута, что освобождает место для
+    блоков «Поручения» и «Задачи TFS».
 """
 from __future__ import annotations
 
@@ -3336,6 +3341,43 @@ class SettingsWindow(QDialog):
         layout.addSpacing(12)
 
         # ==============================================================
+        # Блок 0.1: панель результата анализа
+        # ==============================================================
+        analysis_header = QHBoxLayout()
+        analysis_header.addWidget(
+            QLabel("<b>Панель результата анализа</b>")
+        )
+        analysis_header.addStretch()
+        analysis_icon = make_info_icon(
+            "app_scrum_analysis_collapsed_by_default"
+        )
+        if analysis_icon is not None:
+            analysis_header.addWidget(analysis_icon)
+        layout.addLayout(analysis_header)
+
+        analysis_hint = QLabel(
+            "<span style='color:#666'>"
+            "Панель «Результат анализа» в нижней части левой "
+            "колонки окна «Скрам». Когда панель свёрнута — "
+            "блоки «Поручения» и «Задачи TFS» получают больше "
+            "места.</span>"
+        )
+        analysis_hint.setWordWrap(True)
+        layout.addWidget(analysis_hint)
+
+        self.scrum_analysis_collapsed_check = QCheckBox(
+            "Панель результата анализа по умолчанию свёрнута"
+        )
+        attach_tooltip(
+            self.scrum_analysis_collapsed_check,
+            "app_scrum_analysis_collapsed_by_default",
+        )
+        self.scrum_analysis_collapsed_check.setChecked(True)
+        layout.addWidget(self.scrum_analysis_collapsed_check)
+
+        layout.addSpacing(12)
+
+        # ==============================================================
         # Блок 1: шаблон промпта для протокола (был раньше)
         # ==============================================================
         scrum_header = QHBoxLayout()
@@ -4008,6 +4050,13 @@ class SettingsWindow(QDialog):
             int(app_cfg.get("scrum_window_height", 1024))
         )
 
+        # --- НОВОЕ: панель результата анализа ---
+        self.scrum_analysis_collapsed_check.setChecked(
+            bool(app_cfg.get(
+                "scrum_analysis_collapsed_by_default", True
+            ))
+        )
+
         # --- ВМ Yandex ---
         ycfg = cfg.get("yandex_vm", {}) or {}
         self.yandex_vm_root_input.setText(
@@ -4545,6 +4594,10 @@ class SettingsWindow(QDialog):
         app_cfg["scrum_window_height"] = int(
             self.scrum_window_height_spin.value()
         )
+        # --- НОВОЕ: панель результата анализа ---
+        app_cfg["scrum_analysis_collapsed_by_default"] = (
+            self.scrum_analysis_collapsed_check.isChecked()
+        )
 
         return cfg
 
@@ -4558,7 +4611,8 @@ class SettingsWindow(QDialog):
                 "default_project=%r, default_chat_id=%r, tags=%d, "
                 "sync_enabled=%s, sync_url=%r, send_media=%s, "
                 "media_prefer_builtin=%s, use_hash_check=%s, "
-                "compress_media=%s, max_artifact_mb=%d",
+                "compress_media=%s, max_artifact_mb=%d, "
+                "scrum_analysis_collapsed=%s",
                 len(cfg.get("projects", [])),
                 cfg.get("default_project"),
                 cfg.get("default_chat_id"),
@@ -4574,6 +4628,9 @@ class SettingsWindow(QDialog):
                     "compress_media_if_too_large"
                 ),
                 cfg.get("sync", {}).get("max_artifact_mb"),
+                cfg.get("app", {}).get(
+                    "scrum_analysis_collapsed_by_default"
+                ),
             )
 
             current = get_current_log_path()

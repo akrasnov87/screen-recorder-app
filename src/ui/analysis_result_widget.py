@@ -19,6 +19,12 @@
     анализа) помещались в левой части окна «Скрам» без
     прокрутки. Минимальная высота QTextBrowser уменьшена
     до 80 px.
+  • НОВОЕ: панель по умолчанию СВЁРНУТА — чтобы не отнимать
+    место у блоков «Поручения» и «Задачи TFS». При появлении
+    результата панель НЕ разворачивается автоматически —
+    пользователь разворачивает её кликом по заголовку.
+    Настройка app.scrum_analysis_collapsed_by_default
+    управляет этим поведением.
 """
 from __future__ import annotations
 
@@ -52,7 +58,8 @@ class AnalysisResultWidget(QWidget):
       • заполненное — заголовок с названием промпта и кнопки +
         отрендеренный результат.
 
-    Сворачивание — клик по заголовку. По умолчанию развёрнуто.
+    Сворачивание — клик по заголовку. По умолчанию СВЁРНУТО
+    (см. параметр start_collapsed).
     """
 
     # Сигнал: пользователь запросил повторный запуск анализа.
@@ -64,12 +71,14 @@ class AnalysisResultWidget(QWidget):
     def __init__(
         self,
         parent: Optional[QWidget] = None,
+        *,
+        start_collapsed: bool = True,
     ) -> None:
         super().__init__(parent)
 
         self._result_text: str = ""
         self._prompt_name: str = ""
-        self._expanded: bool = True
+        self._expanded: bool = not bool(start_collapsed)
 
         self._build_ui()
 
@@ -192,6 +201,7 @@ class AnalysisResultWidget(QWidget):
         self._render_empty_state()
         self._refresh_header()
         self._refresh_buttons_state()
+        self._apply_expanded_state()
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -205,8 +215,9 @@ class AnalysisResultWidget(QWidget):
         """
         Устанавливает результат анализа.
 
-        Автоматически разворачивает панель и прокручивает
-        содержимое в начало.
+        Панель НЕ разворачивается автоматически — пользователь
+        увидит обновлённый заголовок и сам решит, разворачивать
+        ли панель (клик по заголовку).
         """
         self._result_text = text or ""
         self._prompt_name = prompt_name or ""
@@ -234,20 +245,26 @@ class AnalysisResultWidget(QWidget):
             except Exception:
                 pass
 
-        # Автоматически разворачиваем и обновляем заголовок.
-        self._expanded = True
+        # НЕ разворачиваем автоматически — только обновляем
+        # заголовок и состояние кнопок.
         self._refresh_header()
         self._refresh_buttons_state()
         self._apply_expanded_state()
 
         log.info(
             "AnalysisResultWidget: установлен результат "
-            "(промпт=%r, %d символов)",
+            "(промпт=%r, %d символов, expanded=%s)",
             self._prompt_name, len(self._result_text),
+            self._expanded,
         )
 
     def set_error(self, error: str) -> None:
-        """Устанавливает состояние «ошибка»."""
+        """
+        Устанавливает состояние «ошибка».
+
+        Панель НЕ разворачивается автоматически — заголовок
+        подсвечивается «⚠ Результат анализа (ошибка)».
+        """
         self._result_text = ""
         self._prompt_name = self._prompt_name or ""
 
@@ -267,7 +284,7 @@ class AnalysisResultWidget(QWidget):
             "</div>"
         )
         self.browser.setHtml(error_html)
-        self._expanded = True
+
         self._refresh_header()
         self._refresh_buttons_state()
         self._apply_expanded_state()
@@ -287,6 +304,21 @@ class AnalysisResultWidget(QWidget):
     def has_result(self) -> bool:
         """Есть ли результат в панели."""
         return bool(self._result_text.strip())
+
+    def is_expanded(self) -> bool:
+        """Развёрнута ли панель."""
+        return self._expanded
+
+    def set_expanded(self, expanded: bool) -> None:
+        """
+        Программно разворачивает или сворачивает панель.
+
+        Используется, когда пользователь явно хочет развернуть
+        панель после получения результата.
+        """
+        self._expanded = bool(expanded)
+        self._refresh_header()
+        self._apply_expanded_state()
 
     # ------------------------------------------------------------------
     # Внутренняя логика
@@ -320,26 +352,55 @@ class AnalysisResultWidget(QWidget):
         """Обновляет текст заголовка-переключателя."""
         arrow = "▼" if self._expanded else "▶"
 
+        # Определяем, есть ли ошибка (по содержимому браузера).
+        has_error = (
+            not self.has_result()
+            and "Ошибка выполнения запроса" in self.browser.toHtml()
+        )
+
         if self.has_result():
             title = "Результат анализа"
             if self._prompt_name:
                 title += f" — {self._prompt_name}"
             timestamp = datetime.now().strftime("%H:%M:%S")
-            self.header_btn.setText(
-                f"{arrow}  {title}  ({timestamp})"
-            )
+            text = f"{arrow}  {title}  ({timestamp})"
+            color = "#1565C0"
+        elif has_error:
+            text = f"{arrow}  ⚠ Результат анализа (ошибка)"
+            color = "#c62828"
         elif self._result_text:
-            self.header_btn.setText(
-                f"{arrow}  Результат анализа"
+            text = f"{arrow}  Результат анализа"
+            color = "#1565C0"
+        else:
+            text = f"{arrow}  Результат анализа (пусто)"
+            color = "#888"
+
+        self.header_btn.setText(text)
+        self.header_btn.setStyleSheet(
+            "QPushButton {"
+            "  text-align: left;"
+            "  border: none;"
+            "  background: transparent;"
+            f"  color: {color};"
+            "  font-weight: bold;"
+            "  font-size: 10pt;"
+            "  padding: 1px 0;"
+            "}"
+            "QPushButton:hover { color: #0d47a1; }"
+        )
+
+        if self._expanded:
+            self.header_btn.setToolTip(
+                "Клик — свернуть панель результата.\n\n"
+                "Свёрнутая панель освобождает место для блоков "
+                "«Поручения» и «Задачи TFS»."
             )
         else:
-            self.header_btn.setText(
-                f"{arrow}  Результат анализа (пусто)"
+            self.header_btn.setToolTip(
+                "Клик — развернуть панель результата.\n\n"
+                "Панель по умолчанию свёрнута, чтобы не отнимать "
+                "место у блоков «Поручения» и «Задачи TFS»."
             )
-
-        self.header_btn.setToolTip(
-            "Клик — свернуть или развернуть панель результата."
-        )
 
     def _refresh_buttons_state(self) -> None:
         """Включает/выключает кнопки в зависимости от наличия результата."""

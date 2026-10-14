@@ -50,6 +50,13 @@
     — в нижней части левого блока, после панели TFS. Панель
     поддерживает сворачивание. Модальным остаётся только
     короткий диалог ожидания (AnalysisWorkerDialog).
+  • НОВОЕ: панель результата анализа (AnalysisResultWidget)
+    по умолчанию СВЁРНУТА — не отнимает место у блоков
+    «Поручения» и «Задачи TFS». Настройка
+    app.scrum_analysis_collapsed_by_default управляет этим.
+    При получении результата панель НЕ разворачивается
+    автоматически — пользователь разворачивает кликом по
+    заголовку.
 """
 from __future__ import annotations
 
@@ -901,10 +908,11 @@ class ScrumWindow(QDialog):
 
         log.info(
             "ScrumWindow открыто: session=%s, is_scrum=%s, "
-            "day_view_mode=%r",
+            "day_view_mode=%r, analysis_collapsed=%s",
             os.path.basename(session_dir),
             self._session_meta.get("is_scrum"),
             self._initial_day_view_mode,
+            self.analysis_widget.is_expanded() is False,
         )
 
     # ------------------------------------------------------------------
@@ -973,19 +981,30 @@ class ScrumWindow(QDialog):
         self.left_splitter.addWidget(self.tfs_widget)
 
         # --- Встраиваемая панель результата анализа ---
-        self.analysis_widget = AnalysisResultWidget(parent=self)
+        # НОВОЕ: панель по умолчанию свёрнута — настройка
+        # app.scrum_analysis_collapsed_by_default.
+        start_collapsed = bool(
+            self._app_cfg.get(
+                "scrum_analysis_collapsed_by_default", True
+            )
+        )
+        self.analysis_widget = AnalysisResultWidget(
+            parent=self,
+            start_collapsed=start_collapsed,
+        )
         self.analysis_widget.rerun_requested.connect(
             self._on_run_analysis
         )
         self.left_splitter.addWidget(self.analysis_widget)
 
         # Порядок и пропорции: поручения, TFS, результат.
-        # Немного уменьшили доли каждого блока, чтобы всё
-        # поместилось в окне без прокрутки.
+        # Панель результата по умолчанию свёрнута и занимает
+        # минимум места — большую часть высоты отдаём поручениям
+        # и TFS.
         self.left_splitter.setSizes([
-            max(200, int(self._tasks_panel_height * 0.85)),
-            max(200, int(self._tasks_panel_height * 0.85)),
-            max(180, int(self._tasks_panel_height * 0.7)),
+            max(200, int(self._tasks_panel_height * 0.9)),
+            max(200, int(self._tasks_panel_height * 0.9)),
+            60,   # свёрнутая панель — только заголовок
         ])
 
         self.main_splitter.addWidget(self.left_splitter)
@@ -1045,7 +1064,9 @@ class ScrumWindow(QDialog):
             "TFS с помощью LLM.\n\n"
             "Откроется диалог выбора промпта из библиотеки "
             "(Настройки → Промпты и имена).\n\n"
-            "Результат появится в панели под задачами TFS.\n\n"
+            "Результат появится в панели под задачами TFS. "
+            "Панель по умолчанию свёрнута — разверните её "
+            "кликом по заголовку «Результат анализа».\n\n"
             "Провайдер и модель — из Настройки → Суммаризация."
         )
         attach_tooltip(
@@ -1244,6 +1265,10 @@ class ScrumWindow(QDialog):
           5. Открывает маленький модальный диалог ожидания
              и по завершении показывает результат в
              AnalysisResultWidget (встроенная панель под TFS).
+
+        Панель результата по умолчанию свёрнута — после
+        успешного анализа она НЕ разворачивается автоматически,
+        пользователь разворачивает её кликом по заголовку.
         """
         if self._config_manager is None:
             QMessageBox.warning(
@@ -1365,6 +1390,9 @@ class ScrumWindow(QDialog):
         )
 
         # --- 6. Показываем состояние ожидания в панели ---
+        # Панель НЕ разворачиваем — только обновляем содержимое.
+        # Если пользователь захочет посмотреть «что происходит»,
+        # он развернёт панель вручную.
         try:
             self.analysis_widget.browser.setHtml(
                 "<div style='font-family:sans-serif; font-size:11pt; "
@@ -1376,9 +1404,8 @@ class ScrumWindow(QDialog):
                 f"Пожалуйста, подождите."
                 "</div>"
             )
-            self.analysis_widget._expanded = True
             self.analysis_widget._refresh_header()
-            self.analysis_widget._apply_expanded_state()
+            self.analysis_widget._refresh_buttons_state()
         except Exception as exc:
             log.warning(
                 "Не удалось показать состояние ожидания: %s", exc,
@@ -1420,22 +1447,13 @@ class ScrumWindow(QDialog):
             worker_dlg.exec()
 
             # --- 8. Отображаем результат в панели ---
+            # Панель остаётся свёрнутой — пользователь развернёт
+            # её сам, увидев обновлённый заголовок.
             if result_holder["ok"]:
                 self.analysis_widget.set_result(
                     result_holder["text"],
                     prompt_name=prompt_name,
                 )
-                # Прокрутить левый сплиттер так, чтобы панель
-                # результата была видна — но не раздувать её
-                # сверх меры.
-                try:
-                    self.left_splitter.setSizes([
-                        max(180, int(self._tasks_panel_height * 0.8)),
-                        max(180, int(self._tasks_panel_height * 0.8)),
-                        max(220, int(self._tasks_panel_height * 0.9)),
-                    ])
-                except Exception:
-                    pass
             elif result_holder["error"]:
                 self.analysis_widget.set_error(
                     result_holder["error"]
@@ -1447,9 +1465,8 @@ class ScrumWindow(QDialog):
                     "font-style:italic;'>"
                     "Анализ отменён пользователем.</p>"
                 )
-                self.analysis_widget._expanded = True
                 self.analysis_widget._refresh_header()
-                self.analysis_widget._apply_expanded_state()
+                self.analysis_widget._refresh_buttons_state()
         except Exception as exc:
             log.exception(
                 "Не удалось выполнить анализ: %s", exc
