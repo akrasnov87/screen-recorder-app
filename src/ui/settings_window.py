@@ -3022,6 +3022,40 @@ class SettingsWindow(QDialog):
         layout.addSpacing(12)
 
         # ==============================================================
+        # Блок 0.2: сортировка таблиц по исполнителю (НОВОЕ)
+        # ==============================================================
+        sort_header = QHBoxLayout()
+        sort_header.addWidget(
+            QLabel("<b>Сортировка таблиц в окне «Скрам»</b>")
+        )
+        sort_header.addStretch()
+        sort_icon = make_info_icon("app_scrum_sort_by_assignee")
+        if sort_icon is not None:
+            sort_header.addWidget(sort_icon)
+        layout.addLayout(sort_header)
+
+        sort_hint = QLabel(
+            "<span style='color:#666'>"
+            "Управляет сортировкой обеих таблиц окна «Скрам» — "
+            "«Поручения» и «Задачи TFS».</span>"
+        )
+        sort_hint.setWordWrap(True)
+        layout.addWidget(sort_hint)
+
+        self.scrum_sort_by_assignee_check = QCheckBox(
+            "Сортировать таблицы «Поручения» и «Задачи TFS» "
+            "по исполнителю"
+        )
+        attach_tooltip(
+            self.scrum_sort_by_assignee_check,
+            "app_scrum_sort_by_assignee",
+        )
+        self.scrum_sort_by_assignee_check.setChecked(True)
+        layout.addWidget(self.scrum_sort_by_assignee_check)
+
+        layout.addSpacing(12)
+
+        # ==============================================================
         # Блок 1: шаблон промпта для протокола (был раньше)
         # ==============================================================
         scrum_header = QHBoxLayout()
@@ -3654,6 +3688,13 @@ class SettingsWindow(QDialog):
             ))
         )
 
+        # --- НОВОЕ: сортировка таблиц по исполнителю ---
+        self.scrum_sort_by_assignee_check.setChecked(
+            bool(app_cfg.get(
+                "scrum_sort_by_assignee", True
+            ))
+        )
+
         # --- Сжатие (старая вкладка «Форматы и сжатие») ---
         comp = cfg.get("compression", {})
         self.audio_fmt_combo.setCurrentText(
@@ -4118,6 +4159,11 @@ class SettingsWindow(QDialog):
         # --- НОВОЕ: панель результата анализа ---
         app_cfg["scrum_analysis_collapsed_by_default"] = (
             self.scrum_analysis_collapsed_check.isChecked()
+        )
+
+        # --- НОВОЕ: сортировка таблиц по исполнителю ---
+        app_cfg["scrum_sort_by_assignee"] = (
+            self.scrum_sort_by_assignee_check.isChecked()
         )
 
         return cfg

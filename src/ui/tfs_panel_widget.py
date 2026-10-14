@@ -26,6 +26,11 @@
     виджета — чтобы три блока (поручения / TFS / результат
     анализа) помещались в левой части окна «Скрам» без
     прокрутки. Высота WIQL-поля уменьшена до 40–60 px.
+  • НОВОЕ: параметр sort_by_assignee.
+    Прокидывается во внутренний TfsWindow. Если True — задачи
+    сортируются по колонке «Исполнитель» (А→Я, пустые в конце).
+    В дереве связей иерархия сохраняется: сортируются только
+    узлы внутри каждого родителя.
 """
 from __future__ import annotations
 
@@ -90,12 +95,16 @@ class TfsPanelWidget(QWidget):
         *,
         config_manager,
         max_items: int = 200,
+        sort_by_assignee: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
 
         self._config_manager = config_manager
         self._max_items = int(max_items)
+
+        # --- НОВОЕ: сортировка по исполнителю ---
+        self._sort_by_assignee = bool(sort_by_assignee)
 
         # Поля фильтров (создаются в _build_ui).
         self._filter_id: Optional[QLineEdit] = None
@@ -107,6 +116,7 @@ class TfsPanelWidget(QWidget):
         # НЕ показываем.
         self._win = TfsWindow(
             config_manager=config_manager,
+            sort_by_assignee=self._sort_by_assignee,
             parent=self,
         )
 

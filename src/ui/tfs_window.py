@@ -42,6 +42,14 @@
     По умолчанию она свёрнута — показывает одну компактную
     строку с именами переменных. Клик по заголовку разворачивает
     её — видны все переменные с их значениями.
+
+  • НОВОЕ: параметр sort_by_assignee.
+      – True — сортировать задачи по колонке «Исполнитель»
+        (А→Я, пустые — в конце).
+      – В плоском списке: сортируются все top-level items.
+      – В дереве (link-запрос): сортируются только узлы внутри
+        каждого родителя (иерархия сохраняется).
+      – False (по умолчанию) — исходный порядок из TFS.
 """
 from __future__ import annotations
 
@@ -308,10 +316,15 @@ class TfsWindow(QDialog):
     def __init__(
         self,
         config_manager,
+        *,
+        sort_by_assignee: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.config_manager = config_manager
+
+        # --- НОВОЕ: сортировка по исполнителю ---
+        self._sort_by_assignee: bool = bool(sort_by_assignee)
 
         self._worker: Optional[_TfsWorker] = None
         self._items: List[Dict[str, Any]] = []
@@ -349,9 +362,11 @@ class TfsWindow(QDialog):
             )
 
         log.info(
-            "TfsWindow открыто: enabled=%s, base_url=%r",
+            "TfsWindow открыто: enabled=%s, base_url=%r, "
+            "sort_by_assignee=%s",
             self._cfg.get("enabled"),
             self._cfg.get("base_url") or "—",
+            self._sort_by_assignee,
         )
 
     # ------------------------------------------------------------------
@@ -1466,9 +1481,103 @@ class TfsWindow(QDialog):
             f"Запрос выполнен: {datetime.now():%H:%M:%S}"
         )
         log.info(
-            "WIQL выполнен (%s): получено %d задач",
-            kind, len(self._items),
+            "WIQL выполнен (%s): получено %d задач "
+            "(sort_by_assignee=%s)",
+            kind, len(self._items), self._sort_by_assignee,
         )
+
+    # ------------------------------------------------------------------
+    # Сортировка дерева по исполнителю
+    # ------------------------------------------------------------------
+    # Индекс колонки «Исполнитель» в QTreeWidget.
+    _COL_TREE_ASSIGNEE: int = 4
+
+    @staticmethod
+    def _tree_item_sort_key(item: QTreeWidgetItem) -> tuple:
+        """
+        Ключ сортировки узла дерева по исполнителю.
+
+        Логика:
+          • пустой исполнитель — в самом конце;
+          • иначе — регистронезависимо по алфавиту;
+          • при равных исполнителях — по ID (числовой).
+
+        Возвращает кортеж для сравнения.
+        """
+        assignee = (item.text(TfsWindow._COL_TREE_ASSIGNEE) or "").strip()
+        # Пустые и «—» — в конец.
+        is_empty = (not assignee) or (assignee == "—")
+        empty_flag = 1 if is_empty else 0
+
+        try:
+            item_id = int(item.text(0))
+        except (TypeError, ValueError):
+            item_id = 0
+
+        return (
+            empty_flag,
+            assignee.casefold(),
+            item_id,
+        )
+
+    def _sort_tree_recursively(self, item: QTreeWidgetItem) -> None:
+        """
+        Рекурсивно сортирует потомков узла (и всех его
+        подузлов) по исполнителю.
+
+        Иерархия сохраняется: сортируются дети внутри
+        каждого родителя, а не всё дерево плоско.
+        """
+        # Сначала — рекурсивно в детей.
+        for i in range(item.childCount()):
+            self._sort_tree_recursively(item.child(i))
+
+        # Потом сортируем самих детей.
+        if item.childCount() > 1:
+            children = [
+                item.takeChild(0) for _ in range(item.childCount())
+            ]
+            children.sort(key=self._tree_item_sort_key)
+            for ch in children:
+                item.addChild(ch)
+
+    def _apply_tree_sort_by_assignee(self) -> None:
+        """
+        Применяет сортировку по исполнителю ко всему дереву
+        (или плоскому списку).
+
+        Для плоского списка сортируются top-level items.
+        Для дерева связей — сортируются узлы внутри каждого
+        родителя (иерархия сохраняется).
+        """
+        if not self._sort_by_assignee:
+            return
+        try:
+            tree = self.tree
+
+            # --- 1. Сортируем top-level ---
+            if tree.topLevelItemCount() > 1:
+                top_items = [
+                    tree.takeTopLevelItem(0)
+                    for _ in range(tree.topLevelItemCount())
+                ]
+                top_items.sort(key=self._tree_item_sort_key)
+                for it in top_items:
+                    tree.addTopLevelItem(it)
+
+            # --- 2. Рекурсивно сортируем потомков ---
+            for i in range(tree.topLevelItemCount()):
+                self._sort_tree_recursively(tree.topLevelItem(i))
+
+            log.debug(
+                "TfsWindow: дерево отсортировано по исполнителю "
+                "(А→Я, пустые в конце)"
+            )
+        except Exception as exc:
+            log.warning(
+                "TfsWindow: не удалось отсортировать дерево по "
+                "исполнителю: %s", exc,
+            )
 
     def _build_flat_tree(self) -> None:
         """Плоский список — один уровень дерева."""
@@ -1477,7 +1586,10 @@ class TfsWindow(QDialog):
             item = self._make_tree_item(it)
             self.tree.addTopLevelItem(item)
 
-        if self._items:
+        # --- НОВОЕ: сортировка по исполнителю ---
+        self._apply_tree_sort_by_assignee()
+
+        if self.tree.topLevelItemCount() > 0:
             self.tree.setCurrentItem(self.tree.topLevelItem(0))
 
     def _build_tree_from_relations(
@@ -1568,16 +1680,23 @@ class TfsWindow(QDialog):
                     root_items.append(item)
 
         self.tree.addTopLevelItems(root_items)
+
+        # --- НОВОЕ: сортировка по исполнителю ---
+        # ВАЖНО: вызывается ПОСЛЕ addTopLevelItems, до expand —
+        # иначе top-level перестановки могут сбросить разворот.
+        self._apply_tree_sort_by_assignee()
+
         self.tree.expandToDepth(0)
 
-        if root_items:
-            self.tree.setCurrentItem(root_items[0])
+        if self.tree.topLevelItemCount() > 0:
+            self.tree.setCurrentItem(self.tree.topLevelItem(0))
 
         log.info(
             "Дерево построено: связей=%d, узлов=%d, "
-            "корней=%d, задач=%d",
+            "корней=%d, задач=%d, sort_by_assignee=%s",
             len(relations), len(visited),
             len(root_items), len(self._items),
+            self._sort_by_assignee,
         )
 
     def _make_tree_item(

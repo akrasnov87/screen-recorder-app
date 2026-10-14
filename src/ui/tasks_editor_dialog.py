@@ -34,6 +34,16 @@
         TasksEditorWidget. Подписку на двойной клик делает
         сам виджет — иначе получается ДВОЙНОЕ открытие
         редактора (два окна на один двойной клик).
+  • НОВОЕ: параметр sort_by_assignee.
+      – True — сортировать таблицу поручений по колонке
+        «Исполнитель» (по алфавиту, А→Я, пустые — в конце).
+        Применяется всегда, ко всем фильтрам и обновлениям.
+      – False (по умолчанию) — исходный порядок из
+        action_items.json (с возможной сортировкой по сроку,
+        если включён «Сортировать по сроку»).
+      Сортировка по исполнителю имеет приоритет над сортировкой
+      по сроку: если включена — сортировка по сроку
+      игнорируется.
 """
 from __future__ import annotations
 
@@ -333,6 +343,7 @@ class TasksEditorDialog(QDialog):
         session_name: str = "",
         employees: Optional[List[Dict[str, str]]] = None,
         attach_double_click: bool = True,
+        sort_by_assignee: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -365,6 +376,12 @@ class TasksEditorDialog(QDialog):
         #         а диалог — нет (иначе будет двойное открытие
         #         одного и того же редактора).
         self._attach_double_click = bool(attach_double_click)
+
+        # --- НОВОЕ: сортировка по исполнителю ---
+        # Если True — таблица сортируется по колонке
+        # «Исполнитель» (А→Я, пустые в конце). Приоритет над
+        # сортировкой по сроку.
+        self._sort_by_assignee: bool = bool(sort_by_assignee)
 
         self._build_ui()
         self._reload()
@@ -500,7 +517,9 @@ class TasksEditorDialog(QDialog):
         )
         self.sort_by_due_check.setToolTip(
             "Просроченные — сверху, затем «сегодня», затем "
-            "будущие, затем без срока."
+            "будущие, затем без срока.\n\n"
+            "Игнорируется, если включена сортировка по "
+            "исполнителю (в окне «Скрам»)."
         )
         self.sort_by_due_check.setChecked(True)
         self.sort_by_due_check.toggled.connect(self._reload_table)
@@ -832,7 +851,13 @@ class TasksEditorDialog(QDialog):
 
             result.append(it)
 
-        if self.sort_by_due_check.isChecked():
+        # --- Сортировка ---
+        # НОВОЕ: если включена сортировка по исполнителю — она
+        # имеет приоритет. Иначе применяется сортировка по сроку
+        # (если включена).
+        if self._sort_by_assignee:
+            result.sort(key=self._sort_key_assignee)
+        elif self.sort_by_due_check.isChecked():
             result.sort(key=lambda x: (
                 due_date_priority(x),
                 (x.get("due_date") or "9999-99-99"),
@@ -840,6 +865,30 @@ class TasksEditorDialog(QDialog):
             ))
 
         return result
+
+    @staticmethod
+    def _sort_key_assignee(item: Dict[str, Any]) -> tuple:
+        """
+        Ключ сортировки по исполнителю.
+
+        Логика:
+          • пустой исполнитель — в самом конце;
+          • иначе — регистронезависимо по алфавиту;
+          • при равных исполнителях — по сроку (просроченные
+            сверху), затем по номеру.
+
+        Возвращает кортеж для сравнения.
+        """
+        assignee = (item.get("assignee") or "").strip()
+        # Пустые — в конце: кортеж начинается с 1, у остальных 0.
+        empty_flag = 1 if not assignee else 0
+        return (
+            empty_flag,
+            assignee.casefold(),
+            due_date_priority(item),
+            (item.get("due_date") or "9999-99-99"),
+            int(item.get("number") or 0),
+        )
 
     def _reload_table(self) -> None:
         """

@@ -36,6 +36,10 @@
         Подписку на itemDoubleClicked делает ТОЛЬКО виджет —
         иначе получается ДВОЙНОЕ открытие редактора (два
         окна на один двойной клик).
+  • НОВОЕ: параметр sort_by_assignee.
+      Прокидывается во внутренний TasksEditorDialog. Если True —
+      таблица поручений сортируется по колонке «Исполнитель»
+      (А→Я, пустые в конце). Применяется всегда.
 """
 from __future__ import annotations
 
@@ -102,6 +106,7 @@ class TasksEditorWidget(QWidget):
         session_name: str = "",
         employees: Optional[List[Dict[str, str]]] = None,
         compact: bool = False,
+        sort_by_assignee: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -110,6 +115,11 @@ class TasksEditorWidget(QWidget):
         self._session_name = session_name
         self._employees = list(employees or [])
         self._compact = bool(compact)
+
+        # --- НОВОЕ: сортировка по исполнителю ---
+        # Прокидывается во внутренний TasksEditorDialog и
+        # применяется всегда (в т.ч. при обновлениях и фильтрах).
+        self._sort_by_assignee = bool(sort_by_assignee)
 
         # Защита от реэнтрантности при применении колоночных
         # фильтров. Устанавливается в _apply_column_filters.
@@ -131,6 +141,7 @@ class TasksEditorWidget(QWidget):
             session_name=session_name,
             employees=self._employees,
             attach_double_click=False,
+            sort_by_assignee=self._sort_by_assignee,
             parent=None,
         )
 
@@ -697,10 +708,11 @@ class TasksEditorWidget(QWidget):
         log.info(
             "TasksEditorWidget: колонки таблицы настроены — "
             "скрыты: %s; растягивается: колонка %d (Текст); "
-            "высота строки: %d px",
+            "высота строки: %d px; sort_by_assignee=%s",
             ", ".join(str(c) for c in self._SCRUM_HIDDEN_COLUMNS),
             self._SCRUM_STRETCH_COLUMN,
             self._ROW_HEIGHT_PX,
+            self._sort_by_assignee,
         )
 
     # ------------------------------------------------------------------

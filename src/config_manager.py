@@ -17,6 +17,10 @@
     панель результата анализа (AnalysisResultWidget) в окне
     «Скрам» по умолчанию свёрнута. Это освобождает место
     для блоков «Поручения» и «Задачи TFS».
+  • НОВОЕ: app.scrum_sort_by_assignee — сортировка таблиц
+    «Поручения» и «Задачи TFS» в окне «Скрам» по колонке
+    «Исполнитель» (по возрастанию, пустые — в конце).
+    Применяется всегда и ко всем обновлениям данных.
 """
 from __future__ import annotations
 
@@ -358,6 +362,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "scrum_always_on_top": True,
         "scrum_day_view_mode": "summary",
         "scrum_analysis_collapsed_by_default": True,
+        # --- НОВОЕ: сортировка по исполнителю ---
+        "scrum_sort_by_assignee": True,
     }
 }
 

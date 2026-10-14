@@ -57,6 +57,11 @@
     При получении результата панель НЕ разворачивается
     автоматически — пользователь разворачивает кликом по
     заголовку.
+  • НОВОЕ: сортировка таблиц «Поручения» и «Задачи TFS» по
+    колонке «Исполнитель». Управляется настройкой
+    app.scrum_sort_by_assignee (по умолчанию включена).
+    Настройка читается один раз при открытии окна и
+    прокидывается в TasksEditorWidget и TfsPanelWidget.
 """
 from __future__ import annotations
 
@@ -841,6 +846,15 @@ class ScrumWindow(QDialog):
                 )
 
         self._app_cfg = app_cfg
+
+        # --- НОВОЕ: сортировка таблиц по исполнителю ---
+        # Читаем один раз при открытии окна. Управляет
+        # сортировкой и таблицы поручений, и дерева задач TFS.
+        # Значение берётся из Настройки → Скрам.
+        self._sort_by_assignee = bool(
+            self._app_cfg.get("scrum_sort_by_assignee", True)
+        )
+
         self._max_protocol_chars = int(
             app_cfg.get("scrum_protocol_tab_max_chars", 500_000)
         )
@@ -908,11 +922,13 @@ class ScrumWindow(QDialog):
 
         log.info(
             "ScrumWindow открыто: session=%s, is_scrum=%s, "
-            "day_view_mode=%r, analysis_collapsed=%s",
+            "day_view_mode=%r, analysis_collapsed=%s, "
+            "sort_by_assignee=%s",
             os.path.basename(session_dir),
             self._session_meta.get("is_scrum"),
             self._initial_day_view_mode,
             self.analysis_widget.is_expanded() is False,
+            self._sort_by_assignee,
         )
 
     # ------------------------------------------------------------------
@@ -969,6 +985,7 @@ class ScrumWindow(QDialog):
             session_name=self._session_name,
             employees=self._employees,
             compact=True,
+            sort_by_assignee=self._sort_by_assignee,
             parent=self,
         )
         self.left_splitter.addWidget(self.tasks_widget)
@@ -976,6 +993,7 @@ class ScrumWindow(QDialog):
         self.tfs_widget = TfsPanelWidget(
             config_manager=self._config_manager,
             max_items=self._tfs_max_items,
+            sort_by_assignee=self._sort_by_assignee,
             parent=self,
         )
         self.left_splitter.addWidget(self.tfs_widget)
