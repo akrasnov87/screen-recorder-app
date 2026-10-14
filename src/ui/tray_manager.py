@@ -3,6 +3,9 @@
 Изменения:
   • Добавлен пункт меню «Задачи TFS» и сигнал
     open_tfs_requested.
+  • УДАЛЕНО: пункт «Начать запись…», сигналы toggle_recording
+    и upload_video, метод set_recording_state — механизм записи
+    экрана удалён из приложения.
 """
 from __future__ import annotations
 
@@ -16,7 +19,6 @@ from PySide6.QtWidgets import (
 )
 
 from ..logger import get_logger
-from ..platform_utils import is_screen_recording_available
 
 log = get_logger(__name__)
 
@@ -45,8 +47,6 @@ def _icon_path(name: str) -> str:
     """
     base = os.path.join(_resources_dir(), "icons")
 
-    # Сначала .png (для панели задач / дока это надёжнее),
-    # потом .svg.
     for ext in (".png", ".svg"):
         p = os.path.join(base, name + ext)
         if os.path.exists(p):
@@ -88,14 +88,12 @@ class TrayManager(QObject):
     """Менеджер системного трея."""
 
     open_yandex_vm_requested = Signal()
-    toggle_recording_requested = Signal()
     open_settings_requested = Signal()
     open_queue_requested = Signal()
     open_sessions_requested = Signal()
     open_library_requested = Signal()
     open_sync_requested = Signal()
     import_requested = Signal()
-    upload_video_requested = Signal()
     quit_requested = Signal()
     open_tasks_requested = Signal()
     open_tasks_editor_requested = Signal()
@@ -103,6 +101,8 @@ class TrayManager(QObject):
     open_tfs_requested = Signal()
     # --- НОВОЕ: создание записи-документа ---
     create_document_requested = Signal()
+    # --- НОВОЕ: загрузка внешнего видео ---
+    upload_video_requested = Signal()
 
     def __init__(
         self,
@@ -122,8 +122,6 @@ class TrayManager(QObject):
 
         self._tray: Optional[QSystemTrayIcon] = None
         self._menu: Optional[QMenu] = None
-        self._state = "idle"
-        self._record_action: Optional[QAction] = None
 
     def create_tray_icon(self) -> None:
         log.info("Создание иконки в системном трее")
@@ -150,11 +148,7 @@ class TrayManager(QObject):
         menu = QMenu()
         self._menu = menu
 
-        self._record_action = QAction("Начать запись…", menu)
-        self._record_action.triggered.connect(self.toggle_recording)
-        menu.addAction(self._record_action)
-
-        menu.addSeparator()
+        # --- УДАЛЕНО: пункт «Начать запись…» ---
 
         upload_action = QAction("Загрузить видео", menu)
         upload_action.setToolTip(
@@ -163,7 +157,7 @@ class TrayManager(QObject):
         upload_action.triggered.connect(self.upload_video)
         menu.addAction(upload_action)
 
-        # --- НОВОЕ: создать запись из документов ---
+        # --- Создать запись из документов ---
         create_doc_action = QAction(
             "Создать запись (документ)…", menu
         )
@@ -207,7 +201,7 @@ class TrayManager(QObject):
         tasks_action.triggered.connect(self.open_tasks)
         menu.addAction(tasks_action)
 
-        # --- НОВОЕ: пункт «Задачи TFS» ---
+        # --- Пункт «Задачи TFS» ---
         tfs_action = QAction("Задачи TFS", menu)
         tfs_action.setToolTip(
             "Просмотр списка задач из TFS / Azure DevOps Server "
@@ -263,33 +257,7 @@ class TrayManager(QObject):
         log.debug("Клик: открыть окно «Задачи TFS»")
         self.open_tfs_requested.emit()
 
-    def set_recording_state(self, state: str) -> None:
-        if not is_screen_recording_available():
-            return
-        log.info("Состояние трея: %s → %s", self._state, state)
-        self._state = state
-        if self._tray is None:
-            return
-
-        icon_map = {
-            "idle": "app",
-            "recording": "recording",
-            "paused": "paused",
-            "processing": "processing",
-        }
-        name = icon_map.get(state, "app")
-        path = _icon_path(name)
-
-        if path:
-            self._tray.setIcon(QIcon(path))
-        else:
-            self._tray.setIcon(_app_icon())
-
-        if self._record_action:
-            if state in ("recording", "paused"):
-                self._record_action.setText("Остановить запись")
-            else:
-                self._record_action.setText("Начать запись")
+    # --- УДАЛЕНО: set_recording_state() ---
 
     def open_yandex_vm(self) -> None:
         log.debug("Клик: открыть окно «ВМ Yandex»")
@@ -313,9 +281,7 @@ class TrayManager(QObject):
             self._notify_timeout_ms,
         )
 
-    def toggle_recording(self) -> None:
-        log.debug("Клик: переключить запись")
-        self.toggle_recording_requested.emit()
+    # --- УДАЛЕНО: toggle_recording() ---
 
     def open_settings(self) -> None:
         log.debug("Клик: открыть настройки")

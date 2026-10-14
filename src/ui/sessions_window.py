@@ -90,10 +90,7 @@ from .media_player import (
 from .metadata_dialog import MetadataDialog
 from .text_viewer import TextViewerDialog
 from .tooltips import attach_tooltip
-from ..platform_utils import (
-    is_screen_recording_available,
-    screen_recording_unavailable_reason,
-)
+
 from .tasks_editor_dialog import TasksEditorDialog
 from .scrum_window import ScrumWindow
 

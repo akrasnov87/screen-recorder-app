@@ -6,13 +6,14 @@
     parse_date_from_filename().
   • Добавлена safe_local_path() — нормализует путь от QFileDialog
     (декодирует percent-encoding, убирает \0).
+  • УДАЛЕНО: функции find_drm_card(), is_recording_supported(),
+    recording_unavailable_message() — механизм записи экрана
+    удалён из приложения.
 """
 from __future__ import annotations
 
 import os
-import re
 import shutil
-import subprocess
 import uuid
 from datetime import datetime
 from typing import Dict, List
@@ -21,18 +22,18 @@ from urllib.parse import unquote
 from .logger import get_logger
 from .platform_utils import (
     IS_LINUX,
-    IS_WINDOWS,
     ffmpeg_binary_name,
-    ffprobe_binary_name,
-    is_screen_recording_available,
-    screen_recording_unavailable_reason,
 )
 
 log = get_logger(__name__)
 
 
 def check_ffmpeg_installed() -> bool:
-    """Проверяет наличие ffmpeg в PATH (кроссплатформенно)."""
+    """Проверяет наличие ffmpeg в PATH (кроссплатформенно).
+
+    Используется процессором для конвертации видео в аудио
+    и модулем video_compressor для автосжатия.
+    """
     binary = ffmpeg_binary_name()
     path = shutil.which(binary)
     found = path is not None
@@ -48,8 +49,12 @@ def get_system_monitors() -> List[Dict[str, str]]:
     Возвращает список мониторов.
 
     Кроссплатформенно через Qt (QGuiApplication.screens()).
-    На Linux формат `display` совместим с x11grab
-    (":0.0+X,Y"); на Windows `display` — имя монитора.
+
+    Используется для:
+      • настройки «Монитор» — оставлено для совместимости
+        с форматами legacy-конфигов (в новых версиях поле
+        может быть не нужно);
+      • отображения информации о дисплеях.
 
     Если Qt ещё не инициализирован — возвращает fallback
     1920x1080 (для ранних вызовов из config_manager).
@@ -90,8 +95,6 @@ def get_system_monitors() -> List[Dict[str, str]]:
 
         name = screen.name() or f"screen{i}"
 
-        # На Linux оставляем формат x11grab для совместимости
-        # с recorder.py. На Windows/macOS — просто имя экрана.
         if IS_LINUX:
             display = f":0.0+{geo.x()},{geo.y()}"
         else:
@@ -139,34 +142,6 @@ def generate_task_id() -> str:
     return task_id
 
 
-def find_drm_card() -> str | None:
-    """
-    Возвращает путь к первому доступному /dev/dri/cardN.
-
-    Только для Linux (kmsgrab). На других ОС — None.
-    """
-    if not IS_LINUX:
-        log.debug(
-            "find_drm_card: не Linux (%s) — возвращаем None",
-            "Windows" if IS_WINDOWS else "другая ОС",
-        )
-        return None
-
-    import glob
-    cards = sorted(glob.glob("/dev/dri/card[0-9]*"))
-    if not cards:
-        log.warning("Не найдено ни одного /dev/dri/cardN")
-        return None
-    for c in cards:
-        if os.access(c, os.R_OK):
-            log.debug("Найден доступный DRM-узел: %s", c)
-            return c
-    log.warning(
-        "DRM-узлы найдены, но ни один не доступен: %s", cards
-    )
-    return cards[0]
-
-
 # ---------------------------------------------------------------------------
 # Нормализация путей от QFileDialog
 # ---------------------------------------------------------------------------
@@ -201,7 +176,6 @@ def safe_local_path(path: str) -> str:
             break
         decoded = new_val
 
-    # Убираем нулевые байты — защита от «битых» имён.
     decoded = decoded.replace("\x00", "")
 
     if decoded != path:
@@ -214,12 +188,8 @@ def safe_local_path(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Санитизация имён файлов
 # ---------------------------------------------------------------------------
-
-# Символы, недопустимые в именах файлов на большинстве ФС.
 _FILENAME_BAD_CHARS = '<>:"/\\|?*\n\r\t'
 
-# Значение по умолчанию для лимита имени вложения (символы).
-# Должно совпадать с config["app"]["attachment_name_max_chars"].
 DEFAULT_ATTACHMENT_NAME_MAX_CHARS = 50
 
 
@@ -287,12 +257,10 @@ def sanitize_filename(
 
     stem, ext = os.path.splitext(cleaned)
 
-    # Если расширение слишком длинное — игнорируем его.
     if len(ext) > 10:
         stem = cleaned
         ext = ""
 
-    # Резервируем место под расширение.
     stem_limit = max(1, limit - len(ext))
     if len(stem) > stem_limit:
         stem = stem[:stem_limit]
@@ -306,15 +274,3 @@ def sanitize_filename(
         name, result, len(cleaned), len(result),
     )
     return result
-
-# ---------------------------------------------------------------------------
-# Доступность записи экрана
-# ---------------------------------------------------------------------------
-def is_recording_supported() -> bool:
-    """Доступна ли запись экрана на текущей платформе."""
-    return is_screen_recording_available()
-
-
-def recording_unavailable_message() -> str:
-    """Возвращает сообщение о недоступности записи."""
-    return screen_recording_unavailable_reason()

@@ -5,6 +5,10 @@
   • В _ask_metadata() добавлена передача relations_max_in_dialog
     из app-настроек и session_dir в initial.
   • В _build_default_meta() добавлено поле relations.
+  • УДАЛЕНО: механизм записи экрана (ScreenRecorder,
+    GlobalHotkeyManager, OverlayPanel) и связанные сигналы.
+    Приложение теперь работает как «обработчик готовых видео
+    и документов»: загрузка видео, импорт, запись-документ.
 """
 from __future__ import annotations
 
@@ -24,11 +28,9 @@ if __package__ in (None, ""):
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     )
     from src.config_manager import ConfigManager
-    from src.hotkeys import GlobalHotkeyManager
     from src.ui.import_window import ImportWindow
     from src.ui.library_window import LibraryWindow
     from src.ui.metadata_dialog import MetadataDialog
-    from src.ui.overlay_panel import OverlayPanel
     from src.ui.queue_window import QueueWindow
     from src.ui.sessions_window import SessionsWindow
     from src.ui.settings_window import SettingsWindow
@@ -44,32 +46,20 @@ if __package__ in (None, ""):
         setup_logger,
     )
     from src.processor import VideoProcessor
-    from src.recorder import ScreenRecorder
     from src.sync_manager import SyncManager, is_record_published
     from src.task_queue import TaskQueue
     from src.yandex_vm_manager import YandexVMManager
-    from src.platform_utils import (
-        IS_LINUX,
-        IS_WINDOWS,
-        is_screen_recording_available,
-        is_hotkey_recording_available,
-        screen_recording_unavailable_reason,
-    )
+    from src.platform_utils import IS_LINUX, IS_WINDOWS
     from src.utils import (
         check_ffmpeg_installed,
-        get_system_monitors,
         safe_local_path,
         sanitize_filename,
-        is_recording_supported,
-        recording_unavailable_message,
     )
 else:
     from .config_manager import ConfigManager
-    from .hotkeys import GlobalHotkeyManager
     from .ui.import_window import ImportWindow
     from .ui.library_window import LibraryWindow
     from .ui.metadata_dialog import MetadataDialog
-    from .ui.overlay_panel import OverlayPanel
     from .ui.queue_window import QueueWindow
     from .ui.sessions_window import SessionsWindow
     from .ui.settings_window import SettingsWindow
@@ -85,24 +75,14 @@ else:
         setup_logger,
     )
     from .processor import VideoProcessor
-    from .recorder import ScreenRecorder
     from .sync_manager import SyncManager, is_record_published
     from .task_queue import TaskQueue
     from .yandex_vm_manager import YandexVMManager
-    from src.platform_utils import (
-        IS_LINUX,
-        IS_WINDOWS,
-        is_screen_recording_available,
-        is_hotkey_recording_available,
-        screen_recording_unavailable_reason,
-    )
-    from src.utils import (
+    from .platform_utils import IS_LINUX, IS_WINDOWS
+    from .utils import (
         check_ffmpeg_installed,
-        get_system_monitors,
         safe_local_path,
         sanitize_filename,
-        is_recording_supported,
-        recording_unavailable_message,
     )
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Slot
@@ -117,8 +97,6 @@ log = get_logger(__name__)
 class AppState(Enum):
     """Явные состояния приложения."""
     IDLE = "idle"
-    RECORDING = "recording"
-    PAUSED = "paused"
     PROCESSING = "processing"
     QUITTING = "quitting"
 
@@ -129,7 +107,18 @@ def _resource(name: str) -> str:
 
 
 class ScreenRecorderApp(QObject):
-    """Главный контроллер приложения."""
+    """Главный контроллер приложения.
+
+    После удаления механизма записи экрана приложение
+    выполняет роль «пост-обработчика»:
+      • загрузка готовых видеофайлов;
+      • импорт видео/стенограмм/протоколов;
+      • создание записей-документов;
+      • транскрибация, суммаризация, DeepSeek-промпт;
+      • TFS-выборка, поручения;
+      • синхронизация с сервером;
+      • отправка в Bitrix24.
+    """
 
     def __init__(self, app: QApplication) -> None:
         super().__init__()
@@ -146,15 +135,14 @@ class ScreenRecorderApp(QObject):
         )
         log.debug("Очередь: %s", self.task_queue.get_queue_status())
 
-        self.recorder = ScreenRecorder(self.config_manager.config)
         self.processor = VideoProcessor(
             self.config_manager.config,
             self.task_queue,
-            is_recording_cb=self._is_recording,
+            is_recording_cb=None,     # записи экрана больше нет
             config_manager=self.config_manager,
         )
         self.tray_manager = TrayManager(self.config_manager.config, self)
-        self.overlay_panel = OverlayPanel(self.config_manager.config)
+
         self.settings_window: Optional[SettingsWindow] = None
         self.queue_window: Optional[QueueWindow] = None
         self.sessions_window: Optional[SessionsWindow] = None
@@ -163,25 +151,16 @@ class ScreenRecorderApp(QObject):
         self.tasks_window: Optional[TasksWindow] = None
         self.tfs_window: Optional[TfsWindow] = None
 
-        self.hotkey_manager = GlobalHotkeyManager(
-            self.recorder,
-            self.config_manager,
-            start_cb=self._hotkey_start_recording,
-            stop_cb=self._hotkey_stop_recording,
-        )
-
         self._state: AppState = AppState.IDLE
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._processing_task: Optional[asyncio.Task] = None
         self._sync_pull_task: Optional[asyncio.Task] = None
 
-        self._current_session_meta: Dict[str, Any] = {}
-
         self._connect_signals()
         self._start_async_loop()
         self._maybe_start_sync_puller()
-        log.info("ScreenRecorderApp инициализирован (локальный режим)")
+        log.info("ScreenRecorderApp инициализирован (без записи)")
 
     # ------------------------------------------------------------------
     # Состояние
@@ -197,30 +176,16 @@ class ScreenRecorderApp(QObject):
     def state(self) -> AppState:
         return self._state
 
-    def _is_recording(self) -> bool:
-        """Возвращает True, если идёт запись (в т.ч. на паузе)."""
-        try:
-            return bool(
-                self.recorder.get_recording_status().get(
-                    "recording", False
-                )
-            )
-        except Exception:
-            return False
-
     # ------------------------------------------------------------------
     # Инициализация
     # ------------------------------------------------------------------
     def _connect_signals(self) -> None:
         log.debug("Подключение сигналов")
-        self.tray_manager.toggle_recording_requested.connect(
-            self._toggle_recording
-        )
 
+        # --- Трей: общие пункты меню ---
         self.tray_manager.open_yandex_vm_requested.connect(
             self._open_yandex_vm
         )
-
         self.tray_manager.open_settings_requested.connect(
             self._open_settings
         )
@@ -249,35 +214,14 @@ class ScreenRecorderApp(QObject):
         )
         self.tray_manager.quit_requested.connect(self._quit)
 
-        self.recorder.recording_started.connect(
-            self._on_recording_started
-        )
-        self.recorder.recording_paused.connect(
-            self._on_recording_paused
-        )
-        self.recorder.recording_resumed.connect(
-            self._on_recording_resumed
-        )
-        self.recorder.recording_stopped.connect(
-            self._on_recording_stopped
-        )
-        self.recorder.recording_error.connect(
-            lambda msg: self._notify(
-                "Ошибка записи", msg,
-                QSystemTrayIcon.MessageIcon.Critical,
-            )
-        )
+        # --- УДАЛЕНО: сигналы tray_manager.toggle_recording_requested,
+        #     recorder.*, overlay_panel.* ---
 
+        # --- Обработчик задач ---
         self.processor.task_started.connect(self._on_task_started)
         self.processor.task_progress.connect(self._on_task_progress)
         self.processor.task_completed.connect(self._on_task_completed)
         self.processor.task_failed.connect(self._on_task_failed)
-
-        self.overlay_panel.start_requested.connect(
-            self._start_recording
-        )
-        self.overlay_panel.pause_requested.connect(self._toggle_pause)
-        self.overlay_panel.stop_requested.connect(self._stop_recording)
 
         register_gui_handler(self._on_log_to_gui)
 
@@ -301,8 +245,6 @@ class ScreenRecorderApp(QObject):
             daemon=True,
         )
         self._async_thread.start()
-
-        self.hotkey_manager.set_loop(self._loop)
         log.info("asyncio-loop запущен в фоновом потоке")
 
     # ------------------------------------------------------------------
@@ -319,7 +261,9 @@ class ScreenRecorderApp(QObject):
             log.debug("Фоновый sync-puller не запускается (выключен)")
             return
         if not (cfg.get("base_url") and cfg.get("api_key")):
-            log.debug("Фоновый sync-puller не запускается (нет base_url/api_key)")
+            log.debug(
+                "Фоновый sync-puller не запускается (нет base_url/api_key)"
+            )
             return
 
         interval = int(cfg.get("auto_pull_interval", 300))
@@ -355,17 +299,6 @@ class ScreenRecorderApp(QObject):
     # ------------------------------------------------------------------
     # Геттеры конфига
     # ------------------------------------------------------------------
-    def _rec_cfg(self) -> Dict[str, Any]:
-        return self.config_manager.config.get("recording", {})
-
-    def _show_overlay(self) -> bool:
-        return bool(self._rec_cfg().get("show_overlay_panel", True))
-
-    def _show_start_notification(self) -> bool:
-        return bool(
-            self._rec_cfg().get("show_start_notification", True)
-        )
-
     def _sessions_root(self) -> str:
         return self.config_manager.get_sessions_root()
 
@@ -438,7 +371,6 @@ class ScreenRecorderApp(QObject):
                 )
                 return []
 
-        # --- НОВОЕ: лимит связей в диалоге ---
         relations_max = int(
             self.app_cfg.get("relations_max_in_dialog", 0) or 0
         )
@@ -465,7 +397,6 @@ class ScreenRecorderApp(QObject):
                 self.app_cfg.get("tfs_save_attachment", True)
             ),
             allow_document_only=allow_document_only,
-            # --- НОВОЕ ---
             relations_max_in_dialog=relations_max,
             parent=None,
         )
@@ -525,7 +456,6 @@ class ScreenRecorderApp(QObject):
             "tfs_save_attachment": bool(
                 self.app_cfg.get("tfs_save_attachment", True)
             ),
-            # --- НОВОЕ: связи ---
             "relations": [],
         }
         log.debug(
@@ -690,92 +620,7 @@ class ScreenRecorderApp(QObject):
         return session_dir
 
     # ------------------------------------------------------------------
-    # Запись
-    # ------------------------------------------------------------------
-    @Slot()
-    def _start_recording(self) -> None:
-        log.info("Запрос на старт записи (UI)")
-
-        if not is_screen_recording_available():
-            reason = screen_recording_unavailable_reason()
-            log.warning(
-                "Запись недоступна на платформе %s",
-                "Windows" if IS_WINDOWS else "не Linux",
-            )
-            QMessageBox.warning(
-                None,
-                "Запись экрана недоступна",
-                reason,
-            )
-            return
-
-        rec = self._rec_cfg()
-
-        if rec.get("show_metadata_on_start", True):
-            meta = self._ask_metadata(title="Параметры записи")
-            if meta is None:
-                log.info("Пользователь отменил ввод метаданных")
-                return
-        else:
-            meta = self._build_default_meta()
-
-        self._current_session_meta = meta
-
-        monitors = get_system_monitors()
-        idx = int(rec.get("monitor", 0))
-        display = (monitors[idx]["display"]
-                   if 0 <= idx < len(monitors) else ":0.0+0,0")
-
-        self.recorder.set_overlay_text(
-            f"{meta.get('name', 'ScreenRecorder')} "
-            f"{datetime.now():%Y-%m-%d %H:%M}"
-        )
-
-        async def _run():
-            await self.recorder.start_recording(
-                display, rec.get("with_microphone", True)
-            )
-
-        asyncio.run_coroutine_threadsafe(_run(), self._loop)
-
-    def _toggle_recording(self) -> None:
-        if not is_screen_recording_available():
-            reason = screen_recording_unavailable_reason()
-            QMessageBox.warning(
-                None,
-                "Запись экрана недоступна",
-                reason,
-            )
-            return
-
-        status = self.recorder.get_recording_status()
-        if status["recording"]:
-            self._stop_recording()
-        else:
-            self._start_recording()
-
-    def _toggle_pause(self) -> None:
-        status = self.recorder.get_recording_status()
-        if not status["recording"]:
-            return
-        if status["paused"]:
-            asyncio.run_coroutine_threadsafe(
-                self.recorder.resume_recording(), self._loop
-            )
-        else:
-            asyncio.run_coroutine_threadsafe(
-                self.recorder.pause_recording(), self._loop
-            )
-
-    @Slot()
-    def _stop_recording(self) -> None:
-        log.info("Запрос на остановку записи (UI)")
-        asyncio.run_coroutine_threadsafe(
-            self.recorder.stop_recording(), self._loop
-        )
-
-    # ------------------------------------------------------------------
-    # Загрузить видео
+    # Загрузить видео (вместо старой записи)
     # ------------------------------------------------------------------
     @Slot()
     def _open_upload_video(self) -> None:
@@ -840,16 +685,12 @@ class ScreenRecorderApp(QObject):
             return
 
         meta["date"] = datetime.now().strftime("%Y-%m-%d")
-        meta["monitor"] = (
-            self.config_manager.config["recording"].get("monitor", 0)
-        )
         meta["session_dir"] = session_dir
         meta["video_path"] = target_video
         meta["source"] = "upload"
         meta["source_file"] = src_abs
         meta.pop("task_id", None)
 
-        # --- relations переносим, если пользователь их задал ---
         meta.setdefault("relations", [])
 
         self._copy_attachments_to_session(meta, session_dir)
@@ -1172,10 +1013,6 @@ class ScreenRecorderApp(QObject):
             },
             "video_path": video_dst,
             "session_dir": session_dir,
-            "monitor": (
-                self.config_manager.config["recording"]
-                .get("monitor", 0)
-            ),
             "name_template": "",
             "name_abbr": "",
             "prompt": self.config_manager.get_default_prompt(),
@@ -1196,7 +1033,6 @@ class ScreenRecorderApp(QObject):
             "tfs_project": "",
             "tfs_template_name": "",
             "tfs_save_attachment": False,
-            # --- НОВОЕ: связи ---
             "relations": [],
         }
 
@@ -1252,159 +1088,28 @@ class ScreenRecorderApp(QObject):
         return read_any_text(path)
 
     # ------------------------------------------------------------------
-    # Хоткеи
-    # ------------------------------------------------------------------
-    def _hotkey_start_recording(self) -> None:
-        if not is_hotkey_recording_available():
-            log.debug(
-                "Хоткей старта записи недоступен на этой платформе"
-            )
-            return
-        status = self.recorder.get_recording_status()
-        if status["recording"]:
-            if status["paused"]:
-                QTimer.singleShot(
-                    0, lambda: asyncio.run_coroutine_threadsafe(
-                        self.recorder.resume_recording(), self._loop
-                    )
-                )
-            else:
-                QTimer.singleShot(
-                    0, lambda: asyncio.run_coroutine_threadsafe(
-                        self.recorder.pause_recording(), self._loop
-                    )
-                )
-        else:
-            QTimer.singleShot(0, self._start_recording)
-
-    def _hotkey_stop_recording(self) -> None:
-        if not is_hotkey_recording_available():
-            log.debug(
-                "Хоткей остановки записи недоступен на этой платформе"
-            )
-            return
-        QTimer.singleShot(0, self._stop_recording)
-
-    # ------------------------------------------------------------------
-    # Обработчики записи
-    # ------------------------------------------------------------------
-    def _on_recording_started(self) -> None:
-        log.info("Событие: запись началась")
-        self._set_state(AppState.RECORDING)
-        self.tray_manager.set_recording_state("recording")
-        if self._show_overlay():
-            self.overlay_panel.reset()
-            self.overlay_panel.show_panel()
-            self.overlay_panel.update_status("Запись...")
-        if self._show_start_notification():
-            self._notify("Запись", "Запись началась")
-
-    def _on_recording_paused(self) -> None:
-        log.info("Событие: запись на паузе")
-        self._set_state(AppState.PAUSED)
-        self.tray_manager.set_recording_state("paused")
-        if self._show_overlay():
-            self.overlay_panel.update_status("Пауза")
-        self._notify("Запись", "Запись приостановлена")
-
-    def _on_recording_resumed(self) -> None:
-        log.info("Событие: запись возобновлена")
-        self._set_state(AppState.RECORDING)
-        self.tray_manager.set_recording_state("recording")
-        if self._show_overlay():
-            self.overlay_panel.update_status("Запись...")
-
-    def _on_recording_stopped(self, path: str) -> None:
-        log.info("Событие: запись остановлена, файл=%s", path)
-        self._set_state(AppState.IDLE)
-        if self._show_overlay():
-            self.overlay_panel.reset()
-            self.overlay_panel.update_status("Обработка...")
-
-        if not path or not os.path.exists(path):
-            log.error("Файл записи не найден: %s", path)
-            self._notify(
-                "Ошибка", "Файл записи не найден",
-                QSystemTrayIcon.MessageIcon.Critical,
-            )
-            self.tray_manager.set_recording_state("idle")
-            if self._show_overlay():
-                self.overlay_panel.hide_panel()
-            return
-
-        rec = self._rec_cfg()
-        if rec.get("show_metadata_on_stop", True):
-            initial = dict(self._current_session_meta)
-            meta = self._ask_metadata(
-                title="Уточните данные записи",
-                initial=initial,
-            )
-            if meta is None:
-                meta = initial or self._build_default_meta()
-        else:
-            meta = (dict(self._current_session_meta)
-                    or self._build_default_meta())
-
-        now = datetime.now()
-
-        if not (meta.get("date") or "").strip():
-            meta["date"] = now.strftime("%Y-%m-%d")
-        if not (meta.get("time") or "").strip():
-            meta["time"] = now.strftime("%H:%M:%S")
-
-        meta["monitor"] = (
-            self.config_manager.config["recording"].get("monitor", 0)
-        )
-        session_dir = os.path.dirname(path)
-        meta["session_dir"] = session_dir
-        meta["video_path"] = path
-        meta["source"] = "record"
-        meta.pop("task_id", None)
-        meta.setdefault("relations", [])
-
-        self._copy_attachments_to_session(meta, session_dir)
-        self._save_session_metadata(meta, session_dir)
-
-        task_id = self.task_queue.add_task(
-            {"video_path": path, "metadata": meta}
-        )
-        log.info("Задача %s добавлена в очередь", task_id)
-
-        self._current_session_meta = {}
-
-    # ------------------------------------------------------------------
-    # Обработка задач
+    # Обработчики задач
     # ------------------------------------------------------------------
     def _on_task_started(self, task_id: str) -> None:
-        if self._is_recording():
-            return
         self._set_state(AppState.PROCESSING)
-        self.tray_manager.set_recording_state("processing")
 
     def _on_task_progress(self, task_id: str, progress: int,
                           stage: str) -> None:
-        if self._show_overlay():
-            self.overlay_panel.update_progress(progress, stage)
+        # Overlay-панели больше нет — прогресс виден в
+        # окне «Очередь задач» и в логах.
+        log.debug(
+            "Прогресс задачи %s: %d%% (%s)",
+            task_id, progress, stage,
+        )
 
     def _on_task_completed(self, task_id: str, result: dict) -> None:
-        if not self._is_recording():
-            self._set_state(AppState.IDLE)
-            self.tray_manager.set_recording_state("idle")
-        if self._show_overlay():
-            self.overlay_panel.update_progress(100, "Готово")
+        self._set_state(AppState.IDLE)
         output_dir = result.get("output_dir", "")
         if output_dir:
             self._notify("Обработка",
                          f"Файлы сохранены в {output_dir}")
         else:
             self._notify("Обработка", "Задача завершена")
-        if self._show_overlay() and not self._is_recording():
-            hide_after = int(
-                self.app_cfg.get("overlay_hide_after_task_ms", 3000)
-            )
-            QTimer.singleShot(
-                hide_after, self.overlay_panel.hide_panel
-            )
 
         if output_dir:
             self._auto_publish_after_processing(task_id, output_dir)
@@ -1497,9 +1202,7 @@ class ScreenRecorderApp(QObject):
 
     def _on_task_failed(self, task_id: str, error: str) -> None:
         log.error("Задача %s провалена: %s", task_id, error)
-        if not self._is_recording():
-            self._set_state(AppState.IDLE)
-            self.tray_manager.set_recording_state("idle")
+        self._set_state(AppState.IDLE)
         self._notify(
             "Ошибка обработки", error[:100],
             QSystemTrayIcon.MessageIcon.Critical,
@@ -1585,12 +1288,8 @@ class ScreenRecorderApp(QObject):
         if self.settings_window.exec():
             self.config_manager.load()
             self.app_cfg = self.config_manager.get_app_settings()
-            self.recorder.config = self.config_manager.config
             self.processor.config = self.config_manager.config
             self.processor.config_manager = self.config_manager
-            self.hotkey_manager.update_hotkeys(
-                self.config_manager.config
-            )
 
     def _open_queue(self) -> None:
         self.queue_window = QueueWindow(
@@ -1692,8 +1391,10 @@ class ScreenRecorderApp(QObject):
     # Логи / уведомления
     # ------------------------------------------------------------------
     def _on_log_to_gui(self, message: str, level: str) -> None:
-        if self._show_overlay():
-            self.overlay_panel.add_log(f"[{level}] {message}")
+        # Overlay-панели больше нет — логи только в файл и консоль.
+        # Слот оставлен для будущих GUI-интеграций (например,
+        # окно «Журнал»).
+        pass
 
     def _notify(
         self,
@@ -1713,7 +1414,6 @@ class ScreenRecorderApp(QObject):
         self._set_state(AppState.QUITTING)
 
         self.task_queue.save_queue()
-        self.hotkey_manager.unregister_hotkeys()
 
         if self._loop is not None:
             if self._sync_pull_task is not None:
@@ -1747,20 +1447,10 @@ class ScreenRecorderApp(QObject):
 
     def startup(self) -> None:
         self.tray_manager.create_tray_icon()
-        self.hotkey_manager.register_hotkeys()
-
-        if is_screen_recording_available():
-            self._notify(
-                "Screen Recorder",
-                "Приложение запущено (локальный режим)",
-            )
-        else:
-            self._notify(
-                "Screen Recorder",
-                "Запись экрана недоступна на этой платформе. "
-                "Доступны транскрибация, синхронизация и другие "
-                "функции.",
-            )
+        self._notify(
+            "Screen Recorder",
+            "Приложение запущено",
+        )
 
 
 def main() -> int:
@@ -1786,7 +1476,7 @@ def main() -> int:
         backup_count=backup_count,
     )
     log.info("=" * 60)
-    log.info("Запуск Screen Recorder & Transcriber (локальный режим)")
+    log.info("Запуск Screen Recorder & Transcriber (без записи)")
     log.info("Python: %s", sys.version)
     log.info("=" * 60)
 

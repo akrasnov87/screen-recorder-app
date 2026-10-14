@@ -54,6 +54,17 @@ class VideoProcessor(QObject):
         config_manager=None,
         parent: Optional[QObject] = None,
     ) -> None:
+        """
+        Args:
+            config:          текущий конфиг приложения.
+            task_queue:      очередь задач.
+            is_recording_cb: ОСТАВЛЕН ДЛЯ СОВМЕСТИМОСТИ, но
+                             не используется — механизм записи
+                             экрана удалён. Всегда передавайте
+                             None (или не передавайте вовсе).
+            config_manager:  ConfigManager.
+            parent:          QObject-родитель.
+        """
         super().__init__(parent)
         self.config = config or {}
         self.task_queue = task_queue
@@ -80,10 +91,11 @@ class VideoProcessor(QObject):
             app_cfg.get("ffmpeg_stop_timeout", 10)
         )
 
-        log.info("VideoProcessor инициализирован "
-                 "(is_recording_cb=%s, poll=%.1fs, retry=%.0fs)",
-                 is_recording_cb is not None,
-                 self._poll_interval, self._retry_check_interval)
+        log.info(
+            "VideoProcessor инициализирован "
+            "(poll=%.1fs, retry=%.0fs)",
+            self._poll_interval, self._retry_check_interval,
+        )
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -3178,16 +3190,12 @@ class VideoProcessor(QObject):
     async def run_forever(self) -> None:
         self._running = True
         log.info(
-            "Фоновый воркер обработки запущен (локальный режим)"
+            "Фоновый воркер обработки запущен"
         )
         while self._running:
-            if self._is_recording_cb is not None:
-                try:
-                    if self._is_recording_cb():
-                        await asyncio.sleep(self._poll_interval)
-                        continue
-                except Exception as exc:
-                    log.warning("Ошибка в is_recording_cb: %s", exc)
+            # --- УДАЛЕНО: проверка self._is_recording_cb() ---
+            # Записи экрана больше нет — очередь обрабатывается
+            # без пауз.
 
             task = self.task_queue.get_next_task()
             if task is not None:

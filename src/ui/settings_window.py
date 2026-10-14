@@ -65,9 +65,7 @@ from .sync_window import SyncWindow                # ui → ui
 from .tooltips import attach_tooltip, make_info_icon, with_info
 from ..platform_utils import (
     IS_LINUX,
-    IS_WINDOWS,
-    is_screen_recording_available,
-    screen_recording_unavailable_reason,
+    IS_WINDOWS
 )
 from .transcribe_service_dialog import TranscribeServiceEditDialog
 
@@ -184,8 +182,8 @@ class SettingsWindow(QDialog):
             "Глоссарий",
         )
         self.tabs.addTab(
-            self._wrap_in_scroll(self._build_recording_tab()),
-            "Запись",
+            self._wrap_in_scroll(self._build_media_tab()),
+            "Медиа",
         )
         self.tabs.addTab(
             self._wrap_in_scroll(self._build_queue_tab()),
@@ -2950,168 +2948,39 @@ class SettingsWindow(QDialog):
         self.glossary_table.setCurrentCell(new_row, 0)
 
     # ------------------------------------------------------------------
-    # Запись
+    # Медиа (встроенный плеер и скачивание)
     # ------------------------------------------------------------------
-    def _build_recording_tab(self) -> QWidget:
+    def _build_media_tab(self) -> QWidget:
+        """
+        Вкладка «Медиа» — настройки встроенного плеера и
+        скачивания медиа с сервера.
+
+        Раньше эти настройки жили на вкладке «Запись» вместе с
+        параметрами записи экрана. После удаления механизма
+        записи сюда переехали только настройки плеера.
+        """
         w = QWidget()
         layout = QVBoxLayout(w)
 
-        # --- Блок «Запись» ---
-        main_form = QFormLayout()
-
-        self.monitor_combo = QComboBox()
-        for m in get_system_monitors():
-            self.monitor_combo.addItem(
-                f"{m['name']} ({m['width']}x{m['height']})",
-                m["display"],
-            )
-
-        self.mic_check = QCheckBox("Записывать микрофон")
-        attach_tooltip(self.mic_check, "mic")
-
-        self.watermark_check = QCheckBox(
-            "Наложение водяного знака"
+        info = QLabel(
+            "Настройки воспроизведения видео и аудио из окна "
+            "«Записи». Встроенный плеер (Qt Multimedia) не "
+            "зависит от системного VLC и работает даже в "
+            "snap-окружении."
         )
-        attach_tooltip(self.watermark_check, "watermark")
+        info.setWordWrap(True)
+        layout.addWidget(info)
 
-        self.hotkey_start_input = QLineEdit()
-        self.hotkey_start_input.setPlaceholderText("Ctrl+Shift+R")
+        # --- Статус встроенного плеера ---
+        status_str = probe_media_support()
+        self.player_status_label = QLabel(
+            f"<span style='color:#666'>Статус: </span>"
+            f"<span style='color:#444'>{status_str}</span>"
+        )
+        self.player_status_label.setWordWrap(True)
+        layout.addWidget(self.player_status_label)
 
-        self.hotkey_stop_input = QLineEdit()
-        self.hotkey_stop_input.setPlaceholderText("Ctrl+Shift+S")
-
-        self.metadata_on_start_check = QCheckBox(
-            "Показывать окно метаданных при старте записи"
-        )
-        attach_tooltip(
-            self.metadata_on_start_check, "metadata_on_start"
-        )
-
-        self.metadata_on_stop_check = QCheckBox(
-            "Показывать окно метаданных при остановке записи"
-        )
-        attach_tooltip(
-            self.metadata_on_stop_check, "metadata_on_stop"
-        )
-
-        self.overlay_panel_check = QCheckBox(
-            "Показывать плавающую панель управления"
-        )
-        attach_tooltip(self.overlay_panel_check, "overlay_panel")
-
-        self.start_notification_check = QCheckBox(
-            "Показывать уведомление о начале записи"
-        )
-        attach_tooltip(
-            self.start_notification_check, "start_notification"
-        )
-
-        main_form.addRow(
-            "Монитор:",
-            with_info(self.monitor_combo, "monitor"),
-        )
-        main_form.addRow("", self.mic_check)
-        main_form.addRow("", self.watermark_check)
-        main_form.addRow(
-            "Горячая клавиша старт/пауза:",
-            with_info(self.hotkey_start_input, "hotkey_start"),
-        )
-        main_form.addRow(
-            "Горячая клавиша стоп:",
-            with_info(self.hotkey_stop_input, "hotkey_stop"),
-        )
-        main_form.addRow("", self.metadata_on_start_check)
-        main_form.addRow("", self.metadata_on_stop_check)
-        main_form.addRow("", self.overlay_panel_check)
-        main_form.addRow("", self.start_notification_check)
-
-        self.ffmpeg_start_check_delay = QDoubleSpinBox()
-        self.ffmpeg_start_check_delay.setRange(0.05, 5.0)
-        self.ffmpeg_start_check_delay.setSingleStep(0.05)
-        self.ffmpeg_start_check_delay.setDecimals(2)
-        self.ffmpeg_start_check_delay.setSuffix(" сек")
-        self.ffmpeg_start_check_delay.setValue(0.3)
-
-        self.ffmpeg_stop_timeout = QSpinBox()
-        self.ffmpeg_stop_timeout.setRange(1, 120)
-        self.ffmpeg_stop_timeout.setSuffix(" сек")
-        self.ffmpeg_stop_timeout.setValue(10)
-
-        self.ffmpeg_kill_timeout = QSpinBox()
-        self.ffmpeg_kill_timeout.setRange(1, 60)
-        self.ffmpeg_kill_timeout.setSuffix(" сек")
-        self.ffmpeg_kill_timeout.setValue(5)
-
-        main_form.addRow(
-            "Задержка проверки ffmpeg:",
-            with_info(
-                self.ffmpeg_start_check_delay,
-                "app_ffmpeg_start_check_delay",
-            ),
-        )
-        main_form.addRow(
-            "Таймаут остановки ffmpeg:",
-            with_info(
-                self.ffmpeg_stop_timeout,
-                "app_ffmpeg_stop_timeout",
-            ),
-        )
-        main_form.addRow(
-            "Таймаут SIGKILL:",
-            with_info(
-                self.ffmpeg_kill_timeout,
-                "app_ffmpeg_kill_timeout",
-            ),
-        )
-
-        self.overlay_hide_delay_ms = QSpinBox()
-        self.overlay_hide_delay_ms.setRange(0, 60000)
-        self.overlay_hide_delay_ms.setSuffix(" мс")
-        self.overlay_hide_delay_ms.setSingleStep(500)
-        self.overlay_hide_delay_ms.setValue(5000)
-
-        self.overlay_log_lines = QSpinBox()
-        self.overlay_log_lines.setRange(1, 50)
-        self.overlay_log_lines.setValue(5)
-
-        main_form.addRow(
-            "Панель: скрывать через:",
-            with_info(
-                self.overlay_hide_delay_ms,
-                "app_overlay_hide_delay_ms",
-            ),
-        )
-        main_form.addRow(
-            "Панель: строк лога:",
-            with_info(
-                self.overlay_log_lines,
-                "app_overlay_log_lines",
-            ),
-        )
-
-        layout.addLayout(main_form)
-
-        # --- Блок «Встроенный плеер и скачивание медиа» ---
-        player_header = QHBoxLayout()
-        player_header.addWidget(
-            QLabel("<b>Встроенный плеер и скачивание медиа</b>")
-        )
-        player_header.addStretch()
-        player_header.addWidget(
-            make_info_icon("app_media_prefer_builtin_player")
-        )
-        layout.addLayout(player_header)
-
-        player_hint = QLabel(
-            "<span style='color:#666'>Настройки воспроизведения "
-            "видео и аудио из окна «Записи». Встроенный плеер "
-            "(Qt Multimedia) не зависит от системного VLC и "
-            "работает даже в snap-окружении.</span>"
-        )
-        player_hint.setWordWrap(True)
-        layout.addWidget(player_hint)
-
-        player_form = QFormLayout()
+        form = QFormLayout()
 
         self.media_prefer_builtin_check = QCheckBox(
             "Использовать встроенный плеер для видео и аудио"
@@ -3120,7 +2989,7 @@ class SettingsWindow(QDialog):
             self.media_prefer_builtin_check,
             "app_media_prefer_builtin_player",
         )
-        player_form.addRow("", self.media_prefer_builtin_check)
+        form.addRow("", self.media_prefer_builtin_check)
 
         self.media_auto_download_check = QCheckBox(
             "Автоматически скачивать медиа с сервера, если файла "
@@ -3130,14 +2999,14 @@ class SettingsWindow(QDialog):
             self.media_auto_download_check,
             "app_media_auto_download_from_server",
         )
-        player_form.addRow("", self.media_auto_download_check)
+        form.addRow("", self.media_auto_download_check)
 
         self.media_download_timeout = QSpinBox()
         self.media_download_timeout.setRange(30, 24 * 3600)
         self.media_download_timeout.setSingleStep(30)
         self.media_download_timeout.setSuffix(" сек")
         self.media_download_timeout.setValue(600)
-        player_form.addRow(
+        form.addRow(
             "Таймаут скачивания медиа:",
             with_info(
                 self.media_download_timeout,
@@ -3149,7 +3018,7 @@ class SettingsWindow(QDialog):
         self.media_player_width.setRange(320, 3840)
         self.media_player_width.setSuffix(" px")
         self.media_player_width.setValue(960)
-        player_form.addRow(
+        form.addRow(
             "Ширина окна плеера:",
             with_info(
                 self.media_player_width,
@@ -3161,7 +3030,7 @@ class SettingsWindow(QDialog):
         self.media_player_height.setRange(240, 2160)
         self.media_player_height.setSuffix(" px")
         self.media_player_height.setValue(640)
-        player_form.addRow(
+        form.addRow(
             "Высота окна плеера:",
             with_info(
                 self.media_player_height,
@@ -3169,52 +3038,8 @@ class SettingsWindow(QDialog):
             ),
         )
 
-        layout.addLayout(player_form)
-
-        # --- Статус встроенного плеера ---
-        status_str = probe_media_support()
-        self.player_status_label = QLabel(
-            f"<span style='color:#666'>Статус: </span>"
-            f"<span style='color:#444'>{status_str}</span>"
-        )
-        self.player_status_label.setWordWrap(True)
-        layout.addWidget(self.player_status_label)
-
+        layout.addLayout(form)
         layout.addStretch()
-        # --- Если запись экрана недоступна, отключаем поля ---
-        if not is_screen_recording_available():
-            reason = screen_recording_unavailable_reason()
-
-            warning = QLabel(
-                f"<span style='color:#c62828'><b>Запись экрана "
-                f"недоступна на этой платформе.</b></span><br>"
-                f"<span style='color:#666'>"
-                f"{reason.replace(chr(10), '<br>')}"
-                f"</span>"
-            )
-            warning.setWordWrap(True)
-            warning.setStyleSheet(
-                "QLabel { padding: 8px; border: 1px solid #c62828; "
-                "border-radius: 4px; background-color: #fff5f5; }"
-            )
-            layout.insertWidget(0, warning)
-
-            # Отключаем элементы, связанные с записью.
-            for w in (
-                self.monitor_combo,
-                self.mic_check,
-                self.watermark_check,
-                self.hotkey_start_input,
-                self.hotkey_stop_input,
-                self.metadata_on_start_check,
-                self.metadata_on_stop_check,
-                self.overlay_panel_check,
-                self.start_notification_check,
-            ):
-                try:
-                    w.setEnabled(False)
-                except Exception:
-                    pass
         return w
 
     # ------------------------------------------------------------------
@@ -3931,53 +3756,6 @@ class SettingsWindow(QDialog):
             bool(g["send_to_deepseek"])
         )
 
-        # --- Запись ---
-        rec = cfg.get("recording", {})
-        idx = int(rec.get("monitor", 0))
-        if 0 <= idx < self.monitor_combo.count():
-            self.monitor_combo.setCurrentIndex(idx)
-        self.mic_check.setChecked(
-            bool(rec.get("with_microphone", True))
-        )
-        self.watermark_check.setChecked(
-            bool(rec.get("show_watermark", True))
-        )
-        self.hotkey_start_input.setText(
-            rec.get("hotkey_start", "Ctrl+Shift+R")
-        )
-        self.hotkey_stop_input.setText(
-            rec.get("hotkey_stop", "Ctrl+Shift+S")
-        )
-        self.metadata_on_start_check.setChecked(
-            bool(rec.get("show_metadata_on_start", True))
-        )
-        self.metadata_on_stop_check.setChecked(
-            bool(rec.get("show_metadata_on_stop", True))
-        )
-        self.overlay_panel_check.setChecked(
-            bool(rec.get("show_overlay_panel", True))
-        )
-        self.start_notification_check.setChecked(
-            bool(rec.get("show_start_notification", True))
-        )
-
-        # --- app (ffmpeg, overlay, плеер) ---
-        self.ffmpeg_start_check_delay.setValue(
-            float(app_cfg.get("ffmpeg_start_check_delay", 0.3))
-        )
-        self.ffmpeg_stop_timeout.setValue(
-            int(app_cfg.get("ffmpeg_stop_timeout", 10))
-        )
-        self.ffmpeg_kill_timeout.setValue(
-            int(app_cfg.get("ffmpeg_kill_timeout", 5))
-        )
-        self.overlay_hide_delay_ms.setValue(
-            int(app_cfg.get("overlay_hide_delay_ms", 5000))
-        )
-        self.overlay_log_lines.setValue(
-            int(app_cfg.get("overlay_log_lines", 5))
-        )
-
         # --- встроенный плеер / скачивание медиа ---
         self.media_prefer_builtin_check.setChecked(
             bool(app_cfg.get("media_prefer_builtin_player", True))
@@ -4413,31 +4191,6 @@ class SettingsWindow(QDialog):
                 "Не удалось сохранить настройки транскрибации: %s",
                 exc,
             )
-        cfg["recording"] = {
-            "monitor": self.monitor_combo.currentIndex(),
-            "with_microphone": self.mic_check.isChecked(),
-            "show_watermark": self.watermark_check.isChecked(),
-            "hotkey_start": (
-                self.hotkey_start_input.text().strip()
-                or "Ctrl+Shift+R"
-            ),
-            "hotkey_stop": (
-                self.hotkey_stop_input.text().strip()
-                or "Ctrl+Shift+S"
-            ),
-            "show_metadata_on_start": (
-                self.metadata_on_start_check.isChecked()
-            ),
-            "show_metadata_on_stop": (
-                self.metadata_on_stop_check.isChecked()
-            ),
-            "show_overlay_panel": (
-                self.overlay_panel_check.isChecked()
-            ),
-            "show_start_notification": (
-                self.start_notification_check.isChecked()
-            ),
-        }
         cfg["queue"] = {
             "auto_retry_enabled": (
                 self.auto_retry_check.isChecked()
@@ -4552,26 +4305,11 @@ class SettingsWindow(QDialog):
 
         # --- app ---
         app_cfg = cfg.setdefault("app", {})
-        app_cfg["ffmpeg_start_check_delay"] = float(
-            self.ffmpeg_start_check_delay.value()
-        )
         app_cfg["sync_auto_publish_ready_only"] = (
             self.sync_ready_only_check.isChecked()
         )
         app_cfg["sync_publish_on_ready"] = (
             self.sync_publish_on_ready_check.isChecked()
-        )
-        app_cfg["ffmpeg_stop_timeout"] = int(
-            self.ffmpeg_stop_timeout.value()
-        )
-        app_cfg["ffmpeg_kill_timeout"] = int(
-            self.ffmpeg_kill_timeout.value()
-        )
-        app_cfg["overlay_hide_delay_ms"] = int(
-            self.overlay_hide_delay_ms.value()
-        )
-        app_cfg["overlay_log_lines"] = int(
-            self.overlay_log_lines.value()
         )
         app_cfg["media_prefer_builtin_player"] = (
             self.media_prefer_builtin_check.isChecked()
@@ -5173,6 +4911,17 @@ class SettingsWindow(QDialog):
             "пропускается, публикация продолжается.<br><br>"
             "Прогресс сжатия отображается в окне синхронизации "
             "и в прогресс-диалоге при публикации одной записи."
+        ),
+        "Медиа": (
+            "<b>Встроенный плеер и скачивание медиа</b><br><br>"
+            "<b>Встроенный плеер</b> — используется для просмотра "
+            "видео и прослушивания аудио из окна «Записи» без "
+            "зависимости от системного VLC. Если плеер недоступен "
+            "(нет QtMultimedia или GStreamer-плагинов), медиа "
+            "откроется системным приложением.<br><br>"
+            "<b>Автоскачивание медиа</b> — если файла нет локально, "
+            "но запись опубликована на сервере, можно скачать его "
+            "прямо в окне «Записи» перед воспроизведением."
         ),
         "Промпты и имена": (
             "<b>Промпты и шаблоны имён</b>"

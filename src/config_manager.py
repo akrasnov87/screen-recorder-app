@@ -210,17 +210,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             },
         ],
     },
-    "recording": {
-        "monitor": 0,
-        "with_microphone": True,
-        "show_watermark": True,
-        "hotkey_start": "Ctrl+Shift+R",
-        "hotkey_stop": "Ctrl+Shift+S",
-        "show_metadata_on_start": True,
-        "show_metadata_on_stop": True,
-        "show_overlay_panel": True,
-        "show_start_notification": True,
-    },
     "queue": {
         "auto_retry_enabled": True,
         "retry_interval_minutes": 5,
@@ -332,16 +321,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "app": {
         "max_file_read_chars": 5_000_000,
-        "ffmpeg_start_check_delay": 0.3,
-        "ffmpeg_stop_timeout": 10,
-        "ffmpeg_kill_timeout": 5,
         "processor_poll_interval": 2.0,
         "processor_retry_check_interval": 300,
-        "overlay_hide_delay_ms": 5000,
-        "overlay_hide_after_task_ms": 3000,
-        "overlay_log_lines": 5,
-        "overlay_width": 340,
-        "overlay_height": 190,
+
+        # --- УДАЛЕНЫ: ffmpeg_start_check_delay, ffmpeg_stop_timeout,
+        #     ffmpeg_kill_timeout, overlay_hide_delay_ms,
+        #     overlay_hide_after_task_ms, overlay_log_lines,
+        #     overlay_width, overlay_height ---
+
         "notification_timeout_ms": 4000,
         "notification_max_title": 50,
         "notification_max_message": 100,
@@ -367,41 +354,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "tfs_save_attachment": True,
         "relations_max_in_dialog": 200,
 
-        # --- НОВОЕ: окно «Скрам» ---
-        # Размеры окна «Скрам».
+        # --- Окно «Скрам» ---
         "scrum_window_width": 1920,
         "scrum_window_height": 1024,
-        # Ограничение размера текста протокола при выводе в превью
-        # (символов). Защита от подвисания при гигантских .docx.
         "scrum_protocol_tab_max_chars": 500_000,
-        # Максимум записей за день, которые выводятся во вкладке
-        # «Записи за день». 0 = без ограничения.
         "scrum_day_tab_max_records": 50,
-        # Соотношение левой/правой части в QSplitter окна «Скрам»
-        # (ширина левой части в пикселях).
         "scrum_left_panel_width": 700,
-        # Соотношение верхней/нижней половины в левой части
-        # (высота верхней части в пикселях).
         "scrum_tasks_panel_height": 380,
-        # Максимум задач, загружаемых в TFS-панели окна «Скрам».
         "scrum_tfs_max_items": 200,
-        # Держать окно «Скрам» поверх остальных окон.
-        # Полезно, когда ведёшь митинг и переключаешься
-        # между окнами — «Скрам» всегда на виду.
         "scrum_always_on_top": True,
-        # Режим отображения вкладки «Записи за день» окна
-        # «Скрам»:
-        #   • "summary"  — краткое описание (summary_bb) записи;
-        #   • "protocol" — полный протокол записи.
-        # По умолчанию — summary.
         "scrum_day_view_mode": "summary",
-        # --- НОВОЕ: панель результата анализа ---
-        # Панель результата анализа (AnalysisResultWidget) в окне
-        # «Скрам» по умолчанию СВЁРНУТА — так она не отнимает
-        # место у блоков «Поручения» и «Задачи TFS».
-        # Пользователь разворачивает её кликом по заголовку.
-        # Если поставить False — панель будет всегда развёрнута
-        # (старое поведение).
         "scrum_analysis_collapsed_by_default": True,
     }
 }
