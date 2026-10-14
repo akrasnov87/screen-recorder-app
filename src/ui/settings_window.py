@@ -3022,7 +3022,7 @@ class SettingsWindow(QDialog):
         layout.addSpacing(12)
 
         # ==============================================================
-        # Блок 0.2: сортировка таблиц по исполнителю (НОВОЕ)
+        # Блок 0.2: сортировка таблиц по исполнителю
         # ==============================================================
         sort_header = QHBoxLayout()
         sort_header.addWidget(
@@ -3056,7 +3056,45 @@ class SettingsWindow(QDialog):
         layout.addSpacing(12)
 
         # ==============================================================
-        # Блок 1: шаблон промпта для протокола (был раньше)
+        # Блок 0.3: НОВОЕ — панель управления TFS
+        # ==============================================================
+        tfs_panel_header = QHBoxLayout()
+        tfs_panel_header.addWidget(
+            QLabel("<b>Панель управления TFS</b>")
+        )
+        tfs_panel_header.addStretch()
+        tfs_panel_icon = make_info_icon(
+            "app_scrum_tfs_panel_collapsed_by_default"
+        )
+        if tfs_panel_icon is not None:
+            tfs_panel_header.addWidget(tfs_panel_icon)
+        layout.addLayout(tfs_panel_header)
+
+        tfs_panel_hint = QLabel(
+            "<span style='color:#666'>"
+            "Верхняя панель блока «Задачи TFS» в окне «Скрам» "
+            "содержит выбор проекта, шаблона WIQL, поле запроса, "
+            "переменные и фильтры по колонкам. Когда панель "
+            "свёрнута, всё это скрыто под одной строкой-заголовком "
+            "и дерево задач получает больше места.</span>"
+        )
+        tfs_panel_hint.setWordWrap(True)
+        layout.addWidget(tfs_panel_hint)
+
+        self.scrum_tfs_panel_collapsed_check = QCheckBox(
+            "Панель управления TFS по умолчанию свёрнута"
+        )
+        attach_tooltip(
+            self.scrum_tfs_panel_collapsed_check,
+            "app_scrum_tfs_panel_collapsed_by_default",
+        )
+        self.scrum_tfs_panel_collapsed_check.setChecked(True)
+        layout.addWidget(self.scrum_tfs_panel_collapsed_check)
+
+        layout.addSpacing(12)
+
+        # ==============================================================
+        # Блок 1: шаблон промпта для протокола
         # ==============================================================
         scrum_header = QHBoxLayout()
         scrum_header.addWidget(
@@ -3071,7 +3109,7 @@ class SettingsWindow(QDialog):
         layout.addWidget(self.scrum_template_edit)
 
         # ==============================================================
-        # Блок 2: НОВОЕ — шаблон промпта для поручений
+        # Блок 2: шаблон промпта для поручений
         # ==============================================================
         items_header = QHBoxLayout()
         items_header.addWidget(
@@ -3121,7 +3159,7 @@ class SettingsWindow(QDialog):
             with_info(self.scrum_format_combo, "scrum_format"),
         )
 
-        # --- НОВОЕ: чекбокс автогенерации поручений ---
+        # --- Чекбокс автогенерации поручений ---
         self.generate_action_items_check = QCheckBox(
             "Извлекать поручения автоматически "
             "(action_items.json)"
@@ -3695,6 +3733,13 @@ class SettingsWindow(QDialog):
             ))
         )
 
+        # --- НОВОЕ: панель управления TFS в окне «Скрам» ---
+        self.scrum_tfs_panel_collapsed_check.setChecked(
+            bool(app_cfg.get(
+                "scrum_tfs_panel_collapsed_by_default", True
+            ))
+        )
+
         # --- Сжатие (старая вкладка «Форматы и сжатие») ---
         comp = cfg.get("compression", {})
         self.audio_fmt_combo.setCurrentText(
@@ -4164,6 +4209,11 @@ class SettingsWindow(QDialog):
         # --- НОВОЕ: сортировка таблиц по исполнителю ---
         app_cfg["scrum_sort_by_assignee"] = (
             self.scrum_sort_by_assignee_check.isChecked()
+        )
+
+        # --- НОВОЕ: панель управления TFS в окне «Скрам» ---
+        app_cfg["scrum_tfs_panel_collapsed_by_default"] = (
+            self.scrum_tfs_panel_collapsed_check.isChecked()
         )
 
         return cfg

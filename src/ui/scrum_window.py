@@ -990,10 +990,21 @@ class ScrumWindow(QDialog):
         )
         self.left_splitter.addWidget(self.tasks_widget)
 
+        # --- Панель управления TFS ---
+        # Настройка scrum_tfs_panel_collapsed_by_default
+        # управляет тем, будет ли верхняя панель блока
+        # «Задачи TFS» (проект, шаблон, WIQL, переменные,
+        # фильтры) свёрнута при открытии окна «Скрам».
+        start_tfs_collapsed = bool(
+            self._app_cfg.get(
+                "scrum_tfs_panel_collapsed_by_default", True
+            )
+        )
         self.tfs_widget = TfsPanelWidget(
             config_manager=self._config_manager,
             max_items=self._tfs_max_items,
             sort_by_assignee=self._sort_by_assignee,
+            start_controls_collapsed=start_tfs_collapsed,
             parent=self,
         )
         self.left_splitter.addWidget(self.tfs_widget)

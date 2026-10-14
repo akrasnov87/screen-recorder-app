@@ -31,6 +31,15 @@
     сортируются по колонке «Исполнитель» (А→Я, пустые в конце).
     В дереве связей иерархия сохраняется: сортируются только
     узлы внутри каждого родителя.
+  • НОВОЕ: сворачиваемая верхняя панель управления (проект +
+    шаблон + WIQL + переменные + фильтры по колонкам). Одним
+    кликом по заголовку «▶ Панель управления TFS» вся эта
+    часть скрывается/показывается. Это освобождает заметную
+    часть вертикального места под дерево задач — что особенно
+    важно в левой нижней половине окна «Скрам». Состояние
+    хранится в self._controls_expanded и инициализируется
+    из параметра start_controls_collapsed (по умолчанию —
+    свёрнуто).
 """
 from __future__ import annotations
 
@@ -96,6 +105,7 @@ class TfsPanelWidget(QWidget):
         config_manager,
         max_items: int = 200,
         sort_by_assignee: bool = False,
+        start_controls_collapsed: bool = True,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -105,6 +115,13 @@ class TfsPanelWidget(QWidget):
 
         # --- НОВОЕ: сортировка по исполнителю ---
         self._sort_by_assignee = bool(sort_by_assignee)
+
+        # --- НОВОЕ: сворачиваемая панель управления ---
+        # По умолчанию панель СВЁРНУТА — это освобождает
+        # вертикальное место под дерево задач в окне «Скрам».
+        self._controls_expanded: bool = not bool(
+            start_controls_collapsed
+        )
 
         # Поля фильтров (создаются в _build_ui).
         self._filter_id: Optional[QLineEdit] = None
@@ -125,6 +142,9 @@ class TfsPanelWidget(QWidget):
         # Настраиваем колонки дерева — в панели «Скрама»
         # показываем только 6 нужных колонок, а не все 11.
         self._configure_tree_columns()
+
+        # Применяем начальное состояние сворачивания панели.
+        self._apply_controls_expanded_state()
 
         # Прячем внутреннее окно — оно не должно показываться.
         self._win.hide()
@@ -149,6 +169,48 @@ class TfsPanelWidget(QWidget):
         if icon is not None:
             header.addWidget(icon)
         layout.addLayout(header)
+
+        # ==============================================================
+        # НОВОЕ: сворачиваемая панель управления.
+        #
+        # Кнопка-заголовок всегда видна (одна компактная строка).
+        # Клик по ней сворачивает/разворачивает весь блок
+        # управления: проект, шаблон, WIQL, переменные, фильтры.
+        # ==============================================================
+        self.panel_toggle_btn = QPushButton()
+        self.panel_toggle_btn.setFlat(True)
+        self.panel_toggle_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.panel_toggle_btn.setFocusPolicy(
+            Qt.FocusPolicy.NoFocus
+        )
+        self.panel_toggle_btn.setStyleSheet(
+            "QPushButton {"
+            "  text-align: left;"
+            "  border: none;"
+            "  background: transparent;"
+            "  color: #1565C0;"
+            "  font-weight: bold;"
+            "  font-size: 10pt;"
+            "  padding: 1px 0;"
+            "}"
+            "QPushButton:hover { color: #0d47a1; }"
+        )
+        self.panel_toggle_btn.clicked.connect(
+            self._toggle_controls_panel
+        )
+        attach_tooltip(
+            self.panel_toggle_btn,
+            "scrum_tfs_panel_toggle",
+        )
+        layout.addWidget(self.panel_toggle_btn)
+
+        # --- Контейнер сворачиваемой части ---
+        self.controls_container = QWidget()
+        controls_layout = QVBoxLayout(self.controls_container)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(1)
 
         # --- Панель управления: проект + шаблон + переменные ---
         controls = QHBoxLayout()
@@ -180,7 +242,7 @@ class TfsPanelWidget(QWidget):
         self.run_btn.clicked.connect(self._on_run)
         controls.addWidget(self.run_btn)
 
-        layout.addLayout(controls)
+        controls_layout.addLayout(controls)
 
         # --- WIQL-превью (компактное) ---
         wiql_row = QHBoxLayout()
@@ -194,20 +256,23 @@ class TfsPanelWidget(QWidget):
         self._win.wiql_edit.setMinimumHeight(40)
         self._win.wiql_edit.setMaximumHeight(60)
         wiql_row.addWidget(self._win.wiql_edit, 1)
-        layout.addLayout(wiql_row)
+        controls_layout.addLayout(wiql_row)
 
         # --- Сворачиваемая плашка переменных WIQL ---
         # (из TfsWindow; теперь это variables_panel, а не
         # variables_info_label — плашка стала сворачиваемой).
         self._win.variables_panel.setParent(self)
-        layout.addWidget(self._win.variables_panel)
+        controls_layout.addWidget(self._win.variables_panel)
 
         # Прогресс (из TfsWindow).
         self._win.progress.setParent(self)
-        layout.addWidget(self._win.progress)
+        controls_layout.addWidget(self._win.progress)
 
         # --- Панель фильтров по колонкам ---
-        layout.addWidget(self._build_column_filters())
+        controls_layout.addWidget(self._build_column_filters())
+
+        # Добавляем контейнер в общий layout панели.
+        layout.addWidget(self.controls_container)
 
         # --- Дерево задач ---
         self._win.tree.setParent(self)
@@ -261,6 +326,54 @@ class TfsPanelWidget(QWidget):
 
         bottom.addStretch()
         layout.addLayout(bottom)
+
+    # ------------------------------------------------------------------
+    # Сворачивание панели управления
+    # ------------------------------------------------------------------
+    def _toggle_controls_panel(self) -> None:
+        """
+        Переключает состояние «панель управления развёрнута».
+
+        Скрывает/показывает весь контейнер controls_container,
+        содержащий: проект + шаблон + WIQL + переменные +
+        фильтры по колонкам.
+        """
+        self._controls_expanded = not self._controls_expanded
+        self._apply_controls_expanded_state()
+
+        log.debug(
+            "TfsPanelWidget: панель управления %s",
+            "развёрнута" if self._controls_expanded
+            else "свёрнута",
+        )
+
+    def _apply_controls_expanded_state(self) -> None:
+        """
+        Применяет текущее состояние к UI.
+
+        Обновляет текст кнопки-заголовка (стрелка ▶ / ▼) и
+        видимость контейнера controls_container.
+        """
+        if self._controls_expanded:
+            arrow = "▼"
+            hint = (
+                "Клик — свернуть панель управления. "
+                "Освобождает место под дерево задач."
+            )
+        else:
+            arrow = "▶"
+            hint = (
+                "Клик — развернуть панель управления "
+                "(проект, шаблон, WIQL, переменные, фильтры)."
+            )
+
+        self.panel_toggle_btn.setText(
+            f"{arrow}  Панель управления TFS"
+        )
+        self.panel_toggle_btn.setToolTip(hint)
+
+        # Показ/скрытие контейнера.
+        self.controls_container.setVisible(self._controls_expanded)
 
     # ------------------------------------------------------------------
     # Панель фильтров по колонкам
