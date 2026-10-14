@@ -87,7 +87,6 @@ def _app_icon() -> QIcon:
 class TrayManager(QObject):
     """Менеджер системного трея."""
 
-    open_yandex_vm_requested = Signal()
     open_settings_requested = Signal()
     open_queue_requested = Signal()
     open_sessions_requested = Signal()
@@ -211,14 +210,6 @@ class TrayManager(QObject):
         tfs_action.triggered.connect(self.open_tfs)
         menu.addAction(tfs_action)
 
-        yandex_vm_action = QAction("ВМ Yandex", menu)
-        yandex_vm_action.setToolTip(
-            "Просмотр и редактирование конфигураций виртуальных "
-            "машин Yandex Cloud (расписание и исключения)"
-        )
-        yandex_vm_action.triggered.connect(self.open_yandex_vm)
-        menu.addAction(yandex_vm_action)
-
         queue_action = QAction("Очередь задач", menu)
         queue_action.triggered.connect(self.open_queue)
         menu.addAction(queue_action)
@@ -256,12 +247,6 @@ class TrayManager(QObject):
     def open_tfs(self) -> None:
         log.debug("Клик: открыть окно «Задачи TFS»")
         self.open_tfs_requested.emit()
-
-    # --- УДАЛЕНО: set_recording_state() ---
-
-    def open_yandex_vm(self) -> None:
-        log.debug("Клик: открыть окно «ВМ Yandex»")
-        self.open_yandex_vm_requested.emit()
 
     def show_notification(
         self,

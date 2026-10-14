@@ -15,6 +15,25 @@
   • Поле «Исполнитель» в диалоге создания/редактирования —
     редактируемый QComboBox: можно выбрать сотрудника из
     справочника или ввести произвольное значение вручную.
+  • КРИТИЧНО (fix segfault):
+      – _reload_table защищён от реэнтрантности
+        (_reloading_table) и от мёртвых Qt-объектов
+        (shiboken6.isValid).
+      – Двойной клик по строке подключается через
+        QTimer.singleShot(0, ...). Прямой вызов слота приводил
+        к use-after-free в Qt: Qt держал указатель на
+        QTableWidgetItem, а внутри слота таблица
+        перестраивалась (setRowCount(0)) → segfault.
+        Подтверждено стеком faulthandler.log:
+          QTableWidget::itemDoubleClicked → segfault.
+  • НОВОЕ: параметр attach_double_click.
+      – True (по умолчанию) — диалог используется как
+        самостоятельное окно (из окна «Записи» / «Поручения»),
+        сам подписывается на itemDoubleClicked.
+      – False — диалог используется как «движок» внутри
+        TasksEditorWidget. Подписку на двойной клик делает
+        сам виджет — иначе получается ДВОЙНОЕ открытие
+        редактора (два окна на один двойной клик).
 """
 from __future__ import annotations
 
@@ -24,7 +43,7 @@ import re
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtGui import (
     QColor, QDesktopServices, QKeySequence, QShortcut,
 )
@@ -64,6 +83,16 @@ from .tooltips import attach_tooltip, make_info_icon, with_info
 
 import uuid
 from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Проверка валидности Qt-объектов
+# ---------------------------------------------------------------------------
+try:
+    from shiboken6 import isValid as _qt_is_valid  # type: ignore
+except ImportError:
+    def _qt_is_valid(obj: Any) -> bool:  # type: ignore
+        return obj is not None
 
 
 def _new_uuid_hex() -> str:
@@ -303,6 +332,7 @@ class TasksEditorDialog(QDialog):
         *,
         session_name: str = "",
         employees: Optional[List[Dict[str, str]]] = None,
+        attach_double_click: bool = True,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -320,6 +350,21 @@ class TasksEditorDialog(QDialog):
         # Справочник сотрудников для выпадающего списка
         # в диалоге редактирования поручения.
         self._employees: List[Dict[str, str]] = list(employees or [])
+
+        # Защита от реэнтрантности в _reload_table.
+        self._reloading_table: bool = False
+
+        # Нужно ли подписываться на itemDoubleClicked таблицы.
+        #
+        # True — диалог используется как самостоятельное окно
+        #        (из окна «Записи» или «Поручения»).
+        #
+        # False — диалог используется как «движок» внутри
+        #         TasksEditorWidget. В этом случае на
+        #         itemDoubleClicked подписывается сам виджет,
+        #         а диалог — нет (иначе будет двойное открытие
+        #         одного и того же редактора).
+        self._attach_double_click = bool(attach_double_click)
 
         self._build_ui()
         self._reload()
@@ -480,9 +525,29 @@ class TasksEditorDialog(QDialog):
         self.table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
-        self.table.itemDoubleClicked.connect(
-            lambda _it: self._edit_selected()
-        )
+
+        # ВАЖНО: НЕ подключаем _edit_selected() напрямую к
+        # itemDoubleClicked. Сигнал эмитится синхронно из C++
+        # Qt, пока Qt держит указатель на QTableWidgetItem.
+        # Если внутри слота перестроить таблицу (что делает
+        # _edit_selected → _reload → _reload_table), объект
+        # будет освобождён, и Qt после возврата из слота
+        # обратится к висячему указателю — segfault.
+        #
+        # QTimer.singleShot(0, ...) откладывает вызов до
+        # возврата в event loop.
+        #
+        # Подписка нужна ТОЛЬКО когда диалог используется как
+        # самостоятельное окно. Если он встроен внутрь
+        # TasksEditorWidget (attach_double_click=False),
+        # подписку делает сам виджет — иначе будет двойное
+        # открытие одного и того же редактора.
+        if self._attach_double_click:
+            self.table.itemDoubleClicked.connect(
+                lambda _it: QTimer.singleShot(
+                    0, self._edit_selected
+                )
+            )
 
         # --- СКРЫВАЕМ КОЛОНКУ ID (последняя, индекс 6) ---
         self.table.setColumnHidden(6, True)
@@ -777,188 +842,222 @@ class TasksEditorDialog(QDialog):
         return result
 
     def _reload_table(self) -> None:
-        items = self._filtered_items()
-        self.table.setRowCount(0)
+        """
+        Перестраивает таблицу поручений.
 
-        overdue_bg = QColor("#FFEBEE")
-        overdue_fg = QColor("#B71C1C")
-        today_bg = QColor("#FFF8E1")
-        today_fg = QColor("#B8860B")
+        КРИТИЧНО: этот метод вызывается как реакция на сигналы
+        (изменение фильтров, эмиссии самой таблицы после
+        setRowCount/insertRow). Если внутри цикла что-то снова
+        дёрнет _reload_table, получим реэнтрантность и segfault.
 
-        today = QDate.currentDate()
+        Защита:
+          • self._reloading_table — флаг реэнтрантности;
+          • shiboken6.isValid(self.table) — проверка, что таблица
+            ещё жива на C++.
+        """
+        if self._reloading_table:
+            log.debug(
+                "TasksEditorDialog: пропуск повторного "
+                "_reload_table (реэнтрантность)"
+            )
+            return
 
-        for it in items:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
+        # --- Проверяем, что таблица ещё жива ---
+        if not _qt_is_valid(self.table):
+            log.warning(
+                "TasksEditorDialog: table удалён на C++ — "
+                "_reload_table пропущен"
+            )
+            return
 
-            status = it.get("status") or "created"
-            label = STATUS_LABELS.get(status, status)
-            status_color = STATUS_COLORS.get(status, "#000000")
+        self._reloading_table = True
+        try:
+            items = self._filtered_items()
+            self.table.setRowCount(0)
 
-            overdue = is_overdue(it)
+            overdue_bg = QColor("#FFEBEE")
+            overdue_fg = QColor("#B71C1C")
+            today_bg = QColor("#FFF8E1")
+            today_fg = QColor("#B8860B")
 
-            raw_due = (it.get("due_date") or "").strip()
-            due_is_today = False
-            if raw_due:
+            today = QDate.currentDate()
+
+            for it in items:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+
+                status = it.get("status") or "created"
+                label = STATUS_LABELS.get(status, status)
+                status_color = STATUS_COLORS.get(status, "#000000")
+
+                overdue = is_overdue(it)
+
+                raw_due = (it.get("due_date") or "").strip()
+                due_is_today = False
+                if raw_due:
+                    try:
+                        y, m, d = raw_due.split("-")
+                        due_qdate = QDate(int(y), int(m), int(d))
+                        due_is_today = (due_qdate == today)
+                    except Exception:
+                        due_is_today = False
+
+                # --- № ---
+                number = it.get("number") or 0
                 try:
-                    y, m, d = raw_due.split("-")
-                    due_qdate = QDate(int(y), int(m), int(d))
-                    due_is_today = (due_qdate == today)
-                except Exception:
-                    due_is_today = False
-
-            # --- № ---
-            number = it.get("number") or 0
-            try:
-                number = int(number)
-            except (TypeError, ValueError):
-                number = 0
-            number_text = str(number) if number > 0 else "—"
-            number_item = QTableWidgetItem(number_text)
-            number_item.setForeground(QColor("#444"))
-            number_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight
-                | Qt.AlignmentFlag.AlignVCenter
-            )
-            self.table.setItem(row, 0, number_item)
-
-            # --- Статус ---
-            status_item = QTableWidgetItem(label)
-            status_item.setForeground(QColor(status_color))
-            self.table.setItem(row, 1, status_item)
-
-            # --- Текст ---
-            text = it.get("text") or ""
-            text_item = QTableWidgetItem(text)
-            self.table.setItem(row, 2, text_item)
-
-            # Полный текст поручения — во всплывающей подсказке
-            # на любой ячейке строки.
-            tooltip_lines: List[str] = [text or "(пусто)"]
-
-            extra: List[str] = []
-            if it.get("assignee"):
-                extra.append(f"Исполнитель: {it['assignee']}")
-            if it.get("due_date"):
-                extra.append(f"Срок: {it['due_date']}")
-            status_label = STATUS_LABELS.get(status, status)
-            extra.append(f"Статус: {status_label}")
-            if it.get("comment"):
-                extra.append(f"Комментарий: {it['comment']}")
-            if it.get("session_name"):
-                extra.append(f"Запись: {it['session_name']}")
-            number = it.get("number") or 0
-            try:
-                number = int(number)
-            except (TypeError, ValueError):
-                number = 0
-            if number > 0:
-                extra.insert(0, f"Номер: №{number}")
-
-            if extra:
-                tooltip_lines.append("")
-                tooltip_lines.append("─" * 30)
-                tooltip_lines.extend(extra)
-
-            full_tooltip_text = "\n".join(tooltip_lines)
-
-            import html as _html
-            tooltip_html = (
-                "<html><body style='white-space:pre-wrap; "
-                "max-width:600px'>"
-                + _html.escape(full_tooltip_text)
-                + "</body></html>"
-            )
-
-            # Дублируем tooltip на все ячейки строки, чтобы
-            # подсказка появлялась при наведении в любом месте.
-            for col in range(self.table.columnCount()):
-                cell = self.table.item(row, col)
-                if cell is not None:
-                    cell.setToolTip(tooltip_html)
-
-            # --- Исполнитель ---
-            assignee_item = QTableWidgetItem(
-                it.get("assignee") or "—"
-            )
-            self.table.setItem(row, 3, assignee_item)
-
-            # --- Срок ---
-            due_text = raw_due or "—"
-            if overdue:
-                days = days_until_due(it) or 0
-                if days == 0:
-                    due_text = f"{raw_due}  (сегодня)"
-                elif days > 0:
-                    due_text = f"{raw_due}  (+{days} дн.)"
-                else:
-                    due_text = (
-                        f"{raw_due}  (просрочено на "
-                        f"{abs(days)} дн.)"
-                    )
-            elif due_is_today:
-                due_text = f"{raw_due}  (сегодня)"
-
-            due_item = QTableWidgetItem(due_text)
-            if overdue:
-                due_item.setForeground(overdue_fg)
-                due_item.setToolTip(
-                    f"Просрочено на "
-                    f"{abs(days_until_due(it) or 0)} дн."
+                    number = int(number)
+                except (TypeError, ValueError):
+                    number = 0
+                number_text = str(number) if number > 0 else "—"
+                number_item = QTableWidgetItem(number_text)
+                number_item.setForeground(QColor("#444"))
+                number_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight
+                    | Qt.AlignmentFlag.AlignVCenter
                 )
-            elif due_is_today:
-                due_item.setForeground(today_fg)
-            self.table.setItem(row, 4, due_item)
+                self.table.setItem(row, 0, number_item)
 
-            # --- Комментарий ---
-            self.table.setItem(
-                row, 5, QTableWidgetItem(it.get("comment") or "")
-            )
+                # --- Статус ---
+                status_item = QTableWidgetItem(label)
+                status_item.setForeground(QColor(status_color))
+                self.table.setItem(row, 1, status_item)
 
-            # --- ID ---
-            id_item = QTableWidgetItem(it.get("id") or "")
-            id_item.setForeground(QColor("#888"))
-            self.table.setItem(row, 6, id_item)
+                # --- Текст ---
+                text = it.get("text") or ""
+                text_item = QTableWidgetItem(text)
+                self.table.setItem(row, 2, text_item)
 
-            # --- Подсветка строки ---
-            if overdue:
+                # Полный текст поручения — во всплывающей подсказке
+                # на любой ячейке строки.
+                tooltip_lines: List[str] = [text or "(пусто)"]
+
+                extra: List[str] = []
+                if it.get("assignee"):
+                    extra.append(f"Исполнитель: {it['assignee']}")
+                if it.get("due_date"):
+                    extra.append(f"Срок: {it['due_date']}")
+                status_label = STATUS_LABELS.get(status, status)
+                extra.append(f"Статус: {status_label}")
+                if it.get("comment"):
+                    extra.append(f"Комментарий: {it['comment']}")
+                if it.get("session_name"):
+                    extra.append(f"Запись: {it['session_name']}")
+                number = it.get("number") or 0
+                try:
+                    number = int(number)
+                except (TypeError, ValueError):
+                    number = 0
+                if number > 0:
+                    extra.insert(0, f"Номер: №{number}")
+
+                if extra:
+                    tooltip_lines.append("")
+                    tooltip_lines.append("─" * 30)
+                    tooltip_lines.extend(extra)
+
+                full_tooltip_text = "\n".join(tooltip_lines)
+
+                import html as _html
+                tooltip_html = (
+                    "<html><body style='white-space:pre-wrap; "
+                    "max-width:600px'>"
+                    + _html.escape(full_tooltip_text)
+                    + "</body></html>"
+                )
+
+                # Дублируем tooltip на все ячейки строки, чтобы
+                # подсказка появлялась при наведении в любом месте.
                 for col in range(self.table.columnCount()):
                     cell = self.table.item(row, col)
-                    if cell is None:
-                        continue
-                    cell.setBackground(overdue_bg)
-                    if col != 1:
-                        cell.setForeground(overdue_fg)
-                first_cell = self.table.item(row, 2)
-                if first_cell is not None:
-                    first_cell.setText(
-                        "⚠  " + (first_cell.text() or "")
+                    if cell is not None:
+                        cell.setToolTip(tooltip_html)
+
+                # --- Исполнитель ---
+                assignee_item = QTableWidgetItem(
+                    it.get("assignee") or "—"
+                )
+                self.table.setItem(row, 3, assignee_item)
+
+                # --- Срок ---
+                due_text = raw_due or "—"
+                if overdue:
+                    days = days_until_due(it) or 0
+                    if days == 0:
+                        due_text = f"{raw_due}  (сегодня)"
+                    elif days > 0:
+                        due_text = f"{raw_due}  (+{days} дн.)"
+                    else:
+                        due_text = (
+                            f"{raw_due}  (просрочено на "
+                            f"{abs(days)} дн.)"
+                        )
+                elif due_is_today:
+                    due_text = f"{raw_due}  (сегодня)"
+
+                due_item = QTableWidgetItem(due_text)
+                if overdue:
+                    due_item.setForeground(overdue_fg)
+                    due_item.setToolTip(
+                        f"Просрочено на "
+                        f"{abs(days_until_due(it) or 0)} дн."
                     )
-            elif due_is_today and status != "done":
-                for col in range(self.table.columnCount()):
-                    cell = self.table.item(row, col)
-                    if cell is None:
-                        continue
-                    cell.setBackground(today_bg)
+                elif due_is_today:
+                    due_item.setForeground(today_fg)
+                self.table.setItem(row, 4, due_item)
 
-        # --- Итоги ---
-        all_items = self._data.get("items", [])
-        overdue_count = sum(
-            1 for x in all_items if is_overdue(x)
-        )
-        total = len(all_items)
+                # --- Комментарий ---
+                self.table.setItem(
+                    row, 5, QTableWidgetItem(it.get("comment") or "")
+                )
 
-        stats = (
-            f"Всего: {total} · показано: {len(items)}"
-        )
-        if overdue_count:
-            stats += f" · просрочено: {overdue_count}"
-        self.stats_label.setText(stats)
+                # --- ID ---
+                id_item = QTableWidgetItem(it.get("id") or "")
+                id_item.setForeground(QColor("#888"))
+                self.table.setItem(row, 6, id_item)
+
+                # --- Подсветка строки ---
+                if overdue:
+                    for col in range(self.table.columnCount()):
+                        cell = self.table.item(row, col)
+                        if cell is None:
+                            continue
+                        cell.setBackground(overdue_bg)
+                        if col != 1:
+                            cell.setForeground(overdue_fg)
+                    first_cell = self.table.item(row, 2)
+                    if first_cell is not None:
+                        first_cell.setText(
+                            "⚠  " + (first_cell.text() or "")
+                        )
+                elif due_is_today and status != "done":
+                    for col in range(self.table.columnCount()):
+                        cell = self.table.item(row, col)
+                        if cell is None:
+                            continue
+                        cell.setBackground(today_bg)
+
+            # --- Итоги ---
+            all_items = self._data.get("items", [])
+            overdue_count = sum(
+                1 for x in all_items if is_overdue(x)
+            )
+            total = len(all_items)
+
+            stats = (
+                f"Всего: {total} · показано: {len(items)}"
+            )
+            if overdue_count:
+                stats += f" · просрочено: {overdue_count}"
+            self.stats_label.setText(stats)
+        finally:
+            self._reloading_table = False
 
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
     def _selected_item(self) -> Optional[Dict[str, Any]]:
+        if not _qt_is_valid(self.table):
+            return None
         row = self.table.currentRow()
         if row < 0:
             return None

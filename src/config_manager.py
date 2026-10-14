@@ -135,13 +135,6 @@ DEFAULT_TFS_WIQL: str = (
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "yandex_vm": {
-        "root_path": "",
-        "transcribe_vm_name": "",
-        "transcribe_vm_start_timeout": 600,
-        "transcribe_vm_check_interval": 10,
-        "transcribe_vm_schedule_extension_minutes": 30,
-    },
     "projects": [
         {"name": "Россети",     "chat_id": ""},
         {"name": "iserv",       "chat_id": ""},
@@ -594,26 +587,6 @@ class ConfigManager:
         except Exception as exc:
             log.error("decrypt: ошибка: %s", exc)
             return ""
-
-    def get_yandex_vm_settings(self) -> Dict[str, Any]:
-        cfg = self.config.get("yandex_vm", {}) or {}
-        return {
-            "root_path": str(cfg.get("root_path", "")).strip(),
-            "transcribe_vm_name": str(
-                cfg.get("transcribe_vm_name", "") or ""
-            ).strip(),
-            "transcribe_vm_start_timeout": int(
-                cfg.get("transcribe_vm_start_timeout", 600)
-            ),
-            "transcribe_vm_check_interval": int(
-                cfg.get("transcribe_vm_check_interval", 10)
-            ),
-            "transcribe_vm_schedule_extension_minutes": int(
-                cfg.get(
-                    "transcribe_vm_schedule_extension_minutes", 30
-                )
-            ),
-        }
 
     # ------------------------------------------------------------------
     # Загрузка / сохранение

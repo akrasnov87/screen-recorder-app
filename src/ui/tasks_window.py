@@ -30,7 +30,7 @@ import threading
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QDate, Qt, QUrl
+from PySide6.QtCore import QDate, Qt, QUrl, QTimer
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
@@ -96,111 +96,279 @@ class _SendTasksDialog(QDialog):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
 
+        info_row = QHBoxLayout()
         info = QLabel(
-            "Поручения будут отправлены одним сообщением в "
-            "выбранный чат. Отметьте получателя и при "
-            "необходимости отредактируйте текст."
+            "Сводная таблица поручений по всем записям. "
+            "Можно фильтровать по статусу, исполнителю, "
+            "проекту, номеру поручения и дате создания, "
+            "выбирать несколько строк и отправлять их "
+            "в Bitrix24 одним сообщением."
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #666; }")
-        root.addWidget(info)
+        info_row.addWidget(info, 1)
+        icon = make_info_icon("tasks_window_intro")
+        if icon is not None:
+            info_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+        root.addLayout(info_row)
 
-        rec_row = QHBoxLayout()
-        rec_row.addWidget(QLabel("Получатель:"))
+        # --- Фильтры (верхний ряд) ---
+        filters = QHBoxLayout()
 
-        self.recipient_combo = QComboBox()
-        self.recipient_combo.setMinimumWidth(320)
-        self.recipient_combo.addItem(
-            "— выберите чат —", ""
+        filters.addWidget(QLabel("Статус:"))
+        self.status_filter = QComboBox()
+        self.status_filter.addItem("— все —", "")
+        for s in STATUS_ORDER:
+            self.status_filter.addItem(STATUS_LABELS[s], s)
+        self.status_filter.currentIndexChanged.connect(
+            self._reload_table
         )
-        if self._default_chat_id:
-            self.recipient_combo.addItem(
-                f"По умолчанию ({self._default_chat_id})",
-                self._default_chat_id,
+        filters.addWidget(self.status_filter)
+
+        filters.addSpacing(8)
+        filters.addWidget(QLabel("Исполнитель:"))
+        self.assignee_filter = QComboBox()
+        self.assignee_filter.addItem("— все —", "")
+        self.assignee_filter.setMinimumWidth(180)
+        self.assignee_filter.currentIndexChanged.connect(
+            self._reload_table
+        )
+        filters.addWidget(self.assignee_filter)
+
+        filters.addSpacing(8)
+        filters.addWidget(QLabel("Проект:"))
+        self.project_filter = QComboBox()
+        self.project_filter.addItem("— все —", "")
+        self.project_filter.setMinimumWidth(160)
+        self.project_filter.currentIndexChanged.connect(
+            self._reload_table
+        )
+        filters.addWidget(self.project_filter)
+
+        filters.addSpacing(8)
+        filters.addWidget(QLabel("№ поручения:"))
+        self.number_search_input = QLineEdit()
+        self.number_search_input.setPlaceholderText(
+            "Например: 42, 43 или 40-50"
+        )
+        self.number_search_input.setMaximumWidth(180)
+        self.number_search_input.setClearButtonEnabled(True)
+        self.number_search_input.setToolTip(
+            "Поиск по номеру поручения.\n\n"
+            "Поддерживается:\n"
+            "  • одно число: 42;\n"
+            "  • несколько через запятую: 42, 43, 44;\n"
+            "  • диапазон: 40-50;\n"
+            "  • смешанное: 1, 5-7, 10.\n\n"
+            "Пробелы игнорируются. Пустое поле — фильтр выключен."
+        )
+        self.number_search_input.textChanged.connect(
+            self._reload_table
+        )
+        filters.addWidget(self.number_search_input)
+
+        filters.addSpacing(8)
+        filters.addWidget(QLabel("Контекст:"))
+        self.context_search_input = QLineEdit()
+        self.context_search_input.setPlaceholderText(
+            "Поиск по названию записи…"
+        )
+        self.context_search_input.setClearButtonEnabled(True)
+        self.context_search_input.textChanged.connect(
+            self._reload_table
+        )
+        filters.addWidget(self.context_search_input, 1)
+
+        root.addLayout(filters)
+
+        # --- Фильтры (нижний ряд) ---
+        filters2 = QHBoxLayout()
+
+        self.overdue_only_check = QCheckBox(
+            "Только просроченные"
+        )
+        self.overdue_only_check.setToolTip(
+            "Показать поручения, у которых срок уже истёк "
+            "(due_date < сегодня) и статус не «Выполнен»."
+        )
+        self.overdue_only_check.toggled.connect(self._reload_table)
+        filters2.addWidget(self.overdue_only_check)
+
+        filters2.addSpacing(12)
+
+        filters2.addWidget(QLabel("Дата создания:"))
+        self.created_date_filter = QDateEdit()
+        self.created_date_filter.setCalendarPopup(True)
+        self.created_date_filter.setDisplayFormat("yyyy-MM-dd")
+        self.created_date_filter.setDate(QDate.currentDate())
+        self.created_date_filter.dateChanged.connect(
+            self._reload_table
+        )
+        filters2.addWidget(self.created_date_filter)
+
+        self.clear_created_date_btn = QPushButton("Сбросить дату")
+        self.clear_created_date_btn.setToolTip(
+            "Показать поручения за все даты"
+        )
+        self.clear_created_date_btn.clicked.connect(
+            self._clear_created_date
+        )
+        filters2.addWidget(self.clear_created_date_btn)
+
+        filters2.addSpacing(12)
+
+        self.sort_by_due_check = QCheckBox(
+            "Сортировать по сроку"
+        )
+        self.sort_by_due_check.setToolTip(
+            "Просроченные — сверху, затем «сегодня», затем "
+            "будущие, затем без срока."
+        )
+        self.sort_by_due_check.setChecked(True)
+        self.sort_by_due_check.toggled.connect(self._reload_table)
+        filters2.addWidget(self.sort_by_due_check)
+
+        filters2.addStretch()
+
+        root.addLayout(filters2)
+
+        # --- Таблица ---
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels([
+            "№", "Статус", "Поручение", "Исполнитель",
+            "Проект", "Контекст (запись)",
+        ])
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+
+        # ВАЖНО: НЕ вызываем _open_editor_for_current() напрямую!
+        # Сигнал itemDoubleClicked эмитится синхронно из C++ Qt,
+        # пока Qt держит указатель на QTableWidgetItem. Слот
+        # открывает модальный диалог и после закрытия вызывает
+        # self.refresh(), что перестраивает эту таблицу —
+        # use-after-free и segfault.
+        #
+        # QTimer.singleShot(0, ...) откладывает вызов до возврата
+        # в event loop.
+        self.table.itemDoubleClicked.connect(
+            lambda _it: QTimer.singleShot(
+                0, self._open_editor_for_current
             )
-        for p in self._projects:
-            cid = (p.get("chat_id") or "").strip()
-            label = f"Проект: {p.get('name')}"
-            if cid:
-                label += f"  ({cid})"
-            else:
-                label += "  — чат не задан"
-            self.recipient_combo.addItem(label, cid)
-        for e in self._employees:
-            cid = (e.get("chat_id") or "").strip()
-            label = f"Сотрудник: {e.get('name')}"
-            if cid:
-                label += f"  ({cid})"
-            else:
-                label += "  — чат не задан"
-            self.recipient_combo.addItem(label, cid)
-
-        rec_row.addWidget(self.recipient_combo, 1)
-
-        self.manual_chat_input = QLineEdit()
-        self.manual_chat_input.setPlaceholderText(
-            "Или введите ID чата вручную (chat2101)"
         )
-        rec_row.addWidget(self.manual_chat_input)
 
-        root.addLayout(rec_row)
-
-        fmt_row = QHBoxLayout()
-        fmt_row.addWidget(QLabel("Формат:"))
-
-        self.format_combo = QComboBox()
-        self.format_combo.addItem("Список", "list")
-        self.format_combo.addItem("Таблица", "table")
-        fmt_row.addWidget(self.format_combo)
-
-        fmt_row.addSpacing(12)
-
-        self.group_by_assignee_check = QCheckBox(
-            "Группировать по исполнителю"
+        hv = self.table.horizontalHeader()
+        hv.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
         )
-        self.group_by_assignee_check.setChecked(True)
-        fmt_row.addWidget(self.group_by_assignee_check)
-
-        fmt_row.addSpacing(12)
-
-        self.header_check = QCheckBox(
-            "Добавлять заголовок «Поручения»"
+        hv.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
         )
-        self.header_check.setChecked(True)
-        fmt_row.addWidget(self.header_check)
-
-        fmt_row.addStretch()
-        root.addLayout(fmt_row)
-
-        root.addWidget(QLabel("<b>Предпросмотр сообщения:</b>"))
-        self.preview = QPlainTextEdit()
-        self.preview.setReadOnly(True)
-        self.preview.setMinimumHeight(280)
-        root.addWidget(self.preview, 1)
-
-        self.format_combo.currentIndexChanged.connect(
-            self._refresh_preview
+        # Поручение — тянется на всё свободное место.
+        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hv.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents
         )
-        self.group_by_assignee_check.toggled.connect(
-            self._refresh_preview
+        hv.setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents
         )
-        self.header_check.toggled.connect(self._refresh_preview)
+        # Контекст (запись) — по ширине текста.
+        hv.setSectionResizeMode(
+            5, QHeaderView.ResizeMode.ResizeToContents
+        )
+        root.addWidget(self.table, 1)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel,
-            parent=self,
+        # --- Действия ---
+        actions = QHBoxLayout()
+
+        self.refresh_btn = QPushButton("Обновить")
+        self.refresh_btn.clicked.connect(self.refresh)
+        actions.addWidget(self.refresh_btn)
+
+        self.select_all_btn = QPushButton("Выбрать все")
+        self.select_all_btn.clicked.connect(self._select_all)
+        actions.addWidget(self.select_all_btn)
+
+        self.clear_selection_btn = QPushButton("Снять выбор")
+        self.clear_selection_btn.clicked.connect(self._clear_selection)
+        actions.addWidget(self.clear_selection_btn)
+
+        actions.addSpacing(12)
+
+        self.edit_btn = QPushButton("Открыть редактор записи…")
+        self.edit_btn.setToolTip(
+            "Открыть редактор поручений той записи, к которой "
+            "относится выбранное поручение."
         )
-        buttons.button(
-            QDialogButtonBox.StandardButton.Ok
-        ).setText("Отправить")
-        buttons.button(
-            QDialogButtonBox.StandardButton.Cancel
-        ).setText("Отмена")
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        self.edit_btn.clicked.connect(self._open_editor_for_current)
+        actions.addWidget(self.edit_btn)
+
+        self.delete_btn = QPushButton("Удалить выбранные")
+        self.delete_btn.clicked.connect(self._delete_selected)
+        actions.addWidget(self.delete_btn)
+
+        actions.addStretch()
+
+        self.status_combo = QComboBox()
+        for s in STATUS_ORDER:
+            self.status_combo.addItem(STATUS_LABELS[s], s)
+        self.set_status_btn = QPushButton("Применить статус")
+        self.set_status_btn.setToolTip(
+            "Проставить выбранный статус всем выделенным "
+            "поручениям."
+        )
+        self.set_status_btn.clicked.connect(self._apply_status)
+        actions.addWidget(self.status_combo)
+        actions.addWidget(self.set_status_btn)
+
+        root.addLayout(actions)
+
+        # --- Итог ---
+        bottom = QHBoxLayout()
+        self.stats_label = QLabel("")
+        self.stats_label.setStyleSheet(
+            "QLabel { color: #444; font-weight: bold; }"
+        )
+        bottom.addWidget(self.stats_label)
+        bottom.addStretch()
+
+        self.send_bitrix_btn = QPushButton(
+            "Отправить выбранные в Bitrix24…"
+        )
+        self.send_bitrix_btn.setToolTip(
+            "Сформировать одно сообщение из выбранных поручений "
+            "и отправить его в чат Bitrix24."
+        )
+        self.send_bitrix_btn.clicked.connect(self._send_to_bitrix)
+        bottom.addWidget(self.send_bitrix_btn)
+
+        self.send_employees_btn = QPushButton(
+            "Отправить сотрудникам…"
+        )
+        self.send_employees_btn.setToolTip(
+            "Сопоставить исполнителей из поручений с сотрудниками "
+            "из справочника и отправить каждому его поручения "
+            "отдельным сообщением."
+        )
+        self.send_employees_btn.clicked.connect(
+            self._send_to_employees
+        )
+        bottom.addWidget(self.send_employees_btn)
+
+        self.close_btn = QPushButton("Закрыть")
+        self.close_btn.clicked.connect(self.close)
+        bottom.addWidget(self.close_btn)
+
+        root.addLayout(bottom)
 
     # ------------------------------------------------------------------
     # Построение сообщения

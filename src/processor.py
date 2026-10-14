@@ -231,7 +231,6 @@ class VideoProcessor(QObject):
                     "summary": "",
                     "output_dir": os.path.dirname(video_path),
                     "skipped_transcription": True,
-                    "vm_session": None,
                 }
                 total = time.monotonic() - t0
                 log.info(
@@ -333,70 +332,21 @@ class VideoProcessor(QObject):
                 transcribe_cfg.get("service_name"),
                 transcribe_url or "—",
             )
-            vm_session = None
 
-            # --- Проверка доступности транскрибации и ВМ ---
-            # Если стенограмма уже есть — ВМ не нужна.
-            need_vm_check = (
-                transcribe_url
-                and self.config_manager is not None
-                and not has_existing_transcript
-            )
-
-            if need_vm_check:
-                from .transcribe_vm_controller import (
-                    TranscribeVMController,
-                )
-
-                controller = TranscribeVMController(
-                    self.config_manager
-                )
-
-                self.task_progress.emit(
-                    task_id, 45,
-                    "Проверка сервиса транскрибации…"
-                )
-
-                try:
-                    prep = await controller.prepare_for_transcribe(
-                        progress_cb=lambda msg: self.task_progress.emit(
-                            task_id, 45, msg
-                        ),
-                        cancel_event=cancel_event,
-                    )
-                except Exception as exc:
-                    log.exception(
-                        "[%s] Ошибка проверки ВМ: %s", task_id, exc
-                    )
-                    prep = None
-
-                if prep is not None:
-                    if prep.can_transcribe:
-                        transcribe_available = True
-                        vm_session = prep.vm_session
-                        log.info(
-                            "[%s] Транскрибация доступна "
-                            "(ВМ: %s)",
-                            task_id,
-                            "использована"
-                            if vm_session else "не требовалась",
-                        )
-                    else:
-                        transcribe_available = False
-                        log.warning(
-                            "[%s] Транскрибация недоступна: %s",
-                            task_id, prep.skipped_reason,
-                        )
-                        self.task_progress.emit(
-                            task_id, 45,
-                            f"Транскрибация пропущена: "
-                            f"{prep.skipped_reason[:60]}"
-                        )
-            elif has_existing_transcript:
+            # --- Проверка доступности транскрибации ---
+            # Сервис транскрибации доступен, если задан его URL.
+            # Управления ВМ Yandex в приложении больше нет —
+            # если сервис недоступен по какой-то причине,
+            # обработка всё равно попробует к нему обратиться,
+            # и ошибка всплывёт на этапе transcribe().
+            if not transcribe_url:
+                transcribe_available = False
                 log.info(
-                    "[%s] Проверка ВМ пропущена: стенограмма "
-                    "уже есть", task_id,
+                    "[%s] Транскрибация недоступна: URL сервиса "
+                    "не задан", task_id,
                 )
+            else:
+                transcribe_available = True
 
             sum_cfg = self.config.get("summarizer", {}) or {}
             provider = str(
@@ -1131,25 +1081,6 @@ class VideoProcessor(QObject):
                 "transcript": transcript_path,
                 "summary": summary_path if transcript_path else "",
                 "output_dir": os.path.dirname(video_path),
-                # --- Информация о VM-сессии для UI ---
-                "vm_session": (
-                    {
-                        "schedule_modified": (
-                            vm_session.schedule_modified
-                            if vm_session else False
-                        ),
-                        "schedule_path": (
-                            vm_session.schedule_path
-                            if vm_session else ""
-                        ),
-                        "vm_name": (
-                            vm_session.vm_manager.vm_name
-                            if vm_session and vm_session.vm_manager
-                            else ""
-                        ),
-                    }
-                    if vm_session else None
-                ),
             }
             total = time.monotonic() - t0
             log.info(
@@ -1624,7 +1555,6 @@ class VideoProcessor(QObject):
                 "summary": summary_path,
                 "output_dir": session_dir,
                 "document_only": True,
-                "vm_session": None,
             }
             total = time.monotonic() - t0
             log.info(

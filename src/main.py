@@ -7,8 +7,22 @@
   • В _build_default_meta() добавлено поле relations.
   • УДАЛЕНО: механизм записи экрана (ScreenRecorder,
     GlobalHotkeyManager, OverlayPanel) и связанные сигналы.
-    Приложение теперь работает как «обработчик готовых видео
-    и документов»: загрузка видео, импорт, запись-документ.
+    Приложение работает как «обработчик готовых видео и
+    документов»: загрузка видео, импорт, запись-документ.
+  • УДАЛЕНО: механизм управления ВМ Yandex — вкладка в
+    настройках, окно «ВМ Yandex», сигнал open_yandex_vm_requested,
+    обработка vm_session в результате задачи.
+  • КРИТИЧНО (fix segfault):
+      – Включён faulthandler (пишет C-стек в
+        /tmp/screen-recorder/faulthandler.log при segfault).
+      – _quit() теперь:
+          * закрывает все открытые окна,
+          * отменяет sync-puller и processing task,
+          * ждёт их завершения,
+          * и только потом останавливает loop.
+        Это устраняет падение при выходе, когда фоновые
+        корутины продолжают работать, а Qt уже разобрал
+        свои объекты.
 """
 from __future__ import annotations
 
@@ -36,7 +50,6 @@ if __package__ in (None, ""):
     from src.ui.settings_window import SettingsWindow
     from src.ui.sync_window import SyncWindow
     from src.ui.tray_manager import TrayManager
-    from src.ui.yandex_vm_window import YandexVMDialog
     from src.ui.tasks_window import TasksWindow
     from src.ui.tfs_window import TfsWindow
     from src.logger import (
@@ -48,7 +61,6 @@ if __package__ in (None, ""):
     from src.processor import VideoProcessor
     from src.sync_manager import SyncManager, is_record_published
     from src.task_queue import TaskQueue
-    from src.yandex_vm_manager import YandexVMManager
     from src.platform_utils import IS_LINUX, IS_WINDOWS
     from src.utils import (
         check_ffmpeg_installed,
@@ -65,7 +77,6 @@ else:
     from .ui.settings_window import SettingsWindow
     from .ui.sync_window import SyncWindow
     from .ui.tray_manager import TrayManager
-    from .ui.yandex_vm_window import YandexVMDialog
     from .ui.tasks_window import TasksWindow
     from .ui.tfs_window import TfsWindow
     from .logger import (
@@ -77,7 +88,6 @@ else:
     from .processor import VideoProcessor
     from .sync_manager import SyncManager, is_record_published
     from .task_queue import TaskQueue
-    from .yandex_vm_manager import YandexVMManager
     from .platform_utils import IS_LINUX, IS_WINDOWS
     from .utils import (
         check_ffmpeg_installed,
@@ -109,8 +119,7 @@ def _resource(name: str) -> str:
 class ScreenRecorderApp(QObject):
     """Главный контроллер приложения.
 
-    После удаления механизма записи экрана приложение
-    выполняет роль «пост-обработчика»:
+    Приложение работает как «пост-обработчик»:
       • загрузка готовых видеофайлов;
       • импорт видео/стенограмм/протоколов;
       • создание записей-документов;
@@ -160,7 +169,7 @@ class ScreenRecorderApp(QObject):
         self._connect_signals()
         self._start_async_loop()
         self._maybe_start_sync_puller()
-        log.info("ScreenRecorderApp инициализирован (без записи)")
+        log.info("ScreenRecorderApp инициализирован")
 
     # ------------------------------------------------------------------
     # Состояние
@@ -183,9 +192,6 @@ class ScreenRecorderApp(QObject):
         log.debug("Подключение сигналов")
 
         # --- Трей: общие пункты меню ---
-        self.tray_manager.open_yandex_vm_requested.connect(
-            self._open_yandex_vm
-        )
         self.tray_manager.open_settings_requested.connect(
             self._open_settings
         )
@@ -213,9 +219,6 @@ class ScreenRecorderApp(QObject):
             self._open_upload_video
         )
         self.tray_manager.quit_requested.connect(self._quit)
-
-        # --- УДАЛЕНО: сигналы tray_manager.toggle_recording_requested,
-        #     recorder.*, overlay_panel.* ---
 
         # --- Обработчик задач ---
         self.processor.task_started.connect(self._on_task_started)
@@ -620,7 +623,7 @@ class ScreenRecorderApp(QObject):
         return session_dir
 
     # ------------------------------------------------------------------
-    # Загрузить видео (вместо старой записи)
+    # Загрузить видео
     # ------------------------------------------------------------------
     @Slot()
     def _open_upload_video(self) -> None:
@@ -1114,92 +1117,6 @@ class ScreenRecorderApp(QObject):
         if output_dir:
             self._auto_publish_after_processing(task_id, output_dir)
 
-        vm_info = result.get("vm_session")
-        if vm_info and vm_info.get("schedule_modified"):
-            self._finish_vm_session(vm_info)
-
-    def _finish_vm_session(self, vm_info: dict) -> None:
-        vm_name = vm_info.get("vm_name", "")
-        schedule_path = vm_info.get("schedule_path", "")
-
-        if not schedule_path:
-            log.warning(
-                "_finish_vm_session: не передан schedule_path — "
-                "нечего восстанавливать"
-            )
-            return
-
-        try:
-            vm_settings = self.config_manager.get_yandex_vm_settings()
-        except Exception as exc:
-            log.warning(
-                "Не удалось прочитать настройки ВМ: %s", exc
-            )
-            return
-
-        vm_manager = YandexVMManager(vm_settings)
-        backup_path = schedule_path + ".transcribe_bak"
-
-        info = vm_manager.get_modified_schedule_info(
-            schedule_path=schedule_path
-        )
-        next_stop = info.get("next_stop_time", "")
-
-        if next_stop:
-            msg = (
-                f"<b>Транскрибация завершена.</b><br><br>"
-                f"ВМ «{vm_name}» была временно включена для "
-                f"транскрибации.<br><br>"
-                f"<b>Отключить ВМ сейчас?</b><br>"
-                f"Если да — расписание будет восстановлено.<br><br>"
-                f"Если нет — ВМ будет работать до "
-                f"<b>{next_stop}</b>."
-            )
-        else:
-            msg = (
-                f"<b>Транскрибация завершена.</b><br><br>"
-                f"ВМ «{vm_name}» была временно включена. "
-                f"Отключить её сейчас?"
-            )
-
-        reply = QMessageBox.question(
-            None, "Управление ВМ Yandex",
-            msg,
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            restore = vm_manager.restore_from_backup(
-                schedule_path=schedule_path,
-                backup_path=backup_path,
-            )
-            if restore["ok"]:
-                self._notify(
-                    "ВМ Yandex",
-                    f"Расписание ВМ «{vm_name}» восстановлено",
-                )
-            else:
-                QMessageBox.warning(
-                    None, "ВМ Yandex",
-                    f"Не удалось восстановить расписание:\n"
-                    f"{restore['message']}",
-                )
-        else:
-            if next_stop:
-                QMessageBox.information(
-                    None, "ВМ Yandex",
-                    f"ВМ «{vm_name}» продолжит работу до "
-                    f"{next_stop}.",
-                )
-            else:
-                QMessageBox.information(
-                    None, "ВМ Yandex",
-                    f"ВМ «{vm_name}» продолжит работу по "
-                    f"изменённому расписанию.",
-                )
-
     def _on_task_failed(self, task_id: str, error: str) -> None:
         log.error("Задача %s провалена: %s", task_id, error)
         self._set_state(AppState.IDLE)
@@ -1376,24 +1293,11 @@ class ScreenRecorderApp(QObject):
                 f"Не удалось открыть окно:\n{exc}",
             )
 
-    def _open_yandex_vm(self) -> None:
-        yandex_cfg = self.config_manager.get_yandex_vm_settings()
-        root_path = yandex_cfg.get("root_path", "")
-
-        dlg = YandexVMDialog(
-            root_path=root_path,
-            config_manager=self.config_manager,
-            parent=None,
-        )
-        dlg.exec()
-
     # ------------------------------------------------------------------
     # Логи / уведомления
     # ------------------------------------------------------------------
     def _on_log_to_gui(self, message: str, level: str) -> None:
         # Overlay-панели больше нет — логи только в файл и консоль.
-        # Слот оставлен для будущих GUI-интеграций (например,
-        # окно «Журнал»).
         pass
 
     def _notify(
@@ -1410,37 +1314,103 @@ class ScreenRecorderApp(QObject):
     # Завершение
     # ------------------------------------------------------------------
     def _quit(self) -> None:
+        """
+        Корректное завершение приложения.
+
+        Порядок важен:
+          1. Сохраняем очередь.
+          2. Закрываем все открытые окна — чтобы Qt-объекты,
+             на которые держат ссылки корутины, не удалились
+             «на ходу».
+          3. Отменяем фоновые задачи (sync-puller, processor).
+          4. Даём loop-у обработать отмену.
+          5. Останавливаем processor.
+          6. Останавливаем loop.
+          7. Останавливаем Qt.
+
+        Нарушение этого порядка (например, остановка loop до
+        отмены задач) приводило к segfault при выходе.
+        """
         log.info("Завершение работы приложения")
         self._set_state(AppState.QUITTING)
 
-        self.task_queue.save_queue()
+        # 1. Сохраняем очередь
+        try:
+            self.task_queue.save_queue()
+        except Exception as exc:
+            log.warning("Не удалось сохранить очередь: %s", exc)
 
-        if self._loop is not None:
-            if self._sync_pull_task is not None:
-                try:
-                    self._loop.call_soon_threadsafe(
-                        self._sync_pull_task.cancel
-                    )
-                except Exception:
-                    pass
+        if self._loop is None:
+            log.info("Приложение остановлено (loop=None)")
+            self.app.quit()
+            return
 
-            if self._processing_task is not None:
-                try:
-                    self._loop.call_soon_threadsafe(
-                        self._processing_task.cancel
-                    )
-                except Exception:
-                    pass
-
+        # 2. Закрываем все окна, которые могут держать ссылки
+        #    на объекты, используемые в loop-потоке.
+        for win_attr in (
+            "sessions_window",
+            "library_window",
+            "sync_window",
+            "tasks_window",
+            "tfs_window",
+            "queue_window",
+            "settings_window",
+        ):
+            win = getattr(self, win_attr, None)
+            if win is None:
+                continue
             try:
-                self.processor.stop()
-            except Exception:
-                pass
+                win.close()
+                log.debug("Окно %s закрыто", win_attr)
+            except Exception as exc:
+                log.warning(
+                    "Ошибка закрытия %s: %s", win_attr, exc
+                )
+            setattr(self, win_attr, None)
 
+        # 3. Отменяем sync-puller и ждём
+        if self._sync_pull_task is not None:
+            log.info("Отмена фонового sync-puller…")
             try:
-                self._loop.call_soon_threadsafe(self._loop.stop)
-            except Exception:
-                pass
+                self._loop.call_soon_threadsafe(
+                    self._sync_pull_task.cancel
+                )
+                import time as _t
+                _t.sleep(0.3)
+            except Exception as exc:
+                log.warning(
+                    "Ошибка отмены sync-puller: %s", exc
+                )
+
+        # 4. Отменяем processing task
+        if self._processing_task is not None:
+            log.info("Отмена воркера обработки…")
+            try:
+                self._loop.call_soon_threadsafe(
+                    self._processing_task.cancel
+                )
+                import time as _t
+                _t.sleep(0.3)
+            except Exception as exc:
+                log.warning(
+                    "Ошибка отмены обработчика: %s", exc
+                )
+
+        # 5. Останавливаем processor
+        try:
+            self.processor.stop()
+        except Exception as exc:
+            log.warning(
+                "Ошибка остановки processor: %s", exc
+            )
+
+        # 6. Останавливаем loop
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception as exc:
+            log.warning(
+                "Ошибка остановки loop: %s", exc
+            )
 
         log.info("Приложение остановлено")
         self.app.quit()
@@ -1454,6 +1424,40 @@ class ScreenRecorderApp(QObject):
 
 
 def main() -> int:
+    # ------------------------------------------------------------------
+    # КРИТИЧНО: включаем faulthandler.
+    #
+    # При segfault Python не печатает traceback — падает «нативно».
+    # faulthandler перехватывает SIGSEGV/SIGABRT и пишет C-стек в
+    # файл. Это единственный способ понять, где именно упал Qt.
+    # ------------------------------------------------------------------
+    import faulthandler
+
+    _faulthandler_dir = "/tmp/screen-recorder"
+    try:
+        os.makedirs(_faulthandler_dir, exist_ok=True)
+        _faulthandler_path = os.path.join(
+            _faulthandler_dir, "faulthandler.log"
+        )
+        _faulthandler_file = open(
+            _faulthandler_path, "a", encoding="utf-8"
+        )
+        faulthandler.enable(file=_faulthandler_file, all_threads=True)
+        print(
+            f"[faulthandler] включён, пишет в {_faulthandler_path}",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        print(
+            f"[faulthandler] не удалось включить: {exc}",
+            file=sys.stderr,
+        )
+        # Пробуем без файла — пойдёт в stderr.
+        try:
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            pass
+
     log_level = os.environ.get(
         "SCREEN_RECORDER_LOG_LEVEL", "DEBUG"
     )
