@@ -76,6 +76,34 @@ class TaskQueue:
                 log.warning("Задача %s не найдена для обновления", task_id)
             self.save_queue()
 
+    def set_task_live_log(
+        self,
+        task_id: str,
+        message: str,
+        percent: int = -1,
+    ) -> None:
+        """
+        Обновляет «живой» лог задачи (для длительных операций,
+        таких как локальная транскрибация).
+
+        Args:
+            task_id: ID задачи.
+            message: текущее сообщение (например, «Обработано
+                     100/500 сегментов»).
+            percent: процент выполнения (0–100) или -1, если
+                     неизвестен.
+        """
+        with self._lock:
+            for t in self._tasks:
+                if t.get("task_id") != task_id:
+                    continue
+                t["live_log"] = str(message or "")[:500]
+                t["live_log_at"] = datetime.now().isoformat()
+                if percent is not None and int(percent) >= 0:
+                    t["local_progress"] = int(percent)
+                self.save_queue()
+                break
+
     def mark_failed(self, task_id: str, error: str) -> None:
         """Помечает задачу как error с сохранением текста ошибки."""
         with self._lock:

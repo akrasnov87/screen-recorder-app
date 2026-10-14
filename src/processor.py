@@ -46,12 +46,17 @@ class VideoProcessor(QObject):
     task_completed = Signal(str, dict)
     task_failed = Signal(str, str)
 
+    # --- НОВОЕ: прогресс локальной транскрибации ---
+    # (task_id, message, percent) — percent = -1, если неизвестен
+    local_transcribe_progress = Signal(str, str, int)
+
     def __init__(
         self,
         config: Dict,
         task_queue: TaskQueue,
         is_recording_cb: Optional[Callable[[], bool]] = None,
         config_manager=None,
+        ask_user_cb: Optional[Callable[[str], Any]] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         """
@@ -64,6 +69,14 @@ class VideoProcessor(QObject):
                              None (или не передавайте вовсе).
             config_manager:  ConfigManager.
             parent:          QObject-родитель.
+            ask_user_cb: асинхронный callback, спрашивающий у
+                         пользователя, нужно ли выполнить
+                         транскрибацию локально.
+                         Сигнатура:
+                           async def ask_user(reason: str) -> bool
+                         True = выполнять локально,
+                         False = прервать (падение задачи).
+                         Если None — фоллбэк отключён.
         """
         super().__init__(parent)
         self.config = config or {}
@@ -73,6 +86,12 @@ class VideoProcessor(QObject):
         self._cancel_events: Dict[str, asyncio.Event] = {}
         self._running = False
         self._last_retry_check = 0.0
+
+        # --- НОВОЕ: callback для вопроса о локальной транскрибации ---
+        # Устанавливается либо через параметр конструктора, либо
+        # позже (см. main.py — там проставляется после создания
+        # VideoProcessor).
+        self._ask_user_cb: Optional[Callable[[str], Any]] = ask_user_cb
 
         app_cfg = (self.config.get("app", {}) or {})
         self._poll_interval = float(
@@ -642,6 +661,7 @@ class VideoProcessor(QObject):
                     target_for_transcribe, transcribe_cfg,
                     prompt=server_prompt,
                     cancel_event=cancel_event,
+                    task_id=task_id,
                 )
                 log.info(
                     "[%s] Транскрибация завершена за %.1f с",
@@ -1671,13 +1691,422 @@ class VideoProcessor(QObject):
                     pass
             return ""
 
+    # ------------------------------------------------------------------
+    # Публичный сеттер для callback (используется из main.py)
+    # ------------------------------------------------------------------
+    def set_ask_user_callback(
+        self, cb: Optional[Callable[[str], Any]]
+    ) -> None:
+        """
+        Устанавливает callback для вопроса «выполнять локально?».
+
+        Args:
+            cb: асинхронная функция async def(reason: str) -> bool.
+                Если None — фоллбэк отключён.
+        """
+        self._ask_user_cb = cb
+        log.info(
+            "VideoProcessor: ask_user_callback %s",
+            "установлен" if cb is not None else "снят",
+        )
+
+    # ------------------------------------------------------------------
+    # Классификация ошибок сервера транскрибации
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_server_unavailable_error(exc: BaseException) -> bool:
+        """
+        Определяет, является ли ошибка «сервер недоступен»
+        (фоллбэк на локальную транскрибацию уместен).
+
+        Возвращает True для:
+          • таймаутов соединения / чтения;
+          • ошибок соединения (DNS, refused, network unreachable);
+          • HTTP 5xx.
+
+        Возвращает False для:
+          • 401/403 (неверный access_key) — фоллбэк не поможет;
+          • 4xx (клиентские ошибки — неверный формат запроса);
+          • ошибок логики (status=error, невалидный JSON) —
+            они означают, что сервер ответил, но что-то не так
+            в самом запросе/данных.
+        """
+        try:
+            import aiohttp
+        except ImportError:
+            aiohttp = None  # type: ignore
+
+        # --- Сетевые ошибки aiohttp ---
+        if aiohttp is not None:
+            if isinstance(
+                exc, (
+                    aiohttp.ClientConnectorError,
+                    aiohttp.ClientConnectionError,
+                    aiohttp.ServerTimeoutError,
+                    aiohttp.ServerDisconnectedError,
+                    aiohttp.ClientOSError,
+                )
+            ):
+                return True
+
+        # --- asyncio-таймауты ---
+        if isinstance(exc, asyncio.TimeoutError):
+            return True
+
+        # --- TranscribeError с HTTP-статусом ---
+        from .transcribe_client import TranscribeError
+        if isinstance(exc, TranscribeError):
+            status = int(getattr(exc, "status", 0) or 0)
+            if status >= 500:
+                return True
+            if status in (401, 403, 404, 400, 422):
+                return False
+            # status == 0 — это сетевая ошибка, не HTTP.
+            if status == 0:
+                msg = str(exc).lower()
+                if any(
+                    marker in msg
+                    for marker in (
+                        "connection", "timeout", "timed out",
+                        "недоступен", "не отвечает",
+                        "connection refused",
+                        "network is unreachable",
+                        "no route to host",
+                        "name or service not known",
+                        "getaddrinfo",
+                    )
+                ):
+                    return True
+
+        # --- Прочие сетевые ошибки ---
+        msg = str(exc).lower()
+        if any(
+            marker in msg
+            for marker in (
+                "connection refused",
+                "connection reset",
+                "network is unreachable",
+                "no route to host",
+                "name or service not known",
+                "timed out",
+                "timeout",
+                "getaddrinfo failed",
+            )
+        ):
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Локальная транскрибация
+    # ------------------------------------------------------------------
+    async def _try_local_transcribe(
+        self,
+        task_id: str,
+        video_path: str,
+        reason: str,
+        cancel_event: asyncio.Event,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Спрашивает пользователя и выполняет локальную транскрибацию.
+
+        Returns:
+            dict-результат транскрибации (как от сервера),
+            либо None — если пользователь отказался ИЛИ
+            локальный транскрибер не сконфигурирован.
+        """
+        log.info(
+            "[%s] _try_local_transcribe: ВХОД "
+            "(video=%s, reason=%d символов)",
+            task_id, os.path.basename(video_path), len(reason),
+        )
+
+        from .local_transcriber import (
+            is_video2text_available,
+            transcribe_locally,
+            LocalTranscriberError,
+        )
+
+        # --- 1. Проверяем настройки фоллбэка ---
+        log.debug(
+            "[%s] _try_local_transcribe: проверка настроек "
+            "local_fallback",
+            task_id,
+        )
+        local_cfg: Dict[str, Any] = {}
+        if self.config_manager is not None:
+            try:
+                local_cfg = (
+                    self.config_manager.get_local_fallback_settings()
+                )
+                log.debug(
+                    "[%s] _try_local_transcribe: "
+                    "local_fallback настройки прочитаны: %s",
+                    task_id, local_cfg,
+                )
+            except Exception as exc:
+                log.warning(
+                    "[%s] Не удалось прочитать local_fallback "
+                    "настройки: %s",
+                    task_id, exc,
+                )
+                local_cfg = {}
+
+        if not local_cfg.get("enabled", True):
+            log.warning(
+                "[%s] _try_local_transcribe: локальный фоллбэк "
+                "выключен в настройках (enabled=False) — "
+                "задача упадёт с ошибкой сервера",
+                task_id,
+            )
+            return None
+
+        # --- 2. Проверяем, установлена ли библиотека ---
+        log.debug(
+            "[%s] _try_local_transcribe: проверка video2text",
+            task_id,
+        )
+        if not is_video2text_available():
+            log.warning(
+                "[%s] _try_local_transcribe: video2text не "
+                "установлен — локальный фоллбэк невозможен",
+                task_id,
+            )
+            self.local_transcribe_progress.emit(
+                task_id,
+                "Локальный фоллбэк недоступен: библиотека "
+                "video2text не установлена. "
+                "Установите её командой: pip install video2text",
+                -1,
+            )
+            return None
+
+        log.debug(
+            "[%s] _try_local_transcribe: video2text доступен",
+            task_id,
+        )
+
+        # --- 3. Проверяем наличие callback ---
+        log.info(
+            "[%s] _try_local_transcribe: проверка "
+            "_ask_user_cb (тип=%s)",
+            task_id,
+            type(self._ask_user_cb).__name__
+            if self._ask_user_cb is not None
+            else "None",
+        )
+
+        if self._ask_user_cb is None:
+            log.warning(
+                "[%s] _try_local_transcribe: ask_user_callback "
+                "не установлен — не могу спросить про локальную "
+                "транскрибацию. Проверьте, что при создании "
+                "VideoProcessor передан параметр "
+                "ask_user_cb=...",
+                task_id,
+            )
+            return None
+
+        # --- 4. Спрашиваем пользователя ---
+        log.info(
+            "[%s] _try_local_transcribe: эмитим task_progress "
+            "и вызываем ask_user_cb…",
+            task_id,
+        )
+
+        self.task_progress.emit(
+            task_id, 50,
+            "Ожидание решения пользователя: локальная "
+            "транскрибация?"
+        )
+
+        try:
+            log.debug(
+                "[%s] _try_local_transcribe: "
+                "iscoroutinefunction=%s",
+                task_id,
+                asyncio.iscoroutinefunction(self._ask_user_cb),
+            )
+
+            if asyncio.iscoroutinefunction(self._ask_user_cb):
+                log.info(
+                    "[%s] _try_local_transcribe: await callback "
+                    "(корутина)…",
+                    task_id,
+                )
+                decision = await self._ask_user_cb(reason)
+                log.info(
+                    "[%s] _try_local_transcribe: callback вернул "
+                    "результат: %r",
+                    task_id, decision,
+                )
+            else:
+                log.info(
+                    "[%s] _try_local_transcribe: вызов callback "
+                    "как обычной функции…",
+                    task_id,
+                )
+                result = self._ask_user_cb(reason)
+                if asyncio.iscoroutine(result):
+                    log.info(
+                        "[%s] _try_local_transcribe: результат — "
+                        "корутина, await её…",
+                        task_id,
+                    )
+                    decision = await result
+                else:
+                    decision = result
+                log.info(
+                    "[%s] _try_local_transcribe: callback вернул "
+                    "результат: %r",
+                    task_id, decision,
+                )
+        except Exception as exc:
+            log.exception(
+                "[%s] _try_local_transcribe: ошибка в "
+                "ask_user_callback: %s",
+                task_id, exc,
+            )
+            return None
+
+        if not decision:
+            log.info(
+                "[%s] _try_local_transcribe: пользователь "
+                "ОТКАЗАЛСЯ от локальной транскрибации",
+                task_id,
+            )
+            return None
+
+        # --- 5. Выполняем локально ---
+        log.info(
+            "[%s] _try_local_transcribe: пользователь "
+            "СОГЛАСИЛСЯ, запуск локальной транскрибации "
+            "(модель=%s, устройство=%s)",
+            task_id,
+            local_cfg.get("model_size", "medium"),
+            local_cfg.get("device", "cpu"),
+        )
+
+        self.task_progress.emit(
+            task_id, 55,
+            "Локальная транскрибация запущена…"
+        )
+
+        session_dir = os.path.dirname(video_path)
+
+        def _progress_emit(msg: str, pct: int, total: int) -> None:
+            try:
+                self.local_transcribe_progress.emit(
+                    task_id, msg, int(pct)
+                )
+            except Exception as exc:
+                log.debug(
+                    "Не удалось эмитить local_transcribe_progress: %s",
+                    exc,
+                )
+
+        try:
+            log.info(
+                "[%s] _try_local_transcribe: вызываю "
+                "transcribe_locally(input=%s, output_dir=%s)…",
+                task_id, video_path, session_dir,
+            )
+            result = await transcribe_locally(
+                input_path=video_path,
+                output_dir=session_dir,
+                options={
+                    "model_size": str(
+                        local_cfg.get("model_size") or "medium"
+                    ),
+                    "device": str(
+                        local_cfg.get("device") or "cpu"
+                    ),
+                    "compute_type": str(
+                        local_cfg.get("compute_type") or "int8"
+                    ),
+                    "language": local_cfg.get("language"),
+                    "beam_size": int(
+                        local_cfg.get("beam_size") or 5
+                    ),
+                    "vad_filter": bool(
+                        local_cfg.get("vad_filter", True)
+                    ),
+                },
+                progress_cb=_progress_emit,
+                cancel_event=cancel_event,
+            )
+            log.info(
+                "[%s] _try_local_transcribe: "
+                "transcribe_locally вернулся (status=%s)",
+                task_id,
+                result.get("status") if isinstance(result, dict)
+                else "—",
+            )
+        except LocalTranscriberError as exc:
+            log.error(
+                "[%s] Локальная транскрибация не удалась: %s",
+                task_id, exc,
+            )
+            raise
+        except Exception as exc:
+            log.exception(
+                "[%s] Неожиданная ошибка локальной транскрибации: %s",
+                task_id, exc,
+            )
+            raise LocalTranscriberError(
+                f"Локальная транскрибация: {exc}"
+            )
+
+        if result.get("status") == "cancelled":
+            log.info(
+                "[%s] _try_local_transcribe: локальная "
+                "транскрибация ОТМЕНЕНА пользователем",
+                task_id,
+            )
+            return result
+
+        self.local_transcribe_progress.emit(
+            task_id,
+            (
+                f"Локальная транскрибация завершена за "
+                f"{result.get('elapsed_sec', 0):.0f} с"
+            ),
+            100,
+        )
+
+        log.info(
+            "[%s] _try_local_transcribe: ВЫХОД (успех, %d симв.)",
+            task_id, len(result.get("script") or ""),
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Транскрибация (сервер + локальный фоллбэк)
+    # ------------------------------------------------------------------
     async def transcribe(
         self,
         video_path: str,
         config: Dict[str, Any],
         prompt: str = "",
         cancel_event: Optional[asyncio.Event] = None,
+        *,
+        task_id: str = "",
     ) -> Dict[str, Any]:
+        """
+        Транскрибация через сервер. При недоступности сервера —
+        предложение выполнить локально (см. _try_local_transcribe).
+
+        Args:
+            video_path:   путь к аудио/видео.
+            config:       словарь настроек сервиса транскрибации.
+            prompt:       промпт (уходит на сервер как summary_prompt).
+            cancel_event: event отмены.
+            task_id:      ID задачи — для эмиссии сигналов
+                          прогресса локальной транскрибации.
+
+        Returns:
+            Результат сервера ИЛИ локальной транскрибации.
+        """
         base_url = config.get("url", "")
         access_key = config.get("access_key", "")
         connect_timeout = float(config.get("connect_timeout", 15))
@@ -1693,6 +2122,9 @@ class VideoProcessor(QObject):
             connect_timeout, read_timeout, max_wait,
         )
 
+        # --------------------------------------------------------
+        # Попытка обратиться к серверу.
+        # --------------------------------------------------------
         try:
             async with TranscribeClient(
                 base_url=base_url,
@@ -1723,7 +2155,71 @@ class VideoProcessor(QObject):
                 )
                 return result
         except Exception as exc:
-            log.exception("Ошибка транскрибации: %s", exc)
+            # --- Пользователь отменил ---
+            if cancel_event is not None and cancel_event.is_set():
+                log.info(
+                    "Транскрибация отменена пользователем во "
+                    "время работы с сервером"
+                )
+                return {"status": "cancelled", "error": "cancelled"}
+
+            # --- Классифицируем ошибку ---
+            server_unavailable = (
+                self._is_server_unavailable_error(exc)
+            )
+            log.warning(
+                "Ошибка сервера транскрибации: %s "
+                "(server_unavailable=%s)",
+                exc, server_unavailable,
+            )
+
+            if not server_unavailable:
+                # Ошибка НЕ про недоступность — фоллбэк не уместен.
+                log.info(
+                    "Фоллбэк не применяется: ошибка не связана "
+                    "с недоступностью сервера."
+                )
+                return {"error": str(exc)}
+
+            # --- Спрашиваем и запускаем локально ---
+            if not task_id:
+                log.warning(
+                    "Локальный фоллбэк отключён: transcribe() "
+                    "вызван без task_id — некуда эмитить "
+                    "прогресс и не с чем связать вопрос."
+                )
+                return {"error": str(exc)}
+
+            reason = (
+                "Сервер транскрибации недоступен:\n\n"
+                f"{exc}\n\n"
+                "Можно выполнить транскрибацию локально через "
+                "библиотеку video2text.\n\n"
+                "ВАЖНО: локальная транскрибация занимает "
+                "значительно больше времени — от нескольких "
+                "минут до нескольких часов в зависимости от "
+                "длительности файла и модели. Прогресс будет "
+                "показан в окне «Очередь задач».\n\n"
+                "Выполнить локально?"
+            )
+
+            try:
+                local_result = await self._try_local_transcribe(
+                    task_id=task_id,
+                    video_path=video_path,
+                    reason=reason,
+                    cancel_event=cancel_event or asyncio.Event(),
+                )
+            except Exception as local_exc:
+                log.exception(
+                    "Локальный фоллбэк упал: %s", local_exc
+                )
+                return {"error": str(local_exc)}
+
+            if local_result is not None:
+                return local_result
+
+            # Пользователь отказался или фоллбэк недоступен.
             return {"error": str(exc)}
 
     # ------------------------------------------------------------------

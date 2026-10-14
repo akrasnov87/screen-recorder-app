@@ -2179,8 +2179,246 @@ class SettingsWindow(QDialog):
 
         layout.addLayout(btns)
 
+        layout.addSpacing(12)
+
+        # ==============================================================
+        # НОВОЕ: Локальный транскрибер (фоллбэк)
+        # ==============================================================
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep)
+
+        local_header = QHBoxLayout()
+        local_header.addWidget(
+            QLabel("<b>Локальный транскрибер (фоллбэк)</b>")
+        )
+        local_header.addStretch()
+        local_icon = make_info_icon("tr_local_fallback_intro")
+        if local_icon is not None:
+            local_header.addWidget(local_icon)
+        layout.addLayout(local_header)
+
+        local_hint = QLabel(
+            "<span style='color:#666'>"
+            "Если сервер транскрибации недоступен (нет "
+            "соединения, таймаут, HTTP 5xx), приложение "
+            "предложит выполнить транскрибацию локально через "
+            "библиотеку <code>video2text</code> (faster-whisper)."
+            "<br><br>"
+            "<b>Внимание:</b> локальная транскрибация идёт "
+            "значительно дольше — от нескольких минут до "
+            "нескольких часов. Прогресс виден в окне "
+            "«Очередь задач»."
+            "</span>"
+        )
+        local_hint.setWordWrap(True)
+        layout.addWidget(local_hint)
+
+        local_form = QFormLayout()
+        local_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.local_fallback_enabled_check = QCheckBox(
+            "Разрешить локальный фоллбэк"
+        )
+        attach_tooltip(
+            self.local_fallback_enabled_check,
+            "tr_local_fallback_enabled",
+        )
+        self.local_fallback_enabled_check.setChecked(True)
+        local_form.addRow("", self.local_fallback_enabled_check)
+
+        self.local_fallback_model_combo = QComboBox()
+        for size in ("tiny", "base", "small", "medium", "large"):
+            self.local_fallback_model_combo.addItem(size, size)
+        self.local_fallback_model_combo.setCurrentText("medium")
+        local_form.addRow(
+            "Размер модели:",
+            with_info(
+                self.local_fallback_model_combo,
+                "tr_local_fallback_model",
+            ),
+        )
+
+        self.local_fallback_device_combo = QComboBox()
+        self.local_fallback_device_combo.addItem("CPU", "cpu")
+        self.local_fallback_device_combo.addItem("CUDA (GPU)", "cuda")
+        local_form.addRow(
+            "Устройство:",
+            with_info(
+                self.local_fallback_device_combo,
+                "tr_local_fallback_device",
+            ),
+        )
+
+        self.local_fallback_compute_combo = QComboBox()
+        for ct in ("int8", "float16", "float32"):
+            self.local_fallback_compute_combo.addItem(ct, ct)
+        self.local_fallback_compute_combo.setCurrentText("int8")
+        local_form.addRow(
+            "Тип вычислений:",
+            with_info(
+                self.local_fallback_compute_combo,
+                "tr_local_fallback_compute",
+            ),
+        )
+
+        self.local_fallback_language_input = QLineEdit()
+        self.local_fallback_language_input.setPlaceholderText(
+            "Например: ru — или пусто для автоопределения"
+        )
+        local_form.addRow(
+            "Язык:",
+            with_info(
+                self.local_fallback_language_input,
+                "tr_local_fallback_language",
+            ),
+        )
+
+        self.local_fallback_beam_spin = QSpinBox()
+        self.local_fallback_beam_spin.setRange(1, 20)
+        self.local_fallback_beam_spin.setValue(5)
+        local_form.addRow(
+            "Beam size:",
+            with_info(
+                self.local_fallback_beam_spin,
+                "tr_local_fallback_beam",
+            ),
+        )
+
+        self.local_fallback_vad_check = QCheckBox(
+            "Использовать VAD-фильтр (отсекать паузы)"
+        )
+        attach_tooltip(
+            self.local_fallback_vad_check,
+            "tr_local_fallback_vad",
+        )
+        self.local_fallback_vad_check.setChecked(True)
+        local_form.addRow("", self.local_fallback_vad_check)
+
+        layout.addLayout(local_form)
+
+        # --- Статус библиотеки video2text + кнопка «Проверить снова» ---
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(8)
+
+        self.local_fallback_status_label = QLabel("")
+        self.local_fallback_status_label.setWordWrap(True)
+        self.local_fallback_status_label.setTextFormat(
+            Qt.TextFormat.RichText
+        )
+        status_row.addWidget(self.local_fallback_status_label, 1)
+
+        self.local_fallback_recheck_btn = QPushButton(
+            "Проверить снова"
+        )
+        self.local_fallback_recheck_btn.setToolTip(
+            "Перепроверить наличие библиотеки video2text.\n\n"
+            "Используйте после установки библиотеки, не закрывая "
+            "окно настроек:\n"
+            "  pip install video2text\n\n"
+            "Проверка сбрасывает кэш импорта, поэтому подхватит "
+            "пакет, установленный во время работы приложения."
+        )
+        self.local_fallback_recheck_btn.clicked.connect(
+            self._refresh_video2text_status
+        )
+        status_row.addWidget(
+            self.local_fallback_recheck_btn, 0,
+            Qt.AlignmentFlag.AlignTop,
+        )
+
+        layout.addLayout(status_row)
+
+        # Первичная проверка статуса при построении вкладки.
+        self._refresh_video2text_status()
+
         layout.addStretch()
         return w
+
+    # ------------------------------------------------------------------
+    # НОВОЕ: перепроверка статуса video2text
+    # ------------------------------------------------------------------
+    def _refresh_video2text_status(self) -> None:
+        """
+        Пересчитывает статус библиотеки video2text и обновляет
+        self.local_fallback_status_label.
+
+        Сбрасывает кэш импорта (см. local_transcriber) — поэтому
+        срабатывает и после установки пакета без перезапуска
+        приложения.
+        """
+        try:
+            from ..local_transcriber import (
+                is_video2text_available,
+                video2text_import_error,
+                video2text_version,
+            )
+
+            available = is_video2text_available()
+            version = video2text_version() if available else ""
+            import_error = (
+                "" if available else video2text_import_error()
+            )
+        except Exception as exc:
+            available = False
+            version = ""
+            import_error = f"{type(exc).__name__}: {exc}"
+            log.exception(
+                "Не удалось проверить статус video2text: %s", exc,
+            )
+
+        if available:
+            version_note = (
+                f" (версия {version})" if version else ""
+            )
+            self.local_fallback_status_label.setText(
+                f"<span style='color:#2E7D32'>"
+                f"✓ Библиотека video2text установлена"
+                f"{version_note}"
+                f"</span>"
+            )
+            log.info(
+                "Статус video2text: доступен%s",
+                f", версия {version}" if version else "",
+            )
+        else:
+            # Разделяем два случая:
+            #   • пакет не установлен → ModuleNotFoundError;
+            #   • пакет установлен, но не импортируется
+            #     (например, конфликт зависимостей).
+            if "ModuleNotFoundError" in import_error and (
+                "video2text" in import_error
+            ):
+                hint = (
+                    "Установите её командой: "
+                    "<code>pip install video2text</code>"
+                )
+            else:
+                hint = (
+                    "Пакет установлен, но не импортируется. "
+                    "Проверьте зависимости (faster-whisper, "
+                    "onnxruntime, ctranslate2) и версию Python."
+                )
+
+            error_line = (
+                f"<br><code>{import_error}</code>"
+                if import_error else ""
+            )
+
+            self.local_fallback_status_label.setText(
+                f"<span style='color:#c62828'>"
+                f"✗ Библиотека video2text не доступна. "
+                f"{hint}</span>{error_line}"
+            )
+            log.warning(
+                "Статус video2text: НЕ доступен (%s)",
+                import_error or "причина неизвестна",
+            )
 
     # ------------------------------------------------------------------
     # Управление списком сервисов транскрибации
@@ -3602,6 +3840,41 @@ class SettingsWindow(QDialog):
             active_id=tr_settings.get("service_id") or "",
         )
 
+        # --- НОВОЕ: локальный фоллбэк ---
+        try:
+            local_cfg = self.config_manager.get_local_fallback_settings()
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать local_fallback: %s", exc,
+            )
+            local_cfg = {}
+
+        self.local_fallback_enabled_check.setChecked(
+            bool(local_cfg.get("enabled", True))
+        )
+        self.local_fallback_model_combo.setCurrentText(
+            str(local_cfg.get("model_size") or "medium")
+        )
+        idx = self.local_fallback_device_combo.findData(
+            str(local_cfg.get("device") or "cpu")
+        )
+        if idx >= 0:
+            self.local_fallback_device_combo.setCurrentIndex(idx)
+        idx = self.local_fallback_compute_combo.findData(
+            str(local_cfg.get("compute_type") or "int8")
+        )
+        if idx >= 0:
+            self.local_fallback_compute_combo.setCurrentIndex(idx)
+        self.local_fallback_language_input.setText(
+            str(local_cfg.get("language") or "")
+        )
+        self.local_fallback_beam_spin.setValue(
+            int(local_cfg.get("beam_size") or 5)
+        )
+        self.local_fallback_vad_check.setChecked(
+            bool(local_cfg.get("vad_filter", True))
+        )
+
         # --- Суммаризация ---
         sum_cfg = self.config_manager.get_summarizer_settings()
         self.sum_enabled_check.setChecked(
@@ -4060,6 +4333,41 @@ class SettingsWindow(QDialog):
                 "Не удалось сохранить настройки транскрибации: %s",
                 exc,
             )
+
+        # --- НОВОЕ: локальный фоллбэк ---
+        try:
+            self.config_manager.set_local_fallback_settings({
+                "enabled": (
+                    self.local_fallback_enabled_check.isChecked()
+                ),
+                "model_size": (
+                    self.local_fallback_model_combo.currentData()
+                    or "medium"
+                ),
+                "device": (
+                    self.local_fallback_device_combo.currentData()
+                    or "cpu"
+                ),
+                "compute_type": (
+                    self.local_fallback_compute_combo.currentData()
+                    or "int8"
+                ),
+                "language": (
+                    self.local_fallback_language_input.text().strip()
+                ),
+                "beam_size": int(
+                    self.local_fallback_beam_spin.value()
+                ),
+                "vad_filter": (
+                    self.local_fallback_vad_check.isChecked()
+                ),
+            })
+        except Exception as exc:
+            log.exception(
+                "Не удалось сохранить настройки локального "
+                "фоллбэка: %s", exc,
+            )
+
         cfg["queue"] = {
             "auto_retry_enabled": (
                 self.auto_retry_check.isChecked()

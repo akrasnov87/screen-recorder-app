@@ -29,6 +29,31 @@ class QueueWindow(QDialog):
         self._build_ui()
         self.refresh()
 
+        # --- НОВОЕ: автообновление раз в 2 секунды ---
+        # Чтобы видеть прогресс локальной транскрибации в
+        # реальном времени, без ручного нажатия «Обновить».
+        from PySide6.QtCore import QTimer
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(2000)
+        self._auto_timer.timeout.connect(self._on_auto_refresh)
+        self._auto_timer.start()
+
+    def _on_auto_refresh(self) -> None:
+        """
+        Автообновление — только если окно видимо.
+
+        Без этой проверки таймер будет молотить вхолостую,
+        когда окно закрыто.
+        """
+        if not self.isVisible():
+            return
+        # Не перетираем выделение пользователя: запоминаем
+        # текущую строку и восстанавливаем её после refresh().
+        current_row = self.table.currentRow()
+        self.refresh()
+        if 0 <= current_row < self.table.rowCount():
+            self.table.selectRow(current_row)
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
 
@@ -44,10 +69,12 @@ class QueueWindow(QDialog):
         root.addLayout(header)
 
         # Таблица
-        self.table = QTableWidget(0, 7)
+        # Добавлены 2 колонки: «Этап» (live_log) и «Локально %».
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels([
             "Task ID", "Создана", "Статус", "Прогресс",
             "Попытки", "Ошибка", "Видео",
+            "Этап", "Локально %",
         ])
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -66,6 +93,10 @@ class QueueWindow(QDialog):
         header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header_view.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        # «Этап» — растягивается: там длинные сообщения.
+        header_view.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        # «Локально %» — по содержимому.
+        header_view.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         root.addWidget(self.table)
 
         # Кнопки действий
@@ -124,6 +155,34 @@ class QueueWindow(QDialog):
             self.table.setItem(row, 4, QTableWidgetItem(str(t.get("retries", 0))))
             self.table.setItem(row, 5, QTableWidgetItem(str(t.get("last_error", ""))[:120]))
             self.table.setItem(row, 6, QTableWidgetItem(str(t.get("video_path", ""))[:120]))
+
+            # --- НОВОЕ: этап (live_log) ---
+            live_log = str(t.get("live_log") or "")
+            stage_item = QTableWidgetItem(live_log[:200])
+            if live_log:
+                stage_item.setToolTip(live_log)
+                # Подсвечиваем «живые» сообщения.
+                if "ошибк" in live_log.lower():
+                    stage_item.setForeground(Qt.GlobalColor.darkRed)
+                elif "завершена" in live_log.lower():
+                    stage_item.setForeground(Qt.GlobalColor.darkGreen)
+                else:
+                    stage_item.setForeground(Qt.GlobalColor.darkBlue)
+            self.table.setItem(row, 7, stage_item)
+
+            # --- НОВОЕ: локальный прогресс (%) ---
+            local_pct = t.get("local_progress")
+            if local_pct is not None and int(local_pct) >= 0:
+                pct_item = QTableWidgetItem(f"{int(local_pct)}%")
+                pct_item.setForeground(Qt.GlobalColor.darkBlue)
+                pct_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight
+                    | Qt.AlignmentFlag.AlignVCenter
+                )
+            else:
+                pct_item = QTableWidgetItem("—")
+                pct_item.setForeground(Qt.GlobalColor.gray)
+            self.table.setItem(row, 8, pct_item)
 
         log.debug("Очередь обновлена в окне: %d задач", len(tasks))
 
