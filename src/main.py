@@ -95,7 +95,7 @@ else:
         sanitize_filename,
     )
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Slot, Qt
+from PySide6.QtCore import QObject, QTimer, QUrl, Slot
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QMessageBox, QSystemTrayIcon,
@@ -149,17 +149,8 @@ class ScreenRecorderApp(QObject):
             self.task_queue,
             is_recording_cb=None,     # записи экрана больше нет
             config_manager=self.config_manager,
-            ask_user_cb=self._ask_local_transcribe_async,
         )
         self.tray_manager = TrayManager(self.config_manager.config, self)
-
-        # --- Диагностика: подтверждаем, что callback установлен ---
-        log.info(
-            "Проверка: processor._ask_user_cb = %r, "
-            "processor.config_manager = %r",
-            getattr(self.processor, "_ask_user_cb", "<no attr>"),
-            getattr(self.processor, "config_manager", "<no attr>"),
-        )
 
         self.settings_window: Optional[SettingsWindow] = None
         self.queue_window: Optional[QueueWindow] = None
@@ -234,13 +225,6 @@ class ScreenRecorderApp(QObject):
         self.processor.task_progress.connect(self._on_task_progress)
         self.processor.task_completed.connect(self._on_task_completed)
         self.processor.task_failed.connect(self._on_task_failed)
-
-        # --- НОВОЕ: прогресс локальной транскрибации ---
-        # Записываем «живой» лог в очередь; UI обновит его
-        # при следующем refresh.
-        self.processor.local_transcribe_progress.connect(
-            self._on_local_transcribe_progress
-        )
 
         register_gui_handler(self._on_log_to_gui)
 
@@ -1120,223 +1104,6 @@ class ScreenRecorderApp(QObject):
             "Прогресс задачи %s: %d%% (%s)",
             task_id, progress, stage,
         )
-
-    # ------------------------------------------------------------------
-    # НОВОЕ: локальная транскрибация — прогресс и вопрос
-    # ------------------------------------------------------------------
-    @Slot(str, str, int)
-    def _on_local_transcribe_progress(
-        self, task_id: str, message: str, percent: int,
-    ) -> None:
-        """
-        Принимает сообщение о прогрессе локальной транскрибации
-        и записывает его в очередь задач.
-        """
-        log.info(
-            "[%s] local_progress: %s (%d%%)",
-            task_id, message, percent,
-        )
-        try:
-            self.task_queue.set_task_live_log(
-                task_id, message, percent,
-            )
-        except Exception as exc:
-            log.debug(
-                "Не удалось записать live_log для %s: %s",
-                task_id, exc,
-            )
-
-    async def _ask_local_transcribe_async(
-        self, reason: str,
-    ) -> bool:
-        """
-        Асинхронный callback: спрашивает у пользователя,
-        нужно ли выполнить транскрибацию локально.
-
-        ВАЖНО: вызывается из фонового потока (asyncio-loop
-        processor-а). Прямой вызов Qt-виджетов из чужого потока
-        НЕБЕЗОПАСЕН, а QTimer.singleShot из чужого потока Qt
-        молча игнорирует (именно поэтому окно не появлялось).
-
-        Используем QMetaObject.invokeMethod с
-        BlockingQueuedConnection — это гарантированно выполнит
-        слот в главном Qt-потоке и дождётся его завершения.
-        """
-        import threading
-        from PySide6.QtCore import (
-            QMetaObject, QObject, Qt as _Qt, Slot as _Slot,
-        )
-        from PySide6.QtWidgets import QApplication
-
-        log.info(
-            "_ask_local_transcribe_async: ВЫЗВАН "
-            "(reason=%d символов, поток=%s)",
-            len(reason or ""),
-            threading.current_thread().name,
-        )
-
-        app = QApplication.instance()
-        if app is None:
-            log.error(
-                "_ask_local_transcribe_async: нет QApplication — "
-                "невозможно показать диалог. Возвращаю False."
-            )
-            return False
-
-        in_main_thread = (
-            threading.current_thread() is app.thread()
-        )
-
-        # Если вдруг уже в главном потоке — вызываем диалог
-        # напрямую (invokeMethod с BlockingQueuedConnection
-        # в этом случае дал бы дедлок).
-        if in_main_thread:
-            log.info(
-                "_ask_local_transcribe_async: уже в главном "
-                "потоке — показываю диалог напрямую"
-            )
-            return self._show_local_transcribe_dialog(reason)
-
-        log.info(
-            "_ask_local_transcribe_async: перебрасываю диалог "
-            "в главный поток через BlockingQueuedConnection…"
-        )
-
-        result_holder = {"answer": False}
-        outer_self = self
-
-        class _DialogInvoker(QObject):
-            @_Slot()
-            def show_dialog(self) -> None:
-                log.info(
-                    "_DialogInvoker.show_dialog: ВХОД "
-                    "(главный Qt-поток)"
-                )
-                try:
-                    result_holder["answer"] = (
-                        outer_self._show_local_transcribe_dialog(
-                            reason
-                        )
-                    )
-                    log.info(
-                        "_DialogInvoker.show_dialog: "
-                        "получили ответ=%s",
-                        result_holder["answer"],
-                    )
-                except Exception as exc:
-                    log.exception(
-                        "_DialogInvoker.show_dialog: ошибка: %s",
-                        exc,
-                    )
-                    result_holder["answer"] = False
-
-        invoker = _DialogInvoker()
-        invoker.moveToThread(app.thread())
-
-        log.info(
-            "_ask_local_transcribe_async: invokeMethod "
-            "(BlockingQueuedConnection)…"
-        )
-        QMetaObject.invokeMethod(
-            invoker,
-            "show_dialog",
-            _Qt.ConnectionType.BlockingQueuedConnection,
-        )
-        log.info(
-            "_ask_local_transcribe_async: invokeMethod "
-            "вернулся, ответ=%s",
-            result_holder["answer"],
-        )
-
-        log.info(
-            "Пользователь %s локальную транскрибацию",
-            "выбрал" if result_holder["answer"] else "отклонил",
-        )
-        return bool(result_holder["answer"])
-
-    def _show_local_transcribe_dialog(
-        self, reason: str,
-    ) -> bool:
-        """
-        Синхронно показывает модальный диалог выбора локальной
-        транскрибации.
-
-        ДОЛЖЕН вызываться ТОЛЬКО из главного Qt-потока.
-
-        Returns:
-            True  — «Выполнить локально».
-            False — «Отменить задачу».
-        """
-        from PySide6.QtWidgets import QMessageBox
-
-        log.info(
-            "_show_local_transcribe_dialog: ВХОД "
-            "(reason=%d символов)",
-            len(reason or ""),
-        )
-
-        try:
-            box = QMessageBox()
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setWindowTitle(
-                "Сервер транскрибации недоступен"
-            )
-            box.setTextFormat(Qt.TextFormat.PlainText)
-            box.setText(reason)
-
-            box.setWindowModality(
-                Qt.WindowModality.ApplicationModal
-            )
-            box.setWindowFlag(
-                Qt.WindowType.WindowStaysOnTopHint, True
-            )
-
-            local_btn = box.addButton(
-                "Выполнить локально",
-                QMessageBox.ButtonRole.AcceptRole,
-            )
-            cancel_btn = box.addButton(
-                "Отменить задачу",
-                QMessageBox.ButtonRole.RejectRole,
-            )
-            box.setDefaultButton(cancel_btn)
-
-            log.info(
-                "_show_local_transcribe_dialog: QMessageBox "
-                "создан, показываю и поднимаю…"
-            )
-
-            box.show()
-            box.raise_()
-            box.activateWindow()
-            try:
-                handle = box.windowHandle()
-                if handle is not None:
-                    handle.requestActivate()
-            except Exception as exc:
-                log.debug(
-                    "_show_local_transcribe_dialog: "
-                    "requestActivate упал: %s", exc,
-                )
-
-            log.info(
-                "_show_local_transcribe_dialog: вхожу в exec() "
-                "— ждём ответа пользователя…"
-            )
-            box.exec()
-            clicked = box.clickedButton()
-            log.info(
-                "_show_local_transcribe_dialog: вышли из "
-                "exec(), clickedButton=%r, локальная=%s",
-                clicked, clicked is local_btn,
-            )
-            return clicked is local_btn
-        except Exception as exc:
-            log.exception(
-                "_show_local_transcribe_dialog: ошибка: %s",
-                exc,
-            )
-            return False
 
     def _on_task_completed(self, task_id: str, result: dict) -> None:
         self._set_state(AppState.IDLE)

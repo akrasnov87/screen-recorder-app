@@ -206,16 +206,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "max_wait": 7200,
             },
         ],
-        # --- НОВОЕ: локальный фоллбэк через video2text ---
-        "local_fallback": {
-            "enabled": True,
-            "model_size": "medium",
-            "device": "cpu",
-            "compute_type": "int8",
-            "language": "",
-            "beam_size": 5,
-            "vad_filter": True,
-        },
     },
     "queue": {
         "auto_retry_enabled": True,
@@ -739,54 +729,6 @@ class ConfigManager:
             "max_bytes_mb": int(cfg.get("max_bytes_mb", 10)),
             "backup_count": int(cfg.get("backup_count", 5)),
         }
-
-    # ------------------------------------------------------------------
-    # НОВОЕ: локальный фоллбэк транскрибации
-    # ------------------------------------------------------------------
-    def get_local_fallback_settings(self) -> Dict[str, Any]:
-        """
-        Возвращает настройки локального фоллбэка (video2text).
-
-        Все ключи, кроме model_size/device/compute_type, могут
-        отсутствовать — возвращаются разумные дефолты.
-        """
-        cfg = self.config.get("transcribe", {}) or {}
-        lf = cfg.get("local_fallback", {}) or {}
-
-        return {
-            "enabled": bool(lf.get("enabled", True)),
-            "model_size": str(lf.get("model_size", "medium")),
-            "device": str(lf.get("device", "cpu")),
-            "compute_type": str(lf.get("compute_type", "int8")),
-            "language": str(lf.get("language", "") or "").strip(),
-            "beam_size": int(lf.get("beam_size", 5)),
-            "vad_filter": bool(lf.get("vad_filter", True)),
-        }
-
-    def set_local_fallback_settings(
-        self, settings: Dict[str, Any],
-    ) -> None:
-        """Сохраняет настройки локального фоллбэка."""
-        cfg = self.config.setdefault("transcribe", {})
-        lf = cfg.setdefault("local_fallback", {})
-
-        lf["enabled"] = bool(settings.get("enabled", True))
-        lf["model_size"] = str(settings.get("model_size", "medium"))
-        lf["device"] = str(settings.get("device", "cpu"))
-        lf["compute_type"] = str(
-            settings.get("compute_type", "int8")
-        )
-        lf["language"] = str(settings.get("language", "") or "").strip()
-        lf["beam_size"] = int(settings.get("beam_size", 5))
-        lf["vad_filter"] = bool(settings.get("vad_filter", True))
-
-        self.save()
-        log.info(
-            "Настройки локального фоллбэка сохранены: enabled=%s, "
-            "model=%s, device=%s, compute=%s",
-            lf["enabled"], lf["model_size"],
-            lf["device"], lf["compute_type"],
-        )
 
     def get_transcribe_settings(self) -> Dict[str, Any]:
         """Возвращает настройки АКТИВНОГО сервиса транскрибации."""
