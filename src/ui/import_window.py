@@ -65,6 +65,7 @@ class ImportWindow(QDialog):
         get_tags: Optional[
             Callable[[], List[Dict[str, str]]]
         ] = None,
+        categories: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Импорт материалов")
@@ -80,12 +81,18 @@ class ImportWindow(QDialog):
         self._get_tags_cb = get_tags
         self._selected_tags: List[str] = []
 
+        # --- Категории ---
+        self._categories: List[Dict[str, str]] = list(
+            categories or []
+        )
+
         self._build_ui()
         self._refresh_ok_state()
         log.debug(
-            "ImportWindow открыто, проектов=%d, тегов=%d, "
-            "sessions_root=%s",
-            len(self._projects), len(self._tags), sessions_root,
+            "ImportWindow открыто, проектов=%d, категорий=%d, "
+            "тегов=%d, sessions_root=%s",
+            len(self._projects), len(self._categories),
+            len(self._tags), sessions_root,
         )
 
     # ------------------------------------------------------------------
@@ -214,6 +221,19 @@ class ImportWindow(QDialog):
         if self._projects:
             self.project_combo.setCurrentIndex(0)
         meta_form.addRow("Проект:", with_info(self.project_combo, "imp_project"))
+
+        # Категория
+        self.category_combo = QComboBox()
+        self.category_combo.setEditable(True)
+        self.category_combo.addItem("— не указана —", "")
+        for c in self._categories:
+            name = (c.get("name") or "").strip()
+            if name:
+                self.category_combo.addItem(name, name)
+        meta_form.addRow(
+            "Категория:",
+            with_info(self.category_combo, "meta_category"),
+        )
 
         # Комментарий
         self.comment_input = QPlainTextEdit()
@@ -600,6 +620,12 @@ class ImportWindow(QDialog):
 
         selected_tags = self._ordered_selected_tags()
 
+        category_data = self.category_combo.currentData() or ""
+        category_text = self.category_combo.currentText().strip()
+        if category_text == "— не указана —":
+            category_text = ""
+        category = str(category_data).strip() or category_text
+
         self.result_data = {
             "video_path": video,
             "transcript_path": transcript,
@@ -610,6 +636,7 @@ class ImportWindow(QDialog):
                 self.project_combo.currentText().strip()
                 or "Default"
             ),
+            "category": category,       # ← НОВОЕ
             "comment": self.comment_input.toPlainText().strip(),
             "tags": selected_tags,
             "enqueue": self.enqueue_check.isChecked(),

@@ -336,6 +336,7 @@ class ScreenRecorderApp(QObject):
         allow_document_only: bool = False,
     ) -> Optional[Dict[str, Any]]:
         projects = self.config_manager.get_project_names()
+        categories = self.config_manager.get_categories()
         prompts = self.config_manager.get_prompts()
         default_prompt = self.config_manager.get_default_prompt()
         name_templates = self.config_manager.get_name_templates()
@@ -393,6 +394,7 @@ class ScreenRecorderApp(QObject):
             tags=tags,
             on_save_tag=self._add_tag_to_library,
             get_tags=self.config_manager.get_tags,
+            categories=categories,       # ← НОВОЕ
             tfs_settings=tfs_settings,
             tfs_templates=tfs_templates,
             on_request_tfs_projects=_on_request_tfs_projects,
@@ -430,6 +432,7 @@ class ScreenRecorderApp(QObject):
 
         meta = {
             "project": default_project,
+            "category": "",       # ← НОВОЕ
             "name": f"Запись {now_str}",
             "description": f"Запись {now_str}",
             "name_template": "",
@@ -893,6 +896,7 @@ class ScreenRecorderApp(QObject):
         projects = self.config_manager.get_project_names()
         tags = self.config_manager.get_tags()
 
+        categories = self.config_manager.get_categories()
         dlg = ImportWindow(
             projects=projects,
             sessions_root=self._sessions_root(),
@@ -900,6 +904,7 @@ class ScreenRecorderApp(QObject):
             tags=tags,
             on_save_tag=self._add_tag_to_library,
             get_tags=self.config_manager.get_tags,
+            categories=categories,      # ← НОВОЕ
         )
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
@@ -1000,6 +1005,7 @@ class ScreenRecorderApp(QObject):
 
         meta: Dict[str, Any] = {
             "project": project,
+            "category": str(data.get("category") or ""),   # ← НОВОЕ
             "name": name,
             "description": name,
             "date": date_dt.strftime("%Y-%m-%d"),

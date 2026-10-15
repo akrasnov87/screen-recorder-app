@@ -16,10 +16,6 @@
   │  │  │ Задачи TFS       │  │ │  │ Записи за день         │  │ │
   │  │  │ (TfsPanel)       │  │ │  │                        │  │ │
   │  │  └──────────────────┘  │ │  └────────────────────────┘  │ │
-  │  │  ┌──────────────────┐  │ │                              │ │
-  │  │  │ Результат        │  │ │                              │ │
-  │  │  │ анализа          │  │ │                              │ │
-  │  │  └──────────────────┘  │ │                              │ │
   │  └────────────────────────┘ └──────────────────────────────┘ │
   └──────────────────────────────────────────────────────────────┘
 
@@ -35,33 +31,19 @@
     (app.scrum_day_view_mode).
   • ИСПРАВЛЕНО: рендеринг summary во вкладке «Записи за день»
     (было — BB-код, стало — Markdown через QTextDocument.setMarkdown).
-  • НОВОЕ: кнопка «Анализ поручений и TFS…» — собирает данные
-    из таблицы поручений и дерева TFS, открывает диалог выбора
-    промпта из библиотеки и отправляет запрос к LLM (провайдер
-    LiteLLM из настроек «Суммаризация»).
-  • ИСПРАВЛЕНО: для кнопки анализа проверяется только провайдер
-    LiteLLM и Base URL — флаг «Формировать summary для новых
-    записей» игнорируется.
-  • НОВОЕ: методы _collect_tasks_text и _collect_tfs_text
-    учитывают активные фильтры — в промпт уходят только те
-    данные, что видны в таблице/дереве.
-  • ИЗМЕНЕНО: результат анализа теперь выводится НЕ в отдельном
-    модальном окне, а во встроенной панели AnalysisResultWidget
-    — в нижней части левого блока, после панели TFS. Панель
-    поддерживает сворачивание. Модальным остаётся только
-    короткий диалог ожидания (AnalysisWorkerDialog).
-  • НОВОЕ: панель результата анализа (AnalysisResultWidget)
-    по умолчанию СВЁРНУТА — не отнимает место у блоков
-    «Поручения» и «Задачи TFS». Настройка
-    app.scrum_analysis_collapsed_by_default управляет этим.
-    При получении результата панель НЕ разворачивается
-    автоматически — пользователь разворачивает кликом по
-    заголовку.
   • НОВОЕ: сортировка таблиц «Поручения» и «Задачи TFS» по
     колонке «Исполнитель». Управляется настройкой
     app.scrum_sort_by_assignee (по умолчанию включена).
     Настройка читается один раз при открытии окна и
     прокидывается в TasksEditorWidget и TfsPanelWidget.
+  • УДАЛЕНО: кнопка «Анализ поручений и TFS…» и встроенная
+    панель результата анализа (AnalysisResultWidget).
+    Модули analysis_prompt_dialog, analysis_result_widget,
+    analysis_worker_dialog удалены. Настройка
+    app.scrum_analysis_collapsed_by_default больше не
+    используется. Логика работы с LLM (литellm_client)
+    сохранена для суммаризации и извлечения поручений в
+    processor.py.
 """
 from __future__ import annotations
 
@@ -84,9 +66,6 @@ from ..bbcode_editor import bbcode_to_html
 from ..docx_to_html import docx_to_html
 from ..file_readers import read_any_text, read_json_file
 from ..logger import get_logger
-from .analysis_prompt_dialog import AnalysisPromptDialog
-from .analysis_result_widget import AnalysisResultWidget
-from .analysis_worker_dialog import AnalysisWorkerDialog
 from .tasks_editor_widget import TasksEditorWidget
 from .tfs_panel_widget import TfsPanelWidget
 from .tooltips import (
@@ -847,7 +826,7 @@ class ScrumWindow(QDialog):
 
         self._app_cfg = app_cfg
 
-        # --- НОВОЕ: сортировка таблиц по исполнителю ---
+        # --- Сортировка таблиц по исполнителю ---
         # Читаем один раз при открытии окна. Управляет
         # сортировкой и таблицы поручений, и дерева задач TFS.
         # Значение берётся из Настройки → Скрам.
@@ -922,12 +901,10 @@ class ScrumWindow(QDialog):
 
         log.info(
             "ScrumWindow открыто: session=%s, is_scrum=%s, "
-            "day_view_mode=%r, analysis_collapsed=%s, "
-            "sort_by_assignee=%s",
+            "day_view_mode=%r, sort_by_assignee=%s",
             os.path.basename(session_dir),
             self._session_meta.get("is_scrum"),
             self._initial_day_view_mode,
-            self.analysis_widget.is_expanded() is False,
             self._sort_by_assignee,
         )
 
@@ -971,7 +948,7 @@ class ScrumWindow(QDialog):
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(self.main_splitter, 1)
 
-        # --- Левая часть: поручения + TFS + результат анализа ---
+        # --- Левая часть: поручения + TFS ---
         self.left_splitter = QSplitter(Qt.Orientation.Vertical)
         self.left_splitter.setChildrenCollapsible(False)
         # Компактный зазор между блоками в левой части.
@@ -1009,31 +986,11 @@ class ScrumWindow(QDialog):
         )
         self.left_splitter.addWidget(self.tfs_widget)
 
-        # --- Встраиваемая панель результата анализа ---
-        # НОВОЕ: панель по умолчанию свёрнута — настройка
-        # app.scrum_analysis_collapsed_by_default.
-        start_collapsed = bool(
-            self._app_cfg.get(
-                "scrum_analysis_collapsed_by_default", True
-            )
-        )
-        self.analysis_widget = AnalysisResultWidget(
-            parent=self,
-            start_collapsed=start_collapsed,
-        )
-        self.analysis_widget.rerun_requested.connect(
-            self._on_run_analysis
-        )
-        self.left_splitter.addWidget(self.analysis_widget)
-
-        # Порядок и пропорции: поручения, TFS, результат.
-        # Панель результата по умолчанию свёрнута и занимает
-        # минимум места — большую часть высоты отдаём поручениям
-        # и TFS.
+        # Пропорции левой части: поручения и TFS делят место
+        # примерно поровну.
         self.left_splitter.setSizes([
-            max(200, int(self._tasks_panel_height * 0.9)),
-            max(200, int(self._tasks_panel_height * 0.9)),
-            60,   # свёрнутая панель — только заголовок
+            max(200, int(self._tasks_panel_height * 1.0)),
+            max(200, int(self._tasks_panel_height * 1.0)),
         ])
 
         self.main_splitter.addWidget(self.left_splitter)
@@ -1082,29 +1039,6 @@ class ScrumWindow(QDialog):
 
         # --- Нижние кнопки ---
         bottom = QHBoxLayout()
-
-        # Кнопка «Анализ поручений и TFS» — открывает диалог
-        # выбора промпта и отправляет запрос к LLM.
-        self.analysis_btn = QPushButton(
-            "Анализ поручений и TFS…"
-        )
-        self.analysis_btn.setToolTip(
-            "Проанализировать данные поручений записи и задачи "
-            "TFS с помощью LLM.\n\n"
-            "Откроется диалог выбора промпта из библиотеки "
-            "(Настройки → Промпты и имена).\n\n"
-            "Результат появится в панели под задачами TFS. "
-            "Панель по умолчанию свёрнута — разверните её "
-            "кликом по заголовку «Результат анализа».\n\n"
-            "Провайдер и модель — из Настройки → Суммаризация."
-        )
-        attach_tooltip(
-            self.analysis_btn, "scrum_analysis_button"
-        )
-        self.analysis_btn.clicked.connect(
-            self._on_run_analysis
-        )
-        bottom.addWidget(self.analysis_btn)
 
         bottom.addStretch()
 
@@ -1278,533 +1212,6 @@ class ScrumWindow(QDialog):
             log.warning(
                 "Не удалось перезагрузить записи за день: %s", exc
             )
-
-    # ------------------------------------------------------------------
-    # Анализ поручений и TFS через LLM
-    # ------------------------------------------------------------------
-    def _on_run_analysis(self) -> None:
-        """
-        Запускает анализ поручений и задач TFS через LLM.
-
-        Шаги:
-          1. Проверяет, что суммаризация настроена (LiteLLM).
-          2. Загружает список промптов из библиотеки.
-          3. Собирает текст поручений и задач TFS.
-          4. Открывает диалог выбора промпта.
-          5. Открывает маленький модальный диалог ожидания
-             и по завершении показывает результат в
-             AnalysisResultWidget (встроенная панель под TFS).
-
-        Панель результата по умолчанию свёрнута — после
-        успешного анализа она НЕ разворачивается автоматически,
-        пользователь разворачивает её кликом по заголовку.
-        """
-        if self._config_manager is None:
-            QMessageBox.warning(
-                self, "Анализ",
-                "Нет доступа к настройкам (ConfigManager).",
-            )
-            return
-
-        # --- 1. Проверка настроек суммаризации ---
-        # Флаг «enabled» (Формировать summary для новых записей)
-        # НЕ проверяем — он управляет автоматической суммаризацией
-        # при обработке новых записей.
-        try:
-            sum_cfg = self._config_manager.get_summarizer_settings()
-        except Exception as exc:
-            log.warning(
-                "Не удалось прочитать настройки суммаризации: %s",
-                exc,
-            )
-            QMessageBox.critical(
-                self, "Анализ",
-                f"Не удалось прочитать настройки:\n{exc}",
-            )
-            return
-
-        provider = str(
-            sum_cfg.get("provider", "server")
-        ).strip().lower()
-        if provider != "litellm":
-            QMessageBox.information(
-                self, "Анализ",
-                "Для анализа требуется провайдер LiteLLM.\n\n"
-                "Сейчас выбран: "
-                f"«{provider}».\n\n"
-                "Переключите провайдер в Настройки → Суммаризация "
-                "на «LiteLLM (OpenAI-совместимый API)».",
-            )
-            return
-
-        lcfg = sum_cfg.get("litellm", {}) or {}
-        base_url = str(lcfg.get("base_url") or "").strip()
-        api_key = str(lcfg.get("api_key") or "")
-        model = str(lcfg.get("model") or "gpt-4o-mini")
-        temperature = float(lcfg.get("temperature", 0.25))
-        max_tokens = int(lcfg.get("max_tokens", 4000))
-        connect_timeout = float(lcfg.get("connect_timeout", 15))
-        read_timeout = float(lcfg.get("read_timeout", 600))
-        system_prompt = str(lcfg.get("system_prompt") or "").strip()
-
-        if not base_url:
-            QMessageBox.warning(
-                self, "Анализ",
-                "Не задан Base URL для LiteLLM.\n\n"
-                "Откройте Настройки → Суммаризация.",
-            )
-            return
-
-        # --- 2. Промпты из библиотеки ---
-        try:
-            prompts = self._config_manager.get_prompts()
-        except Exception as exc:
-            log.warning(
-                "Не удалось прочитать промпты: %s", exc
-            )
-            prompts = []
-
-        if not prompts:
-            QMessageBox.information(
-                self, "Анализ",
-                "Библиотека промптов пуста.\n\n"
-                "Добавьте хотя бы один промпт в "
-                "Настройки → Промпты и имена.",
-            )
-            return
-
-        # --- 3. Сбор данных ---
-        tasks_text = self._collect_tasks_text()
-        tfs_text = self._collect_tfs_text()
-
-        if not tasks_text.strip() and not tfs_text.strip():
-            QMessageBox.information(
-                self, "Анализ",
-                "Нет данных для анализа.\n\n"
-                "Убедитесь, что в таблице поручений есть записи "
-                "и/или в панели TFS загружены задачи.",
-            )
-            return
-
-        # --- 4. Диалог выбора промпта ---
-        prompt_dlg = AnalysisPromptDialog(
-            prompts=prompts,
-            parent=self,
-        )
-        if prompt_dlg.exec() != QDialog.DialogCode.Accepted:
-            log.info(
-                "ScrumWindow: выбор промпта отменён пользователем"
-            )
-            return
-
-        selected = prompt_dlg.selected_prompt()
-        if not selected:
-            return
-
-        prompt_name = selected.get("name") or ""
-        prompt_text = selected.get("text") or ""
-
-        # --- 5. Сборка итогового user-промпта ---
-        user_prompt = self._build_analysis_user_prompt(
-            prompt_text=prompt_text,
-            tasks_text=tasks_text,
-            tfs_text=tfs_text,
-        )
-
-        log.info(
-            "ScrumWindow: анализ — промпт=%r, "
-            "поручений=%d симв., TFS=%d симв., итог=%d симв.",
-            prompt_name, len(tasks_text), len(tfs_text),
-            len(user_prompt),
-        )
-
-        # --- 6. Показываем состояние ожидания в панели ---
-        # Панель НЕ разворачиваем — только обновляем содержимое.
-        # Если пользователь захочет посмотреть «что происходит»,
-        # он развернёт панель вручную.
-        try:
-            self.analysis_widget.browser.setHtml(
-                "<div style='font-family:sans-serif; font-size:11pt; "
-                "color:#666; padding:16px;'>"
-                f"<b style='color:#1565C0;'>"
-                f"Анализ выполняется…</b><br><br>"
-                f"Промпт: <b>{html.escape(prompt_name)}</b><br>"
-                f"Модель: <code>{html.escape(model)}</code><br><br>"
-                f"Пожалуйста, подождите."
-                "</div>"
-            )
-            self.analysis_widget._refresh_header()
-            self.analysis_widget._refresh_buttons_state()
-        except Exception as exc:
-            log.warning(
-                "Не удалось показать состояние ожидания: %s", exc,
-            )
-
-        # --- 7. Модальный диалог ожидания (маленький) ---
-        try:
-            worker_dlg = AnalysisWorkerDialog(
-                base_url=base_url,
-                api_key=api_key,
-                model=model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                prompt_name=prompt_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                connect_timeout=connect_timeout,
-                read_timeout=read_timeout,
-                parent=self,
-            )
-
-            # Подписываемся на сигналы ДО exec — иначе сигналы,
-            # эмитнутые в момент accept(), могут быть потеряны.
-            result_holder: Dict[str, Any] = {
-                "ok": False, "text": "", "error": "",
-            }
-
-            def _on_ok(text: str) -> None:
-                result_holder["ok"] = True
-                result_holder["text"] = text
-
-            def _on_fail(error: str) -> None:
-                result_holder["ok"] = False
-                result_holder["error"] = error
-
-            worker_dlg.finished_ok.connect(_on_ok)
-            worker_dlg.failed.connect(_on_fail)
-
-            worker_dlg.exec()
-
-            # --- 8. Отображаем результат в панели ---
-            # Панель остаётся свёрнутой — пользователь развернёт
-            # её сам, увидев обновлённый заголовок.
-            if result_holder["ok"]:
-                self.analysis_widget.set_result(
-                    result_holder["text"],
-                    prompt_name=prompt_name,
-                )
-            elif result_holder["error"]:
-                self.analysis_widget.set_error(
-                    result_holder["error"]
-                )
-            else:
-                # Пользователь отменил ожидание.
-                self.analysis_widget.browser.setHtml(
-                    "<p style='color:#666; padding:16px; "
-                    "font-style:italic;'>"
-                    "Анализ отменён пользователем.</p>"
-                )
-                self.analysis_widget._refresh_header()
-                self.analysis_widget._refresh_buttons_state()
-        except Exception as exc:
-            log.exception(
-                "Не удалось выполнить анализ: %s", exc
-            )
-            QMessageBox.critical(
-                self, "Анализ",
-                f"Ошибка выполнения:\n{exc}",
-            )
-
-    def _collect_tasks_text(self) -> str:
-        """
-        Возвращает текстовое представление поручений,
-        КОТОРЫЕ СЕЙЧАС ВИДНЫ в таблице — с учётом всех
-        активных фильтров (диалоговых и колоночных).
-
-        Логика:
-          1. Берём отфильтрованный список из внутреннего
-             TasksEditorDialog._filtered_items() — это уже
-             учитывает фильтры самого диалога (статус,
-             исполнитель, номер, поиск).
-          2. Поверх накладываем колоночные фильтры из
-             TasksEditorWidget — те, что в панели «Фильтр
-             по колонкам»: №, Статус, Текст, Исполнитель,
-             Комментарий.
-          3. Сверяем с таблицей — каждая строка, которая
-             не скрыта (setRowHidden(False)), попадает
-             в результат.
-
-        Формат — Markdown-таблица.
-        """
-        try:
-            widget = self.tasks_widget
-            dlg = getattr(widget, "_dlg", None)
-            if dlg is None:
-                return ""
-        except Exception as exc:
-            log.warning(
-                "Не удалось получить внутренний диалог поручений: %s",
-                exc,
-            )
-            return ""
-
-        # --- Список после фильтров самого диалога ---
-        try:
-            items_after_dlg = list(dlg._filtered_items())
-        except Exception as exc:
-            log.warning(
-                "Не удалось применить фильтры диалога поручений: %s",
-                exc,
-            )
-            items_after_dlg = list(dlg._data.get("items", []) or [])
-
-        # --- Отсеиваем те, что не проходят колоночные фильтры ---
-        items: List[Dict[str, Any]] = []
-        try:
-            for it in items_after_dlg:
-                if widget._matches_column_filters(it):
-                    items.append(it)
-        except Exception as exc:
-            log.warning(
-                "Не удалось применить колоночные фильтры "
-                "поручений: %s", exc,
-            )
-            items = items_after_dlg
-
-        # --- Дополнительная защита: сверяем со таблицей ---
-        try:
-            table = dlg.table
-            visible_ids: set = set()
-            for row in range(table.rowCount()):
-                if table.isRowHidden(row):
-                    continue
-                id_item = table.item(row, 6)  # колонка ID
-                if id_item:
-                    visible_ids.add(id_item.text())
-            if visible_ids:
-                filtered_by_table = [
-                    it for it in items
-                    if str(it.get("id") or "") in visible_ids
-                ]
-                if filtered_by_table:
-                    items = filtered_by_table
-        except Exception as exc:
-            log.debug(
-                "Не удалось сверить поручения с видимостью таблицы: %s",
-                exc,
-            )
-
-        if not items:
-            return ""
-
-        from ..tasks_manager import STATUS_LABELS
-
-        lines: List[str] = []
-        lines.append("## Поручения записи")
-        lines.append("")
-        lines.append(
-            "| № | Статус | Текст | Исполнитель | Срок | Комментарий |"
-        )
-        lines.append(
-            "| --- | --- | --- | --- | --- | --- |"
-        )
-
-        def _esc(v: Any) -> str:
-            s = str(v or "").strip()
-            return s.replace("|", "/").replace("\n", " ")
-
-        for it in items:
-            number = it.get("number") or 0
-            try:
-                number = int(number)
-            except (TypeError, ValueError):
-                number = 0
-            num_str = str(number) if number > 0 else "—"
-
-            status = it.get("status") or "created"
-            status_label = STATUS_LABELS.get(status, status)
-
-            text = _esc(it.get("text"))
-            assignee = _esc(it.get("assignee")) or "—"
-            due = _esc(it.get("due_date")) or "—"
-            comment = _esc(it.get("comment")) or ""
-
-            lines.append(
-                f"| {num_str} | {status_label} | {text} | "
-                f"{assignee} | {due} | {comment} |"
-            )
-
-        log.info(
-            "Сбор поручений для анализа: видимых=%d "
-            "(диалоговых=%d)",
-            len(items), len(items_after_dlg),
-        )
-
-        return "\n".join(lines)
-
-    def _collect_tfs_text(self) -> str:
-        """
-        Возвращает текстовое представление задач TFS,
-        КОТОРЫЕ СЕЙЧАС ВИДНЫ в дереве — с учётом всех
-        активных колоночных фильтров (ID, Тип, Заголовок,
-        Исполнитель).
-
-        Логика:
-          Рекурсивно обходим дерево. Каждый узел проверяем
-          через isHidden() — если скрыт, пропускаем. Если
-          виден — берём данные из _items_by_id.
-
-        Формат — Markdown-таблица.
-        """
-        try:
-            win = getattr(self.tfs_widget, "_win", None)
-            if win is None:
-                return ""
-            tree = win.tree
-            items_by_id = win._items_by_id
-        except Exception as exc:
-            log.warning(
-                "Не удалось получить дерево TFS: %s", exc
-            )
-            return ""
-
-        # --- Собираем ID всех видимых узлов ---
-        visible_ids: List[int] = []
-
-        def _walk(node) -> None:
-            """Рекурсивный обход дерева."""
-            if node is None:
-                return
-
-            # Проверяем видимость узла.
-            try:
-                if not node.isHidden():
-                    try:
-                        item_id = int(
-                            node.data(
-                                0, Qt.ItemDataRole.UserRole
-                            )
-                        )
-                        if item_id > 0:
-                            visible_ids.append(item_id)
-                    except (TypeError, ValueError):
-                        pass
-            except Exception:
-                pass
-
-            # Идём в потомков.
-            for i in range(node.childCount()):
-                _walk(node.child(i))
-
-        try:
-            for i in range(tree.topLevelItemCount()):
-                _walk(tree.topLevelItem(i))
-        except Exception as exc:
-            log.warning(
-                "Ошибка обхода дерева TFS: %s", exc
-            )
-
-        if not visible_ids:
-            log.info(
-                "Сбор TFS для анализа: видимых задач нет "
-                "(все скрыты фильтрами)"
-            )
-            return ""
-
-        # --- Собираем данные по видимым ID ---
-        items: List[Dict[str, Any]] = []
-        seen: set = set()
-        for item_id in visible_ids:
-            if item_id in seen:
-                continue
-            seen.add(item_id)
-            data = items_by_id.get(item_id)
-            if data is not None:
-                items.append(data)
-
-        if not items:
-            return ""
-
-        def _esc(v: Any) -> str:
-            s = str(v or "").strip()
-            return s.replace("|", "/").replace("\n", " ")
-
-        def _short_date(raw: Any) -> str:
-            s = str(raw or "").strip()
-            if not s:
-                return ""
-            if "." in s:
-                s = s.split(".", 1)[0]
-            if s.endswith("Z"):
-                s = s[:-1]
-            if "T" in s:
-                s = s.replace("T", " ")
-            return s[:16]
-
-        lines: List[str] = []
-        lines.append("## Задачи TFS")
-        lines.append("")
-        lines.append(
-            "| ID | Тип | Заголовок | Статус | "
-            "Исполнитель | Work Date |"
-        )
-        lines.append(
-            "| --- | --- | --- | --- | --- | --- |"
-        )
-
-        for it in items:
-            item_id = it.get("id") or ""
-            wtype = _esc(it.get("work_item_type"))
-            title = _esc(it.get("title"))
-            state = _esc(it.get("state"))
-            assignee = _esc(it.get("assigned_to")) or "—"
-
-            fields = it.get("fields") or {}
-            work_date = _short_date(
-                fields.get("IServ.VSTS.Scheduling.WorkDate")
-            ) or "—"
-
-            lines.append(
-                f"| {item_id} | {wtype} | {title} | "
-                f"{state} | {assignee} | {work_date} |"
-            )
-
-        log.info(
-            "Сбор TFS для анализа: видимых задач=%d "
-            "(всего в дереве=%d)",
-            len(items), len(items_by_id),
-        )
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def _build_analysis_user_prompt(
-        *,
-        prompt_text: str,
-        tasks_text: str,
-        tfs_text: str,
-    ) -> str:
-        """
-        Собирает итоговый user-промпт для LLM.
-
-        Структура:
-            === ЗАДАНИЕ ===
-            <выбранный промпт из библиотеки>
-
-            === ДАННЫЕ ===
-            <таблица поручений>
-
-            <таблица задач TFS>
-        """
-        parts: List[str] = []
-
-        parts.append("=== ЗАДАНИЕ ===")
-        parts.append("")
-        parts.append(prompt_text.strip() or "—")
-        parts.append("")
-
-        parts.append("=== ДАННЫЕ ===")
-        parts.append("")
-
-        if tasks_text.strip():
-            parts.append(tasks_text.strip())
-            parts.append("")
-
-        if tfs_text.strip():
-            parts.append(tfs_text.strip())
-            parts.append("")
-
-        return "\n".join(parts).strip()
 
     # ------------------------------------------------------------------
     # События

@@ -340,6 +340,7 @@ class MetadataDialog(QDialog):
         get_tags: Optional[
             Callable[[], List[Dict[str, str]]]
         ] = None,
+        categories: Optional[List[Dict[str, str]]] = None,
         tfs_settings: Optional[Dict[str, Any]] = None,
         tfs_templates: Optional[List[Dict[str, str]]] = None,
         on_request_tfs_projects: Optional[Callable[[], List[str]]] = None,
@@ -373,6 +374,11 @@ class MetadataDialog(QDialog):
         self._get_tags_cb = get_tags
         self._selected_tags: List[str] = []
 
+        # --- Категории ---
+        self._categories: List[Dict[str, str]] = list(
+            categories or []
+        )
+
         self._tfs_settings: Dict[str, Any] = dict(tfs_settings or {})
         self._tfs_templates: List[Dict[str, str]] = list(
             tfs_templates or []
@@ -401,11 +407,12 @@ class MetadataDialog(QDialog):
 
         log.debug(
             "MetadataDialog: title=%r, allow_document_only=%s, "
-            "projects=%d, prompts=%d, tags=%d, tfs_templates=%d, "
-            "relations_max_in_dialog=%d",
+            "projects=%d, categories=%d, prompts=%d, tags=%d, "
+            "tfs_templates=%d, relations_max_in_dialog=%d",
             title, self._allow_document_only,
-            len(self._projects), len(self._prompts),
-            len(self._tags), len(self._tfs_templates),
+            len(self._projects), len(self._categories),
+            len(self._prompts), len(self._tags),
+            len(self._tfs_templates),
             self._relations_max_in_dialog,
         )
 
@@ -478,14 +485,38 @@ class MetadataDialog(QDialog):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
+        # --- Строка «Проект + Категория» ---
+        project_category_row = QWidget()
+        pc_layout = QHBoxLayout(project_category_row)
+        pc_layout.setContentsMargins(0, 0, 0, 0)
+        pc_layout.setSpacing(6)
+
+        # Проект
         self.project_combo = QComboBox()
         self.project_combo.setEditable(True)
         self.project_combo.addItems(self._projects)
         self.project_combo.setCurrentIndex(-1)
-        form.addRow(
-            "Проект:",
-            with_info(self.project_combo, "meta_project"),
+        self.project_combo.setMinimumWidth(220)
+        pc_layout.addWidget(
+            with_info(self.project_combo, "meta_project"), 2
         )
+
+        pc_layout.addWidget(QLabel("Категория:"), 0)
+
+        # Категория
+        self.category_combo = QComboBox()
+        self.category_combo.setEditable(True)
+        self.category_combo.addItem("— не указана —", "")
+        for c in self._categories:
+            name = (c.get("name") or "").strip()
+            if name:
+                self.category_combo.addItem(name, name)
+        self.category_combo.setMinimumWidth(180)
+        pc_layout.addWidget(
+            with_info(self.category_combo, "meta_category"), 1
+        )
+
+        form.addRow("Проект / Категория:", project_category_row)
 
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText(
@@ -2486,6 +2517,24 @@ class MetadataDialog(QDialog):
         elif self._projects:
             self.project_combo.setCurrentIndex(0)
 
+        # --- Категория ---
+        init_category = str(init.get("category") or "").strip()
+        if init_category:
+            idx = self.category_combo.findData(init_category)
+            if idx >= 0:
+                self.category_combo.setCurrentIndex(idx)
+            else:
+                # Категории нет в справочнике — добавляем
+                # её пунктом «на лету», чтобы не потерять.
+                self.category_combo.addItem(
+                    init_category, init_category
+                )
+                self.category_combo.setCurrentIndex(
+                    self.category_combo.count() - 1
+                )
+        else:
+            self.category_combo.setCurrentIndex(0)
+
         init_name = (
             init.get("name", "") or init.get("description", "")
         )
@@ -2868,6 +2917,15 @@ class MetadataDialog(QDialog):
             self.project_combo.currentText().strip() or "Default"
         )
 
+        # --- Категория ---
+        # currentData() — если выбрано из справочника;
+        # currentText() — если пользователь ввёл вручную.
+        category_data = self.category_combo.currentData() or ""
+        category_text = self.category_combo.currentText().strip()
+        if category_text == "— не указана —":
+            category_text = ""
+        category = str(category_data).strip() or category_text
+
         template = self._current_template()
         raw_name = self.name_input.text().strip()
         abbr = self.name_abbr_input.text().strip()
@@ -2992,6 +3050,7 @@ class MetadataDialog(QDialog):
 
         result: Dict[str, Any] = {
             "project": project,
+            "category": category,       # ← НОВОЕ
             "name": final_name,
             "description": final_name,
             "name_template": template,

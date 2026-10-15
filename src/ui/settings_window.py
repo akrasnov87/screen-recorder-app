@@ -345,6 +345,63 @@ class SettingsWindow(QDialog):
         sep = QLabel("<hr>")
         layout.addWidget(sep)
 
+        # ==============================================================
+        # Категории
+        # ==============================================================
+        cat_header = QHBoxLayout()
+        cat_header.addWidget(QLabel("<b>Категории записей</b>"))
+        cat_header.addStretch()
+        cat_header.addWidget(make_info_icon("categories_list"))
+        layout.addLayout(cat_header)
+
+        cat_hint = QLabel(
+            "Справочник категорий — тип записи: «Совещание», "
+            "«Созвон», «Встреча с клиентом», «Внутренняя встреча» "
+            "и т.д.<br><br>"
+            "Категория отображается в карточке метаданных рядом "
+            "с проектом. Одна запись имеет ровно одну категорию."
+        )
+        cat_hint.setWordWrap(True)
+        cat_hint.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(cat_hint)
+
+        self.categories_table = QTableWidget(0, 1)
+        self.categories_table.setHorizontalHeaderLabels([
+            "Категория",
+        ])
+        self.categories_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.categories_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        cat_hv = self.categories_table.horizontalHeader()
+        cat_hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.categories_table.setMinimumHeight(180)
+        layout.addWidget(self.categories_table)
+
+        cat_btns = QHBoxLayout()
+        cat_add_btn = QPushButton("Добавить")
+        cat_add_btn.clicked.connect(self._category_add)
+        cat_del_btn = QPushButton("Удалить")
+        cat_del_btn.clicked.connect(self._category_delete)
+        cat_up_btn = QPushButton("Вверх")
+        cat_up_btn.clicked.connect(lambda: self._category_move(-1))
+        cat_down_btn = QPushButton("Вниз")
+        cat_down_btn.clicked.connect(lambda: self._category_move(1))
+        cat_btns.addWidget(cat_add_btn)
+        cat_btns.addWidget(cat_del_btn)
+        cat_btns.addWidget(cat_up_btn)
+        cat_btns.addWidget(cat_down_btn)
+        cat_btns.addStretch()
+        layout.addLayout(cat_btns)
+
+        sep2 = QLabel("<hr>")
+        layout.addWidget(sep2)
+
+        # ==============================================================
+        # Проект и чат по умолчанию
+        # ==============================================================
         default_header = QHBoxLayout()
         default_header.addWidget(
             QLabel("<b>Проект и чат по умолчанию</b>")
@@ -467,6 +524,49 @@ class SettingsWindow(QDialog):
             current=self.default_project_combo.currentData() or ""
         )
         log.debug("Проект перемещён: %d → %d", row, new_row)
+
+    # ------------------------------------------------------------------
+    # Категории
+    # ------------------------------------------------------------------
+    def _category_add(self) -> None:
+        row = self.categories_table.rowCount()
+        self.categories_table.insertRow(row)
+        self.categories_table.setItem(
+            row, 0, QTableWidgetItem("Новая категория")
+        )
+        self.categories_table.editItem(
+            self.categories_table.item(row, 0)
+        )
+        log.debug("Добавлена пустая категория (строка %d)", row)
+
+    def _category_delete(self) -> None:
+        row = self.categories_table.currentRow()
+        if row < 0:
+            return
+        item = self.categories_table.item(row, 0)
+        name = item.text() if item else ""
+        if QMessageBox.question(
+            self, "Удалить категорию",
+            f"Удалить категорию «{name}»?",
+        ) == QMessageBox.StandardButton.Yes:
+            log.info(
+                "Удаление категории «%s» (строка %d)", name, row
+            )
+            self.categories_table.removeRow(row)
+
+    def _category_move(self, delta: int) -> None:
+        row = self.categories_table.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if (new_row < 0
+                or new_row >= self.categories_table.rowCount()):
+            return
+        a = self.categories_table.takeItem(row, 0)
+        b = self.categories_table.takeItem(new_row, 0)
+        self.categories_table.setItem(row, 0, b)
+        self.categories_table.setItem(new_row, 0, a)
+        self.categories_table.setCurrentCell(new_row, 0)
 
     # ------------------------------------------------------------------
     # Теги
@@ -2985,43 +3085,6 @@ class SettingsWindow(QDialog):
         layout.addSpacing(12)
 
         # ==============================================================
-        # Блок 0.1: панель результата анализа
-        # ==============================================================
-        analysis_header = QHBoxLayout()
-        analysis_header.addWidget(
-            QLabel("<b>Панель результата анализа</b>")
-        )
-        analysis_header.addStretch()
-        analysis_icon = make_info_icon(
-            "app_scrum_analysis_collapsed_by_default"
-        )
-        if analysis_icon is not None:
-            analysis_header.addWidget(analysis_icon)
-        layout.addLayout(analysis_header)
-
-        analysis_hint = QLabel(
-            "<span style='color:#666'>"
-            "Панель «Результат анализа» в нижней части левой "
-            "колонки окна «Скрам». Когда панель свёрнута — "
-            "блоки «Поручения» и «Задачи TFS» получают больше "
-            "места.</span>"
-        )
-        analysis_hint.setWordWrap(True)
-        layout.addWidget(analysis_hint)
-
-        self.scrum_analysis_collapsed_check = QCheckBox(
-            "Панель результата анализа по умолчанию свёрнута"
-        )
-        attach_tooltip(
-            self.scrum_analysis_collapsed_check,
-            "app_scrum_analysis_collapsed_by_default",
-        )
-        self.scrum_analysis_collapsed_check.setChecked(True)
-        layout.addWidget(self.scrum_analysis_collapsed_check)
-
-        layout.addSpacing(12)
-
-        # ==============================================================
         # Блок 0.2: сортировка таблиц по исполнителю
         # ==============================================================
         sort_header = QHBoxLayout()
@@ -3056,7 +3119,7 @@ class SettingsWindow(QDialog):
         layout.addSpacing(12)
 
         # ==============================================================
-        # Блок 0.3: НОВОЕ — панель управления TFS
+        # Блок 0.3: панель управления TFS
         # ==============================================================
         tfs_panel_header = QHBoxLayout()
         tfs_panel_header.addWidget(
@@ -3351,6 +3414,16 @@ class SettingsWindow(QDialog):
             )
             self.projects_table.setItem(
                 row, 1, QTableWidgetItem(p["chat_id"])
+            )
+
+        # --- Категории ---
+        categories = self.config_manager.get_categories()
+        self.categories_table.setRowCount(0)
+        for c in categories:
+            row = self.categories_table.rowCount()
+            self.categories_table.insertRow(row)
+            self.categories_table.setItem(
+                row, 0, QTableWidgetItem(c.get("name", ""))
             )
 
         default_project = self.config_manager.get_default_project()
@@ -3719,13 +3792,6 @@ class SettingsWindow(QDialog):
             int(app_cfg.get("scrum_window_height", 1024))
         )
 
-        # --- НОВОЕ: панель результата анализа ---
-        self.scrum_analysis_collapsed_check.setChecked(
-            bool(app_cfg.get(
-                "scrum_analysis_collapsed_by_default", True
-            ))
-        )
-
         # --- НОВОЕ: сортировка таблиц по исполнителю ---
         self.scrum_sort_by_assignee_check.setChecked(
             bool(app_cfg.get(
@@ -3817,6 +3883,18 @@ class SettingsWindow(QDialog):
                 continue
             projects.append({"name": name, "chat_id": chat_id})
         cfg["projects"] = projects
+
+        # --- Категории ---
+        categories: List[Dict[str, str]] = []
+        seen_cats = set()
+        for row in range(self.categories_table.rowCount()):
+            name_item = self.categories_table.item(row, 0)
+            name = name_item.text().strip() if name_item else ""
+            if not name or name in seen_cats:
+                continue
+            categories.append({"name": name})
+            seen_cats.add(name)
+        cfg["categories"] = categories
 
         cfg["attachment_name_max_chars"] = int(
             self.attachment_name_max_chars.value()
@@ -4201,10 +4279,6 @@ class SettingsWindow(QDialog):
         app_cfg["scrum_window_height"] = int(
             self.scrum_window_height_spin.value()
         )
-        # --- НОВОЕ: панель результата анализа ---
-        app_cfg["scrum_analysis_collapsed_by_default"] = (
-            self.scrum_analysis_collapsed_check.isChecked()
-        )
 
         # --- НОВОЕ: сортировка таблиц по исполнителю ---
         app_cfg["scrum_sort_by_assignee"] = (
@@ -4228,8 +4302,7 @@ class SettingsWindow(QDialog):
                 "default_project=%r, default_chat_id=%r, tags=%d, "
                 "sync_enabled=%s, sync_url=%r, send_media=%s, "
                 "media_prefer_builtin=%s, use_hash_check=%s, "
-                "compress_media=%s, max_artifact_mb=%d, "
-                "scrum_analysis_collapsed=%s",
+                "compress_media=%s, max_artifact_mb=%d",
                 len(cfg.get("projects", [])),
                 cfg.get("default_project"),
                 cfg.get("default_chat_id"),
@@ -4245,9 +4318,6 @@ class SettingsWindow(QDialog):
                     "compress_media_if_too_large"
                 ),
                 cfg.get("sync", {}).get("max_artifact_mb"),
-                cfg.get("app", {}).get(
-                    "scrum_analysis_collapsed_by_default"
-                ),
             )
 
             current = get_current_log_path()

@@ -440,6 +440,7 @@ def build_payload_from_meta(
 
     optional_str = (
         "name", "description", "comment", "source",
+        "category",      # ← НОВОЕ
         "date", "time",
         "summary_bb", "prompt", "prompt_name",
         "name_template", "name_abbr",
@@ -2263,7 +2264,8 @@ class SyncManager:
         new_meta: Dict[str, Any] = dict(existing)
 
         server_fields = (
-            "project", "name", "description", "comment",
+            "project", "category",      # ← "category" добавлено
+            "name", "description", "comment",
             "source", "is_scrum", "date", "time",
             "tags", "summary_bb", "prompt", "prompt_name",
             "prompt_edited", "name_template", "name_abbr",

@@ -13,14 +13,14 @@
       – scrum_day_tab_max_records;
       – scrum_left_splitter_ratio;
       – scrum_tfs_max_items.
-  • ДОБАВЛЕНО: app.scrum_analysis_collapsed_by_default —
-    панель результата анализа (AnalysisResultWidget) в окне
-    «Скрам» по умолчанию свёрнута. Это освобождает место
-    для блоков «Поручения» и «Задачи TFS».
-  • НОВОЕ: app.scrum_sort_by_assignee — сортировка таблиц
+  • ДОБАВЛЕНО: app.scrum_sort_by_assignee — сортировка таблиц
     «Поручения» и «Задачи TFS» в окне «Скрам» по колонке
     «Исполнитель» (по возрастанию, пустые — в конце).
     Применяется всегда и ко всем обновлениям данных.
+  • НОВОЕ: справочник категорий записей (config["categories"]).
+    По аналогии с тегами — список словарей {"name": <str>}.
+    Методы: get_categories(), get_category_names(),
+    set_categories().
 """
 from __future__ import annotations
 
@@ -144,6 +144,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         {"name": "iserv",       "chat_id": ""},
         {"name": "Внутренние",  "chat_id": ""},
         {"name": "Тестовые",    "chat_id": ""},
+    ],
+    "categories": [
+        {"name": "Совещание"},
+        {"name": "Созвон"},
+        {"name": "Встреча с клиентом"},
+        {"name": "Внутренняя встреча"},
     ],
     "tags": [
         {"name": "важное",       "color": "#C62828"},
@@ -321,11 +327,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "processor_poll_interval": 2.0,
         "processor_retry_check_interval": 300,
 
-        # --- УДАЛЕНЫ: ffmpeg_start_check_delay, ffmpeg_stop_timeout,
-        #     ffmpeg_kill_timeout, overlay_hide_delay_ms,
-        #     overlay_hide_after_task_ms, overlay_log_lines,
-        #     overlay_width, overlay_height ---
-
         "notification_timeout_ms": 4000,
         "notification_max_title": 50,
         "notification_max_message": 100,
@@ -361,14 +362,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "scrum_tfs_max_items": 200,
         "scrum_always_on_top": True,
         "scrum_day_view_mode": "summary",
-        "scrum_analysis_collapsed_by_default": True,
         # --- НОВОЕ: сортировка по исполнителю ---
         "scrum_sort_by_assignee": True,
         # --- НОВОЕ: панель управления TFS в окне «Скрам» ---
-        # По умолчанию панель управления TFS (проект, шаблон,
-        # WIQL, переменные, фильтры по колонкам) свёрнута.
-        # Это освобождает вертикальное место под дерево задач
-        # в нижней половине левой части окна «Скрам».
         "scrum_tfs_panel_collapsed_by_default": True,
     }
 }
@@ -490,9 +486,7 @@ class ConfigManager:
     def get_tfs_projects_cached(
         self, *, force: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Возвращает кэшированный список проектов TFS.
-        """
+        """Возвращает кэшированный список проектов TFS."""
         import time
 
         cfg = self.get_tfs_settings()
@@ -530,7 +524,6 @@ class ConfigManager:
                 "error": "",
             }
 
-        # --- Обновляем ---
         try:
             from .tfs_client import TfsClient, TfsError
             import asyncio as _asyncio
@@ -969,6 +962,70 @@ class ConfigManager:
             if p["name"] == name:
                 return p["chat_id"]
         return ""
+
+    # ------------------------------------------------------------------
+    # Категории (справочник)
+    # ------------------------------------------------------------------
+    def get_categories(self) -> List[Dict[str, str]]:
+        """
+        Возвращает список категорий записей.
+
+        Формат каждого элемента: {"name": <str>}.
+        Совместим с форматом projects/tags — на случай, если
+        в старых конфигах хранились словари с другими ключами.
+        """
+        raw = self.config.get("categories", []) or []
+        result: List[Dict[str, str]] = []
+        seen = set()
+
+        for item in raw:
+            if isinstance(item, str):
+                name = item.strip()
+                if name and name not in seen:
+                    result.append({"name": name})
+                    seen.add(name)
+            elif isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if not name or name in seen:
+                    continue
+                result.append({"name": name})
+                seen.add(name)
+
+        return result
+
+    def get_category_names(self) -> List[str]:
+        """Возвращает список названий категорий (для ComboBox)."""
+        return [c["name"] for c in self.get_categories()]
+
+    def set_categories(
+        self, categories: List[Dict[str, str]],
+    ) -> None:
+        """
+        Сохраняет справочник категорий.
+
+        Принимает список словарей {"name": ...} или список строк.
+        Пустые и дублирующиеся имена отбрасываются.
+        """
+        cleaned: List[Dict[str, str]] = []
+        seen = set()
+
+        for item in categories or []:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+            else:
+                continue
+            if not name or name in seen:
+                continue
+            cleaned.append({"name": name})
+            seen.add(name)
+
+        self.config["categories"] = cleaned
+        self.save()
+        log.info(
+            "Справочник категорий обновлён: %d шт.", len(cleaned)
+        )
 
     # ------------------------------------------------------------------
     # Проект и чат по умолчанию

@@ -11,8 +11,8 @@
 Изменения:
   • Модуль создан.
   • ДОБАВЛЕНО: настройка видимых колонок таблицы поручений —
-    в панели «Скрама» скрываем колонки «Срок» и «ID», чтобы
-    таблица была компактной. Колонка «Текст» растягивается
+    в панели «Скрама» скрываем колонки «Статус», «Срок» и «ID»,
+    чтобы таблица была компактной. Колонка «Текст» растягивается
     на всю оставшуюся ширину.
   • НОВОЕ: панель фильтров по колонкам поручений (только в
     компактном режиме «Скрама»).
@@ -40,6 +40,13 @@
       Прокидывается во внутренний TasksEditorDialog. Если True —
       таблица поручений сортируется по колонке «Исполнитель»
       (А→Я, пустые в конце). Применяется всегда.
+  • НОВОЕ: скрытие колонки «Статус» в панели «Скрама» — при
+    этом подкраска строк поручений сохраняется (фон ячеек
+    по-прежнему назначается на все колонки, включая скрытую —
+    при скрытии колонка просто не отображается).
+  • НОВОЕ: колонка «Комментарий» получила фиксированную
+    стартовую ширину (Interactive) и по умолчанию уже, чем
+    раньше — чтобы колонка «Текст» занимала больше места.
 """
 from __future__ import annotations
 
@@ -90,12 +97,26 @@ class TasksEditorWidget(QWidget):
     # ------------------------------------------------------------------
     # Настройка колонок таблицы
     # ------------------------------------------------------------------
+    # В панели «Скрама» скрываем три колонки, чтобы освободить
+    # место под «Текст» и «Комментарий»:
+    #   • 1 — Статус (подкраска строки при этом сохраняется);
+    #   • 4 — Срок;
+    #   • 6 — ID (уже скрыта в TasksEditorDialog — дублируем
+    #           на случай, если базовый класс изменится).
     _SCRUM_HIDDEN_COLUMNS: tuple = (
+        1,   # Статус
         4,   # Срок
-        6,   # ID (уже скрыта в TasksEditorDialog — дублируем)
+        6,   # ID
     )
 
-    _SCRUM_STRETCH_COLUMN: int = 2   # «Текст»
+    # Индекс колонки «Текст» — растягивается на всё свободное место.
+    _SCRUM_STRETCH_COLUMN: int = 2
+
+    # Индекс колонки «Комментарий» и её стартовая ширина.
+    # Ширина задаётся в пикселях; пользователь может её изменить
+    # (режим Interactive).
+    _COMMENT_COLUMN: int = 5
+    _COMMENT_COLUMN_WIDTH: int = 180
 
     _ROW_HEIGHT_PX: int = 22
 
@@ -621,7 +642,25 @@ class TasksEditorWidget(QWidget):
     # Настройка колонок таблицы
     # ------------------------------------------------------------------
     def _configure_table_columns(self) -> None:
-        """Скрывает лишние колонки и настраивает ширину."""
+        """
+        Скрывает лишние колонки и настраивает ширину.
+
+        Что делаем:
+          • Скрываем колонки «Статус» (1), «Срок» (4) и «ID» (6).
+            Подкраска строк (просроченные / на сегодня) остаётся:
+            базовый TasksEditorDialog._reload_table назначает фон
+            на все колонки строки, а скрытая колонка просто
+            не отображается. При этом остальные видимые колонки
+            («№», «Текст», «Исполнитель», «Комментарий») получают
+            тот же цвет фона, что и раньше.
+          • Колонка «Текст» (2) растягивается на всё свободное
+            место (Stretch).
+          • Колонка «Комментарий» (5) получает фиксированную
+            стартовую ширину (Interactive, 180 px) — уже, чем
+            раньше, чтобы дать «Тексту» больше места.
+          • Остальные видимые колонки («№», «Исполнитель») —
+            ResizeToContents.
+        """
         try:
             table = self._dlg.table
         except AttributeError:
@@ -631,6 +670,7 @@ class TasksEditorWidget(QWidget):
             )
             return
 
+        # --- Скрытие колонок ---
         for col in self._SCRUM_HIDDEN_COLUMNS:
             try:
                 table.setColumnHidden(col, True)
@@ -640,6 +680,7 @@ class TasksEditorWidget(QWidget):
                     "колонку %d: %s", col, exc,
                 )
 
+        # --- Ширина и режим ресайза ---
         try:
             from PySide6.QtWidgets import QHeaderView
 
@@ -654,6 +695,16 @@ class TasksEditorWidget(QWidget):
                     header.setSectionResizeMode(
                         idx, QHeaderView.ResizeMode.Stretch
                     )
+                elif idx == self._COMMENT_COLUMN:
+                    # Колонка «Комментарий» — фиксированная
+                    # стартовая ширина, но пользователь может
+                    # её перетащить.
+                    header.setSectionResizeMode(
+                        idx, QHeaderView.ResizeMode.Interactive
+                    )
+                    table.setColumnWidth(
+                        idx, self._COMMENT_COLUMN_WIDTH
+                    )
                 else:
                     header.setSectionResizeMode(
                         idx,
@@ -665,6 +716,7 @@ class TasksEditorWidget(QWidget):
                 "QHeaderView: %s", exc,
             )
 
+        # --- Высота строк ---
         try:
             vheader = table.verticalHeader()
             vheader.setSectionResizeMode(
@@ -679,6 +731,7 @@ class TasksEditorWidget(QWidget):
                 "вертикальный заголовок: %s", exc,
             )
 
+        # --- Компактный QSS ---
         compact_qss = (
             "QTableView::item {"
             "  padding: 1px 6px;"
@@ -708,9 +761,12 @@ class TasksEditorWidget(QWidget):
         log.info(
             "TasksEditorWidget: колонки таблицы настроены — "
             "скрыты: %s; растягивается: колонка %d (Текст); "
+            "комментарий: колонка %d, ширина %d px; "
             "высота строки: %d px; sort_by_assignee=%s",
             ", ".join(str(c) for c in self._SCRUM_HIDDEN_COLUMNS),
             self._SCRUM_STRETCH_COLUMN,
+            self._COMMENT_COLUMN,
+            self._COMMENT_COLUMN_WIDTH,
             self._ROW_HEIGHT_PX,
             self._sort_by_assignee,
         )

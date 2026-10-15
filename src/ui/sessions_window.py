@@ -379,6 +379,7 @@ class SessionsScanThread(QThread):
                 "dir": session_dir,
                 "name": meta.get("name") or name,
                 "project": meta.get("project") or "",
+                "category": meta.get("category") or "",    # ← НОВОЕ
                 "status": status,
                 "source": meta.get("source") or "record",
                 "is_scrum": bool(meta.get("is_scrum", False)),
@@ -3912,6 +3913,7 @@ class SessionsWindow(QDialog):
         meta = read_json_file(session_json) or {}
 
         projects = self.config_manager.get_project_names()
+        categories = self.config_manager.get_categories()
         prompts = self.config_manager.get_prompts()
         default_prompt = self.config_manager.get_default_prompt()
         name_templates = self.config_manager.get_name_templates()
@@ -3939,6 +3941,7 @@ class SessionsWindow(QDialog):
             tags=tags,
             on_save_tag=self._on_save_tag_to_config,
             get_tags=self.config_manager.get_tags,
+            categories=categories,      # ← НОВОЕ
             relations_max_in_dialog=int(
                 self._app_cfg.get(
                     "relations_max_in_dialog", 0
@@ -5132,6 +5135,7 @@ class SessionsWindow(QDialog):
         session_info = {
             "name": r.get("name") or "",
             "project": project,
+            "category": r.get("category") or "",   # ← НОВОЕ
             "date": r.get("datetime") or "",
             "protocol_path": protocol_path,
             "protocol_label": (
@@ -5196,6 +5200,7 @@ class SessionsWindow(QDialog):
         meta = read_json_file(session_json) or {}
 
         projects = self.config_manager.get_project_names()
+        categories = self.config_manager.get_categories()
         prompts = self.config_manager.get_prompts()
         default_prompt = self.config_manager.get_default_prompt()
         name_templates = self.config_manager.get_name_templates()
@@ -5223,6 +5228,7 @@ class SessionsWindow(QDialog):
             tags=tags,
             on_save_tag=self._on_save_tag_to_config,
             get_tags=self.config_manager.get_tags,
+            categories=categories,      # ← НОВОЕ
             relations_max_in_dialog=int(
                 self._app_cfg.get(
                     "relations_max_in_dialog", 0
@@ -6248,6 +6254,7 @@ class SessionsWindow(QDialog):
         meta = read_json_file(session_json) or {}
 
         projects = self.config_manager.get_project_names()
+        categories = self.config_manager.get_categories()
         prompts = self.config_manager.get_prompts()
         default_prompt = self.config_manager.get_default_prompt()
         name_templates = self.config_manager.get_name_templates()
