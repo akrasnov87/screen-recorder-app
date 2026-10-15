@@ -26,8 +26,9 @@ from PySide6.QtWidgets import (
 )
 
 from ..library_search import (
-    SearchFilters, SearchHit, build_prompt_from_hits, list_projects,
-    list_tags, save_prompt_docx, save_prompt_markdown, search,
+    SearchFilters, SearchHit, build_prompt_from_hits, list_categories,
+    list_projects, list_tags, save_prompt_docx,
+    save_prompt_markdown, search,
 )
 from ..logger import get_logger
 from .tooltips import (
@@ -114,6 +115,7 @@ class LibraryWindow(QDialog):
 
         self._build_ui()
         self._reload_projects()
+        self._reload_categories()      # ← НОВОЕ
         self._reload_tags()
         log.info(
             "LibraryWindow открыто, sessions_root=%s", sessions_root
@@ -169,8 +171,19 @@ class LibraryWindow(QDialog):
         root.addLayout(intro_row)
 
         # --- Форма фильтров ---
+        #
+        # Разбита на четыре строки, чтобы всё помещалось без
+        # обрезания:
+        #   Строка 1: Запрос + Найти / Стоп
+        #   Строка 2: Искать в: (Стенограммах, Протоколах,
+        #                        Summary, Вложениях)
+        #   Строка 3: Проект, Категория, Тег
+        #   Строка 4: Период (с/по), Ограничить по датам, Fuzzy
         filters_box = QVBoxLayout()
 
+        # ==============================================================
+        # Строка 1: Запрос + кнопки Найти / Стоп
+        # ==============================================================
         row1 = QHBoxLayout()
         self.query_input = QLineEdit()
         self.query_input.setPlaceholderText(
@@ -197,6 +210,9 @@ class LibraryWindow(QDialog):
 
         filters_box.addLayout(row1)
 
+        # ==============================================================
+        # Строка 2: Искать в: (чекбоксы)
+        # ==============================================================
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Искать в:"))
 
@@ -233,17 +249,34 @@ class LibraryWindow(QDialog):
         row2.addStretch()
         filters_box.addLayout(row2)
 
+        # ==============================================================
+        # Строка 3: Проект, Категория, Тег
+        # ==============================================================
         row3 = QHBoxLayout()
+        row3.setSpacing(6)
 
         self.project_combo = QComboBox()
         self.project_combo.addItem("— все —", "")
-        self.project_combo.setMinimumWidth(180)
+        self.project_combo.setMinimumWidth(150)
         row3.addWidget(QLabel("Проект:"))
         row3.addWidget(
             with_info(self.project_combo, "lib_project")
         )
 
-        row3.addSpacing(12)
+        row3.addSpacing(8)
+
+        # --- Категория ---
+        self.category_combo = QComboBox()
+        self.category_combo.addItem("— все —", "")
+        self.category_combo.setMinimumWidth(130)
+        row3.addWidget(QLabel("Категория:"))
+        row3.addWidget(
+            with_info(self.category_combo, "lib_category")
+        )
+
+        row3.addSpacing(8)
+
+        # --- Тег ---
         self.tag_enabled = QCheckBox("Тег:")
         self.tag_enabled.setChecked(False)
         attach_tooltip(self.tag_enabled, "lib_tag_enabled")
@@ -253,17 +286,26 @@ class LibraryWindow(QDialog):
         row3.addWidget(self.tag_enabled)
 
         self.tag_combo = QComboBox()
-        self.tag_combo.setMinimumWidth(180)
+        self.tag_combo.setMinimumWidth(150)
         attach_tooltip(self.tag_combo, "lib_tag")
         row3.addWidget(self.tag_combo)
 
-        row3.addSpacing(12)
+        row3.addStretch()
+        filters_box.addLayout(row3)
+
+        # ==============================================================
+        # Строка 4: Период, Ограничить по датам, Fuzzy
+        # ==============================================================
+        row4 = QHBoxLayout()
+        row4.setSpacing(6)
+
         self.date_from = QDateEdit()
         self.date_from.setCalendarPopup(True)
         self.date_from.setDisplayFormat("yyyy-MM-dd")
         self.date_from.setDate(self._default_from_date())
-        row3.addWidget(QLabel("С:"))
-        row3.addWidget(
+        self.date_from.setMinimumWidth(110)
+        row4.addWidget(QLabel("Период с:"))
+        row4.addWidget(
             with_info(self.date_from, "lib_date_from")
         )
 
@@ -271,26 +313,32 @@ class LibraryWindow(QDialog):
         self.date_to.setCalendarPopup(True)
         self.date_to.setDisplayFormat("yyyy-MM-dd")
         self.date_to.setDate(self._default_to_date())
-        row3.addWidget(QLabel("По:"))
-        row3.addWidget(with_info(self.date_to, "lib_date_to"))
+        self.date_to.setMinimumWidth(110)
+        row4.addWidget(QLabel("по:"))
+        row4.addWidget(with_info(self.date_to, "lib_date_to"))
+
+        row4.addSpacing(8)
 
         self.date_enabled = QCheckBox("Ограничить по датам")
         self.date_enabled.setChecked(True)
         attach_tooltip(self.date_enabled, "lib_date_enabled")
-        row3.addWidget(self.date_enabled)
+        row4.addWidget(self.date_enabled)
 
-        row3.addSpacing(12)
+        row4.addSpacing(8)
+
+        # --- Fuzzy ---
         self.fuzzy_spin = QSpinBox()
         self.fuzzy_spin.setRange(50, 100)
         self.fuzzy_spin.setValue(
             int(self._app_cfg.get("search_default_fuzzy", 82))
         )
         self.fuzzy_spin.setSuffix(" %")
-        row3.addWidget(QLabel("Fuzzy:"))
-        row3.addWidget(with_info(self.fuzzy_spin, "lib_fuzzy"))
+        self.fuzzy_spin.setMinimumWidth(80)
+        row4.addWidget(QLabel("Fuzzy:"))
+        row4.addWidget(with_info(self.fuzzy_spin, "lib_fuzzy"))
 
-        row3.addStretch()
-        filters_box.addLayout(row3)
+        row4.addStretch()
+        filters_box.addLayout(row4)
 
         root.addLayout(filters_box)
 
@@ -818,6 +866,7 @@ class LibraryWindow(QDialog):
     # ------------------------------------------------------------------
     def _on_refresh_meta(self) -> None:
         self._reload_projects()
+        self._reload_categories()      # ← НОВОЕ
         self._reload_tags()
 
     def _reload_projects(self) -> None:
@@ -839,6 +888,69 @@ class LibraryWindow(QDialog):
             self.project_combo.setCurrentIndex(idx)
         self.project_combo.blockSignals(False)
         log.debug("Проекты обновлены: %d", len(projects))
+
+    def _reload_categories(self) -> None:
+        """
+        Заполняет выпадающий список категорий.
+
+        Объединяет справочник из настроек и категории, реально
+        встречающиеся в сохранённых записях.
+        """
+        if not hasattr(self, "category_combo"):
+            return
+
+        # --- Из справочника ---
+        categories_from_config: List[str] = []
+        if self.config_manager is not None:
+            try:
+                categories_from_config = (
+                    self.config_manager.get_category_names()
+                )
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать справочник категорий: %s",
+                    exc,
+                )
+
+        # --- Из записей ---
+        try:
+            categories_from_sessions = list_categories(
+                self.sessions_root
+            )
+        except Exception as exc:
+            log.warning(
+                "Не удалось получить категории из сессий: %s", exc
+            )
+            categories_from_sessions = []
+
+        # --- Объединяем ---
+        merged: List[str] = []
+        seen = set()
+        for c in categories_from_config + categories_from_sessions:
+            c = (c or "").strip()
+            if c and c not in seen:
+                merged.append(c)
+                seen.add(c)
+
+        current = self.category_combo.currentData() or ""
+
+        self.category_combo.blockSignals(True)
+        self.category_combo.clear()
+        self.category_combo.addItem("— все —", "")
+        for c in merged:
+            self.category_combo.addItem(c, c)
+        idx = self.category_combo.findData(current)
+        if idx >= 0:
+            self.category_combo.setCurrentIndex(idx)
+        self.category_combo.blockSignals(False)
+
+        log.debug(
+            "Категории обновлены: из справочника %d, из сессий %d, "
+            "итого %d",
+            len(categories_from_config),
+            len(categories_from_sessions),
+            len(merged),
+        )
 
     def _reload_tags(self) -> None:
         """
@@ -909,6 +1021,9 @@ class LibraryWindow(QDialog):
         f.search_summaries = self.cb_summaries.isChecked()
         f.search_attachments = self.cb_attachments.isChecked()
         f.project = self.project_combo.currentData() or ""
+        f.category = (
+            self.category_combo.currentData() or ""
+        ) if hasattr(self, "category_combo") else ""
         if self.date_enabled.isChecked():
             qd_from = self.date_from.date()
             qd_to = self.date_to.date()
@@ -959,10 +1074,11 @@ class LibraryWindow(QDialog):
         self._update_prompt_buttons_state()
 
         log.info(
-            "Поиск: query=%r, проекты=%s, даты=%s..%s, "
+            "Поиск: query=%r, проекты=%s, категория=%r, "
+            "даты=%s..%s, "
             "транскрипт=%s, протокол=%s, summary=%s, вложения=%s, "
             "fuzzy=%.2f, mwd=%d, tag=%r, untagged=%s",
-            filters.query, filters.project or "все",
+            filters.query, filters.project or "все", filters.category or "все",
             filters.date_from.date() if filters.date_from else "—",
             filters.date_to.date() if filters.date_to else "—",
             filters.search_transcripts, filters.search_protocols,

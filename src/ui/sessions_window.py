@@ -2170,6 +2170,17 @@ class SessionsWindow(QDialog):
     # Панель фильтров
     # ------------------------------------------------------------------
     def _build_filters_bar(self) -> QWidget:
+        """
+        Панель фильтров.
+
+        Разбита на две строки, чтобы все элементы помещались
+        без обрезания:
+
+        Строка 1: Проект, Категория, Период (с/по),
+                  Ограничить по датам, Сбросить фильтры.
+        Строка 2: Тег (галочка + ComboBox), Поиск,
+                  счётчик «Показано: N».
+        """
         outer = QWidget()
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 0, 0)
@@ -2181,11 +2192,18 @@ class SessionsWindow(QDialog):
             "QFrame { background-color: palette(window); "
             "border: 1px solid palette(mid); border-radius: 6px; }"
         )
-        row = QHBoxLayout(box)
-        row.setContentsMargins(10, 6, 10, 6)
-        row.setSpacing(8)
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(10, 6, 10, 6)
+        box_layout.setSpacing(4)
 
-        row.addWidget(QLabel("Проект:"))
+        # ==============================================================
+        # Строка 1: Проект, Категория, Период, Ограничить, Сброс
+        # ==============================================================
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(6)
+
+        row1.addWidget(QLabel("Проект:"))
         self.filter_project_combo = QComboBox()
         self.filter_project_combo.setMinimumWidth(180)
         self.filter_project_combo.addItem("— все проекты —", "")
@@ -2195,11 +2213,31 @@ class SessionsWindow(QDialog):
         self.filter_project_combo.setToolTip(
             "Показать записи только выбранного проекта."
         )
-        row.addWidget(self.filter_project_combo)
+        row1.addWidget(self.filter_project_combo)
 
-        row.addSpacing(12)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("Категория:"))
+        self.filter_category_combo = QComboBox()
+        self.filter_category_combo.setMinimumWidth(160)
+        self.filter_category_combo.addItem(
+            "— все категории —", ""
+        )
+        self.filter_category_combo.addItem(
+            "— без категории —", "__untagged__"
+        )
+        self.filter_category_combo.currentIndexChanged.connect(
+            self._apply_filters
+        )
+        self.filter_category_combo.setToolTip(
+            "Показать записи только выбранной категории.\n\n"
+            "«— без категории —» оставляет только записи, "
+            "у которых категория не указана."
+        )
+        row1.addWidget(self.filter_category_combo)
 
-        row.addWidget(QLabel("Период с:"))
+        row1.addSpacing(12)
+
+        row1.addWidget(QLabel("Период с:"))
 
         default_from = QDate.currentDate().addDays(-31)
 
@@ -2211,9 +2249,9 @@ class SessionsWindow(QDialog):
         self.filter_date_from.setToolTip(
             "Начало периода (включительно)."
         )
-        row.addWidget(self.filter_date_from)
+        row1.addWidget(self.filter_date_from)
 
-        row.addWidget(QLabel("по:"))
+        row1.addWidget(QLabel("по:"))
         self.filter_date_to = QDateEdit()
         self.filter_date_to.setCalendarPopup(True)
         self.filter_date_to.setDisplayFormat("yyyy-MM-dd")
@@ -2222,7 +2260,7 @@ class SessionsWindow(QDialog):
         self.filter_date_to.setToolTip(
             "Конец периода (включительно)."
         )
-        row.addWidget(self.filter_date_to)
+        row1.addWidget(self.filter_date_to)
 
         self.filter_date_enabled = QCheckBox("Ограничить по датам")
         self.filter_date_enabled.setChecked(True)
@@ -2232,18 +2270,28 @@ class SessionsWindow(QDialog):
         self.filter_date_enabled.toggled.connect(
             self._on_date_filter_toggled
         )
-        row.addWidget(self.filter_date_enabled)
+        row1.addWidget(self.filter_date_enabled)
 
         self.filter_reset_btn = QPushButton("Сбросить фильтры")
         self.filter_reset_btn.setToolTip(
-            "Убрать все фильтры (проект, даты, тег, поиск, связи)."
+            "Убрать все фильтры (проект, категория, даты, тег, "
+            "поиск, связи)."
         )
         self.filter_reset_btn.clicked.connect(self._reset_filters)
-        row.addWidget(self.filter_reset_btn)
+        row1.addWidget(self.filter_reset_btn)
 
-        row.addStretch()
+        row1.addStretch()
 
-        row.addWidget(QLabel("Тег:"))
+        box_layout.addLayout(row1)
+
+        # ==============================================================
+        # Строка 2: Тег, Поиск, Счётчик
+        # ==============================================================
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(6)
+
+        row2.addWidget(QLabel("Тег:"))
 
         self.filter_tag_enabled = QCheckBox()
         self.filter_tag_enabled.setChecked(False)
@@ -2254,10 +2302,10 @@ class SessionsWindow(QDialog):
         self.filter_tag_enabled.toggled.connect(
             self._on_tag_filter_toggled
         )
-        row.addWidget(self.filter_tag_enabled)
+        row2.addWidget(self.filter_tag_enabled)
 
         self.filter_tag_combo = QComboBox()
-        self.filter_tag_combo.setMinimumWidth(180)
+        self.filter_tag_combo.setMinimumWidth(220)
         self.filter_tag_combo.addItem("— без тега —", "__untagged__")
         self.filter_tag_combo.setEnabled(False)
         self.filter_tag_combo.currentIndexChanged.connect(
@@ -2266,22 +2314,24 @@ class SessionsWindow(QDialog):
         self.filter_tag_combo.setToolTip(
             "Выберите тег."
         )
-        row.addWidget(self.filter_tag_combo)
+        row2.addWidget(self.filter_tag_combo)
 
-        row.addWidget(QLabel("Поиск:"))
+        row2.addSpacing(12)
+
+        row2.addWidget(QLabel("Поиск:"))
         self.filter_search_input = QLineEdit()
         self.filter_search_input.setPlaceholderText(
             "Подстрока в названии, тегах, проекте…"
         )
         self.filter_search_input.setClearButtonEnabled(True)
-        self.filter_search_input.setMinimumWidth(220)
+        self.filter_search_input.setMinimumWidth(280)
         self.filter_search_input.textChanged.connect(
             self._apply_filters
         )
         self.filter_search_input.setToolTip(
             "Поиск по подстроке без учёта регистра."
         )
-        row.addWidget(self.filter_search_input)
+        row2.addWidget(self.filter_search_input, 1)
 
         self.filter_count_label = QLabel("")
         self.filter_count_label.setStyleSheet(
@@ -2292,14 +2342,19 @@ class SessionsWindow(QDialog):
             Qt.AlignmentFlag.AlignRight
             | Qt.AlignmentFlag.AlignVCenter
         )
-        row.addWidget(self.filter_count_label)
+        row2.addWidget(self.filter_count_label)
 
+        box_layout.addLayout(row2)
+
+        # Начальное состояние дат.
         self.filter_date_from.setEnabled(True)
         self.filter_date_to.setEnabled(True)
 
         outer_layout.addWidget(box)
 
-        # --- НОВОЕ: плашка активного фильтра по связям ---
+        # ==============================================================
+        # Плашка активного фильтра по связям (без изменений)
+        # ==============================================================
         self.relation_filter_label = QLabel("")
         self.relation_filter_label.setWordWrap(True)
         self.relation_filter_label.setVisible(False)
@@ -2343,6 +2398,12 @@ class SessionsWindow(QDialog):
         self.filter_project_combo.blockSignals(True)
         self.filter_project_combo.setCurrentIndex(0)
         self.filter_project_combo.blockSignals(False)
+
+        # --- НОВОЕ: сбрасываем категорию ---
+        if hasattr(self, "filter_category_combo"):
+            self.filter_category_combo.blockSignals(True)
+            self.filter_category_combo.setCurrentIndex(0)
+            self.filter_category_combo.blockSignals(False)
 
         self.filter_date_enabled.blockSignals(True)
         self.filter_date_enabled.setChecked(True)
@@ -2407,6 +2468,66 @@ class SessionsWindow(QDialog):
             self.filter_project_combo.setCurrentIndex(idx)
         self.filter_project_combo.blockSignals(False)
 
+    def _refresh_category_filter(self) -> None:
+        """
+        Заполняет выпадающий список категорий.
+
+        Объединяет справочник из настроек и категории, реально
+        встречающиеся в сохранённых записях.
+        """
+        if not hasattr(self, "filter_category_combo"):
+            return
+
+        current = self.filter_category_combo.currentData() or ""
+
+        # --- Из справочника ---
+        categories_from_config: List[str] = []
+        if self.config_manager is not None:
+            try:
+                categories_from_config = (
+                    self.config_manager.get_category_names()
+                )
+            except Exception as exc:
+                log.warning(
+                    "Не удалось прочитать справочник категорий: %s",
+                    exc,
+                )
+
+        # --- Из записей ---
+        categories_from_sessions: List[str] = []
+        seen = set()
+        for r in self._all_rows:
+            c = (r.get("category") or "").strip()
+            if c and c not in seen:
+                categories_from_sessions.append(c)
+                seen.add(c)
+
+        # --- Объединяем, сохраняя порядок ---
+        merged: List[str] = []
+        seen = set()
+        for c in categories_from_config + categories_from_sessions:
+            c = (c or "").strip()
+            if c and c not in seen:
+                merged.append(c)
+                seen.add(c)
+
+        self.filter_category_combo.blockSignals(True)
+        self.filter_category_combo.clear()
+        self.filter_category_combo.addItem(
+            "— все категории —", ""
+        )
+        self.filter_category_combo.addItem(
+            "— без категории —", "__untagged__"
+        )
+        for c in merged:
+            self.filter_category_combo.addItem(c, c)
+
+        idx = self.filter_category_combo.findData(current)
+        if idx < 0:
+            idx = 0
+        self.filter_category_combo.setCurrentIndex(idx)
+        self.filter_category_combo.blockSignals(False)
+
     def _refresh_tag_filter(self) -> None:
         if not hasattr(self, "filter_tag_combo"):
             return
@@ -2465,6 +2586,16 @@ class SessionsWindow(QDialog):
         project_filter = (
             self.filter_project_combo.currentData() or ""
         )
+        # --- НОВОЕ: категория ---
+        category_filter = ""
+        category_only_untagged = False
+        if hasattr(self, "filter_category_combo"):
+            data = self.filter_category_combo.currentData() or ""
+            if data == "__untagged__":
+                category_only_untagged = True
+            else:
+                category_filter = str(data).strip()
+
         date_enabled = self.filter_date_enabled.isChecked()
         search_query = (
             self.filter_search_input.text().strip().lower()
@@ -2509,6 +2640,14 @@ class SessionsWindow(QDialog):
             # --- Фильтр по проекту ---
             if project_filter:
                 if (r.get("project") or "") != project_filter:
+                    continue
+
+            # --- НОВОЕ: фильтр по категории ---
+            if category_filter:
+                if (r.get("category") or "") != category_filter:
+                    continue
+            elif category_only_untagged:
+                if (r.get("category") or "").strip():
                     continue
 
             # --- Фильтр по тегу ---
@@ -3569,6 +3708,7 @@ class SessionsWindow(QDialog):
         self._all_rows = list(rows or [])
 
         self._refresh_project_filter()
+        self._refresh_category_filter()      # ← НОВОЕ
         self._refresh_tag_filter()
 
         if hasattr(self, "tag_stats_layout"):

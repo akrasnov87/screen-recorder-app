@@ -10,6 +10,22 @@
   • Дельта-синхронизация + настройки.
   • Синхронизация справочников проектов и тегов.
   • Журнал операций.
+
+Изменения:
+  • Модуль создан.
+  • НОВОЕ: в фильтры обеих вкладок добавлен ComboBox «Категория»
+    рядом с «Проект»:
+      – на вкладке «На сервер» — фильтр применяется в
+        _refresh_local_sessions по meta["category"] записи
+        (поддерживается «— без категории —»);
+      – на вкладке «С сервера» — фильтр применяется на клиенте
+        в _apply_download_category_filter по полю category
+        серверной записи (сервер не умеет фильтровать по
+        категории, поэтому фильтруем уже загруженный список).
+  • ИСПРАВЛЕНО: _render_remote_records больше не перезаписывает
+    self._remote_records — теперь метод отображает переданное
+    подмножество, а полный список хранится отдельно. Это нужно
+    для корректной клиентской фильтрации по категории.
 """
 from __future__ import annotations
 
@@ -205,6 +221,30 @@ class SyncWindow(QDialog):
         )
         filter_row.addWidget(self.upload_project_combo)
 
+        # --- НОВОЕ: фильтр по категории ---
+        filter_row.addSpacing(12)
+        filter_row.addWidget(QLabel("Категория:"))
+
+        self.upload_category_combo = QComboBox()
+        self.upload_category_combo.addItem(
+            "— все категории —", ""
+        )
+        self.upload_category_combo.addItem(
+            "— без категории —", "__untagged__"
+        )
+        self.upload_category_combo.setMinimumWidth(180)
+        self.upload_category_combo.setToolTip(
+            "Фильтр по категории записи (session.json → category).\n\n"
+            "«— все категории —» — показать записи с любой "
+            "категорией, включая пустую.\n"
+            "«— без категории —» — только записи, у которых "
+            "категория не указана."
+        )
+        self.upload_category_combo.currentIndexChanged.connect(
+            self._refresh_local_sessions
+        )
+        filter_row.addWidget(self.upload_category_combo)
+
         self.upload_only_new_check = QCheckBox(
             "Только ещё не опубликованные"
         )
@@ -330,6 +370,26 @@ class SyncWindow(QDialog):
             self._on_download_project_changed
         )
         filter_row.addWidget(self.download_project_combo)
+
+        # --- НОВОЕ: фильтр по категории (клиентский) ---
+        filter_row.addSpacing(12)
+        filter_row.addWidget(QLabel("Категория:"))
+
+        self.download_category_combo = QComboBox()
+        self.download_category_combo.addItem(
+            "— все категории —", ""
+        )
+        self.download_category_combo.setMinimumWidth(180)
+        self.download_category_combo.setToolTip(
+            "Фильтр по категории серверной записи.\n\n"
+            "Применяется на клиенте — сервер не умеет "
+            "фильтровать по категории. Список категорий "
+            "заполняется после загрузки серверных записей."
+        )
+        self.download_category_combo.currentIndexChanged.connect(
+            self._on_download_category_changed
+        )
+        filter_row.addWidget(self.download_category_combo)
 
         filter_row.addWidget(QLabel("Год:"))
         self.download_year_combo = QComboBox()
@@ -871,9 +931,20 @@ class SyncWindow(QDialog):
         project_filter = (
             self.upload_project_combo.currentData() or ""
         )
+        # --- НОВОЕ: категория ---
+        category_filter = ""
+        category_only_untagged = False
+        if hasattr(self, "upload_category_combo"):
+            data = self.upload_category_combo.currentData() or ""
+            if data == "__untagged__":
+                category_only_untagged = True
+            else:
+                category_filter = str(data).strip()
+
         only_new = self.upload_only_new_check.isChecked()
 
         projects_set = set()
+        categories_set = set()
         rows: List[Dict[str, Any]] = []
         try:
             entries = sorted(os.listdir(self.sessions_root))
@@ -894,7 +965,17 @@ class SyncWindow(QDialog):
             if project:
                 projects_set.add(project)
 
+            category = (meta.get("category") or "").strip()
+            if category:
+                categories_set.add(category)
+
             if project_filter and project != project_filter:
+                continue
+
+            # --- НОВОЕ: фильтр по категории ---
+            if category_filter and category != category_filter:
+                continue
+            if category_only_untagged and category:
                 continue
 
             sync_ready = bool(meta.get("sync_ready", False))
@@ -934,6 +1015,7 @@ class SyncWindow(QDialog):
                 "date": date_str,
                 "name": meta.get("name") or name,
                 "project": project or "—",
+                "category": category,
                 "local": ", ".join(local_parts) or "—",
                 "published": published,
                 # --- Флаг готовности к синхронизации ---
@@ -951,6 +1033,27 @@ class SyncWindow(QDialog):
         if idx >= 0:
             self.upload_project_combo.setCurrentIndex(idx)
         self.upload_project_combo.blockSignals(False)
+
+        # --- НОВОЕ: обновляем список категорий ---
+        if hasattr(self, "upload_category_combo"):
+            current_cat = (
+                self.upload_category_combo.currentData() or ""
+            )
+            self.upload_category_combo.blockSignals(True)
+            self.upload_category_combo.clear()
+            self.upload_category_combo.addItem(
+                "— все категории —", ""
+            )
+            self.upload_category_combo.addItem(
+                "— без категории —", "__untagged__"
+            )
+            for c in sorted(categories_set):
+                self.upload_category_combo.addItem(c, c)
+            idx_cat = self.upload_category_combo.findData(current_cat)
+            if idx_cat < 0:
+                idx_cat = 0
+            self.upload_category_combo.setCurrentIndex(idx_cat)
+            self.upload_category_combo.blockSignals(False)
 
         self.upload_table.setRowCount(0)
         published_count = 0
@@ -1189,6 +1292,8 @@ class SyncWindow(QDialog):
             f"Опубликовать {len(rows)} записей на сервер?\n\n"
             f"Фильтр: проект="
             f"{self.upload_project_combo.currentText()}, "
+            f"категория="
+            f"{self.upload_category_combo.currentText()}, "
             f"только новые="
             f"{'да' if self.upload_only_new_check.isChecked() else 'нет'}\n"
             f"Передача медиа: "
@@ -1614,8 +1719,10 @@ class SyncWindow(QDialog):
 
         def _on_ok(data: Dict[str, Any]) -> None:
             self._remote_tree = data["tree"]
-            self._render_remote_records(data["records"])
+            self._remote_records = list(data["records"])
+            self._render_remote_records(self._remote_records)
             self._refresh_remote_project_combo()
+            self._refresh_remote_category_combo()
             self._append_log(
                 f"Получено записей: {len(data['records'])}"
             )
@@ -1636,6 +1743,36 @@ class SyncWindow(QDialog):
             self.download_project_combo.setCurrentIndex(idx)
         self.download_project_combo.blockSignals(False)
 
+    def _refresh_remote_category_combo(self) -> None:
+        """
+        Заполняет ComboBox категорий по данным серверных записей.
+
+        Список категорий собирается из всех загруженных записей —
+        сервер не даёт отдельного «списка категорий», категория
+        хранится в самой записи.
+        """
+        if not hasattr(self, "download_category_combo"):
+            return
+
+        current = self.download_category_combo.currentData() or ""
+        categories_set = set()
+        for r in self._remote_records:
+            c = (r.get("category") or "").strip()
+            if c:
+                categories_set.add(c)
+
+        self.download_category_combo.blockSignals(True)
+        self.download_category_combo.clear()
+        self.download_category_combo.addItem(
+            "— все категории —", ""
+        )
+        for c in sorted(categories_set):
+            self.download_category_combo.addItem(c, c)
+        idx = self.download_category_combo.findData(current)
+        if idx >= 0:
+            self.download_category_combo.setCurrentIndex(idx)
+        self.download_category_combo.blockSignals(False)
+
     def _on_download_project_changed(self) -> None:
         name = self.download_project_combo.currentData() or ""
         self.download_year_combo.blockSignals(True)
@@ -1654,6 +1791,36 @@ class SyncWindow(QDialog):
                 for y in proj.get("years") or []:
                     self.download_year_combo.addItem(str(y), str(y))
                 break
+
+    def _on_download_category_changed(self) -> None:
+        """
+        Реакция на смену категории в фильтре вкладки «С сервера».
+
+        Сервер, к сожалению, не фильтрует записи по категории —
+        фильтр применяется на клиенте, при отображении списка.
+        """
+        self._apply_download_category_filter()
+
+    def _apply_download_category_filter(self) -> None:
+        """
+        Перерисовывает таблицу серверных записей с учётом
+        фильтра по категории.
+        """
+        if not hasattr(self, "download_category_combo"):
+            return
+
+        data = self.download_category_combo.currentData() or ""
+        if not data:
+            # Снят фильтр — показать всё из _remote_records.
+            self._render_remote_records(self._remote_records)
+            return
+
+        target = str(data).strip()
+        filtered = [
+            r for r in self._remote_records
+            if (r.get("category") or "").strip() == target
+        ]
+        self._render_remote_records(filtered)
 
     def _on_download_year_changed(self) -> None:
         project = self.download_project_combo.currentData() or ""
@@ -1686,9 +1853,18 @@ class SyncWindow(QDialog):
     def _render_remote_records(
         self, records: List[Dict[str, Any]]
     ) -> None:
+        """
+        Отображает переданное подмножество серверных записей.
+
+        ВАЖНО: этот метод НЕ перезаписывает self._remote_records —
+        там хранится полный список, полученный с сервера.
+        Метод вызывается:
+          • при первичной загрузке списка (передаётся полный список);
+          • при клиентской фильтрации по категории
+            (передаётся подмножество).
+        """
         self.download_table.setRowCount(0)
-        self._remote_records = list(records or [])
-        for r in self._remote_records:
+        for r in records or []:
             row = self.download_table.rowCount()
             self.download_table.insertRow(row)
             self.download_table.setItem(
@@ -1717,9 +1893,16 @@ class SyncWindow(QDialog):
                 QTableWidgetItem(str(r.get("id") or "")),
             )
 
-        self.download_stats_label.setText(
-            f"Записей на сервере: {len(self._remote_records)}"
-        )
+        total = len(self._remote_records)
+        shown = self.download_table.rowCount()
+        if shown == total:
+            self.download_stats_label.setText(
+                f"Записей на сервере: {total}"
+            )
+        else:
+            self.download_stats_label.setText(
+                f"Показано: {shown} из {total}"
+            )
 
     def _selected_download_ids(self) -> List[str]:
         records = self._remote_records or []

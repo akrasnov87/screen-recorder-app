@@ -51,6 +51,9 @@ class SearchFilters:
     search_summaries: bool = True
     search_attachments: bool = False
     project: str = ""
+    # --- НОВОЕ: фильтр по категории записи ---
+    # Если пусто — фильтр не применяется.
+    category: str = ""
     date_from: Optional[datetime] = None
     date_to: Optional[datetime] = None
     fuzzy_threshold: float = 0.82
@@ -159,6 +162,15 @@ def list_projects(sessions_root: str) -> List[str]:
             projects.add(p)
     return sorted(projects)
 
+def list_categories(sessions_root: str) -> List[str]:
+    """Возвращает уникальные категории из всех сессий."""
+    categories = set()
+    for d in _iter_session_dirs(sessions_root):
+        meta = _load_session_meta(d)
+        c = (meta.get("category") or "").strip()
+        if c:
+            categories.add(c)
+    return sorted(categories)
 
 def list_tags(sessions_root: str) -> List[str]:
     """
@@ -383,6 +395,11 @@ def search(
         # --- Фильтр по проекту ---
         if filters.project:
             if (meta.get("project") or "") != filters.project:
+                continue
+
+        # --- НОВОЕ: фильтр по категории ---
+        if filters.category:
+            if (meta.get("category") or "") != filters.category:
                 continue
 
         # --- Фильтр по тегу ---
