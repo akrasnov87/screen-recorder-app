@@ -1557,13 +1557,44 @@ class SessionsWindow(QDialog):
         root.addWidget(self._build_stats_bar())
         root.addWidget(self._build_filters_bar())
 
+        # --- Колонки таблицы ---
+        # ВАЖНО: порядок и количество колонок должны точно
+        # совпадать с _render_rows и _on_selection_changed.
+        #
+        # Изменения:
+        #   • Добавлена колонка «Категория» (индекс 3).
+        #   • Убрана колонка «Task ID» (была на индексе 12).
+        #   • Колонка «Папка» осталась последней (индекс 13)
+        #     и скрыта.
         self.table = QTableWidget(0, 14)
         self.table.setHorizontalHeaderLabels([
-            "Дата и время", "Название", "Проект", "Теги",
-            "Статус", "Источник", "Скрам", "Вложения",
-            "Поручения", "Связи", "Summary", "Синхр.",
-            "Task ID", "Папка",
+            "Дата и время",      # 0
+            "Название",          # 1
+            "Проект",            # 2
+            "Категория",         # 3  ← НОВОЕ
+            "Теги",              # 4
+            "Статус",            # 5
+            "Источник",          # 6
+            "Скрам",             # 7
+            "Вложения",          # 8
+            "Поручения",         # 9
+            "Связи",             # 10
+            "Summary",           # 11
+            "Синхр.",            # 12
+            "Папка",             # 13 (скрыта)
         ])
+        # --- Подсказка для заголовка новой колонки ---
+        # (заголовок «Категория» — индекс 3)
+        cat_header_item = self.table.horizontalHeaderItem(3)
+        if cat_header_item is not None:
+            cat_header_item.setToolTip(
+                "Категория записи (session.json → category).\n\n"
+                "Задаётся в карточке метаданных: «Метаданные → "
+                "Изменить метаданные…», поле «Категория» рядом "
+                "с «Проект».\n\n"
+                "Справочник категорий — Настройки → "
+                "«Проекты и чаты Bitrix24» → блок «Категории»."
+            )
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
@@ -1581,6 +1612,7 @@ class SessionsWindow(QDialog):
         hv.setSectionResizeMode(
             2, QHeaderView.ResizeMode.ResizeToContents
         )
+        # --- Категория (новая колонка) ---
         hv.setSectionResizeMode(
             3, QHeaderView.ResizeMode.ResizeToContents
         )
@@ -1753,7 +1785,7 @@ class SessionsWindow(QDialog):
         self.tasks_btn.clicked.connect(self._open_tasks_editor)
         bottom_actions.addWidget(self.tasks_btn)
 
-        # --- НОВОЕ: кнопка «Связи» ---
+        # --- Кнопка «Связи» ---
         self.relations_btn = QPushButton("Связи")
         attach_tooltip(
             self.relations_btn, "sess_relations_button"
@@ -1763,7 +1795,7 @@ class SessionsWindow(QDialog):
         )
         bottom_actions.addWidget(self.relations_btn)
 
-        # --- НОВОЕ: кнопка «Скрам» ---
+        # --- Кнопка «Скрам» ---
         self.scrum_btn = QPushButton("Скрам")
         self.scrum_btn.setToolTip(
             "Открыть рабочее место скрам-митинга.\n\n"
@@ -3561,7 +3593,6 @@ class SessionsWindow(QDialog):
                 self.copy_public_link_btn.setEnabled(False)
             if hasattr(self, "relations_btn"):
                 self.relations_btn.setEnabled(False)
-            # --- НОВОЕ ---
             if hasattr(self, "m_scrum"):
                 self.m_scrum.setEnabled(False)
             if hasattr(self, "scrum_btn"):
@@ -3574,6 +3605,11 @@ class SessionsWindow(QDialog):
 
         if r.get("project"):
             parts.append(f"проект: {r['project']}")
+
+        # --- НОВОЕ: категория в статусной строке ---
+        if r.get("category"):
+            parts.append(f"категория: {r['category']}")
+
         if r.get("tags"):
             parts.append(
                 f"теги: {', '.join(r['tags'])}"
@@ -3588,7 +3624,9 @@ class SessionsWindow(QDialog):
             )
 
         if r.get("sync_ready"):
-            parts.append("<span style='color:#2E7D32'>готово к синхр.</span>")
+            parts.append(
+                "<span style='color:#2E7D32'>готово к синхр.</span>"
+            )
         if r.get("manual_protocol_path"):
             parts.append("протокол: прикреплён")
         if (r.get("summary_bb") or "").strip():
@@ -3600,7 +3638,6 @@ class SessionsWindow(QDialog):
                 f"<span style='color:#1565C0'>"
                 f"поручений: {ai_done}/{ai_total}</span>"
             )
-        # --- Связи ---
         rel_count = int(r.get("relations_count") or 0)
         if rel_count > 0:
             parts.append(
@@ -3663,11 +3700,9 @@ class SessionsWindow(QDialog):
         protocol_path = self._find_manual_protocol_path(r)
         self.open_protocol_btn.setEnabled(bool(protocol_path))
 
-        # --- НОВОЕ: кнопка «Связи» ---
         if hasattr(self, "relations_btn"):
             self.relations_btn.setEnabled(bool(r.get("dir")))
 
-        # --- НОВОЕ: меню и кнопка «Скрам» ---
         is_scrum = bool(r.get("is_scrum"))
         if hasattr(self, "m_scrum"):
             self.m_scrum.setEnabled(is_scrum)
@@ -3770,16 +3805,40 @@ class SessionsWindow(QDialog):
             row = self.table.rowCount()
             self.table.insertRow(row)
 
+            # --- 0: Дата и время ---
             self.table.setItem(
                 row, 0, QTableWidgetItem(r["datetime"])
             )
+
+            # --- 1: Название ---
             self.table.setItem(
                 row, 1, QTableWidgetItem(r["name"])
             )
+
+            # --- 2: Проект ---
             self.table.setItem(
                 row, 2, QTableWidgetItem(r["project"])
             )
 
+            # --- 3: Категория (НОВОЕ) ---
+            category = (r.get("category") or "").strip()
+            category_item = QTableWidgetItem(category or "—")
+            if category:
+                category_item.setToolTip(
+                    f"Категория записи: {category}\n\n"
+                    f"Задаётся в карточке метаданных "
+                    f"(поле «Категория» рядом с «Проект»)."
+                )
+            else:
+                category_item.setForeground(Qt.GlobalColor.gray)
+                category_item.setToolTip(
+                    "Категория не указана.\n\n"
+                    "Откройте «Метаданные → Изменить метаданные…», "
+                    "чтобы задать категорию."
+                )
+            self.table.setItem(row, 3, category_item)
+
+            # --- 4: Теги ---
             tags = r.get("tags") or []
             tags_text = ", ".join(tags) if tags else "—"
             tags_item = QTableWidgetItem(tags_text)
@@ -3787,7 +3846,6 @@ class SessionsWindow(QDialog):
                 tags_item.setToolTip(
                     "Теги записи: " + ", ".join(tags)
                 )
-
                 tag_color = self._resolve_first_tag_color(tags)
                 if tag_color is not None:
                     qcolor = QColor(tag_color)
@@ -3796,9 +3854,9 @@ class SessionsWindow(QDialog):
                         tags_item.setForeground(
                             QColor("#000000")
                         )
+            self.table.setItem(row, 4, tags_item)
 
-            self.table.setItem(row, 3, tags_item)
-
+            # --- 5: Статус ---
             status_item = QTableWidgetItem(r["status"])
             if r["status"] == STATUS_ERROR:
                 status_item.setForeground(Qt.GlobalColor.red)
@@ -3806,8 +3864,9 @@ class SessionsWindow(QDialog):
                 status_item.setForeground(Qt.GlobalColor.darkGreen)
             elif r["status"] == STATUS_TRANSCRIBING:
                 status_item.setForeground(Qt.GlobalColor.darkYellow)
-            self.table.setItem(row, 4, status_item)
+            self.table.setItem(row, 5, status_item)
 
+            # --- 6: Источник ---
             src_map = {
                 "record": "Запись",
                 "upload": "Загрузка",
@@ -3824,20 +3883,24 @@ class SessionsWindow(QDialog):
                     f"Запись создана из документов.\n\n"
                     f"Документов в attachments/: {docs_n}"
                 )
-            self.table.setItem(row, 5, src_item)
+            self.table.setItem(row, 6, src_item)
+
+            # --- 7: Скрам ---
             self.table.setItem(
-                row, 6,
+                row, 7,
                 QTableWidgetItem("да" if r["is_scrum"] else "—"),
             )
 
+            # --- 8: Вложения ---
             att_count = len(r.get("attachments", []) or [])
             self.table.setItem(
-                row, 7,
+                row, 8,
                 QTableWidgetItem(
                     str(att_count) if att_count else "—"
                 ),
             )
 
+            # --- 9: Поручения ---
             ai_total = int(r.get("action_items_total") or 0)
             ai_by_status: Dict[str, int] = (
                 r.get("action_items_by_status") or {}
@@ -3898,9 +3961,9 @@ class SessionsWindow(QDialog):
                     "У этой записи нет поручений."
                 )
 
-            self.table.setItem(row, 8, ai_item)
+            self.table.setItem(row, 9, ai_item)
 
-            # --- НОВОЕ: колонка «Связи» ---
+            # --- 10: Связи ---
             rel_count = int(r.get("relations_count") or 0)
             if rel_count > 0:
                 rel_item = QTableWidgetItem(str(rel_count))
@@ -3922,8 +3985,9 @@ class SessionsWindow(QDialog):
                     "Добавить можно в карточке метаданных на "
                     "вкладке «Зависимости»."
                 )
-            self.table.setItem(row, 9, rel_item)
+            self.table.setItem(row, 10, rel_item)
 
+            # --- 11: Summary ---
             summary_bb = (r.get("summary_bb") or "").strip()
             if summary_bb:
                 summary_item = QTableWidgetItem("да")
@@ -3943,8 +4007,9 @@ class SessionsWindow(QDialog):
                 summary_item.setToolTip(
                     "У этой записи нет краткого описания."
                 )
-            self.table.setItem(row, 10, summary_item)
+            self.table.setItem(row, 11, summary_item)
 
+            # --- 12: Синхр. ---
             published = bool(r.get("published"))
             sync_ready = bool(r.get("sync_ready"))
 
@@ -3979,12 +4044,12 @@ class SessionsWindow(QDialog):
                 sync_item.setToolTip(
                     "Запись — черновик (sync_ready=false)."
                 )
-            self.table.setItem(row, 11, sync_item)
+            self.table.setItem(row, 12, sync_item)
 
-            self.table.setItem(
-                row, 12,
-                QTableWidgetItem(r["task_id"] or "—"),
-            )
+            # --- 13: Папка (скрыта) ---
+            # Раньше здесь был Task ID, теперь — только путь к папке.
+            # Task ID из таблицы убран; при необходимости его можно
+            # посмотреть в «Очередь задач».
             self.table.setItem(row, 13, QTableWidgetItem(r["dir"]))
 
     # ------------------------------------------------------------------
