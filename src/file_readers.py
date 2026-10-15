@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, Optional
 
 from .logger import get_logger
@@ -63,33 +64,149 @@ def read_docx_file(
         return ""
 
 
-def read_pdf_file(
+def read_docx_file(
     path: str,
     max_chars: int = DEFAULT_MAX_CHARS,
 ) -> str:
-    """Извлекает текст из .pdf. Требует pypdf."""
+    """
+    Извлекает текст из .docx с сохранением таблиц.
+
+    Обходит документ в порядке следования элементов
+    (параграфы и таблицы идут вперемешку), таблицы выводит
+    в Markdown-формате — так, чтобы их можно было отдать LLM
+    и они корректно рендерились в промпт.
+
+    Требует python-docx.
+    """
     if not path or not os.path.isfile(path):
         return ""
     try:
-        from pypdf import PdfReader  # type: ignore
+        from docx import Document  # type: ignore
     except ImportError:
-        log.warning("pypdf не установлен, .pdf не прочитан: %s", path)
+        log.warning(
+            "python-docx не установлен, .docx не прочитан: %s", path
+        )
         return ""
 
     try:
-        reader = PdfReader(path)
-        chunks = []
-        total = 0
-        for page in reader.pages:
-            t = page.extract_text() or ""
-            chunks.append(t)
-            total += len(t)
-            if total >= max_chars:
-                break
-        return "\n".join(chunks)[:max_chars]
+        doc = Document(path)
     except Exception as exc:
-        log.warning("Ошибка чтения .pdf %s: %s", path, exc)
+        log.warning("Ошибка чтения .docx %s: %s", path, exc)
         return ""
+
+    # Пытаемся обойти body в порядке следования элементов.
+    # Если получится — параграфы и таблицы будут в правильном
+    # порядке. Если нет — fallback на раздельные обходы.
+    parts: list[str] = []
+    try:
+        from docx.document import Document as _DocClass  # type: ignore
+        from docx.table import Table  # type: ignore
+        from docx.text.paragraph import Paragraph  # type: ignore
+
+        body = doc.element.body
+        for child in body.iterchildren():
+            tag = child.tag
+            if tag.endswith("}p"):
+                paragraph = Paragraph(child, doc)
+                text = paragraph.text or ""
+                if text.strip():
+                    parts.append(text)
+                else:
+                    # Пустой параграф — сохраняем как разделитель.
+                    parts.append("")
+            elif tag.endswith("}tbl"):
+                table = Table(child, doc)
+                md = _docx_table_to_markdown(table)
+                if md:
+                    if parts and parts[-1] != "":
+                        parts.append("")
+                    parts.append(md)
+                    parts.append("")
+    except Exception as exc:
+        log.warning(
+            "Не удалось обойти .docx в порядке следования, "
+            "использую fallback (%s): %s", path, exc,
+        )
+        # --- Fallback: сначала все параграфы, потом таблицы ---
+        parts = [p.text for p in doc.paragraphs if p.text]
+        for table in doc.tables:
+            md = _docx_table_to_markdown(table)
+            if md:
+                parts.append("")
+                parts.append(md)
+
+    text = "\n".join(parts)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text[:max_chars]
+
+
+def _docx_table_to_markdown(table) -> str:
+    """
+    Преобразует таблицу python-docx в Markdown.
+
+    Первая строка считается заголовком. Если в таблице одна
+    строка — выводится без разделителя заголовка.
+
+    Ячейки очищаются от переводов строк (для Markdown-таблицы
+    это критично: перенос строки внутри ячейки ломает разметку).
+    """
+    try:
+        rows = list(table.rows)
+    except Exception:
+        return ""
+
+    if not rows:
+        return ""
+
+    def _cell_text(cell) -> str:
+        # Собираем текст из всех параграфов ячейки.
+        try:
+            txt = "\n".join(
+                (p.text or "") for p in cell.paragraphs
+            )
+        except Exception:
+            txt = cell.text or ""
+        # Схлопываем переводы строк и лишние пробелы —
+        # внутри Markdown-ячейки это недопустимо.
+        txt = txt.replace("\n", " ").replace("\r", " ")
+        txt = re.sub(r"\s{2,}", " ", txt)
+        # Экранируем вертикальную черту (символ разделителя
+        # в Markdown-таблице).
+        txt = txt.replace("|", "\\|")
+        return txt.strip()
+
+    # --- Определяем число колонок как максимум по строкам ---
+    row_cells: list[list[str]] = []
+    for r in rows:
+        try:
+            cells = list(r.cells)
+        except Exception:
+            cells = []
+        row_cells.append([_cell_text(c) for c in cells])
+
+    if not row_cells:
+        return ""
+
+    n_cols = max(len(r) for r in row_cells)
+    if n_cols == 0:
+        return ""
+
+    # --- Выравниваем строки по числу колонок ---
+    def _pad(row: list[str]) -> list[str]:
+        if len(row) < n_cols:
+            return row + [""] * (n_cols - len(row))
+        return row[:n_cols]
+
+    header = _pad(row_cells[0])
+    body = [_pad(r) for r in row_cells[1:]]
+
+    lines: list[str] = []
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("| " + " | ".join(["---"] * n_cols) + " |")
+    for r in body:
+        lines.append("| " + " | ".join(r) + " |")
+
+    return "\n".join(lines)
 
 
 def read_json_file(path: str) -> Optional[Dict[str, Any]]:
