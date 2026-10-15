@@ -761,6 +761,26 @@ class MetadataDialog(QDialog):
         return w
 
     def _build_document_options_section(self) -> QWidget:
+        """
+        Блок «Что делать с документами» на вкладке «Документ».
+
+        Значения по умолчанию подобраны под сценарий
+        «запись-документ» (без видео):
+          • Сохранить извлечённый текст как video.txt — ВКЛ.
+            (это основа для последующих шагов: поиска,
+            TFS-выборки, экспорта протоколов и т.д.)
+          • Передать извлечённый текст в промпт DeepSeek
+            как вложение — ВКЛ.
+            (пользователь обычно хочет, чтобы содержимое
+            документов попало в промпт DeepSeek.)
+          • Формировать summary из документов — ВЫКЛ.
+            (тяжёлая операция; пользователь включает её
+            осознанно, если ему действительно нужна
+            краткая выжимка.)
+          • Формировать файл промпта для DeepSeek — ВЫКЛ.
+            (это отдельный шаг обработки, не всем нужен;
+            включается вручную.)
+        """
         box = QFrame()
         box.setFrameShape(QFrame.Shape.StyledPanel)
         box.setStyleSheet(
@@ -786,11 +806,15 @@ class MetadataDialog(QDialog):
 
         hint = QLabel(
             "<span style='color:#666'>Текст документов будет "
-            "извлечён и использован так же, как стенограмма.</span>"
+            "извлечён и использован так же, как стенограмма."
+            "</span>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        # --- Формировать summary из документов ---
+        # По умолчанию ВЫКЛ: тяжёлая операция, включается
+        # пользователем осознанно.
         self.doc_generate_summary_check = QCheckBox(
             "Сформировать summary из документов"
         )
@@ -798,9 +822,12 @@ class MetadataDialog(QDialog):
             self.doc_generate_summary_check,
             "meta_doc_generate_summary",
         )
-        self.doc_generate_summary_check.setChecked(True)
+        self.doc_generate_summary_check.setChecked(False)
         layout.addWidget(self.doc_generate_summary_check)
 
+        # --- Формировать файл промпта для DeepSeek ---
+        # По умолчанию ВЫКЛ: отдельный шаг обработки,
+        # не всем нужен.
         self.doc_generate_deepseek_check = QCheckBox(
             "Сформировать файл промпта для DeepSeek"
         )
@@ -808,9 +835,13 @@ class MetadataDialog(QDialog):
             self.doc_generate_deepseek_check,
             "meta_doc_generate_deepseek",
         )
-        self.doc_generate_deepseek_check.setChecked(True)
+        self.doc_generate_deepseek_check.setChecked(False)
         layout.addWidget(self.doc_generate_deepseek_check)
 
+        # --- Сохранить извлечённый текст как video.txt ---
+        # По умолчанию ВКЛ: это базовая операция, дающая
+        # возможность работать с документом так же, как
+        # с обычной записью.
         self.doc_include_text_as_transcript_check = QCheckBox(
             "Сохранить извлечённый текст как «стенограмму» "
             "(video.txt)"
@@ -824,6 +855,10 @@ class MetadataDialog(QDialog):
             self.doc_include_text_as_transcript_check
         )
 
+        # --- Передать извлечённый текст в промпт DeepSeek ---
+        # По умолчанию ВКЛ: пользователь, как правило, хочет,
+        # чтобы содержимое документов попало в DeepSeek-промпт
+        # (это и есть смысл «записи из документов»).
         self.doc_send_to_deepseek_check = QCheckBox(
             "Передать извлечённый текст в промпт DeepSeek "
             "как вложение"
@@ -2781,7 +2816,7 @@ class MetadataDialog(QDialog):
                 bool(init.get("generate_summary", False))
             )
             self.doc_generate_deepseek_check.setChecked(
-                bool(init.get("generate_deepseek_prompt", True))
+                bool(init.get("generate_deepseek_prompt", False))
             )
             self.doc_include_text_as_transcript_check.setChecked(
                 bool(init.get("document_save_transcript", True))
