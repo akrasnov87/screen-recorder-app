@@ -51,6 +51,10 @@ from ..markdown_to_bitrix import (
     markdown_to_plain_with_bb,
 )
 from .tooltips import attach_tooltip, make_info_icon, with_info
+from ..tasks_manager import load_action_items
+from ..file_readers import read_json_file
+from .employees_matching_widget import EmployeesMatchingWidget
+from ..bitrix_employees_sender import send_items_to_employees
 
 log = get_logger(__name__)
 
@@ -445,6 +449,12 @@ class SendToBitrixDialog(QDialog):
         self._worker: Optional[_SendWorker] = None
         self._progress_dlg: Optional[QProgressDialog] = None
 
+        # --- НОВОЕ: виджет сопоставления сотрудников (для скрама) ---
+        self._employees_widget: Optional[EmployeesMatchingWidget] = None
+        # Список сообщений сотрудникам, подготовленных к отправке
+        # после успешной отправки в чат.
+        self._pending_employee_messages: List[Dict[str, Any]] = []
+
         self.selected_count_label: Optional[QLabel] = None
         self.empty_hint: Optional[QLabel] = None
 
@@ -489,12 +499,112 @@ class SendToBitrixDialog(QDialog):
             self._wrap_tab(self._build_server_link_tab()),
             "Ссылка на сервер",
         )
+
+        # --- НОВОЕ: вкладка «Сотрудникам» только для скрам-записей ---
+        self._maybe_add_employees_tab()
+
         self.tabs.addTab(
             self._wrap_tab(self._build_options_tab()),
             "Параметры",
         )
 
         root.addWidget(self._build_actions_bar())
+
+    # ------------------------------------------------------------------
+    # Вкладка «Сотрудникам» (только для скрам-записей)
+    # ------------------------------------------------------------------
+    def _is_scrum_record(self) -> bool:
+        """
+        Определяет, помечена ли запись как скрам-митинг.
+
+        Приоритет:
+          1. session_info["is_scrum"] (передаётся из окна «Записи»).
+          2. session.json → is_scrum (читаем напрямую).
+        """
+        if self.session_info.get("is_scrum"):
+            return True
+
+        session_dir = self.session_info.get("session_dir") or ""
+        if not session_dir:
+            return False
+
+        meta = read_json_file(
+            os.path.join(session_dir, "session.json")
+        ) or {}
+        return bool(meta.get("is_scrum", False))
+
+    def _load_action_items_for_session(self) -> List[Dict[str, Any]]:
+        """
+        Читает action_items.json из папки записи.
+
+        Возвращает плоский список поручений с полем session_dir.
+        """
+        session_dir = self.session_info.get("session_dir") or ""
+        if not session_dir:
+            return []
+
+        data = load_action_items(session_dir)
+        items = list(data.get("items") or [])
+        for it in items:
+            it.setdefault("session_dir", session_dir)
+        return items
+
+    def _maybe_add_employees_tab(self) -> None:
+        """
+        Добавляет вкладку «Сотрудникам», если:
+          • запись помечена как скрам-митинг;
+          • есть поручения в action_items.json;
+          • есть справочник сотрудников.
+        """
+        if not self._is_scrum_record():
+            log.debug(
+                "SendToBitrixDialog: вкладка «Сотрудникам» не "
+                "добавлена — запись не скрам-митинг"
+            )
+            return
+
+        items = self._load_action_items_for_session()
+        if not items:
+            log.info(
+                "SendToBitrixDialog: вкладка «Сотрудникам» не "
+                "добавлена — у записи нет поручений"
+            )
+            return
+
+        if not self.employees:
+            log.info(
+                "SendToBitrixDialog: вкладка «Сотрудникам» не "
+                "добавлена — справочник сотрудников пуст"
+            )
+            return
+
+        self._employees_widget = EmployeesMatchingWidget(
+            items=items,
+            employees=self.employees,
+            parent=self,
+        )
+
+        tab_index = self.tabs.addTab(
+            self._wrap_tab(self._employees_widget),
+            "Сотрудникам",
+        )
+
+        # --- Подсказка для вкладки (по SKILS.md) ---
+        self.tabs.setTabToolTip(
+            tab_index,
+            "Сопоставьте исполнителей поручений с сотрудниками "
+            "из справочника.\n\n"
+            "Сообщения сотрудникам уйдут в их личные чаты Bitrix24 "
+            "ПОСЛЕ успешной отправки протокола/summary в чат.\n\n"
+            "Вкладка появляется только для скрам-записей с "
+            "поручениями и настроенным справочником сотрудников."
+        )
+
+        log.info(
+            "SendToBitrixDialog: добавлена вкладка «Сотрудникам» "
+            "(поручений=%d, сотрудников=%d)",
+            len(items), len(self.employees),
+        )
 
     @staticmethod
     def _wrap_tab(widget: QWidget) -> QScrollArea:
@@ -2511,10 +2621,6 @@ class SendToBitrixDialog(QDialog):
 
             if state["ok"]:
                 link = state["link"]
-                # BB-код Bitrix24: [url=URL]текст[/url].
-                # Голый URL в plain-тексте Bitrix24 показывает
-                # целиком (percent-encoded кириллица) и иногда
-                # обрезает по лимиту строки.
                 extra_tail = (
                     "\n\n[url=" + link + "]Подробнее[/url]"
                 )
@@ -2572,6 +2678,63 @@ class SendToBitrixDialog(QDialog):
                 "(отправка без ссылки)</span>"
             )
 
+        # --------------------------------------------------------------
+        # НОВОЕ: подготовка рассылки сотрудникам
+        # --------------------------------------------------------------
+        employee_messages: List[Dict[str, Any]] = []
+        employees_note = ""
+
+        if self._employees_widget is not None:
+            try:
+                employee_messages = (
+                    self._employees_widget.collect_messages()
+                )
+            except Exception as exc:
+                log.warning(
+                    "Не удалось собрать план рассылки сотрудникам: %s",
+                    exc,
+                )
+                employee_messages = []
+
+            validation = (
+                self._employees_widget.validation_errors()
+            )
+
+            if employee_messages:
+                employees_note = (
+                    f"<br><br><b>После этого будет разослано "
+                    f"поручений сотрудникам:</b> "
+                    f"{len(employee_messages)} сообщений."
+                )
+                if validation:
+                    validation_html = "<br>".join(
+                        f"• {html.escape(e)}" for e in validation
+                    )
+                    employees_note += (
+                        f"<br><span style='color:#B8860B'>"
+                        f"Предупреждения:</span>"
+                        f"<br><span style='color:#666; "
+                        f"font-size:11px'>"
+                        f"{validation_html}</span>"
+                    )
+            else:
+                employees_note = (
+                    "<br><br><b>Рассылка сотрудникам:</b> "
+                    "<span style='color:#c62828'>не будет "
+                    "выполнена — не сформировано ни одного "
+                    "сообщения (нет сопоставлений или "
+                    "chat_id).</span>"
+                )
+                if validation:
+                    validation_html = "<br>".join(
+                        f"• {html.escape(e)}" for e in validation
+                    )
+                    employees_note += (
+                        f"<br><span style='color:#666; "
+                        f"font-size:11px'>"
+                        f"{validation_html}</span>"
+                    )
+
         reply = QMessageBox.question(
             self, "Массовая отправка в Bitrix24",
             f"<b>Получателей:</b> {len(chat_ids)}<br><br>"
@@ -2581,7 +2744,8 @@ class SendToBitrixDialog(QDialog):
             f"в формате .docx. Имя файла = заголовок, "
             f"тот же заголовок — текстом в том же сообщении."
             f"</span>"
-            f"{link_note}<br><br>"
+            f"{link_note}"
+            f"{employees_note}<br><br>"
             f"<b>Кому:</b><br>"
             f"<pre style='font-family:monospace'>"
             f"{html.escape(recipients_text)}</pre>"
@@ -2593,37 +2757,12 @@ class SendToBitrixDialog(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        # --- Запоминаем план рассылки сотрудникам для post-step ---
+        self._pending_employee_messages = employee_messages
+
         connect_timeout = float(
             self.bitrix_cfg.get("connect_timeout", 15)
         )
-        read_timeout = float(
-            self.bitrix_cfg.get("read_timeout", 60)
-        )
-        max_message_chars = int(
-            self.bitrix_cfg.get("max_message_chars", 15000)
-        )
-        system = self.system_check.isChecked()
-        url_preview = not self.no_preview_check.isChecked()
-
-        forced_folder_id = int(
-            self.bitrix_cfg.get("upload_folder_id", 0) or 0
-        )
-        prefer_chat_folder = forced_folder_id <= 0
-
-        self._progress_dlg = QProgressDialog(
-            "Отправка в Bitrix24…",
-            "Отмена",
-            0,
-            len(chat_ids),
-            self,
-        )
-        self._progress_dlg.setWindowTitle("Отправка в Bitrix24")
-        self._progress_dlg.setWindowModality(
-            Qt.WindowModality.WindowModal
-        )
-        self._progress_dlg.setMinimumDuration(0)
-        self._progress_dlg.setValue(0)
-        self._progress_dlg.canceled.connect(self._on_cancel_send)
 
         self._worker = _SendWorker(
             webhook=webhook,
@@ -2669,6 +2808,8 @@ class SendToBitrixDialog(QDialog):
             self._progress_dlg.close()
             self._progress_dlg = None
         self._worker = None
+
+        # --- Показываем отчёт по чат-рассылке ---
         self._show_send_report(
             sent_count=report.get("sent_count", 0),
             errors_by_chat=report.get("errors_by_chat", {}),
@@ -2677,11 +2818,47 @@ class SendToBitrixDialog(QDialog):
             total_chats=report.get("total_chats", 0),
         )
 
+        # --------------------------------------------------------------
+        # НОВОЕ: post-step — рассылка сотрудникам
+        # --------------------------------------------------------------
+        messages = self._pending_employee_messages
+        self._pending_employee_messages = []
+
+        if not messages:
+            return
+
+        log.info(
+            "Чат-рассылка завершена, запускаю рассылку сотрудникам: "
+            "%d сообщений (fail_chats=%d)",
+            len(messages), len(report.get("fail_chats", [])),
+        )
+
+        # Отправляем сотрудникам — через общий модуль.
+        # show_confirmation=False: пользователь уже подтверждал
+        # в общем диалоге.
+        send_items_to_employees(
+            messages=messages,
+            bitrix_cfg=self.bitrix_cfg,
+            parent=self,
+            show_confirmation=False,
+        )
+
     def _on_send_failed(self, error: str) -> None:
         if self._progress_dlg is not None:
             self._progress_dlg.close()
             self._progress_dlg = None
         self._worker = None
+
+        # --- НОВОЕ: сбрасываем отложенную рассылку сотрудникам ---
+        # Если чат-часть провалилась — сотрудникам не отправляем.
+        if self._pending_employee_messages:
+            log.warning(
+                "Чат-рассылка провалена — отменяю отложенную "
+                "рассылку сотрудникам (%d сообщений)",
+                len(self._pending_employee_messages),
+            )
+            self._pending_employee_messages = []
+
         log.error(
             "Bitrix24: массовая рассылка провалена: %s", error
         )

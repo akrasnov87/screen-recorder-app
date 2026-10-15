@@ -5340,8 +5340,12 @@ class SessionsWindow(QDialog):
         session_info = {
             "name": r.get("name") or "",
             "project": project,
-            "category": r.get("category") or "",   # ← НОВОЕ
+            "category": r.get("category") or "",
             "date": r.get("datetime") or "",
+            # --- НОВОЕ: передаём признак скрам-митинга, чтобы
+            #     диалог отправки знал, показывать ли вкладку
+            #     «Сотрудникам». ---
+            "is_scrum": bool(r.get("is_scrum")),
             "protocol_path": protocol_path,
             "protocol_label": (
                 os.path.basename(protocol_path) if protocol_path else ""
