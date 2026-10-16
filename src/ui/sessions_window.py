@@ -2868,6 +2868,27 @@ class SessionsWindow(QDialog):
         )
         bar.setStyleSheet(_MENU_QSS)
 
+        # --- НОВОЕ: индикаторы состояния серверов справа ---
+        try:
+            from .server_status_widget import ServerStatusWidget
+            if hasattr(self, "config_manager") and self.config_manager:
+                self._server_status = ServerStatusWidget(
+                    config_manager=self.config_manager,
+                    parent=self,
+                )
+                bar.setCornerWidget(
+                    self._server_status,
+                    Qt.Corner.TopRightCorner,
+                )
+                log.info(
+                    "Записи: панель индикаторов серверов добавлена"
+                )
+        except Exception as exc:
+            log.warning(
+                "Не удалось создать панель индикаторов серверов: %s",
+                exc,
+            )
+
         layout: QVBoxLayout = self.layout()
         layout.insertWidget(0, bar)
 
