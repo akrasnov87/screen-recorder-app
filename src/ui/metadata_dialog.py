@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -50,16 +51,38 @@ _DOCUMENT_EXTS = (
     ".rtf", ".odt", ".pptx",
 )
 
-
 def format_name_template(
     template: str,
     name: str,
     abbr: str = "",
     now: Optional[datetime] = None,
 ) -> str:
+    """
+    Формирует итоговое имя по шаблону.
+
+    Плейсхолдеры:
+      {name} / {название}   — введённое название;
+      {abbr} / {сокр}       — аббревиатура;
+      {date} / {дата}       — дата в формате YYYY-MM-DD;
+      {time} / {время}      — время в формате HH-MM;
+      {datetime}            — дата и время.
+
+    ИСТОРИЯ:
+      • Раньше при now=None подставлялся datetime.now().
+        Из-за этого «Итоговое имя» в диалоге метаданных
+        показывало текущую дату, а не ту, что пользователь
+        выбрал в поле «Дата и время».
+      • Теперь вызывающий код обязан передать `now` явно
+        (обычно — дату+время из полей диалога). Если `now`
+        не передан — используется текущий момент
+        (fallback для обратной совместимости).
+    """
     if not template:
         return (name or "").strip()
-    now = now or datetime.now()
+
+    if now is None:
+        now = datetime.now()
+
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H-%M")
     datetime_str = f"{date_str} {time_str}"
@@ -2302,20 +2325,102 @@ class MetadataDialog(QDialog):
             return ""
         return self.name_combo.itemData(idx) or ""
 
+    # Регулярное выражение для поиска даты в конце названия.
+    # Ловит YYYY-MM-DD и (опционально) время HH:MM / HH-MM.
+    _DATE_TAIL_RE = re.compile(
+        r"\d{4}-\d{2}-\d{2}"
+        r"(?:\s+\d{2}[-:]\d{2}(?:[-:]\d{2})?)?"
+        r"\s*$"
+    )
+
+    @classmethod
+    def _name_already_has_date(cls, name: str) -> bool:
+        """
+        Проверяет, содержит ли имя дату в формате YYYY-MM-DD.
+
+        Используется для защиты от дублирования даты:
+        если пользователь ввёл название
+        «2026-10-15 Коммерческое предложение для БашРТС»,
+        а шаблон — «{name} — {date}», то итоговое имя стало бы
+        «2026-10-15 … — 2026-10-16», что некрасиво.
+
+        Проверяем не только конец строки, но и её начало
+        (частый случай — «2026-10-15 Название …»).
+        """
+        if not name:
+            return False
+        s = name.strip()
+        # Дата в конце.
+        if cls._DATE_TAIL_RE.search(s):
+            return True
+        # Дата в начале.
+        if re.match(r"^\d{4}-\d{2}-\d{2}\b", s):
+            return True
+        return False
+
     def _on_name_template_changed(self, index: int) -> None:
         if index < 0:
             return
         self._refresh_name_preview()
 
     def _refresh_name_preview(self) -> None:
-        template = self._current_template()
+        """
+        Обновляет предпросмотр итогового имени.
+
+        НОВОЕ:
+          • Если шаблон НЕ выбран (индекс 0) — предпросмотр
+            просто показывает название (без добавления даты).
+            Раньше в этом случае подставлялась текущая дата,
+            что приводило к неожиданному «Запись 2026-10-16 …».
+          • Если шаблон выбран — дата/время берутся из полей
+            «Дата и время» диалога, а не из datetime.now().
+            Это убирает расхождение, когда пользователь
+            задним числом создаёт запись или меняет дату.
+          • Дополнительно: если введённое название уже
+            содержит дату (в формате YYYY-MM-DD) и шаблон
+            содержит плейсхолдер {date}/{дата} — шаблон
+            автоматически сбрасывается, чтобы избежать
+            дублирования (2026-10-16 2026-10-15 …).
+        """
         raw_name = self.name_input.text().strip()
         abbr = self.name_abbr_input.text().strip()
+
+        # --- Дополнительная защита от дублирования даты ---
+        # Если пользователь вручную вписал дату в название,
+        # а выбранный шаблон тоже её добавляет — сбрасываем
+        # шаблон на «— без шаблона —».
+        template = self._current_template()
+        if template and self._name_already_has_date(raw_name):
+            # Ищем в шаблоне плейсхолдеры даты.
+            if any(
+                token in template
+                for token in ("{date}", "{дата}", "{datetime}")
+            ):
+                # Сбрасываем шаблон в UI, чтобы пользователь
+                # видел, что он не применяется.
+                self.name_combo.blockSignals(True)
+                self.name_combo.setCurrentIndex(0)
+                self.name_combo.blockSignals(False)
+                template = ""
+
+                log.info(
+                    "Шаблон имени сброшен: в названии уже есть "
+                    "дата (%r), а шаблон её дублирует",
+                    raw_name,
+                )
+
+        # --- Дата и время из полей диалога ---
+        qd = self.date_edit.date()
+        qt = self.time_edit.time()
+        now_dt = datetime(
+            qd.year(), qd.month(), qd.day(),
+            qt.hour(), qt.minute(), qt.second(),
+        )
 
         if not template:
             final = (
                 raw_name
-                or f"Запись {datetime.now():%Y-%m-%d %H-%M}"
+                or f"Запись {now_dt:%Y-%m-%d %H-%M}"
             )
             self.name_preview_label.setText(
                 f"Итоговое имя: {final}"
@@ -2323,10 +2428,10 @@ class MetadataDialog(QDialog):
             return
 
         final = format_name_template(
-            template, name=raw_name, abbr=abbr
+            template, name=raw_name, abbr=abbr, now=now_dt,
         )
         if not final.strip():
-            final = f"Запись {datetime.now():%Y-%m-%d %H-%M}"
+            final = f"Запись {now_dt:%Y-%m-%d %H-%M}"
         self.name_preview_label.setText(f"Итоговое имя: {final}")
 
     def _on_save_name_template(self) -> None:
@@ -2965,16 +3070,39 @@ class MetadataDialog(QDialog):
         raw_name = self.name_input.text().strip()
         abbr = self.name_abbr_input.text().strip()
 
+        # --- Дата/время из полей диалога ---
+        qd_for_name = self.date_edit.date()
+        qt_for_name = self.time_edit.time()
+        name_dt = datetime(
+            qd_for_name.year(), qd_for_name.month(),
+            qd_for_name.day(),
+            qt_for_name.hour(), qt_for_name.minute(),
+            qt_for_name.second(),
+        )
+
+        # --- Защита от дублирования даты ---
+        if template and self._name_already_has_date(raw_name):
+            if any(
+                token in template
+                for token in ("{date}", "{дата}", "{datetime}")
+            ):
+                log.info(
+                    "MetadataDialog._on_accept: шаблон имени "
+                    "сброшен (в названии уже есть дата). "
+                    "template=%r, name=%r", template, raw_name,
+                )
+                template = ""
+
         if template:
             final_name = format_name_template(
-                template, name=raw_name, abbr=abbr
+                template, name=raw_name, abbr=abbr, now=name_dt,
             )
         else:
             final_name = raw_name
 
         if not final_name:
             final_name = (
-                f"Запись {datetime.now():%Y-%m-%d %H-%M}"
+                f"Запись {name_dt:%Y-%m-%d %H-%M}"
             )
 
         comment = self.comment_input.toPlainText().strip()

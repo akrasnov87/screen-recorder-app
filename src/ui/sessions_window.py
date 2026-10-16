@@ -261,10 +261,33 @@ class SessionsScanThread(QThread):
                 ):
                     documents_count = len(meta["documents"])
 
-            task = (
-                tasks_index.get(os.path.abspath(video_path))
-                if video_path else None
-            )
+            # ----------------------------------------------------------
+            # Поиск задачи в очереди.
+            #
+            # ИСТОРИЯ:
+            #   • Раньше задача искалась ТОЛЬКО по video_path.
+            #     Для записей-документов video_path == "" — задача
+            #     не находилась, и статус получался «Неизвестно»,
+            #     даже если задача-документ успешно обработана.
+            #
+            # НОВОЕ:
+            #   1) Пробуем найти по video_path (как раньше — для
+            #      записей с видео).
+            #   2) Если не нашли — пробуем найти по session_dir.
+            #      Для этого _build_tasks_index индексирует задачи
+            #      дополнительно по ключу "session:<abspath>".
+            # ----------------------------------------------------------
+            task = None
+            if video_path:
+                task = tasks_index.get(
+                    os.path.abspath(video_path)
+                )
+            if task is None:
+                session_key = (
+                    f"session:{os.path.abspath(session_dir)}"
+                )
+                task = tasks_index.get(session_key)
+
             task_id = (task or {}).get("task_id", "")
 
             if task is not None:
@@ -279,7 +302,27 @@ class SessionsScanThread(QThread):
                 else:
                     status = STATUS_UNKNOWN
             else:
-                if has_transcript or has_audio:
+                # ------------------------------------------------------
+                # Задача в очереди не найдена.
+                #
+                # Логика для обычных записей (с видео):
+                #   • есть video.txt или video.mp3 → «Обработан»;
+                #   • есть video.mp4 → «Сохранено»;
+                #   • иначе → «Неизвестно».
+                #
+                # НОВОЕ — логика для записей-документов:
+                #   • document_only=True, есть вложения — файлы уже
+                #     лежат в attachments/, задача либо не ставилась
+                #     в очередь (пользователь не выбрал ни одной
+                #     опции обработки), либо была удалена из очереди
+                #     после успеха. Считаем такую запись
+                #     «Обработанной».
+                #   • document_only=True, но вложений нет — это
+                #     битая запись; оставляем «Неизвестно».
+                # ------------------------------------------------------
+                if document_only and documents_count > 0:
+                    status = STATUS_PROCESSED
+                elif has_transcript or has_audio:
                     status = STATUS_PROCESSED
                 elif has_video:
                     status = STATUS_UPLOADED
@@ -3713,12 +3756,40 @@ class SessionsWindow(QDialog):
     # Обновление
     # ------------------------------------------------------------------
     def _build_tasks_index(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Строит индекс задач очереди для быстрого поиска в
+        SessionsScanThread._collect.
+
+        ИНДЕКСИРУЕТСЯ ПО ДВУМ КЛЮЧАМ:
+          1) os.path.abspath(video_path)   — для обычных записей
+             с видео (как было раньше).
+          2) "session:<abspath(session_dir)>" — для записей-
+             документов (video_path == ""), чтобы их статус
+             корректно определялся по задаче из очереди.
+
+        Ключ "session:" с префиксом используется, чтобы случайно
+        не смешать его с ключом-путём к файлу, если путь к папке
+        совпадёт с путём к файлу (теоретически).
+        """
         tasks_index: Dict[str, Dict[str, Any]] = {}
         try:
             for t in self.task_queue.get_queue():
+                # --- 1. Индексируем по video_path (как раньше) ---
                 vp = t.get("video_path", "")
                 if vp:
                     tasks_index[os.path.abspath(vp)] = t
+
+                # --- 2. НОВОЕ: индексируем по session_dir ---
+                # Берём путь сессии из метаданных задачи. Для
+                # записей-документов video_path пустой, и без
+                # этого ключа задача не находилась бы.
+                meta = t.get("metadata") or {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                sdir = str(meta.get("session_dir") or "").strip()
+                if sdir:
+                    key = f"session:{os.path.abspath(sdir)}"
+                    tasks_index[key] = t
         except Exception as exc:
             log.warning("Не удалось получить очередь: %s", exc)
         return tasks_index

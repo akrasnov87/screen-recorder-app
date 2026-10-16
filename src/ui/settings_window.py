@@ -41,15 +41,17 @@ import shutil
 from typing import Dict, List, Optional
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QTimer          # ← QTimer добавлен
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QFont, QGuiApplication,
+    QColor, QDesktopServices, QFont, QGuiApplication,  # ← QFont
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QFrame, QGroupBox,                                  # ← QGroupBox
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMessageBox, QPlainTextEdit,                        # ← QPlainTextEdit
+    QPushButton, QScrollArea,
     QSizePolicy, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
@@ -3389,8 +3391,522 @@ class SettingsWindow(QDialog):
         )
         self.current_log_label.setWordWrap(True)
         layout.addWidget(self.current_log_label)
-        layout.addStretch()
+
+        # ==============================================================
+        # НОВОЕ: встроенный просмотрщик лога
+        # ==============================================================
+        layout.addWidget(self._build_log_viewer_section())
+
         return w
+
+    def _refresh_log_view(self) -> None:
+        """
+        Перечитывает последние N строк лога и обновляет
+        текстовое поле.
+
+        Алгоритм:
+          1. Определяем путь к логу (из поля или из текущего логгера).
+          2. Читаем последние N строк файла (без загрузки всего файла
+             в память — для больших логов это критично).
+          3. Применяем фильтр по уровню, если он задан.
+          4. Заполняем QPlainTextEdit с подсветкой.
+          5. Прокручиваем в конец.
+        """
+        if not hasattr(self, "log_view"):
+            return
+
+        path = (
+            self.log_path_input.text().strip()
+            or get_current_log_path()
+        )
+        path = os.path.expanduser(path)
+
+        if not path or not os.path.isfile(path):
+            self.log_view.setPlainText(
+                f"(Лог-файл не найден: {path or '(путь не задан)'})"
+            )
+            self.log_view_status.setText(
+                "Файл отсутствует. Проверьте путь к логу."
+            )
+            return
+
+        try:
+            size_bytes = os.path.getsize(path)
+        except OSError:
+            size_bytes = 0
+
+        # --- Сколько строк запрошено ---
+        try:
+            n_tail = int(self.log_tail_spin.value())
+        except Exception:
+            n_tail = 1000
+        n_tail = max(1, min(n_tail, 200_000))
+
+        # --- Фильтр по уровню ---
+        level_filter = self.log_filter_combo.currentData() or ""
+        include_above = self.log_filter_above_check.isChecked()
+
+        # Формируем множество уровней для показа.
+        levels_order = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        if level_filter:
+            if include_above:
+                idx = levels_order.index(level_filter)
+                allowed = set(levels_order[idx:])
+            else:
+                allowed = {level_filter}
+        else:
+            allowed = set(levels_order)
+
+        # --- Читаем последние N строк ---
+        try:
+            lines = self._read_tail_lines(path, n_tail)
+        except Exception as exc:
+            log.exception("Не удалось прочитать лог %s: %s", path, exc)
+            self.log_view.setPlainText(
+                f"(Не удалось прочитать лог: {exc})"
+            )
+            self.log_view_status.setText("")
+            return
+
+        # --- Фильтрация ---
+        # Формат строк лога:
+        #   "2026-10-16 11:38:59 [INFO    ] src.ui.foo: сообщение"
+        # Уровень берём между [ ].
+        import re as _re
+        level_re = _re.compile(r"\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\]")
+
+        filtered: List[str] = []
+        for line in lines:
+            m = level_re.search(line)
+            if not m:
+                # Строки без уровня (продолжения traceback и т.п.)
+                # включаем только если фильтр не задан.
+                if not level_filter:
+                    filtered.append(line)
+                continue
+            lvl = m.group(1).upper()
+            if lvl in allowed:
+                filtered.append(line)
+
+        # --- Заполнение с подсветкой ---
+        self._populate_log_view(filtered)
+
+        # --- Прокрутка в конец ---
+        try:
+            sb = self.log_view.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        except Exception:
+            pass
+
+        # --- Статус ---
+        shown = len(filtered)
+        total_read = len(lines)
+        size_mb = size_bytes / 1024 / 1024
+        self.log_view_status.setText(
+            f"Показано строк: {shown} · "
+            f"прочитано последних: {total_read} · "
+            f"размер файла: {size_mb:.2f} МБ · "
+            f"файл: {path}"
+        )
+
+        # --- Автообновление: перезапускаем таймер, если нужно ---
+        if (
+            hasattr(self, "log_autoupdate_check")
+            and self.log_autoupdate_check.isChecked()
+        ):
+            self._start_log_autoupdate_timer()
+
+    # ------------------------------------------------------------------
+    # Чтение последних N строк лога
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_tail_lines(path: str, n: int) -> List[str]:
+        """
+        Читает последние N строк файла, не загружая его целиком.
+
+        Для больших логов (десятки МБ) это критично. Алгоритм:
+          1. Открываем файл в бинарном режиме.
+          2. Читаем блоками с конца по 8 КБ.
+          3. Накапливаем строки, пока не наберём N.
+          4. Декодируем с errors='replace'.
+
+        Возвращает список строк в исходном порядке
+        (от старых к новым).
+        """
+        if n <= 0:
+            return []
+
+        if not os.path.isfile(path):
+            return []
+
+        block_size = 8192
+        newline = b"\n"
+
+        collected_chunks: List[bytes] = []
+        collected_lines = 0
+        remainder = b""
+
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+
+                while pos > 0 and collected_lines <= n:
+                    read_size = min(block_size, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    chunk = f.read(read_size)
+                    chunk += remainder
+
+                    # Считаем строки в чанке.
+                    lines_in_chunk = chunk.count(newline)
+
+                    collected_chunks.append(chunk)
+                    collected_lines += lines_in_chunk
+
+                    # remainder — часть последней неполной строки
+                    first_nl = chunk.find(newline)
+                    if first_nl >= 0:
+                        remainder = chunk[:first_nl]
+                    else:
+                        remainder = chunk
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать tail лога %s: %s", path, exc
+            )
+            return []
+
+        # Собираем всё в один bytes-массив.
+        blob = b"".join(reversed(collected_chunks))
+
+        # Декодируем.
+        text = blob.decode("utf-8", errors="replace")
+
+        # Разбиваем на строки и берём последние n.
+        all_lines = text.splitlines()
+        if len(all_lines) > n:
+            all_lines = all_lines[-n:]
+
+        return all_lines
+
+    # ------------------------------------------------------------------
+    # Заполнение QPlainTextEdit с подсветкой
+    # ------------------------------------------------------------------
+    def _populate_log_view(self, lines: List[str]) -> None:
+        """
+        Заполняет self.log_view строками с подсветкой
+        по уровню.
+
+        Использует HTML-разметку внутри QPlainTextEdit? Нет —
+        QPlainTextEdit не поддерживает HTML. Поэтому
+        применяем QTextCharFormat через QTextCursor.
+        """
+        from PySide6.QtGui import QTextCursor, QTextCharFormat
+        from PySide6.QtGui import QColor
+
+        self.log_view.setUpdatesEnabled(False)
+        try:
+            self.log_view.clear()
+
+            cursor = self.log_view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+
+            fmt_default = QTextCharFormat()
+            fmt_default.setForeground(QColor("#d0d0d0"))
+
+            fmt_debug = QTextCharFormat()
+            fmt_debug.setForeground(QColor("#808080"))
+
+            fmt_info = QTextCharFormat()
+            fmt_info.setForeground(QColor("#d0d0d0"))
+
+            fmt_warning = QTextCharFormat()
+            fmt_warning.setForeground(QColor("#FFD54F"))
+
+            fmt_error = QTextCharFormat()
+            fmt_error.setForeground(QColor("#EF5350"))
+            fmt_error.setFontWeight(QFont.Weight.Bold)
+
+            fmt_critical = QTextCharFormat()
+            fmt_critical.setForeground(QColor("#FFFFFF"))
+            fmt_critical.setBackground(QColor("#B71C1C"))
+            fmt_critical.setFontWeight(QFont.Weight.Bold)
+
+            import re as _re
+            level_re = _re.compile(
+                r"\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\]"
+            )
+
+            for i, line in enumerate(lines):
+                m = level_re.search(line)
+                if m:
+                    lvl = m.group(1).upper()
+                else:
+                    lvl = ""
+
+                if lvl == "DEBUG":
+                    fmt = fmt_debug
+                elif lvl == "INFO":
+                    fmt = fmt_info
+                elif lvl == "WARNING":
+                    fmt = fmt_warning
+                elif lvl == "ERROR":
+                    fmt = fmt_error
+                elif lvl == "CRITICAL":
+                    fmt = fmt_critical
+                else:
+                    fmt = fmt_default
+
+                cursor.insertText(line, fmt)
+                if i != len(lines) - 1:
+                    cursor.insertText("\n", fmt)
+        finally:
+            self.log_view.setUpdatesEnabled(True)
+
+    # ------------------------------------------------------------------
+    # Автообновление
+    # ------------------------------------------------------------------
+    def _on_log_autoupdate_toggled(self, enabled: bool) -> None:
+        """Включает/выключает таймер автообновления."""
+        if enabled:
+            self._start_log_autoupdate_timer()
+            log.debug("Автообновление лога: включено")
+        else:
+            self._stop_log_autoupdate_timer()
+            log.debug("Автообновление лога: выключено")
+
+    def _start_log_autoupdate_timer(self) -> None:
+        """Запускает QTimer на 3 секунды."""
+        if self._log_autoupdate_timer is None:
+            self._log_autoupdate_timer = QTimer(self)
+            self._log_autoupdate_timer.setInterval(3000)
+            self._log_autoupdate_timer.timeout.connect(
+                self._refresh_log_view
+            )
+        if not self._log_autoupdate_timer.isActive():
+            self._log_autoupdate_timer.start()
+
+    def _stop_log_autoupdate_timer(self) -> None:
+        """Останавливает QTimer."""
+        if self._log_autoupdate_timer is not None:
+            if self._log_autoupdate_timer.isActive():
+                log.debug("Таймер автообновления лога остановлен")
+            self._log_autoupdate_timer.stop()
+
+    # ------------------------------------------------------------------
+    # Копирование / прокрутка
+    # ------------------------------------------------------------------
+    def _copy_log_view(self) -> None:
+        """Копирует отображаемый текст в буфер обмена."""
+        text = self.log_view.toPlainText()
+        if not text:
+            return
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(text)
+        self.log_view_status.setText(
+            f"Скопировано в буфер: {len(text)} символов"
+        )
+
+    def _scroll_log_to_bottom(self) -> None:
+        """Прокручивает лог к последним строкам."""
+        try:
+            sb = self.log_view.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Завершение работы окна
+    # ------------------------------------------------------------------
+    def closeEvent(self, event) -> None:
+        """
+        Корректно останавливает таймер автообновления лога
+        перед закрытием окна настроек.
+
+        Зачем это нужно:
+          • Таймер автообновления (раз в 3 секунды) читает
+            файл лога. Если его не остановить, он будет
+            продолжать работать после закрытия окна — это
+            лишняя нагрузка на диск.
+          • Если Qt успеет уничтожить виджет `log_view`,
+            а таймер выстрелит — получим обращение к
+            удалённому объекту (возможен segfault).
+          • Останавливаем таймер заранее — до того, как
+            начнётся разрушение виджетов.
+        """
+        try:
+            self._stop_log_autoupdate_timer()
+        except Exception as exc:
+            log.debug(
+                "closeEvent: не удалось остановить таймер "
+                "автообновления лога: %s", exc,
+            )
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # Просмотрщик лога (вкладка «Логи»)
+    # ------------------------------------------------------------------
+    def _build_log_viewer_section(self) -> QWidget:
+        """
+        Встроенный просмотрщик последних N строк лога.
+
+        Возможности:
+          • выбор количества последних строк (N);
+          • фильтр по уровню (все / DEBUG / INFO / WARNING / ERROR / CRITICAL);
+          • автообновление раз в 3 секунды (чекбокс);
+          • кнопка «Обновить» — принудительная перечитка;
+          • кнопка «Копировать» — весь отображаемый текст в буфер;
+          • кнопка «В конец» — быстрый переход к последним строкам;
+          • подсветка строк по уровню для наглядности.
+        """
+        box = QGroupBox("Просмотр последних записей лога")
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(8, 6, 8, 8)
+        outer.setSpacing(6)
+
+        # --- Панель управления ---
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(6)
+
+        controls.addWidget(QLabel("Показать последних:"))
+
+        self.log_tail_spin = QSpinBox()
+        self.log_tail_spin.setRange(10, 100_000)
+        self.log_tail_spin.setSingleStep(100)
+        self.log_tail_spin.setValue(1000)
+        self.log_tail_spin.setSuffix(" строк")
+        self.log_tail_spin.setMinimumWidth(140)
+        self.log_tail_spin.setToolTip(
+            "Сколько последних строк лога показывать.\n\n"
+            "Чем больше — тем медленнее чтение, но виднее "
+            "история. Разумный диапазон: 100–5000."
+        )
+        self.log_tail_spin.valueChanged.connect(
+            self._refresh_log_view
+        )
+        controls.addWidget(self.log_tail_spin)
+
+        controls.addSpacing(12)
+        controls.addWidget(QLabel("Уровень:"))
+
+        self.log_filter_combo = QComboBox()
+        self.log_filter_combo.addItem("— все —", "")
+        for lvl in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            self.log_filter_combo.addItem(lvl, lvl)
+        self.log_filter_combo.setMinimumWidth(120)
+        self.log_filter_combo.setToolTip(
+            "Фильтр по уровню логирования.\n\n"
+            "«— все —» — показывать все записи.\n"
+            "Иначе — только строки с указанным уровнем "
+            "(и выше, если включён чекбокс «включая выше»)."
+        )
+        self.log_filter_combo.currentIndexChanged.connect(
+            self._refresh_log_view
+        )
+        controls.addWidget(self.log_filter_combo)
+
+        self.log_filter_above_check = QCheckBox("включая выше")
+        self.log_filter_above_check.setChecked(True)
+        self.log_filter_above_check.setToolTip(
+            "Если включено — показывать не только выбранный "
+            "уровень, но и все более критичные.\n\n"
+            "Пример: выбран WARNING — будут показаны WARNING, "
+            "ERROR, CRITICAL."
+        )
+        self.log_filter_above_check.toggled.connect(
+            self._refresh_log_view
+        )
+        controls.addWidget(self.log_filter_above_check)
+
+        controls.addSpacing(12)
+
+        self.log_autoupdate_check = QCheckBox("Автообновление")
+        self.log_autoupdate_check.setChecked(False)
+        self.log_autoupdate_check.setToolTip(
+            "Автоматически обновлять содержимое раз в 3 секунды.\n\n"
+            "Полезно, если вы следите за логом в реальном "
+            "времени. При выключенном — обновляйте вручную "
+            "кнопкой «Обновить»."
+        )
+        self.log_autoupdate_check.toggled.connect(
+            self._on_log_autoupdate_toggled
+        )
+        controls.addWidget(self.log_autoupdate_check)
+
+        controls.addStretch()
+
+        self.log_refresh_btn = QPushButton("Обновить")
+        self.log_refresh_btn.setToolTip(
+            "Перечитать лог и обновить содержимое."
+        )
+        self.log_refresh_btn.clicked.connect(self._refresh_log_view)
+        controls.addWidget(self.log_refresh_btn)
+
+        self.log_copy_btn = QPushButton("Копировать")
+        self.log_copy_btn.setToolTip(
+            "Скопировать отображаемый текст в буфер обмена."
+        )
+        self.log_copy_btn.clicked.connect(self._copy_log_view)
+        controls.addWidget(self.log_copy_btn)
+
+        self.log_bottom_btn = QPushButton("В конец")
+        self.log_bottom_btn.setToolTip(
+            "Прокрутить к последним строкам."
+        )
+        self.log_bottom_btn.clicked.connect(self._scroll_log_to_bottom)
+        controls.addWidget(self.log_bottom_btn)
+
+        outer.addLayout(controls)
+
+        # --- Текстовое поле с логом ---
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.NoWrap
+        )
+        self.log_view.setMaximumBlockCount(200_000)
+
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.StyleHint.TypeWriter)
+        mono.setPointSize(9)
+        self.log_view.setFont(mono)
+
+        self.log_view.setStyleSheet(
+            "QPlainTextEdit {"
+            "  background-color: #1e1e1e;"
+            "  color: #d0d0d0;"
+            "  selection-background-color: #264f78;"
+            "  selection-color: #ffffff;"
+            "}"
+        )
+        self.log_view.setMinimumHeight(240)
+        self.log_view.setToolTip(
+            "Последние строки лога.\n\n"
+            "Цветовая подсветка строк:\n"
+            "  • серый   — DEBUG\n"
+            "  • белый   — INFO\n"
+            "  • жёлтый  — WARNING\n"
+            "  • красный — ERROR / CRITICAL"
+        )
+        outer.addWidget(self.log_view, 1)
+
+        # --- Статусная строка ---
+        self.log_view_status = QLabel("")
+        self.log_view_status.setStyleSheet(
+            "QLabel { color: #666; font-size: 11px; }"
+        )
+        outer.addWidget(self.log_view_status)
+
+        # --- Таймер автообновления (создаём, но не запускаем) ---
+        self._log_autoupdate_timer: Optional[QTimer] = None
+
+        # Первичная загрузка — ленивая, при первом показе
+        # вкладки. Здесь только откладываем через QTimer,
+        # чтобы не читать лог до того, как окно показано.
+        QTimer.singleShot(0, self._refresh_log_view)
+
+        return box
 
     # ------------------------------------------------------------------
     # Загрузка/сохранение
@@ -3847,6 +4363,15 @@ class SettingsWindow(QDialog):
         self.log_backup_count_spin.setValue(
             int(logging_cfg.get("backup_count", 5))
         )
+
+        # --- Обновляем встроенный просмотрщик лога ---
+        try:
+            if hasattr(self, "log_view"):
+                self._refresh_log_view()
+        except Exception as exc:
+            log.debug(
+                "Не удалось обновить просмотрщик лога: %s", exc,
+            )
 
         log.info(
             "Настройки загружены в окно: projects=%d, "
