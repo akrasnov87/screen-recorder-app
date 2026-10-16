@@ -1428,6 +1428,103 @@ class ScreenRecorderApp(QObject):
             "Приложение запущено",
         )
 
+# ---------------------------------------------------------------------------
+# Глобальный стиль для QMenuBar / QMenu
+# ---------------------------------------------------------------------------
+def _install_global_menu_style(app: QApplication) -> None:
+    """
+    Устанавливает QSS для QMenuBar и QMenu на уровне приложения.
+
+    Зачем нужен именно глобальный стиль:
+      • QSS, установленный на QMenuBar, на Linux/GTK НЕ применяется
+        к выпадающим (QMenu) и контекстным (QMenu) меню. Это
+        известное ограничение Qt: QMenu — отдельный popup-widget,
+        и его стиль берётся из QApplication.styleSheet(), а не
+        от родителя.
+      • Если установить стиль глобально (app.setStyleSheet),
+        Qt применяет его ко ВСЕМ виджетам, включая QMenu.
+      • Чтобы не сломать таблицы и прочие виджеты, стиль ниже
+        содержит ТОЛЬКО селекторы QMenuBar и QMenu.
+
+    Что даёт:
+      • при наведении на пункт меню фон — светло-голубой,
+        текст — ЧЁРНЫЙ ЖИРНЫЙ (вместо системного белого);
+      • одинаковый вид меню во всех окнах (Записи, Поручения,
+        Библиотека, Настройки и т.д.).
+
+    Применяется ОДИН раз, до создания виджетов.
+    """
+    menu_only_qss = """
+/* ===================================================================== */
+/* Стиль QMenuBar и QMenu — только эти селекторы.                        */
+/* Установлен глобально, чтобы примениться и к контекстным меню.         */
+/* ===================================================================== */
+
+QMenuBar {
+    background-color: palette(window);
+    color: palette(window-text);
+}
+
+QMenuBar::item {
+    background: transparent;
+    color: palette(window-text);
+    padding: 4px 10px;
+}
+
+QMenuBar::item:selected {
+    background-color: #D8E8F8;
+    color: #000000;
+    font-weight: bold;
+}
+
+QMenuBar::item:pressed {
+    background-color: #B8D0E8;
+    color: #000000;
+    font-weight: bold;
+}
+
+QMenu {
+    background-color: palette(window);
+    color: palette(window-text);
+    border: 1px solid palette(mid);
+}
+
+QMenu::item {
+    background: transparent;
+    color: palette(window-text);
+    padding: 5px 24px 5px 24px;
+}
+
+QMenu::item:selected {
+    background-color: #D8E8F8;
+    color: #000000;
+    font-weight: bold;
+}
+
+QMenu::item:disabled {
+    color: palette(mid);
+}
+
+QMenu::separator {
+    height: 1px;
+    background-color: palette(mid);
+    margin: 4px 8px;
+}
+"""
+
+    existing = app.styleSheet() or ""
+    marker = "/* sr_menu_style_v1 */"
+
+    if marker in existing:
+        # Стиль уже установлен — не наслаиваем повторно.
+        return
+
+    app.setStyleSheet(existing + "\n" + marker + "\n" + menu_only_qss)
+
+    log.info(
+        "Установлен глобальный стиль QMenuBar/QMenu "
+        "(для чёрного жирного текста в меню)"
+    )
 
 def main() -> int:
     # ------------------------------------------------------------------
@@ -1553,6 +1650,16 @@ def main() -> int:
                 app.setStyleSheet(f.read())
         except Exception as exc:
             log.warning("Не удалось загрузить стили: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Глобальный стиль для QMenuBar/QMenu.
+    #
+    # Устанавливаем ПОСЛЕ styles.qss, но ДО создания виджетов —
+    # чтобы все QMenu (в т.ч. контекстные, создаваемые в рантайме)
+    # получили правильный стиль выделения: чёрный жирный текст
+    # на светло-голубом фоне.
+    # ------------------------------------------------------------------
+    _install_global_menu_style(app)
 
     controller = ScreenRecorderApp(app)
     controller.startup()

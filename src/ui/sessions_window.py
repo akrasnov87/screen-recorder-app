@@ -2825,48 +2825,6 @@ class SessionsWindow(QDialog):
     # ------------------------------------------------------------------
     def _build_menu_bar(self) -> None:
         bar = QMenuBar(self)
-        _MENU_QSS = (
-            "QMenuBar {"
-            "  background-color: palette(window);"
-            "  color: palette(window-text);"
-            "}"
-            "QMenuBar::item {"
-            "  background: transparent;"
-            "  color: palette(window-text);"
-            "  padding: 4px 10px;"
-            "}"
-            "QMenuBar::item:selected {"
-            "  background-color: #2D7FF9;"
-            "  color: #FFFFFF;"
-            "}"
-            "QMenuBar::item:pressed {"
-            "  background-color: #1E5FBF;"
-            "  color: #FFFFFF;"
-            "}"
-            "QMenu {"
-            "  background-color: palette(window);"
-            "  color: palette(window-text);"
-            "  border: 1px solid palette(mid);"
-            "}"
-            "QMenu::item {"
-            "  background: transparent;"
-            "  color: palette(window-text);"
-            "  padding: 5px 24px 5px 24px;"
-            "}"
-            "QMenu::item:selected {"
-            "  background-color: #2D7FF9;"
-            "  color: #FFFFFF;"
-            "}"
-            "QMenu::item:disabled {"
-            "  color: palette(mid);"
-            "}"
-            "QMenu::separator {"
-            "  height: 1px;"
-            "  background-color: palette(mid);"
-            "  margin: 4px 8px;"
-            "}"
-        )
-        bar.setStyleSheet(_MENU_QSS)
 
         # --- НОВОЕ: индикаторы состояния серверов справа ---
         try:
