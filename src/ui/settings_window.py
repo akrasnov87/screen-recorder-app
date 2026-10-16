@@ -622,25 +622,6 @@ class SettingsWindow(QDialog):
         hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hv.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.tags_table.setMinimumHeight(320)
-        self.tags_table.setStyleSheet(
-            "QTableWidget {"
-            "  color: palette(text);"
-            "  background-color: palette(base);"
-            "  gridline-color: palette(mid);"
-            "}"
-            "QTableWidget::item {"
-            "  color: palette(text);"
-            "  padding: 3px;"
-            "}"
-            "QTableWidget::item:selected {"
-            "  background-color: #2D7FF9;"
-            "  color: #FFFFFF;"
-            "}"
-            "QTableWidget::item:selected:!active {"
-            "  background-color: #2D7FF9;"
-            "  color: #FFFFFF;"
-            "}"
-        )
         self.tags_table.cellDoubleClicked.connect(
             self._on_tag_cell_double_clicked
         )

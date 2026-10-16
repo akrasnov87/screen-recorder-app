@@ -2867,7 +2867,6 @@ class SessionsWindow(QDialog):
             "}"
         )
         bar.setStyleSheet(_MENU_QSS)
-        self.setStyleSheet(self.styleSheet() + _MENU_QSS)
 
         layout: QVBoxLayout = self.layout()
         layout.insertWidget(0, bar)
