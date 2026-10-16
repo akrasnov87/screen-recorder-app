@@ -2760,9 +2760,53 @@ class SendToBitrixDialog(QDialog):
         # --- Запоминаем план рассылки сотрудникам для post-step ---
         self._pending_employee_messages = employee_messages
 
+        # --------------------------------------------------------------
+        # ФИКС: определяем ВСЕ параметры для _SendWorker.
+        #
+        # Раньше здесь был определён только connect_timeout, а
+        # read_timeout / max_message_chars / system / url_preview /
+        # forced_folder_id / prefer_chat_folder — нет. Это
+        # приводило к NameError при нажатии «Отправить».
+        # --------------------------------------------------------------
         connect_timeout = float(
             self.bitrix_cfg.get("connect_timeout", 15)
         )
+        read_timeout = float(
+            self.bitrix_cfg.get("read_timeout", 60)
+        )
+        max_message_chars = int(
+            self.bitrix_cfg.get("max_message_chars", 15000)
+        )
+        system = bool(
+            self.bitrix_cfg.get("system_message", False)
+        )
+        url_preview = not bool(
+            self.bitrix_cfg.get("disable_url_preview", False)
+        )
+        forced_folder_id = int(
+            self.bitrix_cfg.get("upload_folder_id", 0) or 0
+        )
+        prefer_chat_folder = forced_folder_id <= 0
+
+        # --------------------------------------------------------------
+        # ФИКС: создаём прогресс-диалог (раньше его не было).
+        # --------------------------------------------------------------
+        self._progress_dlg = QProgressDialog(
+            "Отправка в Bitrix24…",
+            "Отмена",
+            0, len(chat_ids),
+            self,
+        )
+        self._progress_dlg.setWindowTitle("Bitrix24")
+        self._progress_dlg.setWindowModality(
+            Qt.WindowModality.WindowModal
+        )
+        self._progress_dlg.setMinimumDuration(0)
+        self._progress_dlg.setValue(0)
+        self._progress_dlg.canceled.connect(
+            self._on_cancel_send
+        )
+        self._progress_dlg.show()
 
         self._worker = _SendWorker(
             webhook=webhook,
