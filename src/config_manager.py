@@ -308,6 +308,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "compression_preset": "veryfast",
         "retry_count": 3,
         "retry_delay": 2.0,
+        # --- НОВОЕ: дельта без медиа ---
+        # Если True — «Подтянуть изменения» на вкладке «Дельта»
+        # по умолчанию не скачивает видео и аудио.
+        # Вложения, протоколы, summary, стенограммы, метаданные
+        # скачиваются как обычно.
+        "pull_changes_without_media": False,
     },
     "tfs": {
         "enabled": False,
@@ -1292,6 +1298,10 @@ class ConfigManager:
             ),
             "retry_count": int(cfg.get("retry_count", 3)),
             "retry_delay": float(cfg.get("retry_delay", 2.0)),
+            # --- НОВОЕ: дельта без медиа ---
+            "pull_changes_without_media": bool(
+                cfg.get("pull_changes_without_media", False)
+            ),
         }
 
     def set_sync_settings(self, settings: Dict[str, Any]) -> None:
@@ -1321,6 +1331,8 @@ class ConfigManager:
             "compression_min_video_bitrate_kbps",
             "compression_audio_bitrate_kbps",
             "compression_preset",
+            # --- НОВОЕ: дельта без медиа ---
+            "pull_changes_without_media",
         ):
             if key in settings:
                 cfg[key] = settings[key]
@@ -1330,7 +1342,8 @@ class ConfigManager:
             "Настройки синхронизации сохранены: enabled=%s, "
             "base_url=%r, auto_upload=%s, auto_pull=%s, "
             "send_media=%s, delete_local_on_delete=%s, "
-            "force_overwrite=%s, use_hash_check=%s",
+            "force_overwrite=%s, use_hash_check=%s, "
+            "pull_changes_without_media=%s",
             cfg.get("enabled"), cfg.get("base_url"),
             cfg.get("auto_upload_after_processing"),
             cfg.get("auto_pull_enabled"),
@@ -1338,6 +1351,7 @@ class ConfigManager:
             cfg.get("delete_local_on_server_delete"),
             cfg.get("force_overwrite_on_download"),
             cfg.get("use_hash_check"),
+            cfg.get("pull_changes_without_media"),
         )
 
     def is_sync_enabled(self) -> bool:

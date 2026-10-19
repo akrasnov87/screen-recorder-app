@@ -574,11 +574,51 @@ class SyncWindow(QDialog):
         )
         form.addRow("", self.delete_local_check)
 
+        # ==============================================================
+        # НОВОЕ: «Не скачивать видео и аудио» при «Подтянуть изменения»
+        # ==============================================================
+        self.pull_without_media_check = QCheckBox(
+            "Не скачивать видео и аудио"
+        )
+        self.pull_without_media_check.setToolTip(
+            "Если включено — при нажатии «Подтянуть изменения» "
+            "И «Полная синхронизация (snapshot)» видео и аудио "
+            "НЕ будут скачиваться.\n\n"
+            "Всё остальное подтягивается как обычно:\n"
+            "  • стенограмма (video.txt);\n"
+            "  • summary (video_summary.md);\n"
+            "  • протоколы (protocol.*, manual_protocol.*);\n"
+            "  • промпт DeepSeek (deepseek_prompt.*);\n"
+            "  • поручения (action_items.json);\n"
+            "  • вложения (attachments/*);\n"
+            "  • метаданные (session.json).\n\n"
+            "Полезно для экономии трафика, когда текст и протоколы "
+            "нужны, а видео/аудио можно скачать позже — вручную, "
+            "из окна «Записи» (кнопка «Смотреть видео» / "
+            "«Прослушать аудио» предложит скачать медиа с сервера).\n\n"
+            "Настройка сохраняется в конфиге "
+            "(sync.pull_changes_without_media) и применяется "
+            "к обеим операциям на этой вкладке."
+        )
+        self.pull_without_media_check.setChecked(
+            self._load_pull_without_media_setting()
+        )
+        self.pull_without_media_check.toggled.connect(
+            self._on_pull_without_media_toggled
+        )
+        form.addRow("", self.pull_without_media_check)
+
         layout.addLayout(form)
 
         btns = QHBoxLayout()
 
         self.pull_btn = QPushButton("Подтянуть изменения")
+        self.pull_btn.setToolTip(
+            "Запросить у сервера изменения с последней ревизии "
+            "и применить их локально.\n\n"
+            "Если включён чекбокс «Не скачивать видео и аудио» — "
+            "медиа будет пропущено."
+        )
         self.pull_btn.clicked.connect(self._on_pull_changes)
         btns.addWidget(self.pull_btn)
 
@@ -830,6 +870,34 @@ class SyncWindow(QDialog):
         QMessageBox.critical(
             self, "Синхронизация", f"Ошибка:\n\n{error}"
         )
+
+    def _load_pull_without_media_setting(self) -> bool:
+        """Читает sync.pull_changes_without_media из конфига."""
+        try:
+            cfg = self.config_manager.get_sync_settings()
+            return bool(cfg.get("pull_changes_without_media", False))
+        except Exception as exc:
+            log.warning(
+                "Не удалось прочитать pull_changes_without_media: %s",
+                exc,
+            )
+            return False
+
+    def _on_pull_without_media_toggled(self, checked: bool) -> None:
+        """Сохраняет выбор «не скачивать видео и аудио» в конфиг."""
+        try:
+            cfg = self.config_manager.get_sync_settings()
+            cfg["pull_changes_without_media"] = bool(checked)
+            self.config_manager.set_sync_settings(cfg)
+            log.info(
+                "«Подтянуть изменения без медиа»: %s",
+                "включено" if checked else "выключено",
+            )
+        except Exception as exc:
+            log.warning(
+                "Не удалось сохранить pull_changes_without_media: %s",
+                exc,
+            )
 
     def _on_auto_pull_toggled(self, checked: bool) -> None:
         try:
@@ -2012,20 +2080,30 @@ class SyncWindow(QDialog):
             )
             return
 
+        # --- НОВОЕ: учитываем чекбокс «не скачивать медиа» ---
+        skip_media = (
+            hasattr(self, "pull_without_media_check")
+            and self.pull_without_media_check.isChecked()
+        )
+        download_media = not skip_media
+
+        media_note = " (без видео и аудио)" if skip_media else ""
         self._append_log(
             f"Запрос изменений (since="
-            f"{manager.get_last_revision()})…"
+            f"{manager.get_last_revision()}){media_note}…"
         )
 
         async def _factory(progress):
             return await manager.pull_changes(
-                progress_cb=progress
+                progress_cb=progress,
+                download_media=download_media,
             )
 
         def _on_ok(result: Dict[str, Any]) -> None:
             self._append_log(
                 f"Дельта применена: {result['applied']} "
                 f"изменений, ревизия={result['last_revision']}"
+                + (" (без медиа)" if skip_media else "")
             )
             self.last_revision_label.setText(
                 str(result["last_revision"])
@@ -2040,10 +2118,16 @@ class SyncWindow(QDialog):
                     + "\n".join(result["errors"][:20]),
                 )
             else:
+                media_msg = (
+                    "\n\nВидео и аудио пропущены — включён режим "
+                    "«Не скачивать видео и аудио»."
+                    if skip_media else ""
+                )
                 QMessageBox.information(
                     self, "Синхронизация",
                     f"Применено изменений: {result['applied']}\n"
-                    f"Новая ревизия: {result['last_revision']}",
+                    f"Новая ревизия: {result['last_revision']}"
+                    + media_msg,
                 )
 
         self._start_worker(_factory, on_ok=_on_ok)
@@ -2058,11 +2142,28 @@ class SyncWindow(QDialog):
             )
             return
 
+        # --- НОВОЕ: учитываем чекбокс «Не скачивать видео и аудио» ---
+        # Берём значение с вкладки «Дельта»: та же настройка
+        # sync.pull_changes_without_media, что и для
+        # «Подтянуть изменения».
+        skip_media = (
+            hasattr(self, "pull_without_media_check")
+            and self.pull_without_media_check.isChecked()
+        )
+        download_media = not skip_media
+
+        media_note = (
+            "\n\nВидео и аудио НЕ будут скачиваться "
+            "(включён режим «Не скачивать видео и аудио»)."
+            if skip_media else ""
+        )
+
         reply = QMessageBox.question(
             self, "Полная синхронизация",
             "Будет скачан полный список записей с сервера и "
             "разложен по локальным папкам sessions/.\n\n"
-            "Это может занять время. Продолжить?",
+            "Это может занять время. Продолжить?"
+            + media_note,
             QMessageBox.StandardButton.Yes
             | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -2070,9 +2171,11 @@ class SyncWindow(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        self._append_log("Запрос snapshot с сервера…")
-
-        download_media = self.download_media_check.isChecked()
+        self._append_log(
+            "Запрос snapshot с сервера"
+            + (" (без видео и аудио)" if skip_media else "")
+            + "…"
+        )
 
         async def _factory(progress):
             async with ScrecClient(
@@ -2102,7 +2205,8 @@ class SyncWindow(QDialog):
                     )
                     try:
                         await manager.download_record(
-                            rid, download_media=download_media
+                            rid,
+                            download_media=download_media,
                         )
                         applied += 1
                     except ScrecError as exc:
@@ -2114,6 +2218,7 @@ class SyncWindow(QDialog):
                     "applied": applied,
                     "errors": errors,
                     "revision": server_rev,
+                    "download_media": download_media,
                 }
 
         def _on_ok(result: Dict[str, Any]) -> None:
@@ -2122,11 +2227,21 @@ class SyncWindow(QDialog):
                 f"применено={result['applied']}, "
                 f"ошибок={len(result['errors'])}, "
                 f"ревизия={result['revision']}"
+                + (
+                    " (без видео и аудио)"
+                    if skip_media else ""
+                )
             )
             self.last_revision_label.setText(
                 str(result["revision"])
             )
             self._refresh_local_sessions()
+
+            media_msg = (
+                "\n\nВидео и аудио пропущены — включён режим "
+                "«Не скачивать видео и аудио»."
+                if skip_media else ""
+            )
 
             if not result["errors"]:
                 QMessageBox.information(
@@ -2134,7 +2249,8 @@ class SyncWindow(QDialog):
                     f"Полная синхронизация завершена.\n"
                     f"Скачано: {result['applied']} из "
                     f"{result['total']}\n"
-                    f"Ревизия: {result['revision']}",
+                    f"Ревизия: {result['revision']}"
+                    + media_msg,
                 )
             else:
                 QMessageBox.warning(
@@ -2142,7 +2258,8 @@ class SyncWindow(QDialog):
                     f"Скачано: {result['applied']} из "
                     f"{result['total']}\n"
                     f"Ошибок: {len(result['errors'])}\n\n"
-                    + "\n".join(result["errors"][:20]),
+                    + "\n".join(result["errors"][:20])
+                    + media_msg,
                 )
 
         self._start_worker(_factory, on_ok=_on_ok)

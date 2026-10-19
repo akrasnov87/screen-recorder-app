@@ -1784,12 +1784,22 @@ class SyncManager:
         progress_cb: Optional[Callable[[str], None]] = None,
         force_overwrite: Optional[bool] = None,
         download_media: bool = True,
+        raise_on_not_found: bool = True,
     ) -> Dict[str, Any]:
         """
         Скачивает запись с сервера и раскладывает по локальной папке.
 
         Если известна локальная session_dir — защищено мьютексом
         (не пересекается с publish_session).
+
+        Args:
+            raise_on_not_found: если True (по умолчанию) — при
+                HTTP 404 от сервера бросается ScrecError.
+                Если False — возвращается
+                {"not_found": True, "record_id": record_id}
+                без исключения. Используется в дельта-синхронизации,
+                когда сервер отдаёт change для уже удалённой
+                записи.
         """
         if not self.is_configured():
             raise ScrecError(
@@ -1807,21 +1817,49 @@ class SyncManager:
         if session_dir:
             lock = await self._get_session_lock(session_dir)
             async with lock:
-                return await self._download_record_impl(
-                    record_id,
-                    session_dir=session_dir,
-                    progress_cb=progress_cb,
-                    force_overwrite=force_overwrite,
-                    download_media=download_media,
-                )
+                try:
+                    return await self._download_record_impl(
+                        record_id,
+                        session_dir=session_dir,
+                        progress_cb=progress_cb,
+                        force_overwrite=force_overwrite,
+                        download_media=download_media,
+                    )
+                except ScrecError as exc:
+                    if raise_on_not_found or exc.status != 404:
+                        raise
+                    log.info(
+                        "SyncManager: запись %s не найдена на сервере "
+                        "(HTTP 404) — пропускаю",
+                        record_id,
+                    )
+                    return {
+                        "not_found": True,
+                        "record_id": record_id,
+                        "session_dir": session_dir,
+                    }
 
-        return await self._download_record_impl(
-            record_id,
-            session_dir=None,
-            progress_cb=progress_cb,
-            force_overwrite=force_overwrite,
-            download_media=download_media,
-        )
+        try:
+            return await self._download_record_impl(
+                record_id,
+                session_dir=None,
+                progress_cb=progress_cb,
+                force_overwrite=force_overwrite,
+                download_media=download_media,
+            )
+        except ScrecError as exc:
+            if raise_on_not_found or exc.status != 404:
+                raise
+            log.info(
+                "SyncManager: запись %s не найдена на сервере "
+                "(HTTP 404) — пропускаю",
+                record_id,
+            )
+            return {
+                "not_found": True,
+                "record_id": record_id,
+                "session_dir": session_dir or "",
+            }
 
     async def _download_record_impl(
         self,
@@ -2310,7 +2348,19 @@ class SyncManager:
         *,
         progress_cb: Optional[Callable[[str], None]] = None,
         max_pages: int = 50,
+        download_media: bool = True,
     ) -> Dict[str, Any]:
+        """
+        Дельта-синхронизация.
+
+        Args:
+            progress_cb:    колбэк прогресса.
+            max_pages:      предохранитель от бесконечного цикла.
+            download_media: если False — при применении изменений
+                            НЕ скачивать видео и аудио (только
+                            текстовые артефакты, метаданные и
+                            вложения).
+        """
         if not self.is_configured():
             raise ScrecError(
                 "Синхронизация не настроена: укажите base_url и api_key."
@@ -2318,7 +2368,12 @@ class SyncManager:
 
         since = self.get_last_revision()
         if progress_cb:
-            progress_cb(f"Запрос изменений с revision>{since}")
+            media_note = (
+                "без медиа" if not download_media else "с медиа"
+            )
+            progress_cb(
+                f"Запрос изменений с revision>{since} ({media_note})"
+            )
 
         page_size = int(self.settings.get("sync_page_size", 200))
         applied = 0
@@ -2351,7 +2406,10 @@ class SyncManager:
 
                 for ch in changes:
                     try:
-                        await self._apply_change(ch, client)
+                        await self._apply_change(
+                            ch, client,
+                            download_media=download_media,
+                        )
                         applied += 1
                     except Exception as exc:
                         msg = (
@@ -2372,6 +2430,7 @@ class SyncManager:
             progress_cb(
                 f"Применено изменений: {applied}, "
                 f"новая ревизия: {new_revision}"
+                + (" (без медиа)" if not download_media else "")
             )
 
         return {
@@ -2381,7 +2440,11 @@ class SyncManager:
         }
 
     async def _apply_change(
-        self, change: Dict[str, Any], client: ScrecClient
+        self,
+        change: Dict[str, Any],
+        client: ScrecClient,
+        *,
+        download_media: bool = True,
     ) -> None:
         """
         Применяет одно изменение с сервера.
@@ -2389,6 +2452,12 @@ class SyncManager:
         ВАЖНО: если локальная запись не помечена как
         «готова к синхронизации» (sync_ready=false), изменение
         игнорируется.
+
+        Args:
+            download_media: если False — не скачивать видео и аудио.
+                            Вложения (`attachment`), протоколы,
+                            summary, стенограммы, промпты и
+                            метаданные скачиваются как обычно.
         """
         action = change.get("action")
         record_id = change.get("id") or ""
@@ -2435,8 +2504,9 @@ class SyncManager:
                 session_dir = same_folder
 
         log.info(
-            "SyncManager: применяю изменение action=%s id=%s path=%s",
-            action, record_id, path,
+            "SyncManager: применяю изменение action=%s id=%s path=%s "
+            "(download_media=%s)",
+            action, record_id, path, download_media,
         )
 
         if action == "delete":
@@ -2451,16 +2521,22 @@ class SyncManager:
                 or change.get("artifact")
                 or ""
             )
+            artifact_kind = str(change.get("kind") or "")
 
             session_dir = self._find_local_session(record_id, path)
 
             if not session_dir:
                 log.info(
                     "apply_change: локальной папки нет для "
-                    "record_id=%s — скачиваю запись целиком",
-                    record_id,
+                    "record_id=%s — скачиваю запись целиком "
+                    "(download_media=%s)",
+                    record_id, download_media,
                 )
-                await self.download_record(record_id)
+                await self.download_record(
+                    record_id,
+                    download_media=download_media,
+                    raise_on_not_found=False,
+                )
                 return
 
             if action in ("artifact_delete", "artifact_soft_delete"):
@@ -2471,14 +2547,43 @@ class SyncManager:
                 return
 
             if artifact_filename:
-                kind = str(change.get("kind") or "")
+                # --- НОВОЕ: пропускаем медиа, если download_media=False ---
+                if (not download_media
+                        and artifact_kind in ("video", "audio")):
+                    log.info(
+                        "apply_change: артефакт %s (kind=%s) пропущен — "
+                        "«без медиа» (download_media=False)",
+                        artifact_filename, artifact_kind,
+                    )
+                    # Метаданные всё равно обновим — там могут быть
+                    # изменения relations, sync_ready и т.п.
+                    try:
+                        record = await client.get_record(record_id)
+                        self._save_remote_meta(session_dir, record)
+                    except ScrecError as exc:
+                        if exc.status == 404:
+                            log.info(
+                                "apply_change: запись %s не найдена "
+                                "на сервере (HTTP 404) — пропускаю "
+                                "обновление метаданных",
+                                record_id,
+                            )
+                        else:
+                            log.debug(
+                                "apply_change: не удалось обновить "
+                                "метаданные после пропуска медиа: %s",
+                                exc,
+                            )
+                    return
+
                 log.info(
                     "apply_change: точечное скачивание артефакта "
                     "%s (kind=%s) для record_id=%s",
-                    artifact_filename, kind or "?", record_id,
+                    artifact_filename, artifact_kind or "?", record_id,
                 )
                 await self.download_single_artifact(
-                    record_id, session_dir, kind, artifact_filename,
+                    record_id, session_dir,
+                    artifact_kind, artifact_filename,
                     progress_cb=None,
                 )
 
@@ -2487,10 +2592,19 @@ class SyncManager:
                     record = await client.get_record(record_id)
                     self._save_remote_meta(session_dir, record)
                 except ScrecError as exc:
-                    log.debug(
-                        "apply_change: не удалось обновить метаданные "
-                        "после точечного скачивания: %s", exc,
-                    )
+                    if exc.status == 404:
+                        log.info(
+                            "apply_change: запись %s не найдена "
+                            "на сервере (HTTP 404) — пропускаю "
+                            "обновление метаданных",
+                            record_id,
+                        )
+                    else:
+                        log.debug(
+                            "apply_change: не удалось обновить "
+                            "метаданные после точечного скачивания: %s",
+                            exc,
+                        )
             else:
                 log.info(
                     "apply_change: artifact_upload без filename — "
@@ -2500,17 +2614,27 @@ class SyncManager:
                     record = await client.get_record(record_id)
                     self._save_remote_meta(session_dir, record)
                 except ScrecError as exc:
-                    log.warning(
-                        "apply_change: не удалось получить запись %s: %s",
-                        record_id, exc,
-                    )
+                    if exc.status == 404:
+                        log.info(
+                            "apply_change: запись %s не найдена "
+                            "на сервере (HTTP 404) — пропускаю "
+                            "обновление метаданных",
+                            record_id,
+                        )
+                    else:
+                        log.warning(
+                            "apply_change: не удалось получить запись "
+                            "%s: %s", record_id, exc,
+                        )
             return
 
         if action in ("create", "update", "update_links"):
             session_dir = self._find_local_session(record_id, path)
             if session_dir:
                 await self.download_record(
-                    record_id, session_dir=session_dir
+                    record_id, session_dir=session_dir,
+                    download_media=download_media,
+                    raise_on_not_found=False,
                 )
             else:
                 same_folder = self._find_by_folder_name(path)
@@ -2522,17 +2646,24 @@ class SyncManager:
                         record_id, same_folder,
                     )
                     await self.download_record(
-                        record_id, session_dir=same_folder
+                        record_id, session_dir=same_folder,
+                        download_media=download_media,
+                        raise_on_not_found=False,
                     )
                 else:
-                    await self.download_record(record_id)
+                    await self.download_record(
+                        record_id, download_media=download_media,
+                        raise_on_not_found=False,
+                    )
             return
 
         if action == "artifact_delete_all":
             session_dir = self._find_local_session(record_id, path)
             if session_dir:
                 await self.download_record(
-                    record_id, session_dir=session_dir
+                    record_id, session_dir=session_dir,
+                    download_media=download_media,
+                    raise_on_not_found=False,
                 )
             else:
                 same_folder = self._find_by_folder_name(path)
@@ -2543,10 +2674,15 @@ class SyncManager:
                         same_folder,
                     )
                     await self.download_record(
-                        record_id, session_dir=same_folder
+                        record_id, session_dir=same_folder,
+                        download_media=download_media,
+                        raise_on_not_found=False,
                     )
                 else:
-                    await self.download_record(record_id)
+                    await self.download_record(
+                        record_id, download_media=download_media,
+                        raise_on_not_found=False,
+                    )
             return
 
         log.debug("Неизвестный action=%r — пропускаю", action)
