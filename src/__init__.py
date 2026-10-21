@@ -1,2 +1,2 @@
 """Screen Recorder & Transcriber package."""
-__version__ = "1.13.11"
+__version__ = "1.13.12"

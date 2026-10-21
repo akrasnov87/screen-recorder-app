@@ -329,13 +329,19 @@ class SessionsScanThread(QThread):
                 else:
                     status = STATUS_UNKNOWN
 
-            date_str = meta.get("date") or ""
-            time_str = meta.get("time") or ""
+            # --- ИСПРАВЛЕНО: приоритет у session.json ---
+            # Если пользователь указал дату в карточке метаданных,
+            # она должна иметь приоритет над датой в имени папки.
+            date_str = str(meta.get("date") or "").strip()
+            time_str = str(meta.get("time") or "").strip()
+            
             try:
                 parts = name.split("_")
-                if len(parts) >= 2:
-                    date_str = date_str or parts[0]
-                    time_str = time_str or parts[1].replace("-", ":")
+                # Берем из имени папки ТОЛЬКО если в метаданных пусто
+                if not date_str and len(parts) >= 1:
+                    date_str = parts[0]
+                if not time_str and len(parts) >= 2:
+                    time_str = parts[1].replace("-", ":")
             except Exception:
                 pass
             if not date_str:

@@ -607,14 +607,67 @@ class ScreenRecorderApp(QObject):
             log.warning("Не удалось прочитать %s: %s", path, exc)
             return {}
 
-    def _new_session_dir(self) -> str:
+    @staticmethod
+    def _datetime_from_meta(meta: Dict[str, Any]) -> datetime:
+        """
+        Собирает datetime из meta["date"] (YYYY-MM-DD) и
+        meta["time"] (HH:MM:SS).
+
+        Если какое-то поле пустое или невалидное — подставляется
+        текущий момент для этого компонента. Это защищает от
+        ситуаций, когда пользователь очистил поле в карточке
+        (хотя QDateEdit/QTimeEdit такого не позволяют, но на
+        случай будущих изменений формы).
+
+        Используется при создании папки сессии и при записи
+        метаданных — чтобы папка и session.json совпадали.
+        """
+        now = datetime.now()
+
+        date_str = str(meta.get("date") or "").strip()
+        time_str = str(meta.get("time") or "").strip()
+
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except Exception:
+            d = now.date()
+
+        try:
+            t = datetime.strptime(time_str, "%H:%M:%S").time()
+        except Exception:
+            try:
+                t = datetime.strptime(time_str, "%H:%M").time()
+            except Exception:
+                t = now.time().replace(microsecond=0)
+
+        return datetime.combine(d, t)
+
+    def _new_session_dir(
+        self,
+        date_dt: Optional[datetime] = None,
+    ) -> str:
+        """
+        Создаёт новую папку сессии.
+
+        Args:
+            date_dt: дата/время из карточки метаданных. Если задана —
+                    имя папки формируется по ней (YYYY-MM-DD_HH-MM-SS).
+                    Если None — по текущему моменту.
+                    Это позволяет создавать записи «задним числом»:
+                    папка и запись попадают на указанный день,
+                    а не на сегодняшний.
+        """
         temp = self.config_manager.config["storage"].get(
             "temp_path", "/tmp/screen-recorder"
         )
         sessions_root = os.path.join(temp, "sessions")
+
+        if date_dt is None:
+            date_dt = datetime.now()
+
         session_dir = os.path.join(
             sessions_root,
-            datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+            date_dt.strftime("%Y-%m-%d_%H-%M-%S"),
         )
         base = session_dir
         i = 1
@@ -622,7 +675,10 @@ class ScreenRecorderApp(QObject):
             session_dir = f"{base}_{i}"
             i += 1
         os.makedirs(session_dir, exist_ok=True)
-        log.debug("Создана папка сессии: %s", session_dir)
+        log.debug(
+            "Создана папка сессии: %s (по дате из карточки: %s)",
+            session_dir, date_dt.isoformat(),
+        )
         return session_dir
 
     # ------------------------------------------------------------------
@@ -650,8 +706,14 @@ class ScreenRecorderApp(QObject):
             )
             return
 
+        # --- initial: подставляем текущие дату/время как базу ---
+        # Пользователь может их изменить в карточке, и именно они
+        # попадут в имя папки и в session.json.
+        now = datetime.now()
         initial = {
             "name": os.path.splitext(os.path.basename(file_path))[0],
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
             "include_name_in_prompt": True,
             "include_project_in_prompt": True,
             "include_comment_in_prompt": True,
@@ -665,7 +727,11 @@ class ScreenRecorderApp(QObject):
         if meta is None:
             return
 
-        session_dir = self._new_session_dir()
+        # --- Дата/время из карточки ---
+        session_dt = self._datetime_from_meta(meta)
+
+        # --- Папка сессии по дате из карточки ---
+        session_dir = self._new_session_dir(date_dt=session_dt)
 
         target_video = os.path.join(session_dir, "video.mp4")
         try:
@@ -690,7 +756,20 @@ class ScreenRecorderApp(QObject):
             )
             return
 
-        meta["date"] = datetime.now().strftime("%Y-%m-%d")
+        # --- ВАЖНО: НЕ перезаписываем meta["date"]/meta["time"] ---
+        # Раньше здесь стояло:
+        #   meta["date"] = datetime.now().strftime("%Y-%m-%d")
+        # Из-за этого дата из карточки терялась, и запись
+        # оказывалась на сегодня.
+        #
+        # Теперь фиксируем ровно те значения, которые выбрал
+        # пользователь. Если по каким-то причинам они пустые —
+        # подставим их из session_dt.
+        if not (meta.get("date") or "").strip():
+            meta["date"] = session_dt.strftime("%Y-%m-%d")
+        if not (meta.get("time") or "").strip():
+            meta["time"] = session_dt.strftime("%H:%M:%S")
+
         meta["session_dir"] = session_dir
         meta["video_path"] = target_video
         meta["source"] = "upload"
@@ -706,7 +785,10 @@ class ScreenRecorderApp(QObject):
             task_id = self.task_queue.add_task(
                 {"video_path": target_video, "metadata": meta}
             )
-            log.info("Задача %s добавлена в очередь", task_id)
+            log.info(
+                "Задача %s добавлена в очередь (дата из карточки: %s %s)",
+                task_id, meta["date"], meta["time"],
+            )
             self._notify(
                 "Загрузить видео",
                 f"Файл добавлен в очередь: {meta.get('name', '')}",
@@ -724,7 +806,12 @@ class ScreenRecorderApp(QObject):
     def _create_document_record(self) -> None:
         log.info("Запрос на создание записи-документа")
 
+        # --- initial: подставляем текущие дату/время ---
+        # Пользователь может их изменить в карточке.
+        now = datetime.now()
         initial: Dict[str, Any] = {
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
             "include_name_in_prompt": True,
             "include_project_in_prompt": True,
             "include_comment_in_prompt": True,
@@ -770,7 +857,11 @@ class ScreenRecorderApp(QObject):
             )
             return
 
-        session_dir = self._new_session_dir()
+        # --- Дата/время из карточки ---
+        session_dt = self._datetime_from_meta(meta)
+
+        # --- Папка сессии по дате из карточки ---
+        session_dir = self._new_session_dir(date_dt=session_dt)
 
         att_dir = os.path.join(session_dir, "attachments")
         os.makedirs(att_dir, exist_ok=True)
@@ -792,9 +883,7 @@ class ScreenRecorderApp(QObject):
                 stem, ext = os.path.splitext(base)
                 i = 1
                 while os.path.exists(dst):
-                    dst = os.path.join(
-                        att_dir, f"{stem}_{i}{ext}"
-                    )
+                    dst = os.path.join(att_dir, f"{stem}_{i}{ext}")
                     i += 1
             try:
                 shutil.copy2(src, dst)
@@ -827,10 +916,11 @@ class ScreenRecorderApp(QObject):
         meta.setdefault("document_save_transcript", True)
         meta.setdefault("document_to_deepseek", True)
 
+        # --- Дата/время из карточки (не перезаписываем текущим) ---
         if not (meta.get("date") or "").strip():
-            meta["date"] = datetime.now().strftime("%Y-%m-%d")
+            meta["date"] = session_dt.strftime("%Y-%m-%d")
         if not (meta.get("time") or "").strip():
-            meta["time"] = datetime.now().strftime("%H:%M:%S")
+            meta["time"] = session_dt.strftime("%H:%M:%S")
 
         self._save_session_metadata(meta, session_dir)
 
@@ -849,8 +939,10 @@ class ScreenRecorderApp(QObject):
                 task_id = self.task_queue.add_task(task_payload)
                 log.info(
                     "Задача-документ добавлена в очередь: %s "
-                    "(документов: %d, deepseek=%s, summary=%s)",
-                    task_id, len(copied),
+                    "(дата из карточки: %s %s, документов: %d, "
+                    "deepseek=%s, summary=%s)",
+                    task_id, meta["date"], meta["time"],
+                    len(copied),
                     meta.get("generate_deepseek_prompt"),
                     meta.get("generate_summary"),
                 )
