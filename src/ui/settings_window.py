@@ -95,34 +95,24 @@ class SettingsWindow(QDialog):
     # Скролл для вкладок
     # ------------------------------------------------------------------
     def _wrap_in_scroll(self, widget: QWidget) -> QScrollArea:
-        """
-        Оборачивает содержимое вкладки в QScrollArea.
-
-        Делает виджет прокручиваемым, если его содержимое
-        не помещается по вертикали (или горизонтали).
-
-        Правила:
-          • вертикальная прокрутка — по мере необходимости;
-          • горизонтальная — только если реально нужна
-            (виджеты шире окна);
-          • фон вкладки остаётся системным (без рамки);
-          • содержимое «прижимается» к верху.
-        """
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        
+        # ВАЖНО: отключаем горизонтальный скролл для всей вкладки.
+        # Если какой-то виджет внутри (например, лог) будет слишком 
+        # широким, он сам покажет свой горизонтальный скролл.
         scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
 
-        # Обёртка нужна, чтобы содержимое «прижималось» к верху,
-        # а не растягивалось QScrollArea.
         container = QWidget()
+        # ВАЖНО: запрещаем контейнеру расширяться по горизонтали
         container.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Maximum,
         )
         inner_layout = QVBoxLayout(container)
@@ -1840,7 +1830,7 @@ class SettingsWindow(QDialog):
             "ultrafast", "superfast", "veryfast", "faster",
             "fast", "medium", "slow", "slower", "veryslow",
         ])
-        self.compress_preset_combo.setCurrentText("veryfast")
+        self.compress_preset_combo.setCurrentText("ultrafast")
         form.addRow(
             "Пресет x264:",
             with_info(
@@ -3847,6 +3837,14 @@ class SettingsWindow(QDialog):
             QPlainTextEdit.LineWrapMode.NoWrap
         )
         self.log_view.setMaximumBlockCount(200_000)
+
+        # --- НОВОЕ: не позволяем логу распирать вкладку по ширине ---
+        self.log_view.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.log_view.setMinimumWidth(200)
+        # -------------------------------------------------------------
 
         mono = QFont("Monospace")
         mono.setStyleHint(QFont.StyleHint.TypeWriter)

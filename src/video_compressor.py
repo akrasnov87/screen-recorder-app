@@ -49,7 +49,7 @@ DEFAULT_AUDIO_BITRATE_KBPS = 96
 
 # Пресет x264. Чем быстрее — тем больше размер при том же
 # качестве, но и тем меньше времени на сжатие.
-DEFAULT_PRESET = "veryfast"
+DEFAULT_PRESET = "ultrafast"
 
 # Допустимые пресеты x264.
 ALLOWED_PRESETS = {

@@ -305,7 +305,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "compress_media_if_too_large": True,
         "compression_min_video_bitrate_kbps": 200,
         "compression_audio_bitrate_kbps": 96,
-        "compression_preset": "veryfast",
+        "compression_preset": "ultrafast",
         "retry_count": 3,
         "retry_delay": 2.0,
         # --- НОВОЕ: дельта без медиа ---
