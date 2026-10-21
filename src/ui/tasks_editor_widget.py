@@ -716,6 +716,12 @@ class TasksEditorWidget(QWidget):
                     table.setColumnWidth(
                         idx, self._COMMENT_COLUMN_WIDTH
                     )
+                elif idx == 1:
+                    # --- НОВОЕ: Фиксированная ширина для колонки «Статус» ---
+                    header.setSectionResizeMode(
+                        idx, QHeaderView.ResizeMode.Interactive
+                    )
+                    table.setColumnWidth(idx, 90)
                 else:
                     header.setSectionResizeMode(
                         idx,

@@ -212,7 +212,7 @@ QTreeView::item {
     padding: 3px 6px;
     margin: 0;
     border: none;
-    color: palette(text);
+    /* Убрано color: palette(text), чтобы разрешить перекраску статусов */
 }
 
 QTableWidget::item:alternate,
@@ -294,4 +294,31 @@ QTreeView QScrollBar:horizontal {
     background: transparent;
     height: 10px;
     margin: 0;
+}
+
+/* Стили для колонки статуса в таблице поручений */
+QTableWidget::item[status="created"] {
+    background-color: rgba(21, 101, 192, 40); /* синий */
+    color: #1565C0;
+    font-weight: bold;
+}
+QTableWidget::item[status="in_progress"] {
+    background-color: rgba(239, 108, 0, 40); /* оранжевый */
+    color: #EF6C00;
+    font-weight: bold;
+}
+QTableWidget::item[status="waiting"] {
+    background-color: rgba(123, 31, 162, 40); /* фиолетовый */
+    color: #7B1FA2;
+    font-weight: bold;
+}
+QTableWidget::item[status="done"] {
+    background-color: rgba(46, 125, 50, 40); /* зеленый */
+    color: #2E7D32;
+    font-weight: bold;
+}
+QTableWidget::item[status="cancelled"] {
+    background-color: rgba(117, 117, 117, 40); /* серый */
+    color: #757575;
+    font-weight: bold;
 }

@@ -969,6 +969,18 @@ class TasksEditorDialog(QDialog):
                 # --- Статус ---
                 status_item = QTableWidgetItem(label)
                 status_item.setForeground(QColor(status_color))
+                status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                
+                # Делаем текст жирным для лучшей читаемости на фоне
+                font = status_item.font()
+                font.setBold(True)
+                status_item.setFont(font)
+                
+                # Добавляем полупрозрачный фон (альфа-канал 40)
+                bg_color = QColor(status_color)
+                bg_color.setAlpha(40)
+                status_item.setBackground(bg_color)
+                
                 self.table.setItem(row, 1, status_item)
 
                 # --- Текст ---
@@ -1070,8 +1082,10 @@ class TasksEditorDialog(QDialog):
                         cell = self.table.item(row, col)
                         if cell is None:
                             continue
-                        cell.setBackground(overdue_bg)
+                        # Пропускаем колонку статуса (col == 1), 
+                        # чтобы не затереть её цветной фон
                         if col != 1:
+                            cell.setBackground(overdue_bg)
                             cell.setForeground(overdue_fg)
                     first_cell = self.table.item(row, 2)
                     if first_cell is not None:
@@ -1083,7 +1097,9 @@ class TasksEditorDialog(QDialog):
                         cell = self.table.item(row, col)
                         if cell is None:
                             continue
-                        cell.setBackground(today_bg)
+                        # Пропускаем колонку статуса
+                        if col != 1:
+                            cell.setBackground(today_bg)
 
             # --- Итоги ---
             all_items = self._data.get("items", [])
