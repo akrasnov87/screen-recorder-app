@@ -322,3 +322,69 @@ QTableWidget::item[status="cancelled"] {
     color: #757575;
     font-weight: bold;
 }
+
+/* ===================================================================== */
+/* Исправление отображения календаря (QCalendarWidget)                   */
+/* ===================================================================== */
+
+/* Задаем минимальный размер самому календарю, чтобы влезло 6 недель */
+QCalendarWidget {
+    min-width: 320px;
+    min-height: 280px;
+}
+
+/* Убираем жесткие рамки и задаем комфортный размер ячейки */
+QCalendarWidget QAbstractItemView {
+    outline: 0;
+    selection-background-color: #2D7FF9;
+    selection-color: #FFFFFF;
+}
+
+QCalendarWidget QAbstractItemView:enabled {
+    font-size: 13px; /* Чуть увеличили шрифт для читаемости */
+    color: #333333;
+}
+
+/* Убираем глобальные padding-и от QTableView, которые ломают сетку */
+QCalendarWidget QTableView::item {
+    padding: 0px;
+    margin: 0px;
+    min-width: 36px;  /* Ширина ячейки */
+    min-height: 30px; /* Высота ячейки — это решит проблему обрезки */
+    border: none;
+}
+
+/* Стилизация навигационной панели (месяц, год, стрелки) */
+QCalendarWidget QWidget#qt_calendar_navigationbar {
+    background-color: #F0F0F0;
+    border-bottom: 1px solid #CCCCCC;
+    min-height: 36px;
+}
+
+QCalendarWidget QToolButton {
+    color: #333333;
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 4px;
+}
+
+QCalendarWidget QToolButton:hover {
+    background-color: #E0E0E0;
+}
+
+QCalendarWidget QToolButton::menu-indicator {
+    image: none;
+}
+
+/* Кнопка "сегодня" (если она есть в локали) */
+QCalendarWidget QToolButton#qt_calendar_today_button {
+    padding: 2px 8px;
+    background-color: #E0E0E0;
+    font-weight: bold;
+}
+
+/* Фикс для дней недели (заголовки) */
+QCalendarWidget QWidget {
+    alternate-background-color: #FFFFFF;
+}
