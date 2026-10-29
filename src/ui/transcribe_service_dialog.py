@@ -9,8 +9,9 @@ from typing import Any, Dict, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit,
-    QMessageBox, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from ..logger import get_logger
@@ -91,12 +92,6 @@ class TranscribeServiceEditDialog(QDialog):
         self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.key_input.setPlaceholderText("access_key")
 
-        self.show_key_check = QLineEdit()  # placeholder
-        # Правильный виджет — QCheckBox, но импорт не нужен,
-        # используем QLineEdit в качестве заглушки? Нет —
-        # используем простой чекбокс через импорт.
-        from PySide6.QtWidgets import QCheckBox  # локально
-
         self.show_key_check = QCheckBox("Показать")
         self.show_key_check.toggled.connect(
             lambda checked: self.key_input.setEchoMode(
@@ -106,9 +101,7 @@ class TranscribeServiceEditDialog(QDialog):
         )
 
         key_row = QWidget()
-        key_row_layout = __import__(
-            "PySide6.QtWidgets", fromlist=["QHBoxLayout"]
-        ).QHBoxLayout(key_row)
+        key_row_layout = QHBoxLayout(key_row)
         key_row_layout.setContentsMargins(0, 0, 0, 0)
         key_row_layout.setSpacing(6)
         key_row_layout.addWidget(self.key_input, 1)

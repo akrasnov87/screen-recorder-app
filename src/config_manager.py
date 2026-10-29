@@ -41,8 +41,8 @@ from .platform_utils import (
     default_config_path,
     default_log_path,
     default_temp_dir,
+    IS_WINDOWS,
 )
-
 log = get_logger(__name__)
 
 
@@ -425,12 +425,36 @@ class ConfigManager:
             return None
 
     def _save_key_to_file(self, key: str) -> bool:
+        """
+        Сохраняет мастер-ключ шифрования в файл-fallback.
+
+        Используется, только если keyring недоступен (или не
+        может сохранить ключ). На Linux/macOS файл получает
+        права 0600. На Windows os.chmod поддерживает только
+        флаг read-only — права 0600 выставить нельзя, но файл
+        лежит в %APPDATA%\screen-recorder\, доступ к которому
+        по умолчанию имеет только текущий пользователь.
+        """
         try:
             self._key_file.write_text(key, encoding="utf-8")
             try:
-                os.chmod(self._key_file, stat.S_IRUSR | stat.S_IWUSR)
-            except OSError:
-                pass
+                os.chmod(
+                    self._key_file,
+                    stat.S_IRUSR | stat.S_IWUSR,
+                )
+            except (OSError, NotImplementedError) as exc:
+                if IS_WINDOWS:
+                    log.info(
+                        "Windows: права 0600 на %s не выставляются "
+                        "через os.chmod — используется стандартная "
+                        "защита профиля пользователя (%s)",
+                        self._key_file, exc,
+                    )
+                else:
+                    log.debug(
+                        "Не удалось выставить права 0600 на %s: %s",
+                        self._key_file, exc,
+                    )
             return True
         except Exception as exc:
             log.warning("Не удалось сохранить ключ в %s: %s",

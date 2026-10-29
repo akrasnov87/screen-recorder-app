@@ -1359,16 +1359,29 @@ class DailyDigestDialog(QDialog):
 
     @staticmethod
     def _downloads_dir() -> str:
+        """
+        Папка «Загрузки» текущего пользователя.
+
+        Кроссплатформенно через QStandardPaths — работает
+        и на Linux (XDG user dirs), и на Windows
+        (Known Folder Downloads), и на macOS.
+
+        Резервный fallback — поиск папок «Загрузки» / «Downloads»
+        в домашнем каталоге. Последний вариант — сам домашний
+        каталог.
+        """
         try:
-            import subprocess
-            out = subprocess.check_output(
-                ["xdg-user-dir", "DOWNLOAD"],
-                text=True, timeout=2,
-            ).strip()
-            if out and os.path.isdir(out):
-                return out
-        except Exception:
-            pass
+            from PySide6.QtCore import QStandardPaths
+            p = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DownloadLocation
+            )
+            if p and os.path.isdir(p):
+                return p
+        except Exception as exc:
+            log.debug(
+                "QStandardPaths.DownloadLocation недоступен: %s",
+                exc,
+            )
 
         home = os.path.expanduser("~")
         for candidate in ("Загрузки", "Downloads"):
@@ -5938,22 +5951,35 @@ class SessionsWindow(QDialog):
     # ------------------------------------------------------------------
     @staticmethod
     def _downloads_dir() -> str:
+        """
+        Папка «Загрузки» текущего пользователя.
+
+        Кроссплатформенно через QStandardPaths — работает
+        и на Linux (XDG user dirs), и на Windows
+        (Known Folder Downloads), и на macOS.
+
+        Резервный fallback — поиск папок «Загрузки» / «Downloads»
+        в домашнем каталоге. Последний вариант — сам домашний
+        каталог.
+        """
         try:
-            import subprocess
-            out = subprocess.check_output(
-                ["xdg-user-dir", "DOWNLOAD"],
-                text=True, timeout=2,
-            ).strip()
-            if out and os.path.isdir(out):
-                return out
-        except Exception:
-            pass
+            from PySide6.QtCore import QStandardPaths
+            p = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DownloadLocation
+            )
+            if p and os.path.isdir(p):
+                return p
+        except Exception as exc:
+            log.debug(
+                "QStandardPaths.DownloadLocation недоступен: %s",
+                exc,
+            )
 
         home = os.path.expanduser("~")
         for candidate in ("Загрузки", "Downloads"):
-            path = os.path.join(home, candidate)
-            if os.path.isdir(path):
-                return path
+            p = os.path.join(home, candidate)
+            if os.path.isdir(p):
+                return p
         return home
 
     def _save_prompt_to_downloads(self) -> None:

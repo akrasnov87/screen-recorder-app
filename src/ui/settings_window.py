@@ -67,7 +67,9 @@ from .sync_window import SyncWindow                # ui → ui
 from .tooltips import attach_tooltip, make_info_icon, with_info
 from ..platform_utils import (
     IS_LINUX,
-    IS_WINDOWS
+    IS_WINDOWS,
+    default_log_path,
+    default_temp_dir,
 )
 from .transcribe_service_dialog import TranscribeServiceEditDialog
 
@@ -4319,7 +4321,7 @@ class SettingsWindow(QDialog):
         # --- Хранилище ---
         st = cfg.get("storage", {})
         self.temp_path_input.setText(
-            st.get("temp_path", "/tmp/screen-recorder")
+            st.get("temp_path") or default_temp_dir()
         )
         self.retention_spin.setValue(
             int(st.get("retention_hours", 24))
@@ -4328,9 +4330,7 @@ class SettingsWindow(QDialog):
         # --- Логи ---
         logging_cfg = cfg.get("logging", {})
         self.log_path_input.setText(
-            logging_cfg.get(
-                "log_path", "/tmp/screen-recorder/app.log"
-            )
+            logging_cfg.get("log_path") or default_log_path()
         )
         level = logging_cfg.get("level", "DEBUG")
         i = self.log_level_combo.findText(level)
@@ -4735,13 +4735,13 @@ class SettingsWindow(QDialog):
         cfg["storage"] = {
             "temp_path": (
                 self.temp_path_input.text().strip()
-                or "/tmp/screen-recorder"
+                or default_temp_dir()
             ),
             "retention_hours": self.retention_spin.value(),
         }
         new_log_path = (
             self.log_path_input.text().strip()
-            or "/tmp/screen-recorder/app.log"
+            or default_log_path()
         )
         cfg["logging"] = {
             "log_path": new_log_path,

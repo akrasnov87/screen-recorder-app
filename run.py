@@ -41,14 +41,40 @@ def _setup_import_paths() -> Path:
     return project_root
 
 
+def _is_frozen() -> bool:
+    """
+    Определяет, работает ли приложение в замороженной сборке
+    (PyInstaller / cx_Freeze / Nuitka / py2app).
+
+    В таких сборках исходники упакованы в архив (PYZ), а не
+    лежат отдельными файлами, поэтому проверка `src/` рядом
+    с `run.py` неприменима — импорт всё равно сработает через
+    импорт-хуки PyInstaller.
+    """
+    return bool(
+        getattr(sys, "frozen", False)
+        or hasattr(sys, "_MEIPASS")
+    )
+
+
 def _check_src_exists(project_root: Path) -> bool:
-    """Проверяет, что рядом с run.py лежит папка src/."""
+    """
+    Проверяет, что рядом с run.py лежит папка src/.
+
+    В замороженной сборке (PyInstaller и т.п.) модули упакованы
+    в PYZ-архив, а не лежат отдельной папкой — проверка теряет
+    смысл, возвращаем True.
+    """
+    if _is_frozen():
+        return True
     src_dir = project_root / "src"
     return src_dir.is_dir()
 
 
 def _print_missing_src_help(project_root: Path) -> None:
     """Печатает понятную инструкцию, если src/ не найдена."""
+    import platform
+
     print(
         "ОШИБКА: не найдена папка src/ рядом с run.py.\n"
         f"  Ожидалось: {project_root / 'src'}\n"
@@ -62,9 +88,15 @@ def _print_missing_src_help(project_root: Path) -> None:
         "  │   └── ...\n"
         "  └── resources/\n"
         "\n"
-        "Если приложение установлено через .deb — переустановите:\n"
-        "  sudo dpkg -i screen-recorder_*.deb\n"
-        "  sudo apt-get install -f\n"
+        "Если приложение установлено из пакета — переустановите:\n"
+        "  • Ubuntu (.deb):\n"
+        "      sudo dpkg -i screen-recorder_*.deb\n"
+        "      sudo apt-get install -f\n"
+        "  • Windows (.exe):\n"
+        "      пересоберите дистрибутив:\n"
+        "      .\\packaging\\windows\\build_win.ps1 -Clean\n"
+        "\n"
+        f"Текущая платформа: {platform.system()}\n"
     )
 
 

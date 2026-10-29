@@ -133,10 +133,37 @@ def _iso_now() -> str:
 
 
 def _file_url(path: str) -> str:
+    """
+    Строит file:// URI для локального пути.
+
+    ИСТОРИЯ:
+      • Раньше было `"file://" + os.path.abspath(path)`. На Linux
+        это давало корректный URI (`file:///home/user/video.mp4`),
+        но на Windows — некорректный (`file://C:\\video\\a.mp4`
+        вместо `file:///C:/video/a.mp4`). Такой URI невалиден
+        по RFC 8089 и не открывается ни в браузере, ни в Qt.
+      • Теперь используем стандартный `Path.as_uri()` — он
+        корректно работает на Linux, Windows и macOS:
+          – Linux:   file:///home/user/video.mp4
+          – Windows: file:///C:/Users/user/video.mp4
+          – macOS:   file:///Users/user/video.mp4
+
+    Args:
+        path: локальный путь к файлу.
+
+    Returns:
+        Валидный file:// URI или "" (путь пустой / ошибка).
+    """
     if not path:
         return ""
-    abs_path = os.path.abspath(path)
-    return "file://" + abs_path
+    try:
+        return Path(os.path.abspath(path)).as_uri()
+    except Exception as exc:
+        log.warning(
+            "_file_url: не удалось построить URI для %r: %s",
+            path, exc,
+        )
+        return ""
 
 
 def _parse_date(date_str: str) -> Tuple[str, str, str]:

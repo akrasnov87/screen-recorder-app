@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .logger import get_logger
+from .platform_utils import default_temp_dir
 from .utils import generate_task_id
 
 log = get_logger(__name__)
@@ -18,7 +19,16 @@ class TaskQueue:
 
     def __init__(self, queue_path: str | None = None) -> None:
         if queue_path is None:
-            queue_path = "/tmp/screen-recorder/queue.json"
+            # Кроссплатформенный fallback: на Linux это
+            # /tmp/screen-recorder/queue.json, на Windows —
+            # %TEMP%\screen-recorder\queue.json.
+            #
+            # Жёсткий "/tmp/..." на Windows превращался в
+            # "C:\tmp\..." — это либо PermissionError, либо
+            # неожиданное место хранения.
+            queue_path = os.path.join(
+                default_temp_dir(), "queue.json",
+            )
         self.queue_path = queue_path
         os.makedirs(os.path.dirname(queue_path), exist_ok=True)
         self._lock = threading.RLock()

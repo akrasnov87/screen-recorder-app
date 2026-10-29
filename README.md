@@ -1,6 +1,6 @@
 # Screen Recorder & Transcriber
 
-Приложение для Ubuntu: обработка видео и документов, транскрибация, суммаризация, формирование протоколов, управление поручениями и синхронизация с сервером. **Все исходные файлы сохраняются локально**, синхронизация с сервером — опциональна.
+Приложение для Ubuntu и Windows: обработка видео и документов, транскрибация, суммаризация, формирование протоколов, управление поручениями и синхронизация с сервером. **Все исходные файлы сохраняются локально**, синхронизация с сервером — опциональна.
 
 Версия: **1.13.4**
 
@@ -146,7 +146,99 @@
 
 ## Установка
 
-### Из .deb-пакета
+### Windows 10 / 11
+
+Требуется **Python 3.11+** для Windows.
+
+Проверка в PowerShell (`Win+R` → `powershell`):
+
+```powershell
+python --version
+```
+
+Должно вывести `Python 3.11.x` или новее. Если команда не найдена — установите Python с [python.org/downloads/windows](https://www.python.org/downloads/windows/), поставив галочку **«Add python.exe to PATH»** на первом экране установщика.
+
+> **Про `py -3`.** На части систем `py.exe` (Python Launcher) отсутствует — например, если Python ставился из Microsoft Store. Если `py -3 --version` выдаёт «не распознано», используйте `python` вместо `py -3` во всех командах ниже. Оба варианта эквивалентны.
+
+#### Вариант 1. Готовая сборка (.exe)
+
+1. Скачайте `ScreenRecorder-<версия>-setup.exe` из раздела Releases (или соберите самостоятельно — см. раздел [«Сборка Windows (.exe)»](#сборка-windows-exe)).
+2. Запустите установщик.
+3. Установщик проверит, есть ли `ffmpeg` в `PATH`. Если нет — покажет предупреждение со ссылкой на [ffmpeg.org/download.html](https://ffmpeg.org/download.html).
+4. Запустите `ScreenRecorder.exe` из меню «Пуск».
+
+#### Вариант 2. Запуск из исходников
+
+```powershell
+# 1. Клонируйте репозиторий
+git clone <repo-url> screen-recorder-app
+cd screen-recorder-app
+
+# 2. Разрешить выполнение локальных .ps1 (один раз на пользователя)
+#    Без этого команда .\.venv\Scripts\Activate.ps1 упадёт с
+#    UnauthorizedAccess: running scripts is disabled
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+# 3. Создайте виртуальное окружение
+py -3 -m venv .venv
+# или, если py не установлен:
+#   python -m venv .venv
+
+.\.venv\Scripts\Activate.ps1
+
+# 4. Установите зависимости
+python -m pip install --upgrade pip wheel
+pip install -r requirements.txt
+
+# 5. Установите ffmpeg (если ещё не установлен)
+winget install Gyan.FFmpeg
+# ЗАКРОЙТЕ и ОТКРОЙТЕ PowerShell заново — PATH обновится только
+# в новых процессах. Проверьте:
+#   where ffmpeg
+
+# 6. Запустите
+python run.py
+```
+
+> **Про политику выполнения.** Если `Set-ExecutionPolicy` заблокирован групповой политикой (рабочая машина), можно **не активировать venv**, а вызывать Python из него напрямую:
+> ```powershell
+> .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+> .\.venv\Scripts\python.exe run.py
+> ```
+> Результат идентичен.
+
+#### Вариант 3. Сборка собственного .exe
+
+Краткая версия — подробная в разделе [«Сборка Windows (.exe)»](#сборка-windows-exe).
+
+```powershell
+# Из корня проекта:
+.\packaging\windows\build_win.ps1 -Clean
+```
+
+Результат — `dist\ScreenRecorder\ScreenRecorder.exe` (portable-папка ~160 МБ, Python на целевой машине не нужен).
+
+#### Где хранятся данные на Windows
+
+| Что | Где |
+|---|---|
+| Конфиг | `%APPDATA%\screen-recorder\config.json` |
+| Мастер-ключ шифрования (fallback) | `%APPDATA%\screen-recorder\.fernet_key` |
+| Временные файлы | `%TEMP%\screen-recorder\` |
+| Лог | `%TEMP%\screen-recorder\app.log` |
+| C-стек при segfault | `%TEMP%\screen-recorder\faulthandler.log` |
+| Записи (по умолчанию) | `%TEMP%\screen-recorder\sessions\` |
+
+> ⚠️ `%TEMP%` очищается при перезагрузке. Чтобы сохранять записи надолго — задайте постоянную папку в **Настройки → Хранилище**.
+
+#### Известные особенности Windows
+
+- **Иконка в трее** может «прятаться» в overflow-меню (стрелка `^` справа на панели задач). Закрепите её через «Параметры панели задач → Другие значки системного трея».
+- **`pywin32-ctypes`** ставится автоматически (см. `requirements.txt`) — нужен для работы `keyring` через Windows Credential Manager. Без него мастер-ключ шифрования хранится в файле `%APPDATA%`.
+- **`ffmpeg`** не входит в дистрибутив (лицензионные ограничения). Без него не работают конвертация видео в аудио и автосжатие медиа. Всё остальное (Bitrix24, TFS, синхронизация, поручения, протоколы) — работает.
+- **Права `0600` на `.fernet_key`** на Windows не выставляются (`os.chmod` там поддерживает только флаг read-only). Защита обеспечивается стандартным профилем `%APPDATA%` — доступ имеет только текущий пользователь.
+
+### Из .deb-пакета (Ubuntu)
 
 ```bash
 # Сборка пакета
@@ -161,7 +253,7 @@ sudo apt-get install -f     # доустановить зависимости, �
 
 Запуск: `screen-recorder` или через меню приложений.
 
-### Из исходников
+### Из исходников (Ubuntu)
 
 ```bash
 sudo apt update
@@ -184,19 +276,32 @@ Python:
 - `cryptography` — шифрование чувствительных данных (Fernet)
 - `python-docx` — чтение/запись `.docx` (протоколы, стенограммы, вложения)
 - `pypdf` — чтение `.pdf` (вложения и протоколы)
+- `rapidfuzz` — нечёткий поиск в Библиотеке
+- `pywin32-ctypes` — только на Windows, для `keyring` через Windows Credential Manager
 
 Системные:
 
 - `ffmpeg` — конвертация и сжатие медиа
-- `gnome-shell-extension-appindicator` — корректная иконка в трее под GNOME
+- `gnome-shell-extension-appindicator` — корректная иконка в трее под GNOME (Linux)
 
 ## Запуск
+
+### Ubuntu
 
 ```bash
 source .venv/bin/activate
 python -m src.main
 # или с DEBUG-логом
 SCREEN_RECORDER_LOG_LEVEL=DEBUG python -m src.main
+```
+
+### Windows
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python run.py
+# или, без активации venv:
+.\.venv\Scripts\python.exe run.py
 ```
 
 ## Куда сохраняются файлы
@@ -221,11 +326,13 @@ SCREEN_RECORDER_LOG_LEVEL=DEBUG python -m src.main
     └── ...
 ```
 
-**Важно:** `/tmp` очищается при перезагрузке. Чтобы сохранять файлы надолго:
+На Windows путь по умолчанию: `%TEMP%\screen-recorder\sessions\` (см. таблицу выше).
+
+**Важно:** `/tmp` и `%TEMP%` очищаются при перезагрузке. Чтобы сохранять файлы надолго:
 
 1. Откройте настройки (левый клик по иконке в трее).
 2. Вкладка **«Хранилище»**.
-3. Укажите **постоянную** папку, например `/home/user/Videos/screen-recorder`.
+3. Укажите **постоянную** папку, например `/home/user/Videos/screen-recorder` (Linux) или `D:\ScreenRecorder` (Windows).
 4. Сохранить.
 
 ## Горячие клавиши
@@ -327,13 +434,12 @@ SCREEN_RECORDER_LOG_LEVEL=DEBUG python -m src.main
 
 ### Файл конфигурации
 
-```
-~/.config/screen-recorder/config.json
-```
+- Linux: `~/.config/screen-recorder/config.json`
+- Windows: `%APPDATA%\screen-recorder\config.json`
 
 ### Шифрование секретов
 
-Мастер-ключ хранится в системном keyring (GNOME Keyring / KWallet). Если keyring недоступен — используется файл `~/.config/screen-recorder/.fernet_key` с правами `0600`.
+Мастер-ключ хранится в системном keyring (GNOME Keyring / KWallet / Windows Credential Manager). Если keyring недоступен — используется файл `.fernet_key` с правами `0600` (на Linux) или в `%APPDATA%` с защитой профиля пользователя (на Windows).
 
 Все API-ключи (Bitrix24 webhook, Sync API-key, TFS PAT, LiteLLM API-key) шифруются через Fernet.
 
@@ -341,8 +447,10 @@ SCREEN_RECORDER_LOG_LEVEL=DEBUG python -m src.main
 
 ### Временные файлы
 
+- Linux: `/tmp/screen-recorder/`
+- Windows: `%TEMP%\screen-recorder\`
+
 ```
-/tmp/screen-recorder/
 ├── app.log              # логи приложения
 ├── faulthandler.log     # C-стек при segfault
 └── queue.json           # очередь задач
@@ -544,15 +652,18 @@ SCREEN_RECORDER_LOG_LEVEL=DEBUG python -m src.main
 Все ошибки пишутся в лог:
 
 ```bash
+# Linux
 tail -f /tmp/screen-recorder/app.log
-# или в папку, указанную в настройках → Логи
+
+# Windows (PowerShell)
+Get-Content "$env:TEMP\screen-recorder\app.log" -Tail 50 -Wait
 ```
 
-При segfault — C-стек в `/tmp/screen-recorder/faulthandler.log`.
+При segfault — C-стек в `faulthandler.log` рядом с `app.log`.
 
 ## Устранение неполадок
 
-### 1. `externally-managed-environment` при `pip install`
+### 1. `externally-managed-environment` при `pip install` (Linux)
 
 Используйте venv:
 
@@ -601,13 +712,13 @@ gnome-extensions enable ubuntu-appindicators@ubuntu.com
 
 - Проверьте URL сервера во вкладке **«Транскрибация»**.
 - Если URL пустой — шаг пропускается.
-- Логи: `tail -f /tmp/screen-recorder/app.log | grep transcribe`.
+- Логи: `grep transcribe` в `app.log`.
 
 ### 6. Ошибки при суммаризации через LiteLLM
 
 - Проверьте URL и API key во вкладке **«Суммаризация»**.
 - Кнопка **«Проверить подключение»** делает ping.
-- Логи: `tail -f /tmp/screen-recorder/app.log | grep -i litellm`.
+- Логи: `grep -i litellm` в `app.log`.
 
 ### 7. Ошибки при отправке в Bitrix24
 
@@ -652,7 +763,7 @@ gnome-extensions enable ubuntu-appindicators@ubuntu.com
 **Конфликты при pull**
 - Используйте флаг `sync_ready` для защиты активных записей.
 
-### 10. Предупреждения Wayland про `transientParent`
+### 10. Предупреждения Wayland про `transientParent` (Linux)
 
 ```
 qt.qpa.wayland: Failed to create popup. Ensure popup ... has a transientParent set.
@@ -667,18 +778,32 @@ qt.qpa.wayland: Failed to create popup. Ensure popup ... has a transientParent s
 
 ### 12. Кнопка «Сохранить» в настройках не срабатывает
 
-Проверьте права на `~/.config/screen-recorder/`:
+Проверьте права на папку конфига:
 
 ```bash
+# Linux
 ls -la ~/.config/screen-recorder/
 # владелец — вы, права 700 для папки, 600 для config.json
 ```
 
 ### 13. Приложение упало (segfault)
 
-Загляните в `/tmp/screen-recorder/faulthandler.log` — там C-стек.
+Загляните в `faulthandler.log` рядом с `app.log` — там C-стек. Пришлите его разработчику.
 
-Пришлите его разработчику.
+### 14. Windows-специфичные проблемы
+
+См. раздел [«Сборка Windows (.exe)» → «Типичные ошибки»](#11-типичные-ошибки-и-что-делать). Там полный список:
+- `py` не найден;
+- политика PowerShell;
+- кракозябры в `build_win.ps1`;
+- `magick` не установлен;
+- `ffmpeg` не в `PATH`;
+- запуск `build\` вместо `dist\`;
+- `Failed to load Python DLL`;
+- `ОШИБКА: не найдена папка src/`;
+- молчаливое падение `.exe`;
+- Qt platform plugin;
+- антивирус.
 
 ## Структура проекта
 
@@ -740,7 +865,7 @@ src/
     └── send_to_employees_dialog.py # диалог отправки сотрудникам
 ```
 
-## Сборка .deb
+## Сборка .deb (Ubuntu)
 
 ```bash
 ./build_deb.sh
@@ -763,6 +888,248 @@ packaging/
         ├── applications/screen-recorder.desktop
         └── icons/hicolor/scalable/apps/screen-recorder.svg
 ```
+
+## Сборка Windows (.exe)
+
+Сборка через **PyInstaller**. Результат — **portable-дистрибутив**: папку `dist\ScreenRecorder\` можно скопировать на любую Windows 10/11 без Python.
+
+### 1. Предварительные требования
+
+- Python 3.11+ (`python --version`).
+- PowerShell с разрешёнными `.ps1` (см. шаг 2).
+- ffmpeg в `PATH` (`where ffmpeg`) — опционально, но рекомендуется.
+
+### 2. Разрешить выполнение `.ps1`
+
+Один раз на пользователя:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Без этого `build_win.ps1` (и `Activate.ps1` для venv) не запустится.
+
+Проверка:
+
+```powershell
+Get-ExecutionPolicy -Scope CurrentUser
+# должно быть: RemoteSigned или Unrestricted
+```
+
+### 3. Применить патчи
+
+**До первой сборки** в проекте должны быть применены патчи Windows-совместимости. Список:
+
+| Файл | Что меняется |
+|---|---|
+| `requirements.txt` | `pywin32-ctypes` для keyring |
+| `src/main.py` | `default_temp_dir()` вместо `/tmp`, `_NullStream` для `sys.stdout`, показ диалога ffmpeg после `QApplication` |
+| `src/sync_manager.py` | `_file_url` через `Path.as_uri()` |
+| `src/config_manager.py` | `os.chmod` не падает на Windows |
+| `src/ui/sessions_window.py` | `_downloads_dir` через `QStandardPaths` |
+| `src/task_queue.py` | `default_temp_dir()` вместо `/tmp` |
+| `src/ui/settings_window.py` | `default_temp_dir()`/`default_log_path()` в fallback |
+| `src/ui/transcribe_service_dialog.py` | убран мусорный `QLineEdit` |
+| `run.py` | `_is_frozen()` — пропуск проверки `src/` в PyInstaller-сборке |
+| `src/main.py` → `_resource()` | `os.path.abspath()` для чистых путей в логах |
+
+Быстрая проверка:
+
+```powershell
+Select-String -Path src\main.py -Pattern "default_temp_dir"
+Select-String -Path src\sync_manager.py -Pattern "as_uri"
+Select-String -Path requirements.txt -Pattern "pywin32-ctypes"
+Select-String -Path src\config_manager.py -Pattern "IS_WINDOWS"
+Select-String -Path src\task_queue.py -Pattern "default_temp_dir"
+Select-String -Path run.py -Pattern "_is_frozen"
+```
+
+Все шесть команд должны вывести хотя бы по одной строке. Если что-то пусто — патч не применён, сборка либо не запустится, либо упадёт при старте.
+
+### 4. Иконка `app.ico` (опционально)
+
+Windows требует `.ico` для значка `.exe`. Без него PyInstaller подставит дефолтную иконку — приложение работает, просто выглядит некрасиво.
+
+Способ A — ImageMagick (если установлен):
+
+```powershell
+winget install ImageMagick.ImageMagick
+# ЗАКРОЙТЕ и ОТКРОЙТЕ PowerShell заново
+
+magick resources\icons\app.svg -define icon:auto-resize=256,128,64,48,32,16 packaging\windows\app.ico
+```
+
+Способ B — онлайн-конвертер: загрузите `resources\icons\app.svg` на [convertio.co/svg-ico](https://convertio.co/svg-ico/), сохраните результат как `packaging\windows\app.ico`.
+
+Способ C — пропустить. `ScreenRecorder.spec` (см. Приложение B) соберётся и без иконки — с предупреждением в консоли.
+
+Проверка:
+
+```powershell
+dir packaging\windows\app.ico
+# должен быть файл 10–200 КБ, либо «не найден» — оба варианта ок
+```
+
+### 5. ffmpeg (опционально)
+
+```powershell
+winget install Gyan.FFmpeg
+# ЗАКРОЙТЕ и ОТКРОЙТЕ PowerShell заново
+
+where ffmpeg
+ffmpeg -version
+```
+
+Если `where ffmpeg` пусто после перезапуска — найдите `ffmpeg.exe` в `%LOCALAPPDATA%\Microsoft\WinGet\Packages\` и добавьте его `bin` в `PATH` пользователя вручную:
+
+```powershell
+$old = [Environment]::GetEnvironmentVariable('Path', 'User')
+[Environment]::SetEnvironmentVariable('Path', "$old;C:\путь\к\ffmpeg\bin", 'User')
+```
+
+После — снова перезапустить PowerShell и проверить `where ffmpeg`.
+
+### 6. Сборка
+
+Из корня проекта:
+
+```powershell
+cd C:\Users\<user>\screen-recorder-app
+.\packaging\windows\build_win.ps1 -Clean
+```
+
+Скрипт:
+
+1. Читает версию из `src\__init__.py`.
+2. Создаёт `.venv` (если нет) или переиспользует существующий.
+3. Ставит `requirements.txt` и `pyinstaller`.
+4. Проверяет наличие `app.ico` (предупреждает, если нет).
+5. Запускает `pyinstaller --clean --noconfirm packaging\windows\ScreenRecorder.spec`.
+
+**Ожидаемое время:** 2–5 минут (первая сборка), ~1 минута (повторная). В конце:
+
+```
+Done!
+  EXE:  C:\...\dist\ScreenRecorder\ScreenRecorder.exe
+  Folder: dist\ScreenRecorder\ (158.9 MB)
+```
+
+### 7. Запуск и проверка
+
+**Запускать нужно `.exe` из `dist\`, а не из `build\`.** Это самая частая ошибка. В `build\ScreenRecorder\` лежит **промежуточный** `.exe` PyInstaller — он не рабочий (рядом нет полной `_internal` с `python311.dll`), и при запуске падает с:
+
+```
+Failed to load Python DLL '...\build\ScreenRecorder\_internal\python311.dll'.
+LoadLibrary: Не найден указанный модуль.
+```
+
+Правильный запуск:
+
+```powershell
+.\dist\ScreenRecorder\ScreenRecorder.exe
+```
+
+**Проверьте:**
+
+1. Появилась иконка в трее (может быть в overflow — стрелка `^`).
+2. Левый клик по иконке → открываются «Настройки».
+3. Правый клик → контекстное меню (14 действий).
+4. Правый клик → «Записи» — открывается окно с таблицей.
+5. В логе — свежие строки:
+
+```powershell
+Get-Content "$env:TEMP\screen-recorder\app.log" -Tail 20
+```
+
+Ожидаемое (пример):
+
+```
+Иконка приложения установлена: ...\dist\ScreenRecorder\_internal\resources\icons\app.svg
+Иконка трея показана
+Уведомление: Screen Recorder — Приложение запущено
+Вход в главный цикл приложения
+```
+
+Путь должен содержать `dist\ScreenRecorder\_internal\resources\...` — это доказывает, что ресурсы упакованы правильно.
+
+6. **Закрыть корректно:** правый клик по иконке → «Выход». В логе — строки про отмену фоновых задач и «Приложение остановлено». Не закрывайте через `Ctrl+C` в консоли.
+
+### 8. Портативная проверка (по желанию)
+
+Скопируйте папку `dist\ScreenRecorder\` на другую машину (или флешку) и запустите `ScreenRecorder.exe`. Работает без Python — все зависимости упакованы.
+
+### 9. Инсталлятор (опционально)
+
+Через **Inno Setup 6+**:
+
+```powershell
+winget install JRSoftware.InnoSetup
+# ЗАКРОЙТЕ и ОТКРОЙТЕ PowerShell заново
+
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\installer.iss
+```
+
+Результат: `dist\installer\ScreenRecorder-<версия>-setup.exe`.
+
+Установщик:
+
+- ставит в `%LOCALAPPDATA%\Programs\Screen Recorder\`;
+- создаёт ярлыки в «Пуск» и (опционально) на рабочем столе;
+- регистрирует деинсталлятор;
+- проверяет наличие `ffmpeg` в `PATH` и предупреждает, если нет.
+
+> **Поправка в `installer.iss`.** В блоке `[Code]` функция `InitializeSetup` должна вызывать `Exec` с **шестью** аргументами (Filename, Params, WorkingDir, ShowCmd, Wait, ResultCode):
+> ```pascal
+> FFmpegFound := Exec(
+>     ExpandConstant('{cmd}'),
+>     '/c where ffmpeg >nul 2>nul',
+>     '',
+>     SW_HIDE,
+>     ewWaitUntilTerminated,
+>     ResultCode
+> ) and (ResultCode = 0);
+> ```
+> Если в `installer.iss` стоит версия с пятью аргументами — `ISCC.exe` упадёт с ошибкой компиляции.
+>
+> Если `app.ico` нет — закомментируйте строку `SetupIconFile=app.ico` (поставьте `;` в начале строки), иначе сборка упадёт.
+
+### 10. Отладка: `console=True`
+
+Если `.exe` запускается и **молча закрывается** — это классика `console=False`: PyInstaller-загрузчик `runw.exe` не показывает stderr и не пишет traceback.
+
+Для отладки пересоберите с `console=True`:
+
+1. Откройте `packaging\windows\ScreenRecorder.spec`.
+2. В блоке `EXE(...)` замените `console=False` на `console=True`.
+3. Пересоберите (кэш уже есть — 1 минута):
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm packaging\windows\ScreenRecorder.spec
+   ```
+
+4. Запустите `.exe` — откроется чёрное окно консоли. Если приложение падает — в этом окне будет traceback.
+
+После отладки верните `console=False` и пересоберите.
+
+### 11. Типичные ошибки и что делать
+
+| Ошибка | Причина | Решение |
+|---|---|---|
+| `py : Имя "py" не распознано` | `py.exe` не установлен (Python из Store или лаунчер не поставлен) | Используйте `python` вместо `py -3`. Либо переустановите Python с python.org |
+| `... build_win.ps1 cannot be loaded because running scripts is disabled` | Политика PowerShell | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
+| `build_win.ps1:37 ... Непредвиденная лексема "РЅРµ"` (кракозябры) | PowerShell 5.1 читает `.ps1` в CP1251, а файл сохранён в UTF-8 без BOM | Замените `build_win.ps1` на ASCII-версию (Приложение A) — она не содержит русских символов и работает в любой кодировке |
+| `magick : Имя "magick" не распознано` | ImageMagick не установлен | `winget install ImageMagick.ImageMagick`, перезапустить PowerShell. Или онлайн-конвертер, или пропустить (Приложение B собирается без иконки) |
+| `where ffmpeg` пусто после `winget install` | `PATH` обновился только в новых процессах | Закрыть и открыть PowerShell. Если не помогло — найти `ffmpeg.exe` в `%LOCALAPPDATA%\Microsoft\WinGet\Packages\` и добавить `bin` в `PATH` вручную |
+| `Failed to load Python DLL '...\build\ScreenRecorder\_internal\python311.dll'` | Запущен промежуточный `.exe` из `build\` | Запускать `.exe` из `dist\`, а не из `build\` |
+| `ОШИБКА: не найдена папка src/ рядом с run.py` | `run.py` не знает про PyInstaller-сборку | Применить патч `_is_frozen()` в `run.py` (Приложение C) |
+| `.exe` запускается и молча закрывается | `console=False` глотает stderr | Пересобрать с `console=True` (шаг 10), увидеть traceback |
+| `Could not find the Qt platform plugin "windows"` | PyInstaller не упаковал Qt-плагины | В `ScreenRecorder.spec` добавить `from PyInstaller.utils.hooks import collect_data_files; datas += collect_data_files("PySide6")` |
+| `ModuleNotFoundError: No module named 'src.xxx'` | PyInstaller не увидел динамический импорт | Добавить модуль в `hiddenimports` в `ScreenRecorder.spec` |
+| `keyring: No recommended backend was available` | `pywin32-ctypes` не установился | `pip install pywin32-ctypes` (приложение и без него работает — fallback на файл) |
+| `PermissionError: [WinError 5] ... 'C:\\tmp\\...'` | Патч `main.py` не применился | Проверить, что `_faulthandler_dir = default_temp_dir()` |
+| `file://C:\...` вместо `file:///C:/...` | Патч `sync_manager.py` не применился | Проверить, что `_file_url` использует `Path.as_uri()` |
+| Антивирус удаляет `.exe` | Ложное срабатывание PyInstaller-сборки | Добавить `dist\ScreenRecorder\` в исключения |
+| `_internal` содержит < 50 файлов | Битая сборка (антивирус или прерванная сборка) | `.\packaging\windows\build_win.ps1 -Clean` |
 
 ## Лицензия
 

@@ -34,3 +34,4 @@ config.json
 # --- Ресурсы ОС ---
 .DS_Store
 Thumbs.db
+#!#.git

@@ -61,7 +61,9 @@ if __package__ in (None, ""):
     from src.processor import VideoProcessor
     from src.sync_manager import SyncManager, is_record_published
     from src.task_queue import TaskQueue
-    from src.platform_utils import IS_LINUX, IS_WINDOWS
+    from src.platform_utils import (
+        IS_LINUX, IS_WINDOWS, default_temp_dir,
+    )
     from src.utils import (
         check_ffmpeg_installed,
         safe_local_path,
@@ -88,7 +90,9 @@ else:
     from .processor import VideoProcessor
     from .sync_manager import SyncManager, is_record_published
     from .task_queue import TaskQueue
-    from .platform_utils import IS_LINUX, IS_WINDOWS
+    from .platform_utils import (
+        IS_LINUX, IS_WINDOWS, default_temp_dir,
+    )
     from .utils import (
         check_ffmpeg_installed,
         safe_local_path,
@@ -1620,15 +1624,43 @@ QMenu::separator {
 
 def main() -> int:
     # ------------------------------------------------------------------
+    # Windows + PyInstaller --windowed: sys.stdout / sys.stderr = None.
+    # Любой print(..., file=sys.stderr) упадёт с AttributeError
+    # ('NoneType' object has no attribute 'write'). Подменяем на
+    # безопасные null-обёртки.
+    #
+    # Это безопасно и на Linux/macOS — если stdout/stderr уже
+    # открыты, ничего не меняем.
+    # ------------------------------------------------------------------
+    if sys.stdout is None or sys.stderr is None:
+        class _NullStream:
+            def write(self, *args, **kwargs) -> int:
+                return 0
+            def flush(self) -> None:
+                pass
+            def isatty(self) -> bool:
+                return False
+
+        if sys.stdout is None:
+            sys.stdout = _NullStream()   # type: ignore[assignment]
+        if sys.stderr is None:
+            sys.stderr = _NullStream()   # type: ignore[assignment]
+
+    # ------------------------------------------------------------------
     # КРИТИЧНО: включаем faulthandler.
     #
     # При segfault Python не печатает traceback — падает «нативно».
     # faulthandler перехватывает SIGSEGV/SIGABRT и пишет C-стек в
     # файл. Это единственный способ понять, где именно упал Qt.
+    #
+    # ВАЖНО: путь берём из platform_utils.default_temp_dir() —
+    # на Linux это /tmp/screen-recorder, на Windows —
+    # %TEMP%\screen-recorder. Жёсткий "/tmp/..." на Windows
+    # превращался в "C:\tmp\..." и падал с PermissionError.
     # ------------------------------------------------------------------
     import faulthandler
 
-    _faulthandler_dir = "/tmp/screen-recorder"
+    _faulthandler_dir = default_temp_dir()
     try:
         os.makedirs(_faulthandler_dir, exist_ok=True)
         _faulthandler_path = os.path.join(
@@ -1686,25 +1718,25 @@ def main() -> int:
             "(обход конфликта Qt/GTK3 на GNOME 40+)"
         )
 
-    if not check_ffmpeg_installed():
-        if IS_LINUX:
-            log.critical("ffmpeg не установлен")
-            print(
-                "ОШИБКА: ffmpeg не установлен.\n"
-                "Установите: sudo apt install ffmpeg"
-            )
-            return 1
-        else:
-            log.warning(
-                "ffmpeg не найден в PATH — конвертация видео и "
-                "автосжатие медиа будут недоступны"
-            )
-            print(
-                "ПРЕДУПРЕЖДЕНИЕ: ffmpeg не найден в PATH.\n"
-                "Конвертация видео и автосжатие медиа будут "
-                "недоступны.\n"
-                "Скачайте: https://ffmpeg.org/download.html"
-            )
+    ffmpeg_ok = check_ffmpeg_installed()
+
+    if not ffmpeg_ok and IS_LINUX:
+        log.critical("ffmpeg не установлен")
+        print(
+            "ОШИБКА: ffmpeg не установлен.\n"
+            "Установите: sudo apt install ffmpeg"
+        )
+        return 1
+    elif not ffmpeg_ok:
+        # Windows/macOS: QApplication ещё НЕ создан, поэтому
+        # QMessageBox здесь вызывать нельзя (Qt выдаст
+        # "Must construct a QApplication before a QWidget").
+        # Просто логируем — а диалог покажем позже, после
+        # создания QApplication.
+        log.warning(
+            "ffmpeg не найден в PATH — конвертация видео и "
+            "автосжатие медиа будут недоступны"
+        )
     else:
         log.info("ffmpeg найден: OK")
 
@@ -1752,6 +1784,22 @@ def main() -> int:
     # на светло-голубом фоне.
     # ------------------------------------------------------------------
     _install_global_menu_style(app)
+
+    # ------------------------------------------------------------------
+    # На Windows/macOS предупреждение про отсутствующий ffmpeg
+    # показываем ПОСЛЕ создания QApplication — иначе QMessageBox
+    # упадёт, т.к. Qt требует QApplication до первого QWidget.
+    # ------------------------------------------------------------------
+    if not ffmpeg_ok and not IS_LINUX:
+        QMessageBox.warning(
+            None,
+            "ffmpeg не найден",
+            "ffmpeg не найден в PATH.\n\n"
+            "Конвертация видео в аудио и автосжатие медиа "
+            "будут недоступны.\n\n"
+            "Скачайте: https://ffmpeg.org/download.html\n"
+            "и добавьте папку с ffmpeg.exe в PATH.",
+        )
 
     controller = ScreenRecorderApp(app)
     controller.startup()
