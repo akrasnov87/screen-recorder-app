@@ -153,6 +153,30 @@ def parse_action_items_json(raw: str) -> ParseResult:
                 "Не удалось разобрать JSON: %s\n"
                 "После коррекции: %s", exc, exc2,
             )
+            # --- ВРЕМЕННО (отладка): сохраняем сырой текст ---
+            try:
+                from pathlib import Path
+                import tempfile
+                import time as _time
+
+                dump_dir = Path(tempfile.gettempdir()) / "screen-recorder"
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                stamp = _time.strftime("%Y%m%d_%H%M%S")
+                raw_path = dump_dir / f"tasks_json_broken_{stamp}_raw.txt"
+                fixed_path = dump_dir / f"tasks_json_broken_{stamp}_fixed.txt"
+                raw_path.write_text(text, encoding="utf-8")
+                fixed_path.write_text(fixed, encoding="utf-8")
+                log.warning(
+                    "Сырой JSON сохранён: raw=%s (len=%d), "
+                    "fixed=%s (len=%d), char=%d",
+                    raw_path, len(text),
+                    fixed_path, len(fixed),
+                    exc2.pos,
+                )
+            except Exception as dump_exc:
+                log.error("Не удалось сохранить дамп JSON: %s", dump_exc)
+            # --- /ВРЕМЕННО ---
+
             # Обрезаем текст для показа в UI.
             preview = text[:200]
             if len(text) > 200:

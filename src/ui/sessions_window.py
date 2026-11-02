@@ -82,6 +82,14 @@ from ..sync_manager import (
 )
 from ..task_queue import TaskQueue
 from ..utils import safe_local_path, sanitize_filename
+
+from ..protocol_summary_helper import (
+    find_protocol_in_session,
+    generate_summary_from_protocol_sync,
+    get_litellm_model_name,
+    is_protocol_summary_enabled,
+)
+
 from .docx_viewer import DocxViewerDialog
 from .markdown_editor import MarkdownEditorDialog, MarkdownViewerDialog
 from .media_player import (
@@ -459,6 +467,45 @@ class SessionsScanThread(QThread):
         rows.sort(key=lambda r: r["datetime"], reverse=True)
         return rows
 
+class _SummaryWorker(QThread):
+    """
+    Генерирует summary из протокола записи через LiteLLM.
+
+    Используется после прикрепления/редактирования протокола,
+    если пользователь согласился обновить summary.
+    """
+
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        config_manager,
+        session_dir: str,
+        protocol_path: str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._config_manager = config_manager
+        self._session_dir = session_dir
+        self._protocol_path = protocol_path
+
+    def run(self) -> None:
+        try:
+            result = generate_summary_from_protocol_sync(
+                config_manager=self._config_manager,
+                session_dir=self._session_dir,
+                protocol_path=self._protocol_path,
+                progress_cb=self.progress.emit,
+            )
+            if result.get("ok"):
+                self.finished_ok.emit(result)
+            else:
+                self.failed.emit(result.get("error") or "Неизвестная ошибка")
+        except Exception as exc:
+            log.exception("_SummaryWorker: ошибка: %s", exc)
+            self.failed.emit(str(exc))
 
 # ---------------------------------------------------------------------------
 # Фоновый воркер для синхронизации одной записи
@@ -1582,6 +1629,8 @@ class SessionsWindow(QDialog):
         self._media_worker: Optional[_MediaDownloadWorker] = None
         self._media_progress_dlg: Optional[QProgressDialog] = None
         self._pending_media_request: Optional[Dict[str, Any]] = None
+        self._summary_worker: Optional[_SummaryWorker] = None
+        self._summary_progress_dlg: Optional[QProgressDialog] = None
 
         self._active_tag_chips: Dict[str, QPushButton] = {}
 
@@ -1607,6 +1656,173 @@ class SessionsWindow(QDialog):
             "доступен" if is_builtin_player_available()
             else f"недоступен ({probe_media_support()})",
         )
+
+    def _offer_generate_summary(
+        self,
+        session_dir: str,
+        protocol_path: str = "",
+        *,
+        context: str = "",
+    ) -> None:
+        """
+        Предлагает пользователю сгенерировать/обновить summary из
+        только что прикреплённого/сохранённого протокола.
+
+        Условия показа диалога:
+        • LiteLLM настроен (Настройки → Суммаризация);
+        • протокол существует и читается;
+        • нет уже запущенного воркера summary.
+
+        Если пользователь согласился — запускает фоновую генерацию
+        с прогресс-диалогом.
+        """
+        if not is_protocol_summary_enabled(self.config_manager):
+            log.debug(
+                "_offer_generate_summary: генерация summary из протокола "
+                "отключена (summarizer.protocol_summary_enabled=false) "
+                "или LiteLLM не настроен"
+            )
+            return
+
+        if self._summary_worker is not None and self._summary_worker.isRunning():
+            QMessageBox.information(
+                self, "Summary",
+                "Генерация summary уже выполняется. "
+                "Дождитесь завершения.",
+            )
+            return
+
+        if not protocol_path:
+            protocol_path = find_protocol_in_session(session_dir)
+        if not protocol_path or not os.path.isfile(protocol_path):
+            return
+
+        # Проверяем, что протокол читается (не пустой)
+        protocol_text = read_any_text(protocol_path)
+        if not protocol_text or not protocol_text.strip():
+            log.info(
+                "_offer_generate_summary: протокол пустой — "
+                "предложение не показывается"
+            )
+            return
+
+        model = get_litellm_model_name(self.config_manager) or "—"
+        proto_name = os.path.basename(protocol_path)
+        context_note = f"\n\nКонтекст: {context}" if context else ""
+
+        reply = QMessageBox.question(
+            self, "Сгенерировать summary?",
+            f"<b>Протокол сохранён.</b><br><br>"
+            f"Файл: <code>{html.escape(proto_name)}</code>"
+            f"{context_note}<br><br>"
+            f"Сгенерировать (обновить) краткое описание (summary) "
+            f"на основе протокола через LiteLLM?<br><br>"
+            f"<span style='color:#666'>Модель: "
+            f"<code>{html.escape(model)}</code><br>"
+            f"Существующее summary (если есть) будет "
+            f"перезаписано.</span>",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            log.info(
+                "_offer_generate_summary: пользователь отказался "
+                "генерировать summary"
+            )
+            return
+
+        self._start_summary_generation(
+            session_dir=session_dir,
+            protocol_path=protocol_path,
+        )
+
+    def _start_summary_generation(
+        self,
+        *,
+        session_dir: str,
+        protocol_path: str,
+    ) -> None:
+        """Запускает фоновую генерацию summary с прогресс-диалогом."""
+        self._summary_progress_dlg = QProgressDialog(
+            "Генерация summary через LiteLLM…",
+            None, 0, 0, self,
+        )
+        self._summary_progress_dlg.setWindowTitle("Summary")
+        self._summary_progress_dlg.setWindowModality(
+            Qt.WindowModality.WindowModal
+        )
+        self._summary_progress_dlg.setMinimumDuration(0)
+        self._summary_progress_dlg.setCancelButton(None)
+        self._summary_progress_dlg.show()
+
+        self._summary_worker = _SummaryWorker(
+            config_manager=self.config_manager,
+            session_dir=session_dir,
+            protocol_path=protocol_path,
+            parent=self,
+        )
+        self._summary_worker.progress.connect(
+            self._on_summary_progress
+        )
+        self._summary_worker.finished_ok.connect(
+            self._on_summary_finished
+        )
+        self._summary_worker.failed.connect(
+            self._on_summary_failed
+        )
+        self._summary_worker.finished.connect(
+            self._on_summary_worker_done
+        )
+        self._summary_worker.start()
+
+        log.info(
+            "_start_summary_generation: session=%s, protocol=%s",
+            os.path.basename(session_dir),
+            os.path.basename(protocol_path),
+        )
+
+    def _on_summary_progress(self, message: str) -> None:
+        if getattr(self, "_summary_progress_dlg", None) is not None:
+            self._summary_progress_dlg.setLabelText(message)
+
+
+    def _on_summary_finished(self, result: Dict[str, Any]) -> None:
+        if getattr(self, "_summary_progress_dlg", None) is not None:
+            self._summary_progress_dlg.close()
+            self._summary_progress_dlg = None
+
+        chars = int(result.get("chars") or 0)
+        log.info(
+            "_on_summary_finished: summary готов (%d символов)",
+            chars,
+        )
+
+        QMessageBox.information(
+            self, "Summary",
+            f"Summary успешно сгенерирован.\n\n"
+            f"Символов: {chars}\n\n"
+            f"Открыть просмотр: Меню → Summary → "
+            f"Просмотр summary (Ctrl+Shift+P).",
+        )
+
+        self.refresh()
+
+
+    def _on_summary_failed(self, error: str) -> None:
+        if getattr(self, "_summary_progress_dlg", None) is not None:
+            self._summary_progress_dlg.close()
+            self._summary_progress_dlg = None
+
+        log.error("_on_summary_failed: %s", error)
+        QMessageBox.warning(
+            self, "Summary",
+            f"Не удалось сгенерировать summary:\n\n{error}",
+        )
+
+
+    def _on_summary_worker_done(self) -> None:
+        self._summary_worker = None
 
     # ------------------------------------------------------------------
     # UI
@@ -3299,6 +3515,8 @@ class SessionsWindow(QDialog):
 
         fmt = "docx"
         template = ""
+        generate_from_protocol = False
+
         if self.config_manager is not None:
             try:
                 scrum = (
@@ -3312,22 +3530,67 @@ class SessionsWindow(QDialog):
                     scrum.get("action_items_prompt_template")
                     or ""
                 )
+                generate_from_protocol = bool(
+                    scrum.get(
+                        "generate_action_items_from_protocol",
+                        True,
+                    )
+                )
             except Exception as exc:
                 log.warning(
                     "Не удалось прочитать настройки скрама: %s",
                     exc,
                 )
 
+        # --- Дополнительная проверка: если включена генерация
+        #     из протокола — предупредим, если LiteLLM не настроен ---
+        if generate_from_protocol:
+            from ..protocol_action_items_helper import (
+                is_litellm_configured_for_action_items,
+            )
+            if not is_litellm_configured_for_action_items(
+                self.config_manager
+            ):
+                QMessageBox.information(
+                    self, "Промпт поручений",
+                    "Настройка «Формировать поручения на основе "
+                    "протокола» включена, но LiteLLM не настроен.\n\n"
+                    "Будет обновлён только файл-промпт "
+                    "(action_items_prompt), без обращения к LLM.\n\n"
+                    "Настройте LiteLLM в Настройки → Суммаризация, "
+                    "либо отключите эту опцию в Настройки → Скрам.",
+                )
+                generate_from_protocol = False
+
+        # --- Подтверждение ---
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Обновление промпта поручений")
         msg_box.setIcon(QMessageBox.Icon.Question)
         msg_box.setTextFormat(Qt.TextFormat.RichText)
+
+        llm_note = ""
+        if generate_from_protocol:
+            llm_note = (
+                "<br><br>"
+                "<b>Дополнительно:</b> будет выполнен запрос к LLM "
+                "для извлечения поручений из протокола, и новые "
+                "поручения будут добавлены в action_items.json "
+                "(с дедупликацией по тексту, исполнителю и сроку)."
+            )
+        else:
+            llm_note = (
+                "<br><br>"
+                "<span style='color:#666'>Генерация поручений через "
+                "LLM отключена (Настройки → Скрам).</span>"
+            )
+
         msg_box.setText(
             f"Пересобрать <code>action_items_prompt</code> "
             f"на основе протокола записи:<br><br>"
             f"<b>{html.escape(r.get('name') or '')}</b><br>"
             f"<code>{html.escape(session_dir)}</code><br><br>"
-            f"Существующий файл будет перезаписан.<br><br>"
+            f"Существующий файл-промпт будет перезаписан."
+            f"{llm_note}<br><br>"
             f"Продолжить?"
         )
         msg_box.setStandardButtons(
@@ -3336,10 +3599,10 @@ class SessionsWindow(QDialog):
         )
         msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
 
-        reply = msg_box.exec()
-        if reply != QMessageBox.StandardButton.Yes:
+        if msg_box.exec() != QMessageBox.StandardButton.Yes:
             return
 
+        # --- Шаг 1: пересборка файла-промпта (как раньше) ---
         QGuiApplication.setOverrideCursor(
             Qt.CursorShape.WaitCursor
         )
@@ -3354,19 +3617,188 @@ class SessionsWindow(QDialog):
         finally:
             QGuiApplication.restoreOverrideCursor()
 
-        if res.get("ok"):
+        if not res.get("ok"):
+            QMessageBox.warning(
+                self, "Промпт поручений",
+                f"Не удалось сформировать файл:\n\n"
+                f"{res.get('warning') or 'Неизвестная ошибка'}",
+            )
+            return
+
+        log.info(
+            "Файл-промпт поручений обновлён: %s",
+            res.get("path"),
+        )
+
+        # --- Шаг 2: если включена генерация из протокола ---
+        if not generate_from_protocol:
             QMessageBox.information(
                 self, "Промпт поручений",
                 f"Файл обновлён:\n{res['path']}\n\n"
                 f"Источник протокола:\n"
                 f"{res.get('protocol_path') or '—'}\n"
-                f"Символов: {res.get('protocol_chars', 0)}",
+                f"Символов: {res.get('protocol_chars', 0)}\n\n"
+                f"Генерация поручений через LLM отключена "
+                f"(Настройки → Скрам).",
+            )
+            return
+
+        # --- Статус на время LLM (без отдельного окна) ---
+        # Отдельные QDialog/QMessageBox в твоём окружении
+        # (Wayland + снап + тёмная тема GNOME) рисуются пустым
+        # чёрным прямоугольником — Qt не успевает/не может
+        # отрисовать тело окна.
+        #
+        # Поэтому статус показываем прямо в окне «Записи»:
+        #   • блокируем кнопку «Обновить промпт поручений»;
+        #   • меняем её текст на «Идёт запрос к LLM…»;
+        #   • в статусной строке показываем подсказку.
+        # Никаких новых окон — главное окно уже отрисовано
+        # и его перерисовка работает нормально.
+        original_btn_text = self.regen_action_prompt_btn.text()
+        self.regen_action_prompt_btn.setEnabled(False)
+        self.regen_action_prompt_btn.setText("Идёт запрос к LLM…")
+
+        original_selection = self.selection_label.text()
+        self.selection_label.setText(
+            "<span style='color:#B8860B'>"
+            "Идёт извлечение поручений из протокола через "
+            "LiteLLM… Это может занять несколько секунд.</span>"
+        )
+        QGuiApplication.processEvents()
+
+        try:
+            from ..protocol_action_items_helper import (
+                regenerate_action_items_with_llm_sync,
+            )
+            llm_result = regenerate_action_items_with_llm_sync(
+                config_manager=self.config_manager,
+                session_dir=session_dir,
+                session_name=r.get("name") or "",
+                session_date=r.get("datetime") or "",
+            )
+        except Exception as exc:
+            log.exception(
+                "Ошибка вызова LLM для поручений: %s", exc
+            )
+            llm_result = {
+                "ok": False,
+                "error": str(exc),
+                "added": 0,
+                "skipped": 0,
+                "total": 0,
+            }
+        finally:
+            # Возвращаем кнопку и статус в исходное состояние.
+            self.regen_action_prompt_btn.setEnabled(True)
+            self.regen_action_prompt_btn.setText(original_btn_text)
+            self.selection_label.setText(original_selection)
+            QGuiApplication.processEvents()
+
+        # --- Итоговое сообщение ---
+        self._show_action_items_llm_result(
+            r, res, llm_result, generate_from_protocol=True
+        )
+
+        if llm_result.get("ok") and llm_result.get("added", 0) > 0:
+            self.refresh()
+
+    def _show_action_items_llm_result(
+        self,
+        row: Dict[str, Any],
+        prompt_result: Dict[str, Any],
+        llm_result: Dict[str, Any],
+        *,
+        generate_from_protocol: bool,
+    ) -> None:
+        """
+        Показывает пользователю итог обновления промпта поручений
+        и (опционально) извлечения поручений через LLM.
+        """
+        lines: List[str] = []
+
+        # --- Файл-промпт ---
+        lines.append(
+            "<b>Файл-промпт обновлён.</b><br>"
+            f"Путь: <code>{html.escape(prompt_result.get('path') or '—')}"
+            f"</code><br>"
+            f"Источник протокола: "
+            f"<code>{html.escape(prompt_result.get('protocol_path') or '—')}"
+            f"</code><br>"
+            f"Символов в протоколе: "
+            f"{prompt_result.get('protocol_chars', 0)}"
+        )
+
+        if not generate_from_protocol:
+            QMessageBox.information(
+                self, "Промпт поручений",
+                lines[0] + "<br><br>"
+                "Генерация поручений через LLM отключена "
+                "(Настройки → Скрам).",
+            )
+            return
+
+        # --- LLM ---
+        lines.append("")
+        lines.append("<b>Извлечение поручений через LLM:</b>")
+
+        if not llm_result.get("ok"):
+            lines.append(
+                "<span style='color:#c62828'>"
+                f"Ошибка: {html.escape(llm_result.get('error') or '—')}"
+                "</span>"
+            )
+            QMessageBox.warning(
+                self, "Промпт поручений", "<br>".join(lines)
+            )
+            return
+
+        added = int(llm_result.get("added", 0))
+        skipped = int(llm_result.get("skipped", 0))
+        total = int(llm_result.get("total", 0))
+        transcript_used = bool(llm_result.get("transcript_used"))
+        warning = str(llm_result.get("warning") or "")
+
+        src_note = (
+            "протокол + стенограмма" if transcript_used
+            else "только протокол"
+        )
+
+        if added > 0:
+            lines.append(
+                f"<span style='color:#2E7D32'>"
+                f"Добавлено новых поручений: <b>{added}</b>"
+                f"</span>"
             )
         else:
-            QMessageBox.warning(
-                self, "Промпт поручений",
-                f"Не удалось сформировать файл:\n\n"
-                f"{res.get('warning') or 'Неизвестная ошибка'}",
+            lines.append("Новых поручений не добавлено.")
+
+        if skipped > 0:
+            lines.append(
+                f"Пропущено как дубликаты: {skipped}"
+            )
+
+        lines.append(f"Всего поручений в записи: <b>{total}</b>")
+        lines.append(f"Источник для LLM: {src_note}")
+
+        if warning:
+            lines.append(
+                f"<span style='color:#B8860B'>{html.escape(warning)}"
+                f"</span>"
+            )
+
+        if added > 0:
+            lines.append(
+                "<br>Открыть редактор поручений можно через меню "
+                "«Поручения → Редактор поручений текущей записи…» "
+                "(Ctrl+Shift+K)."
+            )
+            QMessageBox.information(
+                self, "Промпт поручений", "<br>".join(lines)
+            )
+        else:
+            QMessageBox.information(
+                self, "Промпт поручений", "<br>".join(lines)
             )
 
     def _regenerate_tfs_attachment(self) -> None:
@@ -5548,9 +5980,6 @@ class SessionsWindow(QDialog):
             log.exception("Ошибка сохранения тега: %s", exc)
             raise
 
-    # ------------------------------------------------------------------
-    # Протокол
-    # ------------------------------------------------------------------
     def _edit_manual_protocol_md(self) -> None:
         r = self._selected_row()
         if not r:
@@ -5611,6 +6040,13 @@ class SessionsWindow(QDialog):
             self, "Протокол",
             f"Протокол сохранён и прикреплён к записи:\n"
             f"{md_path}",
+        )
+
+        # --- НОВОЕ: предложить обновить summary ---
+        self._offer_generate_summary(
+            session_dir=r["dir"],
+            protocol_path=md_path,
+            context="протокол отредактирован в Markdown-редакторе",
         )
 
     def _export_protocol_docx(self) -> None:
@@ -5696,6 +6132,13 @@ class SessionsWindow(QDialog):
                 f"{target}",
             )
             self.refresh()
+
+            # --- НОВОЕ: предложить обновить summary ---
+            self._offer_generate_summary(
+                session_dir=r["dir"],
+                protocol_path=target,
+                context="протокол экспортирован в DOCX и прикреплён",
+            )
         else:
             QMessageBox.information(
                 self, "Экспорт в DOCX",
@@ -5770,6 +6213,13 @@ class SessionsWindow(QDialog):
             f"Протокол прикреплён к записи:\n{target}",
         )
         self.refresh()
+
+        # --- НОВОЕ: предложить обновить summary ---
+        self._offer_generate_summary(
+            session_dir=r["dir"],
+            protocol_path=target,
+            context="файл протокола прикреплён",
+        )
 
     def _open_manual_protocol(self) -> None:
         r = self._selected_row()

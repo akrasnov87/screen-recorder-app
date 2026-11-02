@@ -99,7 +99,7 @@ else:
         sanitize_filename,
     )
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Slot
+from PySide6.QtCore import Qt, QObject, QTimer, QUrl, Slot
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QMessageBox, QSystemTrayIcon,
@@ -1000,13 +1000,18 @@ class ScreenRecorderApp(QObject):
             tags=tags,
             on_save_tag=self._add_tag_to_library,
             get_tags=self.config_manager.get_tags,
-            categories=categories,      # ← НОВОЕ
+            categories=categories,
         )
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
 
         data = dlg.result_data
         self._perform_import(data)
+
+        # --- НОВОЕ: предложить сгенерировать summary из протокола ---
+        protocol_src = data.get("protocol_path") or ""
+        if protocol_src and os.path.isfile(protocol_src):
+            self._maybe_offer_summary_after_import(data)
 
     def _perform_import(self, data: Dict[str, Any]) -> None:
         date_dt: datetime = data["date"]
@@ -1226,6 +1231,218 @@ class ScreenRecorderApp(QObject):
             "Ошибка обработки", error[:100],
             QSystemTrayIcon.MessageIcon.Critical,
         )
+
+    def _maybe_offer_summary_after_import(
+        self, data: Dict[str, Any]
+    ) -> None:
+        """
+        После импорта записи с протоколом — предлагает пользователю
+        сгенерировать summary из протокола.
+
+        Условия показа:
+        • LiteLLM настроен;
+        • был приложен протокол (файл существует);
+        • протокол читается (не пустой).
+
+        Генерация выполняется в фоновом потоке; по завершении
+        результат сохраняется в session.json → summary_bb и
+        summary.md (через protocol_summary_helper).
+
+        ВАЖНО: метод вызывается из GUI-потока, диалог QMessageBox
+        показывается синхронно; сама генерация — в threading.Thread,
+        чтобы не блокировать UI.
+        """
+        from .protocol_summary_helper import (
+            get_litellm_model_name,
+            is_protocol_summary_enabled,
+            read_protocol_text,
+        )
+
+        if not is_protocol_summary_enabled(self.config_manager):
+            log.debug(
+                "_maybe_offer_summary_after_import: LiteLLM "
+                "не настроен — пропускаем"
+            )
+            return
+
+        protocol_src = data.get("protocol_path") or ""
+        if not protocol_src or not os.path.isfile(protocol_src):
+            return
+
+        protocol_text = read_protocol_text(protocol_src)
+        if not protocol_text:
+            log.info(
+                "_maybe_offer_summary_after_import: протокол пустой — "
+                "предложение не показывается"
+            )
+            return
+
+        # Ищем созданную папку сессии. Импорт создаёт папку
+        # по дате из data["date"] с возможным суффиксом _N.
+        date_dt = data.get("date")
+        session_dir = ""
+        if isinstance(date_dt, datetime):
+            base = date_dt.strftime("%Y-%m-%d_%H-%M-%S")
+            candidate = os.path.join(self._sessions_root(), base)
+            if os.path.isdir(candidate):
+                session_dir = candidate
+            else:
+                # Возможен суффикс _1, _2, ...
+                for i in range(1, 100):
+                    candidate = os.path.join(
+                        self._sessions_root(), f"{base}_{i}"
+                    )
+                    if os.path.isdir(candidate):
+                        session_dir = candidate
+                        break
+
+        if not session_dir:
+            log.warning(
+                "_maybe_offer_summary_after_import: не удалось найти "
+                "папку сессии для %s",
+                protocol_src,
+            )
+            return
+
+        # Копируем протокол внутрь сессии, если ещё не скопирован
+        # (в _perform_import он уже копируется, но на всякий случай
+        # проверим — вдруг вызвали не оттуда).
+        dst_protocol = ""
+        for name in (
+            "manual_protocol.docx",
+            "manual_protocol.md",
+            "manual_protocol.txt",
+            "manual_protocol.pdf",
+        ):
+            p = os.path.join(session_dir, name)
+            if os.path.isfile(p):
+                dst_protocol = p
+                break
+        if not dst_protocol:
+            dst_protocol = protocol_src  # fallback
+
+        model = get_litellm_model_name(self.config_manager) or "—"
+        name = str(data.get("name") or "импортированная запись")
+
+        reply = QMessageBox.question(
+            None, "Сгенерировать summary?",
+            f"<b>Запись импортирована с протоколом.</b><br><br>"
+            f"Запись: <b>{name}</b><br>"
+            f"Протокол: <code>{os.path.basename(dst_protocol)}</code>"
+            f"<br><br>"
+            f"Сгенерировать краткое описание (summary) на основе "
+            f"протокола через LiteLLM?<br><br>"
+            f"<span style='color:#666'>Модель: "
+            f"<code>{model}</code></span>",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            log.info(
+                "_maybe_offer_summary_after_import: пользователь "
+                "отказался генерировать summary"
+            )
+            return
+
+        self._run_summary_generation_in_background(
+            session_dir=session_dir,
+            protocol_path=dst_protocol,
+            name=name,
+        )
+
+    def _run_summary_generation_in_background(
+        self,
+        *,
+        session_dir: str,
+        protocol_path: str,
+        name: str,
+    ) -> None:
+        """
+        Запускает генерацию summary в фоновом потоке.
+
+        Прогресс показывается через QProgressDialog (создаётся
+        в GUI-потоке), а результат возвращается в GUI-поток
+        через QTimer.singleShot.
+        """
+        from .protocol_summary_helper import (
+            generate_summary_from_protocol_sync,
+        )
+
+        progress = QProgressDialog(
+            "Генерация summary через LiteLLM…",
+            None, 0, 0, None,
+        )
+        progress.setWindowTitle("Summary")
+        progress.setWindowModality(
+            Qt.WindowModality.WindowModal
+        )
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.show()
+
+        import threading
+
+        def _worker() -> None:
+            try:
+                result = generate_summary_from_protocol_sync(
+                    config_manager=self.config_manager,
+                    session_dir=session_dir,
+                    protocol_path=protocol_path,
+                )
+            except Exception as exc:
+                log.exception(
+                    "_run_summary_generation_in_background: %s", exc
+                )
+                result = {"ok": False, "error": str(exc)}
+
+            def _finish() -> None:
+                try:
+                    progress.close()
+                except Exception:
+                    pass
+
+                if result.get("ok"):
+                    chars = int(result.get("chars") or 0)
+                    log.info(
+                        "Summary из протокола импорта готов: %d символов",
+                        chars,
+                    )
+                    self._notify(
+                        "Summary",
+                        f"Summary сгенерирован ({chars} символов). "
+                        f"Открыть: Записи → {name}.",
+                    )
+                    # Обновляем окно «Записи», если оно открыто —
+                    # чтобы колонка Summary обновилась.
+                    if getattr(self, "sessions_window", None) is not None:
+                        try:
+                            self.sessions_window.refresh()
+                        except Exception as exc:
+                            log.warning(
+                                "Не удалось обновить окно «Записи»: %s",
+                                exc,
+                            )
+                else:
+                    err = result.get("error") or "Неизвестная ошибка"
+                    log.error(
+                        "Не удалось сгенерировать summary: %s", err
+                    )
+                    self._notify(
+                        "Summary",
+                        f"Не удалось сгенерировать summary: {err[:100]}",
+                        QSystemTrayIcon.MessageIcon.Warning,
+                    )
+
+            # Возврат в GUI-поток.
+            QTimer.singleShot(0, _finish)
+
+        t = threading.Thread(
+            target=_worker,
+            name="summary-after-import",
+            daemon=True,
+        )
+        t.start()
 
     # ------------------------------------------------------------------
     # Автопубликация на сервер

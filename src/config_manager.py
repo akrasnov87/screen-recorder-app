@@ -240,9 +240,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "action_items_prompt_template": DEFAULT_ACTION_ITEMS_PROMPT,
         "export_format": "docx",
         "generate_action_items": False,
+        "generate_action_items_from_protocol": True,
     },
     "summarizer": {
         "enabled": False,
+        "protocol_summary_enabled": True,
         "provider": "server",
         "litellm": {
             "base_url": "http://localhost:4000",
@@ -425,7 +427,7 @@ class ConfigManager:
             return None
 
     def _save_key_to_file(self, key: str) -> bool:
-        """
+        r"""
         Сохраняет мастер-ключ шифрования в файл-fallback.
 
         Используется, только если keyring недоступен (или не
@@ -904,14 +906,25 @@ class ConfigManager:
     def get_scrum_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("scrum", {})
         return {
-            "prompt_template": cfg.get("prompt_template",
-                                       DEFAULT_SCRUM_PROMPT),
+            "prompt_template": cfg.get(
+                "prompt_template", DEFAULT_SCRUM_PROMPT
+            ),
             "export_format": cfg.get("export_format", "docx"),
+            "generate_action_items": bool(
+                cfg.get("generate_action_items", False)
+            ),
+            "generate_action_items_from_protocol": bool(
+                cfg.get("generate_action_items_from_protocol", True)
+            ),
         }
 
     def get_summarizer_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("summarizer", {}) or {}
         enabled = bool(cfg.get("enabled", False))
+        # --- отдельный флаг для summary из протокола ---
+        protocol_summary_enabled = bool(
+            cfg.get("protocol_summary_enabled", True)
+        )
         provider = str(cfg.get("provider", "server")).strip().lower()
         if provider not in ("server", "litellm"):
             provider = "server"
@@ -928,7 +941,7 @@ class ConfigManager:
             "read_timeout": int(l.get("read_timeout", 300)),
             "system_prompt": str(l.get("system_prompt", "")),
         }
-        return {"enabled": enabled, "provider": provider, "litellm": litellm}
+        return {"enabled": enabled, "protocol_summary_enabled": protocol_summary_enabled, "provider": provider, "litellm": litellm}
 
     def get_glossary_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("glossary", {}) or {}

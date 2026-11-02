@@ -2539,6 +2539,22 @@ class SettingsWindow(QDialog):
         attach_tooltip(self.sum_enabled_check, "sum_enabled")
         layout.addWidget(self.sum_enabled_check)
 
+        self.sum_protocol_enabled_check = QCheckBox(
+            "Предлагать генерацию summary при прикреплении протокола"
+        )
+        self.sum_protocol_enabled_check.setToolTip(
+            "Если включено — при сохранении или прикреплении протокола "
+            "записи будет предложено сгенерировать summary через LiteLLM "
+            "на основе текста протокола.\n\n"
+            "Это отдельный сценарий: он не требует включения "
+            "«Формировать summary для новых записей».\n\n"
+            "Требует настроенного LiteLLM (base_url, модель)."
+        )
+        attach_tooltip(
+            self.sum_protocol_enabled_check, "sum_protocol_enabled"
+        )
+        layout.addWidget(self.sum_protocol_enabled_check)
+
         form_top = QFormLayout()
         self.sum_provider_combo = QComboBox()
         self.sum_provider_combo.addItem(
@@ -3212,6 +3228,35 @@ class SettingsWindow(QDialog):
             "(Настройки → Суммаризация)."
         )
         form.addRow("", self.generate_action_items_check)
+
+        # --- Чекбокс «Формировать поручения из протокола» ---
+        self.generate_action_items_from_protocol_check = QCheckBox(
+            "Формировать поручения на основе протокола"
+        )
+        self.generate_action_items_from_protocol_check.setToolTip(
+            "Если включено — при нажатии кнопки «Обновить промпт "
+            "поручений» в окне «Записи» приложение дополнительно:\n"
+            "  1. Отправит протокол (и стенограмму, если есть) в "
+            "LiteLLM.\n"
+            "  2. Распарсит JSON-ответ и добавит новые поручения в "
+            "action_items.json.\n"
+            "  3. Пропустит дубликаты (совпадение по тексту, "
+            "исполнителю и сроку).\n\n"
+            "Существующие поручения не удаляются и не изменяются — "
+            "только добавляются новые.\n\n"
+            "Требует настроенного LiteLLM "
+            "(Настройки → Суммаризация: провайдер = LiteLLM, "
+            "задан base_url).\n\n"
+            "Если выключено — кнопка «Обновить промпт поручений» "
+            "только пересобирает файл-промпт без обращения к LLM."
+        )
+        attach_tooltip(
+            self.generate_action_items_from_protocol_check,
+            "scrum_generate_action_items_from_protocol",
+        )
+        form.addRow(
+            "", self.generate_action_items_from_protocol_check
+        )
 
         layout.addLayout(form)
 
@@ -4177,6 +4222,9 @@ class SettingsWindow(QDialog):
         self.sum_enabled_check.setChecked(
             bool(sum_cfg.get("enabled", False))
         )
+        self.sum_protocol_enabled_check.setChecked(
+            bool(sum_cfg.get("protocol_summary_enabled", True))
+        )
         idx = self.sum_provider_combo.findData(sum_cfg["provider"])
         if idx >= 0:
             self.sum_provider_combo.setCurrentIndex(idx)
@@ -4273,6 +4321,12 @@ class SettingsWindow(QDialog):
         # --- НОВОЕ: чекбокс автогенерации поручений ---
         self.generate_action_items_check.setChecked(
             bool(scrum.get("generate_action_items", True))
+        )
+
+        self.generate_action_items_from_protocol_check.setChecked(
+            bool(scrum.get(
+                "generate_action_items_from_protocol", True
+            ))
         )
 
         # Формат экспорта — без изменений.
@@ -4666,12 +4720,18 @@ class SettingsWindow(QDialog):
             "generate_action_items": (
                 self.generate_action_items_check.isChecked()
             ),
+            "generate_action_items_from_protocol": (
+                self.generate_action_items_from_protocol_check.isChecked()
+            ),
             "export_format": (
                 self.scrum_format_combo.currentText()
             ),
         }
         cfg["summarizer"] = {
             "enabled": self.sum_enabled_check.isChecked(),
+            "protocol_summary_enabled": (
+                self.sum_protocol_enabled_check.isChecked()
+            ),
             "provider": (
                 self.sum_provider_combo.currentData() or "server"
             ),
