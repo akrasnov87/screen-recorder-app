@@ -2532,13 +2532,6 @@ class SettingsWindow(QDialog):
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.sum_enabled_check = QCheckBox(
-            "Формировать summary для новых записей"
-        )
-        self.sum_enabled_check.setChecked(False)
-        attach_tooltip(self.sum_enabled_check, "sum_enabled")
-        layout.addWidget(self.sum_enabled_check)
-
         self.sum_protocol_enabled_check = QCheckBox(
             "Предлагать генерацию summary при прикреплении протокола"
         )
@@ -2546,8 +2539,6 @@ class SettingsWindow(QDialog):
             "Если включено — при сохранении или прикреплении протокола "
             "записи будет предложено сгенерировать summary через LiteLLM "
             "на основе текста протокола.\n\n"
-            "Это отдельный сценарий: он не требует включения "
-            "«Формировать summary для новых записей».\n\n"
             "Требует настроенного LiteLLM (base_url, модель)."
         )
         attach_tooltip(
@@ -4219,9 +4210,6 @@ class SettingsWindow(QDialog):
 
         # --- Суммаризация ---
         sum_cfg = self.config_manager.get_summarizer_settings()
-        self.sum_enabled_check.setChecked(
-            bool(sum_cfg.get("enabled", False))
-        )
         self.sum_protocol_enabled_check.setChecked(
             bool(sum_cfg.get("protocol_summary_enabled", True))
         )
@@ -4728,7 +4716,6 @@ class SettingsWindow(QDialog):
             ),
         }
         cfg["summarizer"] = {
-            "enabled": self.sum_enabled_check.isChecked(),
             "protocol_summary_enabled": (
                 self.sum_protocol_enabled_check.isChecked()
             ),

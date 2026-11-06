@@ -41,8 +41,8 @@ def is_litellm_configured_for_action_items(config_manager) -> bool:
     """
     Техническая готовность LiteLLM для извлечения поручений.
 
-    Не проверяет summarizer.enabled и protocol_summary_enabled —
-    это отдельный сценарий. Требует только:
+    Не проверяет protocol_summary_enabled — это отдельный
+    сценарий. Требует только:
       • provider == "litellm";
       • задан base_url.
     """

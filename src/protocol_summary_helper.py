@@ -37,11 +37,8 @@ def is_litellm_configured(config_manager) -> bool:
     """
     Проверяет техническую готовность LiteLLM.
 
-    НЕ проверяет summarizer.enabled — этот флаг управляет
-    автогенерацией при транскрибации, а для генерации из
-    протокола используется отдельный флаг
-    summarizer.protocol_summary_enabled (см.
-    is_protocol_summary_enabled).
+    Не проверяет флаг генерации из протокола — см.
+    is_protocol_summary_enabled.
     """
     if config_manager is None:
         return False
@@ -70,9 +67,6 @@ def is_protocol_summary_enabled(config_manager) -> bool:
     Условия:
       • техническая готовность LiteLLM (см. is_litellm_configured);
       • summarizer.protocol_summary_enabled == True.
-
-    В отличие от автогенерации при транскрибации, этот флаг
-    НЕ требует summarizer.enabled.
     """
     if not is_litellm_configured(config_manager):
         return False

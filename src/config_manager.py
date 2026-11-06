@@ -243,7 +243,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "generate_action_items_from_protocol": True,
     },
     "summarizer": {
-        "enabled": False,
         "protocol_summary_enabled": True,
         "provider": "server",
         "litellm": {
@@ -920,7 +919,6 @@ class ConfigManager:
 
     def get_summarizer_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("summarizer", {}) or {}
-        enabled = bool(cfg.get("enabled", False))
         # --- отдельный флаг для summary из протокола ---
         protocol_summary_enabled = bool(
             cfg.get("protocol_summary_enabled", True)
@@ -941,7 +939,7 @@ class ConfigManager:
             "read_timeout": int(l.get("read_timeout", 300)),
             "system_prompt": str(l.get("system_prompt", "")),
         }
-        return {"enabled": enabled, "protocol_summary_enabled": protocol_summary_enabled, "provider": provider, "litellm": litellm}
+        return {"protocol_summary_enabled": protocol_summary_enabled, "provider": provider, "litellm": litellm}
 
     def get_glossary_settings(self) -> Dict[str, Any]:
         cfg = self.config.get("glossary", {}) or {}

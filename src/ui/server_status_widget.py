@@ -185,13 +185,6 @@ class _ServerCheckWorker(QThread):
         except Exception as exc:
             return {"state": "error", "hint": f"Настройки: {exc}"}
 
-        if not cfg.get("enabled"):
-            return {
-                "state": "not_configured",
-                "hint": "Суммаризация отключена "
-                        "(Настройки → Суммаризация)",
-            }
-
         provider = str(cfg.get("provider") or "server").lower()
         if provider != "litellm":
             return {

@@ -431,9 +431,6 @@ class ScreenRecorderApp(QObject):
         now = datetime.now()
         now_str = f"{now:%Y-%m-%d %H-%M}"
 
-        sum_cfg = self.config_manager.get_summarizer_settings()
-        default_generate_summary = bool(sum_cfg.get("enabled", False))
-
         meta = {
             "project": default_project,
             "category": "",       # ← НОВОЕ
@@ -450,7 +447,7 @@ class ScreenRecorderApp(QObject):
             "prompt": self.config_manager.get_default_prompt(),
             "prompt_name": "",
             "prompt_edited": False,
-            "generate_summary": default_generate_summary,
+            "generate_summary": False,
             "is_scrum": False,
             "generate_deepseek_prompt": True,
             "include_name_in_prompt": True,
@@ -1101,9 +1098,6 @@ class ScreenRecorderApp(QObject):
                 )
                 protocol_dst = ""
 
-        sum_cfg = self.config_manager.get_summarizer_settings()
-        default_generate_summary = bool(sum_cfg.get("enabled", False))
-
         meta: Dict[str, Any] = {
             "project": project,
             "category": str(data.get("category") or ""),   # ← НОВОЕ
@@ -1128,7 +1122,7 @@ class ScreenRecorderApp(QObject):
             "prompt": self.config_manager.get_default_prompt(),
             "prompt_name": "",
             "prompt_edited": False,
-            "generate_summary": default_generate_summary,
+            "generate_summary": False,
             "is_scrum": False,
             "generate_deepseek_prompt": True,
             "include_name_in_prompt": True,
