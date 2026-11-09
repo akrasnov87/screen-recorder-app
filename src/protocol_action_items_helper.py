@@ -281,7 +281,7 @@ def regenerate_action_items_with_llm_sync(
     base_url = str(l.get("base_url") or "").strip()
     api_key = str(l.get("api_key") or "")
     model = str(l.get("model") or "gpt-4o-mini")
-    max_tokens = int(l.get("max_tokens", 2200))
+    max_tokens = 8192 #int(l.get("max_tokens", 8192))
     connect_timeout = float(l.get("connect_timeout", 15))
     read_timeout = float(l.get("read_timeout", 300))
 

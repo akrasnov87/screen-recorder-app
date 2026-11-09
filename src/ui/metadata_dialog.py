@@ -1739,6 +1739,27 @@ class MetadataDialog(QDialog):
         self.generate_deepseek_check.setChecked(True)
         layout.addWidget(self.generate_deepseek_check)
 
+        layout.addSpacing(8)
+
+        protocol_header = QHBoxLayout()
+        protocol_header.addWidget(
+            QLabel("<b>Автогенерация протокола</b>")
+        )
+        protocol_header.addStretch()
+        protocol_info_icon = make_info_icon("meta_auto_protocol")
+        if protocol_info_icon is not None:
+            protocol_header.addWidget(protocol_info_icon)
+        layout.addLayout(protocol_header)
+
+        self.auto_protocol_check = QCheckBox(
+            "Генерация протокола автоматически"
+        )
+        attach_tooltip(
+            self.auto_protocol_check, "meta_auto_protocol"
+        )
+        self.auto_protocol_check.setChecked(True)
+        layout.addWidget(self.auto_protocol_check)
+
         scrum_header = QHBoxLayout()
         scrum_header.addWidget(QLabel("<b>Скрам-митинг</b>"))
         scrum_header.addStretch()
@@ -2770,6 +2791,12 @@ class MetadataDialog(QDialog):
             gen = True
         self.generate_deepseek_check.setChecked(gen)
 
+        if "auto_generate_protocol" in init:
+            ap = bool(init.get("auto_generate_protocol"))
+        else:
+            ap = True
+        self.auto_protocol_check.setChecked(ap)
+
         # --- Промпт ---
         prompt_text = (
             init.get("prompt", "") or self._default_prompt
@@ -3236,6 +3263,9 @@ class MetadataDialog(QDialog):
             ),
             "generate_deepseek_prompt": bool(
                 self.generate_deepseek_check.isChecked()
+            ),
+            "auto_generate_protocol": bool(
+                self.auto_protocol_check.isChecked()
             ),
             "include_name_in_prompt": bool(
                 self.include_name_check.isChecked()

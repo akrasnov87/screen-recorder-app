@@ -45,6 +45,7 @@ class VideoProcessor(QObject):
     task_progress = Signal(str, int, str)
     task_completed = Signal(str, dict)
     task_failed = Signal(str, str)
+    protocol_generation_failed = Signal(str, str)
 
     def __init__(
         self,
@@ -846,6 +847,95 @@ class VideoProcessor(QObject):
                     "generate_deepseek_prompt=%s, transcript_path=%r",
                     task_id,
                     metadata.get("generate_deepseek_prompt"),
+                    transcript_path,
+                )
+
+            # ============================================================
+            # Шаг 3.1: автогенерация протокола через LLM
+            # ============================================================
+            # Для старых записей ключа может не быть в session.json —
+            # тогда берём дефолт из конфига (scrum.auto_generate_protocol).
+            ap_flag = metadata.get("auto_generate_protocol")
+            if ap_flag is None:
+                ap_flag = bool(
+                    (self.config.get("scrum", {}) or {}).get(
+                        "auto_generate_protocol", True
+                    )
+                )
+            if ap_flag and transcript_path:
+                self.task_progress.emit(
+                    task_id, 82, "Генерация протокола (LLM)…"
+                )
+                session_dir_ap = os.path.dirname(video_path)
+                try:
+                    ap_res = await self._generate_protocol_via_llm(
+                        task_id=task_id,
+                        session_dir=session_dir_ap,
+                        transcript_path=transcript_path,
+                        metadata=metadata,
+                    )
+                    if ap_res.get("ok"):
+                        log.info(
+                            "[%s] Протокол сформирован автоматически: "
+                            "%s (%d символов)",
+                            task_id,
+                            ap_res.get("docx_path") or ap_res.get(
+                                "md_path", ""
+                            ),
+                            ap_res.get("chars") or 0,
+                        )
+                        # Отмечаем в session.json, что протокол был
+                        # сгенерирован автоматически и ещё не утверждён.
+                        try:
+                            session_json = os.path.join(
+                                session_dir_ap, "session.json"
+                            )
+                            meta_saved = await asyncio.to_thread(
+                                self._read_json_safe, session_json
+                            ) or {}
+                            meta_saved[
+                                "protocol_auto_generated"
+                            ] = True
+                            meta_saved[
+                                "protocol_generated_at"
+                            ] = datetime.now().isoformat()
+                            meta_saved["protocol_approved"] = False
+                            await asyncio.to_thread(
+                                self._write_json_safe,
+                                session_json, meta_saved,
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "[%s] Не удалось пометить протокол "
+                                "в session.json: %s",
+                                task_id, exc,
+                            )
+                    else:
+                        err_msg = str(
+                            ap_res.get("error")
+                            or "не удалось сформировать протокол"
+                        )
+                        log.warning(
+                            "[%s] Автогенерация протокола не удалась: %s",
+                            task_id, err_msg,
+                        )
+                        self.protocol_generation_failed.emit(
+                            task_id, err_msg
+                        )
+                except Exception as exc:
+                    log.exception(
+                        "[%s] Не удалось сформировать протокол: %s",
+                        task_id, exc,
+                    )
+                    self.protocol_generation_failed.emit(
+                        task_id, str(exc)
+                    )
+            else:
+                log.info(
+                    "[%s] Автогенерация протокола не выполняется: "
+                    "auto_generate_protocol=%s, transcript_path=%r",
+                    task_id,
+                    ap_flag,
                     transcript_path,
                 )
 
@@ -1757,8 +1847,10 @@ class VideoProcessor(QObject):
             )
 
         if not user_prompt or not user_prompt.strip():
+            meta_cfg = self.config.get("metadata", {}) or {}
             user_prompt = (
-                self.config.get("metadata", {}).get("default_prompt")
+                str(meta_cfg.get("summary_prompt") or "").strip()
+                or str(meta_cfg.get("default_prompt") or "").strip()
                 or "Составь краткое содержание записи."
             )
 
@@ -3346,6 +3438,281 @@ class VideoProcessor(QObject):
             )
 
         return list(result.items)
+
+    # ------------------------------------------------------------------
+    # Автогенерация протокола через LLM
+    # ------------------------------------------------------------------
+    def _find_deepseek_prompt_file(self, session_dir: str) -> str:
+        """
+        Ищет сохранённый файл DeepSeek-промпта в папке записи.
+
+        Сначала проверяется формат из scrum.export_format, затем
+        остальные (.docx / .md / .txt). Возвращает путь к файлу
+        или пустую строку, если файл не найден.
+        """
+        export_format = (
+            (self.config.get("scrum", {}) or {}).get("export_format")
+            or "docx"
+        ).lower()
+        if export_format not in ("docx", "md", "txt"):
+            export_format = "docx"
+        order = [export_format] + [
+            ext for ext in ("docx", "md", "txt") if ext != export_format
+        ]
+        for ext in order:
+            path = os.path.join(session_dir, f"deepseek_prompt.{ext}")
+            if os.path.isfile(path):
+                return path
+        return ""
+
+    async def _generate_protocol_via_llm(
+        self,
+        *,
+        task_id: str,
+        session_dir: str,
+        transcript_path: str,
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Сформировать протокол совещания (Markdown).
+
+        Результат сохраняется в файл protocol.md — его можно
+        редактировать во встроенном редакторе приложения.
+
+        Источник промпта — сохранённый файл deepseek_prompt.*
+        из папки записи (формируется на шаге 3 конвейера): он
+        содержит корректную инструкцию (промпт, указанный
+        пользователем при создании записи, или шаблон скрам),
+        контекст, глоссарий, предыдущий протокол и стенограмму.
+        Если файла нет (формирование отключено или не удалось) —
+        fallback на шаблон scrum.prompt_template + стенограмму.
+
+        Returns:
+            {
+              "ok": bool,
+              "md_path": str,
+              "docx_path": str,   # всегда "" (протокол — только md)
+              "chars": int,
+              "error": str,
+            }
+        """
+        result: Dict[str, Any] = {
+            "ok": False,
+            "md_path": "",
+            "docx_path": "",
+            "chars": 0,
+            "error": "",
+        }
+
+        sum_cfg = self.config.get("summarizer", {}) or {}
+        l = sum_cfg.get("litellm", {}) or {}
+        base_url = str(l.get("base_url", "")).strip()
+        if not base_url:
+            result["error"] = (
+                "LiteLLM не настроен "
+                "(Настройки → Суммаризация)"
+            )
+            log.info(
+                "[%s] Автогенерация протокола: LiteLLM не настроен "
+                "— пропускаем",
+                task_id,
+            )
+            return result
+
+        api_key = str(l.get("api_key", ""))
+        model = str(l.get("model", "gpt-4o-mini"))
+        max_tokens = int(l.get("max_tokens", 4000))
+        connect_timeout = float(l.get("connect_timeout", 15))
+        read_timeout = float(l.get("read_timeout", 300))
+
+        scrum_cfg = self.config.get("scrum", {}) or {}
+        from .config_manager import DEFAULT_SCRUM_PROMPT
+        template = str(
+            scrum_cfg.get("prompt_template")
+            or DEFAULT_SCRUM_PROMPT
+        )
+
+        session_name = str(metadata.get("name") or "").strip()
+        session_date = str(metadata.get("date") or "").strip()
+
+        # Читаем стенограмму
+        transcript_text = ""
+        try:
+            transcript_text = await asyncio.to_thread(
+                read_any_text,
+                transcript_path,
+                self._max_file_read_chars,
+            )
+        except Exception as exc:
+            log.warning(
+                "[%s] Не удалось прочитать стенограмму для протокола: %s",
+                task_id, exc,
+            )
+
+        if not transcript_text.strip():
+            result["error"] = (
+                "Пустая стенограмма — невозможно сформировать протокол"
+            )
+            log.warning(
+                "[%s] Автогенерация протокола: пустая стенограмма",
+                task_id,
+            )
+            return result
+
+        # --- Источник промпта ---
+        # Приоритет — сохранённый файл deepseek_prompt.* из папки
+        # записи (формируется на шаге 3 конвейера). Он содержит
+        # корректную инструкцию (промпт, указанный пользователем
+        # при создании записи, или шаблон скрам), контекст,
+        # глоссарий, предыдущий протокол и стенограмму — всю
+        # информацию, необходимую для генерации протокола.
+        deepseek_path = self._find_deepseek_prompt_file(session_dir)
+        deepseek_text = ""
+        if deepseek_path:
+            try:
+                deepseek_text = await asyncio.to_thread(
+                    read_any_text,
+                    deepseek_path,
+                    self._max_file_read_chars,
+                )
+            except Exception as exc:
+                log.warning(
+                    "[%s] Не удалось прочитать %s: %s",
+                    task_id, deepseek_path, exc,
+                )
+
+        if deepseek_text.strip():
+            system_prompt = (
+                "Ты — ассистент, который оформляет протоколы "
+                "совещаний. В сообщении содержатся инструкция "
+                "и материалы совещания. Строго выполни "
+                "инструкцию из сообщения и верни ТОЛЬКО готовый "
+                "протокол в формате Markdown, без пояснений "
+                "и обрамляющего текста."
+            )
+            user_message = deepseek_text.strip()
+            prompt_source = os.path.basename(deepseek_path)
+            log.info(
+                "[%s] Промпт для протокола: %s (%d символов)",
+                task_id, deepseek_path, len(user_message),
+            )
+        else:
+            # Fallback: файла deepseek_prompt.* нет (формирование
+            # отключено или не удалось) — собираем промпт из
+            # шаблона scrum.prompt_template и стенограммы.
+            system_prompt = template
+
+            # Читаем предыдущий протокол (если указан)
+            prev_protocol_path = str(
+                metadata.get("previous_protocol_path") or ""
+            ).strip()
+            prev_protocol_text = ""
+            if prev_protocol_path and os.path.isfile(prev_protocol_path):
+                try:
+                    prev_protocol_text = await asyncio.to_thread(
+                        read_any_text,
+                        prev_protocol_path,
+                        self._max_file_read_chars,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[%s] Не удалось прочитать предыдущий "
+                        "протокол: %s",
+                        task_id, exc,
+                    )
+
+            parts: List[str] = []
+            if session_name:
+                parts.append(f"# {session_name}")
+                parts.append("")
+            if session_date:
+                parts.append(f"Дата совещания: {session_date}")
+                parts.append("")
+
+            if prev_protocol_text.strip():
+                parts.append("=== ПРОТОКОЛ ПРЕДЫДУЩЕГО СОВЕЩАНИЯ ===")
+                parts.append(prev_protocol_text.strip())
+                parts.append("")
+
+            parts.append("=== СТЕНОГРАММА ===")
+            parts.append(transcript_text.strip())
+
+            user_message = "\n".join(parts)
+            prompt_source = "scrum.prompt_template"
+
+        log.info(
+            "[%s] Генерация протокола через LiteLLM: "
+            "модель=%s, источник промпта=%s, системный=%d симв, "
+            "вход=%d симв",
+            task_id, model, prompt_source,
+            len(system_prompt), len(user_message),
+        )
+
+        raw = ""
+        try:
+            async with LiteLLMClient(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            ) as client:
+                raw = await client.chat_completion(
+                    system_prompt=system_prompt,
+                    user_prompt=user_message,
+                    model=model,
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                )
+        except LiteLLMError as exc:
+            log.error(
+                "[%s] Ошибка LiteLLM при генерации протокола: %s",
+                task_id, exc,
+            )
+            result["error"] = f"Ошибка LiteLLM: {exc}"
+            return result
+        except Exception as exc:
+            log.exception(
+                "[%s] Неожиданная ошибка при генерации протокола: %s",
+                task_id, exc,
+            )
+            result["error"] = f"Ошибка: {exc}"
+            return result
+
+        if not raw or not raw.strip():
+            result["error"] = "LiteLLM вернул пустой ответ"
+            log.warning(
+                "[%s] Автогенерация протокола: пустой ответ LLM",
+                task_id,
+            )
+            return result
+
+        # Сохраняем протокол в формате Markdown — его можно
+        # редактировать во встроенном редакторе приложения
+        # (Меню → Протокол → «Создать/редактировать протокол
+        # (Markdown)», Ctrl+M).
+        md_path = os.path.join(session_dir, "protocol.md")
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(raw)
+        except Exception as exc:
+            log.warning(
+                "[%s] Не удалось сохранить protocol.md: %s",
+                task_id, exc,
+            )
+            result["error"] = f"Не удалось сохранить protocol.md: {exc}"
+            return result
+
+        log.info(
+            "[%s] Протокол (md) сохранён: %s (%d символов)",
+            task_id, md_path, len(raw),
+        )
+
+        result["ok"] = True
+        result["md_path"] = md_path
+        result["docx_path"] = ""
+        result["chars"] = len(raw)
+        return result
 
 
 class _CancelledError(Exception):

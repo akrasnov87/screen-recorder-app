@@ -67,6 +67,10 @@ DEFAULT_SCRUM_PROMPT = (
     "Придерживайся этой структуры, ничего лишнего не добавляй, если этого "
     "не было озвучено в стенограмме."
 )
+DEFAULT_SUMMARY_PROMPT = (
+    "Составь краткое содержание записи на русском языке. "
+    "Выдели ключевые темы, решения и список action items."
+)
 DEFAULT_ACTION_ITEMS_PROMPT = (
     "Ты — ассистент, который извлекает поручения из протокола "
     "совещания.\n\n"
@@ -197,6 +201,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "Выдели ключевые темы и решения. В конце — список "
             "action items."
         ),
+        "summary_prompt": DEFAULT_SUMMARY_PROMPT,
         "name_templates": DEFAULT_NAME_TEMPLATES,
     },
     "transcribe": {
@@ -241,6 +246,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "export_format": "docx",
         "generate_action_items": False,
         "generate_action_items_from_protocol": True,
+        "auto_generate_protocol": True,
     },
     "summarizer": {
         "protocol_summary_enabled": True,
@@ -693,6 +699,11 @@ class ConfigManager:
     def get_default_prompt(self) -> str:
         return self.config.get("metadata", {}).get("default_prompt", "") or ""
 
+    def get_summary_prompt(self) -> str:
+        """Промпт для генерации summary (Настройки → Промпты и имена)."""
+        meta = self.config.get("metadata", {}) or {}
+        return str(meta.get("summary_prompt", "") or "").strip()
+
     def get_name_templates(self) -> List[Dict[str, str]]:
         meta = self.config.get("metadata", {}) or {}
         raw = meta.get("name_templates", [])
@@ -914,6 +925,9 @@ class ConfigManager:
             ),
             "generate_action_items_from_protocol": bool(
                 cfg.get("generate_action_items_from_protocol", True)
+            ),
+            "auto_generate_protocol": bool(
+                cfg.get("auto_generate_protocol", True)
             ),
         }
 

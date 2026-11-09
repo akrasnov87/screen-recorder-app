@@ -727,15 +727,17 @@ class SettingsWindow(QDialog):
         else:
             current_item.setText(hex_color)
 
-        pixmap = QColor(hex_color)
-        current_item.setBackground(pixmap)
+        qcolor = QColor(hex_color)
+        current_item.setBackground(qcolor)
+        # Текст в колонке «Цвет» — контрастный, чтобы читался на фоне
+        current_item.setForeground(
+            QColor("#FFFFFF") if qcolor.lightness() < 128
+            else QColor("#000000")
+        )
         name_item = self.tags_table.item(row, 0)
         if name_item:
-            name_item.setForeground(
-                QColor("#FFFFFF")
-                if pixmap.lightness() < 128
-                else QColor("#000000")
-            )
+            # Текст названия тега — его собственный цвет
+            name_item.setForeground(qcolor)
 
         log.info("Цвет тега «%s»: %s",
                  name_item.text() if name_item else "—", hex_color)
@@ -1997,6 +1999,20 @@ class SettingsWindow(QDialog):
         self.default_prompt_edit.setFixedHeight(90)
         layout.addWidget(self.default_prompt_edit)
 
+        summary_prompt_header = QHBoxLayout()
+        summary_prompt_header.addWidget(
+            QLabel("<b>Промпт для генерации summary</b>")
+        )
+        summary_prompt_header.addStretch()
+        summary_prompt_header.addWidget(
+            make_info_icon("summary_prompt")
+        )
+        layout.addLayout(summary_prompt_header)
+
+        self.summary_prompt_edit = QPlainTextEdit()
+        self.summary_prompt_edit.setFixedHeight(90)
+        layout.addWidget(self.summary_prompt_edit)
+
         names_header = QHBoxLayout()
         names_header.addWidget(
             QLabel("<b>Шаблоны названий записи</b>")
@@ -2592,7 +2608,7 @@ class SettingsWindow(QDialog):
         self.sum_litellm_temperature.setDecimals(2)
 
         self.sum_litellm_max_tokens = QSpinBox()
-        self.sum_litellm_max_tokens.setRange(64, 32000)
+        self.sum_litellm_max_tokens.setRange(64, 64000)
 
         self.sum_litellm_connect_timeout = QSpinBox()
         self.sum_litellm_connect_timeout.setRange(1, 600)
@@ -3986,12 +4002,15 @@ class SettingsWindow(QDialog):
                     qcolor = QColor(color)
                     if qcolor.isValid():
                         color_item.setBackground(qcolor)
-                        if qcolor.lightness() < 128:
-                            name_item.setForeground(QColor("#FFFFFF"))
-                            color_item.setForeground(QColor("#FFFFFF"))
-                        else:
-                            name_item.setForeground(QColor("#000000"))
-                            color_item.setForeground(QColor("#000000"))
+                        # Текст в колонке «Цвет» — контрастный,
+                        # чтобы читался на цветном фоне
+                        color_item.setForeground(
+                            QColor("#FFFFFF")
+                            if qcolor.lightness() < 128
+                            else QColor("#000000")
+                        )
+                        # Текст названия тега — его собственный цвет
+                        name_item.setForeground(qcolor)
                 except Exception:
                     pass
             self.tags_table.setItem(row, 1, color_item)
@@ -4173,6 +4192,9 @@ class SettingsWindow(QDialog):
 
         self.default_prompt_edit.setPlainText(
             cfg.get("metadata", {}).get("default_prompt", "")
+        )
+        self.summary_prompt_edit.setPlainText(
+            cfg.get("metadata", {}).get("summary_prompt", "")
         )
 
         # --- Шаблоны названий ---
@@ -4657,6 +4679,9 @@ class SettingsWindow(QDialog):
         meta_cfg["prompts"] = prompts
         meta_cfg["default_prompt"] = (
             self.default_prompt_edit.toPlainText().strip()
+        )
+        meta_cfg["summary_prompt"] = (
+            self.summary_prompt_edit.toPlainText().strip()
         )
         meta_cfg["name_templates"] = name_templates
 

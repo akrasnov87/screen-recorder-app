@@ -270,8 +270,17 @@ async def _generate_summary_async(
     read_timeout = float(litellm_cfg.get("read_timeout", 300))
     system_prompt = str(litellm_cfg.get("system_prompt") or "").strip()
 
-    # Пользовательский промпт — из metadata.default_prompt
+    # Пользовательский промпт — из настроек
+    # (Настройки → Промпты и имена → «Промпт для генерации summary»),
+    # fallback — «Промпт по умолчанию».
+    summary_prompt = ""
     default_prompt = ""
+    try:
+        summary_prompt = (
+            config_manager.get_summary_prompt() or ""
+        )
+    except Exception:
+        pass
     try:
         default_prompt = (
             config_manager.get_default_prompt() or ""
@@ -280,9 +289,9 @@ async def _generate_summary_async(
         pass
 
     user_prompt = (
-        default_prompt.strip()
-        or "Составь краткое содержание записи на русском языке. "
-           "Выдели ключевые темы, решения и список action items."
+        summary_prompt.strip()
+        or default_prompt.strip()
+        or "Составь краткое содержание записи."
     )
 
     # Глоссарий (если включён)

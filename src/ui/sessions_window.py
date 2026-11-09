@@ -507,6 +507,66 @@ class _SummaryWorker(QThread):
             log.exception("_SummaryWorker: ошибка: %s", exc)
             self.failed.emit(str(exc))
 
+
+# ---------------------------------------------------------------------------
+# Фоновый воркер для автогенерации протокола через LLM
+# ---------------------------------------------------------------------------
+class _ProtocolGenWorker(QThread):
+    """
+    Повторно формирует протокол через LiteLLM (использует метод
+    VideoProcessor._generate_protocol_via_llm).
+    """
+
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        session_dir: str,
+        transcript_path: str,
+        metadata: Dict[str, Any],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._config = config
+        self._session_dir = session_dir
+        self._transcript_path = transcript_path
+        self._metadata = metadata
+
+    def run(self) -> None:
+        try:
+            import asyncio
+            from ..processor import VideoProcessor
+            from ..task_queue import TaskQueue
+
+            # Создаём минимальный VideoProcessor без очереди задач
+            # (мы не используем очередь, только метод генерации).
+            proc = VideoProcessor(
+                config=self._config,
+                task_queue=TaskQueue(),
+                config_manager=None,
+            )
+            task_id = "retry-protocol"
+            result = asyncio.run(
+                proc._generate_protocol_via_llm(
+                    task_id=task_id,
+                    session_dir=self._session_dir,
+                    transcript_path=self._transcript_path,
+                    metadata=self._metadata,
+                )
+            )
+            if result.get("ok"):
+                self.finished_ok.emit(result)
+            else:
+                self.failed.emit(
+                    result.get("error") or "Неизвестная ошибка"
+                )
+        except Exception as exc:
+            log.exception("_ProtocolGenWorker: ошибка: %s", exc)
+            self.failed.emit(str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Фоновый воркер для синхронизации одной записи
 # ---------------------------------------------------------------------------
@@ -1631,6 +1691,9 @@ class SessionsWindow(QDialog):
         self._pending_media_request: Optional[Dict[str, Any]] = None
         self._summary_worker: Optional[_SummaryWorker] = None
         self._summary_progress_dlg: Optional[QProgressDialog] = None
+        self._protocol_gen_worker: Optional[_ProtocolGenWorker] = None
+        self._protocol_gen_session_dir: str = ""
+        self._approve_session_dir: str = ""
 
         self._active_tag_chips: Dict[str, QPushButton] = {}
 
@@ -1798,6 +1861,20 @@ class SessionsWindow(QDialog):
             chars,
         )
 
+        # --- Отмечаем протокол как утверждённый (если было «Утвердить») ---
+        approve_dir = getattr(self, "_approve_session_dir", "") or ""
+        if approve_dir:
+            session_json = os.path.join(approve_dir, "session.json")
+            meta = read_json_file(session_json) or {}
+            meta["protocol_approved"] = True
+            meta["protocol_approved_at"] = datetime.now().isoformat()
+            self._write_json(session_json, meta)
+            self._approve_session_dir = ""
+            log.info(
+                "_on_summary_finished: протокол утверждён (%s)",
+                os.path.basename(approve_dir),
+            )
+
         QMessageBox.information(
             self, "Summary",
             f"Summary успешно сгенерирован.\n\n"
@@ -1823,6 +1900,10 @@ class SessionsWindow(QDialog):
 
     def _on_summary_worker_done(self) -> None:
         self._summary_worker = None
+        # Сбрасываем флаг «утверждения протокола» независимо от исхода:
+        # если summary не удалась, следующий успешный запуск summary
+        # (по любой причине) не должен помечать протокол утверждённым.
+        self._approve_session_dir = ""
 
     # ------------------------------------------------------------------
     # UI
@@ -3320,6 +3401,23 @@ class SessionsWindow(QDialog):
             self._export_protocol_docx
         )
         m_protocol.addAction(act_export_protocol_docx)
+
+        act_approve_protocol = QAction(
+            "Утвердить протокол (сгенерировать summary)", self
+        )
+        act_approve_protocol.setShortcut(QKeySequence("Ctrl+U"))
+        act_approve_protocol.triggered.connect(
+            self._approve_auto_protocol
+        )
+        m_protocol.addAction(act_approve_protocol)
+
+        act_retry_protocol_gen = QAction(
+            "Повторить автогенерацию протокола…", self
+        )
+        act_retry_protocol_gen.triggered.connect(
+            self._retry_protocol_generation
+        )
+        m_protocol.addAction(act_retry_protocol_gen)
 
         m_protocol.addSeparator()
 
@@ -5992,8 +6090,11 @@ class SessionsWindow(QDialog):
         if os.path.exists(md_path):
             initial_text = read_any_text(md_path)
         else:
-            existing = r.get("manual_protocol_path") or ""
-            if existing and os.path.exists(existing):
+            # Ищем существующий протокол (в т.ч. автогенерированный
+            # protocol.md) — его содержимое подгружаем в редактор,
+            # чтобы пользователь мог отредактировать.
+            existing = self._find_manual_protocol_path(r)
+            if existing:
                 initial_text = self._read_protocol_as_text(existing)
 
         default_docx = os.path.join(
@@ -6220,6 +6321,155 @@ class SessionsWindow(QDialog):
             protocol_path=target,
             context="файл протокола прикреплён",
         )
+
+    # ------------------------------------------------------------------
+    # Утверждение автогенерированного протокола
+    # ------------------------------------------------------------------
+    def _approve_auto_protocol(self) -> None:
+        """
+        «Утвердить» протокол: запускает генерацию summary без
+        дополнительного подтверждения (пользователь уже подтвердил
+        нажатием кнопки).
+        """
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        session_dir = r["dir"]
+        session_json = os.path.join(session_dir, "session.json")
+        meta = read_json_file(session_json) or {}
+
+        if not meta.get("protocol_auto_generated"):
+            QMessageBox.information(
+                self, "Протокол",
+                "Этот протокол не был сгенерирован автоматически. "
+                "Используйте «Прикрепить файл протокола…» из меню "
+                "«Протокол».",
+            )
+            return
+
+        if meta.get("protocol_approved"):
+            QMessageBox.information(
+                self, "Протокол",
+                "Протокол уже утверждён.",
+            )
+            return
+
+        if self._summary_worker is not None and self._summary_worker.isRunning():
+            QMessageBox.information(
+                self, "Summary",
+                "Генерация summary уже выполняется. "
+                "Дождитесь завершения.",
+            )
+            return
+
+        protocol_path = find_protocol_in_session(session_dir)
+        if not protocol_path or not os.path.isfile(protocol_path):
+            QMessageBox.warning(
+                self, "Протокол",
+                "Протокол не найден в папке записи.",
+            )
+            return
+
+        self._approve_session_dir = session_dir
+        self._start_summary_generation(
+            session_dir=session_dir,
+            protocol_path=protocol_path,
+        )
+
+    def _retry_protocol_generation(self) -> None:
+        """Повторить автогенерацию протокола (если предыдущая попытка упала)."""
+        r = self._selected_row()
+        if not r:
+            QMessageBox.warning(self, "Записи", "Выберите запись")
+            return
+
+        session_dir = r["dir"]
+        if not os.path.isdir(session_dir):
+            QMessageBox.warning(
+                self, "Записи",
+                f"Папка записи не найдена:\n{session_dir}",
+            )
+            return
+
+        transcript_path = os.path.join(session_dir, "video.txt")
+        if not os.path.isfile(transcript_path):
+            QMessageBox.information(
+                self, "Протокол",
+                "Стенограмма (video.txt) не найдена — "
+                "нельзя сформировать протокол.",
+            )
+            return
+
+        session_json = os.path.join(session_dir, "session.json")
+        meta = read_json_file(session_json) or {}
+
+        cm = self.config_manager
+        cfg = getattr(cm, "config", {}) if cm is not None else {}
+        self._protocol_gen_worker = _ProtocolGenWorker(
+            config=cfg,
+            session_dir=session_dir,
+            transcript_path=transcript_path,
+            metadata=meta,
+            parent=self,
+        )
+        self._protocol_gen_session_dir = session_dir
+        self._protocol_gen_worker.finished_ok.connect(
+            self._on_protocol_gen_ok
+        )
+        self._protocol_gen_worker.failed.connect(
+            self._on_protocol_gen_failed
+        )
+        self._protocol_gen_worker.finished.connect(
+            self._on_protocol_gen_worker_done
+        )
+        self._protocol_gen_worker.start()
+
+        log.info(
+            "_retry_protocol_generation: session=%s",
+            os.path.basename(session_dir),
+        )
+
+    def _on_protocol_gen_ok(self, result: Dict[str, Any]) -> None:
+        session_dir = getattr(
+            self, "_protocol_gen_session_dir", ""
+        ) or ""
+        if not session_dir:
+            r = self._selected_row()
+            if r:
+                session_dir = r["dir"]
+
+        # Сохраняем метки в session.json
+        if session_dir:
+            session_json = os.path.join(session_dir, "session.json")
+            meta = read_json_file(session_json) or {}
+            meta["protocol_auto_generated"] = True
+            meta["protocol_generated_at"] = datetime.now().isoformat()
+            meta["protocol_approved"] = False
+            self._write_json(session_json, meta)
+
+        chars = int(result.get("chars") or 0)
+        protocol_path = result.get("docx_path") or result.get("md_path") or ""
+        QMessageBox.information(
+            self, "Протокол",
+            f"Протокол сформирован ({chars} символов).\n\n"
+            f"Файл: {os.path.basename(protocol_path) if protocol_path else '—'}\n\n"
+            f"Теперь можно отредактировать протокол во встроенном "
+            f"редакторе (Меню → Протокол → «Создать/редактировать "
+            f"протокол (Markdown)», Ctrl+M) и утвердить его: "
+            f"Меню → Протокол → «Утвердить протокол».",
+        )
+        self.refresh()
+
+    def _on_protocol_gen_failed(self, error: str) -> None:
+        QMessageBox.warning(
+            self, "Протокол",
+            f"Не удалось сформировать протокол:\n\n{error}",
+        )
+
+    def _on_protocol_gen_worker_done(self) -> None:
+        self._protocol_gen_worker = None
 
     def _open_manual_protocol(self) -> None:
         r = self._selected_row()

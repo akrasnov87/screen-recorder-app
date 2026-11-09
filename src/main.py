@@ -229,6 +229,9 @@ class ScreenRecorderApp(QObject):
         self.processor.task_progress.connect(self._on_task_progress)
         self.processor.task_completed.connect(self._on_task_completed)
         self.processor.task_failed.connect(self._on_task_failed)
+        self.processor.protocol_generation_failed.connect(
+            self._on_protocol_generation_failed
+        )
 
         register_gui_handler(self._on_log_to_gui)
 
@@ -450,6 +453,7 @@ class ScreenRecorderApp(QObject):
             "generate_summary": False,
             "is_scrum": False,
             "generate_deepseek_prompt": True,
+            "auto_generate_protocol": True,
             "include_name_in_prompt": True,
             "include_project_in_prompt": True,
             "include_comment_in_prompt": True,
@@ -1125,6 +1129,7 @@ class ScreenRecorderApp(QObject):
             "generate_summary": False,
             "is_scrum": False,
             "generate_deepseek_prompt": True,
+            "auto_generate_protocol": True,
             "include_name_in_prompt": True,
             "include_project_in_prompt": True,
             "include_comment_in_prompt": True,
@@ -1224,6 +1229,22 @@ class ScreenRecorderApp(QObject):
         self._notify(
             "Ошибка обработки", error[:100],
             QSystemTrayIcon.MessageIcon.Critical,
+        )
+
+    def _on_protocol_generation_failed(
+        self, task_id: str, error: str
+    ) -> None:
+        log.warning(
+            "Автогенерация протокола (задача %s) не удалась: %s",
+            task_id, error,
+        )
+        self._notify(
+            "Протокол не сформирован",
+            f"Не удалось сгенерировать протокол:\n"
+            f"{error[:120]}\n\n"
+            f"Повторить: окно «Записи» → Протокол → "
+            f"«Повторить автогенерацию протокола…»",
+            QSystemTrayIcon.MessageIcon.Warning,
         )
 
     def _maybe_offer_summary_after_import(
