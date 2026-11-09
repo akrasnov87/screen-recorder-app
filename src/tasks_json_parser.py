@@ -138,59 +138,79 @@ def parse_action_items_json(raw: str) -> ParseResult:
         )
 
     # --- 4. Пробуем распарсить JSON ---
+    data: Any = None
+    truncated: bool = False
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        fixed = _fix_common_json_errors(text)
-        try:
-            data = json.loads(fixed)
-            log.info(
-                "JSON распарсен после мягкой коррекции "
-                "(изначальная ошибка: %s)", exc,
-            )
-        except json.JSONDecodeError as exc2:
-            log.warning(
-                "Не удалось разобрать JSON: %s\n"
-                "После коррекции: %s", exc, exc2,
-            )
-            # --- ВРЕМЕННО (отладка): сохраняем сырой текст ---
-            try:
-                from pathlib import Path
-                import tempfile
-                import time as _time
-
-                dump_dir = Path(tempfile.gettempdir()) / "screen-recorder"
-                dump_dir.mkdir(parents=True, exist_ok=True)
-                stamp = _time.strftime("%Y%m%d_%H%M%S")
-                raw_path = dump_dir / f"tasks_json_broken_{stamp}_raw.txt"
-                fixed_path = dump_dir / f"tasks_json_broken_{stamp}_fixed.txt"
-                raw_path.write_text(text, encoding="utf-8")
-                fixed_path.write_text(fixed, encoding="utf-8")
+        # --- Обрезанный JSON (лимит токенов LLM):
+        #     восстановление по последнему целому элементу ---
+        if "Unterminated string" in exc.msg:
+            data = _recover_truncated_json(text, exc)
+            if data is not None:
+                truncated = True
                 log.warning(
-                    "Сырой JSON сохранён: raw=%s (len=%d), "
-                    "fixed=%s (len=%d), char=%d",
-                    raw_path, len(text),
-                    fixed_path, len(fixed),
-                    exc2.pos,
+                    "Ответ LLM был обрезан (Unterminated string, "
+                    "позиция %d) — восстановлены полные элементы "
+                    "до места обрыва.", exc.pos,
                 )
-            except Exception as dump_exc:
-                log.error("Не удалось сохранить дамп JSON: %s", dump_exc)
-            # --- /ВРЕМЕННО ---
+        if data is None:
+            fixed = _fix_common_json_errors(text)
+            try:
+                data = json.loads(fixed)
+                log.info(
+                    "JSON распарсен после мягкой коррекции "
+                    "(изначальная ошибка: %s)", exc,
+                )
+            except json.JSONDecodeError as exc2:
+                log.warning(
+                    "Не удалось разобрать JSON: %s\n"
+                    "После коррекции: %s", exc, exc2,
+                )
+                # --- ВРЕМЕННО (отладка): сохраняем сырой текст ---
+                try:
+                    from pathlib import Path
+                    import tempfile
+                    import time as _time
 
-            # Обрезаем текст для показа в UI.
-            preview = text[:200]
-            if len(text) > 200:
-                preview += "…"
-            return ParseResult(
-                [],
-                warning=(
-                    f"Не удалось разобрать JSON: {exc.msg} "
-                    f"(строка {exc.lineno}, позиция {exc.colno}).\n"
-                    f"Начало текста: {preview!r}"
-                ),
-            )
+                    dump_dir = Path(tempfile.gettempdir()) / "screen-recorder"
+                    dump_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = _time.strftime("%Y%m%d_%H%M%S")
+                    raw_path = dump_dir / f"tasks_json_broken_{stamp}_raw.txt"
+                    fixed_path = dump_dir / f"tasks_json_broken_{stamp}_fixed.txt"
+                    raw_path.write_text(text, encoding="utf-8")
+                    fixed_path.write_text(fixed, encoding="utf-8")
+                    log.warning(
+                        "Сырой JSON сохранён: raw=%s (len=%d), "
+                        "fixed=%s (len=%d), char=%d",
+                        raw_path, len(text),
+                        fixed_path, len(fixed),
+                        exc2.pos,
+                    )
+                except Exception as dump_exc:
+                    log.error("Не удалось сохранить дамп JSON: %s", dump_exc)
+                # --- /ВРЕМЕННО ---
 
-    return _normalize_parsed(data)
+                # Обрезаем текст для показа в UI.
+                preview = text[:200]
+                if len(text) > 200:
+                    preview += "…"
+                return ParseResult(
+                    [],
+                    warning=(
+                        f"Не удалось разобрать JSON: {exc.msg} "
+                        f"(строка {exc.lineno}, позиция {exc.colno}).\n"
+                        f"Начало текста: {preview!r}"
+                    ),
+                )
+
+    result = _normalize_parsed(data)
+    if truncated and not result.warning:
+        result.warning = (
+            "Ответ LLM был обрезан — JSON восстановлен частично, "
+            "возможно, часть поручений потеряна."
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +488,67 @@ def _fix_common_json_errors(text: str) -> str:
 
     return s
 
+
+def _recover_truncated_json(
+    text: str, exc: json.JSONDecodeError
+) -> Optional[Any]:
+    """
+    Восстанавливает обрезанный JSON (лимит токенов LLM).
+
+    Берёт текст до места ошибки, отрезает по последней закрывающей
+    фигурной скобке (конец последнего целого поручения) и дописывает
+    недостающие закрывающие скобки. Если строка парсится — возвращает
+    данные, иначе None.
+    """
+    cut = text[:exc.pos]
+    last_brace = cut.rfind("}")
+    if last_brace == -1:
+        return None
+    candidate = cut[: last_brace + 1]
+
+    # Сначала точечные варианты (типичный случай ']}').
+    for suffix in ("]}", "]", "}"):
+        try:
+            return json.loads(candidate + suffix)
+        except json.JSONDecodeError:
+            continue
+
+    # Общий вариант: закрываем скобки по стеку, учитывая строки
+    # (скобки внутри строк не считаются).
+    stack: List[str] = []
+    in_str = False
+    esc = False
+    for ch in candidate:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+    closings = '"' if in_str else ""
+    closings += "".join(
+        "}" if o == "{" else "]" for o in reversed(stack)
+    )
+    if not closings:
+        return None
+    try:
+        return json.loads(candidate + closings)
+    except json.JSONDecodeError:
+        return None
+
+
 def _strip_bom(text: str) -> str:
     """Убирает BOM (UTF-8/UTF-16) и ведущие пробельные символы."""
     if not text:
@@ -491,17 +572,11 @@ def _trim_to_json_start(text: str) -> str:
     if not text:
         return ""
 
-    for ch in ("{", "["):
-        idx = text.find(ch)
-        if idx == -1:
-            continue
-        # Если символов до скобки немного (< 40) — обрезаем.
-        # Если больше — скорее всего это не JSON, оставляем как есть,
-        # чтобы показать пользователю исходный текст.
-        if idx <= 40:
-            return text[idx:]
-        # Для длинного мусора — всё равно пробуем отрезать,
-        # чтобы хоть что-то попробовать распарсить.
-        return text[idx:]
-
-    return ""
+    # Ищем самую раннюю открывающую скобку ('{' или '['),
+    # чтобы не отрезать ведущую '[' у топ-уровневого массива.
+    idxs = [text.find(ch) for ch in ("{", "[")]
+    idxs = [i for i in idxs if i != -1]
+    if not idxs:
+        return ""
+    idx = min(idxs)
+    return text[idx:]

@@ -568,6 +568,57 @@ class _ProtocolGenWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Фоновый воркер для извлечения поручений через LLM
+# ---------------------------------------------------------------------------
+class _ActionItemsLLMWorker(QThread):
+    """
+    Извлекает поручения из протокола через LiteLLM
+    (regenerate_action_items_with_llm_sync) в фоновом потоке,
+    чтобы не блокировать UI (запрос занимает ~50 секунд).
+    """
+
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        config_manager,
+        session_dir: str,
+        session_name: str = "",
+        session_date: str = "",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._config_manager = config_manager
+        self._session_dir = session_dir
+        self._session_name = session_name
+        self._session_date = session_date
+
+    def run(self) -> None:
+        try:
+            from ..protocol_action_items_helper import (
+                regenerate_action_items_with_llm_sync,
+            )
+            result = regenerate_action_items_with_llm_sync(
+                config_manager=self._config_manager,
+                session_dir=self._session_dir,
+                session_name=self._session_name,
+                session_date=self._session_date,
+                progress_cb=self.progress.emit,
+            )
+            if result.get("ok"):
+                self.finished_ok.emit(result)
+            else:
+                self.failed.emit(
+                    result.get("error") or "Неизвестная ошибка"
+                )
+        except Exception as exc:
+            log.exception("_ActionItemsLLMWorker: ошибка: %s", exc)
+            self.failed.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Фоновый воркер для синхронизации одной записи
 # ---------------------------------------------------------------------------
 class _OneSyncWorker(QThread):
@@ -1693,6 +1744,8 @@ class SessionsWindow(QDialog):
         self._summary_progress_dlg: Optional[QProgressDialog] = None
         self._protocol_gen_worker: Optional[_ProtocolGenWorker] = None
         self._protocol_gen_session_dir: str = ""
+        self._action_items_worker: Optional[_ActionItemsLLMWorker] = None
+        self._action_items_ctx: Dict[str, Any] = {}
         self._approve_session_dir: str = ""
 
         self._active_tag_chips: Dict[str, QPushButton] = {}
@@ -3765,41 +3818,85 @@ class SessionsWindow(QDialog):
         )
         QGuiApplication.processEvents()
 
-        try:
-            from ..protocol_action_items_helper import (
-                regenerate_action_items_with_llm_sync,
-            )
-            llm_result = regenerate_action_items_with_llm_sync(
-                config_manager=self.config_manager,
-                session_dir=session_dir,
-                session_name=r.get("name") or "",
-                session_date=r.get("datetime") or "",
-            )
-        except Exception as exc:
-            log.exception(
-                "Ошибка вызова LLM для поручений: %s", exc
-            )
-            llm_result = {
+        # --- Фоновый воркер: LLM-запрос без блокировки UI ---
+        self._action_items_ctx = {
+            "row": r,
+            "prompt_result": res,
+            "original_btn_text": original_btn_text,
+            "original_selection": original_selection,
+        }
+        self._action_items_worker = _ActionItemsLLMWorker(
+            config_manager=self.config_manager,
+            session_dir=session_dir,
+            session_name=r.get("name") or "",
+            session_date=r.get("datetime") or "",
+            parent=self,
+        )
+        self._action_items_worker.progress.connect(
+            self._on_action_items_llm_progress
+        )
+        self._action_items_worker.finished_ok.connect(
+            self._on_action_items_llm_finished
+        )
+        self._action_items_worker.failed.connect(
+            self._on_action_items_llm_failed
+        )
+        self._action_items_worker.finished.connect(
+            self._on_action_items_llm_worker_done
+        )
+        self._action_items_worker.start()
+
+    def _restore_action_items_ui(self) -> None:
+        """Возвращает кнопку и статусную строку в исходное состояние."""
+        ctx = getattr(self, "_action_items_ctx", None) or {}
+        self.regen_action_prompt_btn.setEnabled(True)
+        self.regen_action_prompt_btn.setText(
+            ctx.get("original_btn_text") or ""
+        )
+        self.selection_label.setText(
+            ctx.get("original_selection") or ""
+        )
+        QGuiApplication.processEvents()
+
+    def _on_action_items_llm_progress(self, message: str) -> None:
+        if not message:
+            return
+        self.selection_label.setText(
+            f"<span style='color:#B8860B'>{html.escape(message)}</span>"
+        )
+
+    def _on_action_items_llm_finished(
+        self, llm_result: Dict[str, Any]
+    ) -> None:
+        self._restore_action_items_ui()
+        ctx = getattr(self, "_action_items_ctx", None) or {}
+        self._show_action_items_llm_result(
+            ctx.get("row") or {},
+            ctx.get("prompt_result") or {},
+            llm_result,
+            generate_from_protocol=True,
+        )
+        if llm_result.get("ok") and llm_result.get("added", 0) > 0:
+            self.refresh()
+
+    def _on_action_items_llm_failed(self, error: str) -> None:
+        self._restore_action_items_ui()
+        ctx = getattr(self, "_action_items_ctx", None) or {}
+        self._show_action_items_llm_result(
+            ctx.get("row") or {},
+            ctx.get("prompt_result") or {},
+            {
                 "ok": False,
-                "error": str(exc),
+                "error": error,
                 "added": 0,
                 "skipped": 0,
                 "total": 0,
-            }
-        finally:
-            # Возвращаем кнопку и статус в исходное состояние.
-            self.regen_action_prompt_btn.setEnabled(True)
-            self.regen_action_prompt_btn.setText(original_btn_text)
-            self.selection_label.setText(original_selection)
-            QGuiApplication.processEvents()
-
-        # --- Итоговое сообщение ---
-        self._show_action_items_llm_result(
-            r, res, llm_result, generate_from_protocol=True
+            },
+            generate_from_protocol=True,
         )
 
-        if llm_result.get("ok") and llm_result.get("added", 0) > 0:
-            self.refresh()
+    def _on_action_items_llm_worker_done(self) -> None:
+        self._action_items_worker = None
 
     def _show_action_items_llm_result(
         self,
@@ -3884,6 +3981,36 @@ class SessionsWindow(QDialog):
                 f"<span style='color:#B8860B'>{html.escape(warning)}"
                 f"</span>"
             )
+
+        # --- НОВОЕ: Проверка, найден ли раздел с поручениями ---
+        section_found = llm_result.get("section_found", True)
+        if not section_found:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Раздел с поручениями не найден")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setTextFormat(Qt.TextFormat.RichText)
+            msg.setText(
+                "<b>Внимание!</b> В тексте протокола не найден явный "
+                "раздел с поручениями (например, <code>## 3. ПОРУЧЕНИЯ НА ...</code>).<br><br>"
+                "Модель обработала весь протокол целиком. Из-за большого "
+                "объёма текста ответ мог быть обрезан.<br><br>"
+                "<b>Рекомендация:</b> Откройте файл <code>action_items_prompt.docx</code> "
+                "и добавьте заголовок <code>## ПОРУЧЕНИЯ</code> перед таблицей с задачами. "
+                "Тогда в следующий раз программа передаст модели только этот раздел."
+            )
+            
+            open_btn = msg.addButton("Открыть файл протокола", QMessageBox.ButtonRole.ActionRole)
+            msg.addButton("Понятно", QMessageBox.ButtonRole.AcceptRole)
+            
+            msg.exec()
+            
+            if msg.clickedButton() == open_btn:
+                protocol_path = prompt_result.get("protocol_path")
+                if protocol_path and os.path.exists(protocol_path):
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(protocol_path))
+                else:
+                    QMessageBox.warning(self, "Файл не найден", 
+                                        "Не удалось найти файл протокола для открытия.")
 
         if added > 0:
             lines.append(

@@ -213,6 +213,34 @@ class LiteLLMClient:
         Один запрос Chat Completions. Возвращает `content` первого choice.
         Бросает LiteLLMError при HTTP >= 400 или некорректном ответе.
         """
+        d = await self.chat_completion_detailed(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return d["content"]
+
+    async def chat_completion_detailed(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: Optional[str] = None,
+        temperature: float = 0.25,
+        max_tokens: int = 2200,
+    ) -> Dict[str, Any]:
+        """
+        Один запрос Chat Completions.
+
+        Возвращает dict:
+          {
+            "content": str,        # content первого choice
+            "finish_reason": str,  # "stop" | "length" | ...
+            "usage": dict,         # статистика токенов (если есть)
+          }
+        Бросает LiteLLMError при HTTP >= 400 или некорректном ответе.
+        """
         if self._session is None:
             raise LiteLLMError("aiohttp-сессия не открыта")
 
@@ -228,7 +256,7 @@ class LiteLLMClient:
             "messages": messages,
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
-            "stream": False,
+            "stream": False
         }
 
         log.info("LiteLLM chat: url=%s, model=%s, sys=%d симв, user=%d симв",
@@ -264,14 +292,24 @@ class LiteLLMClient:
                     log.error(msg)
                     raise LiteLLMError(msg, status=resp.status, body=body)
 
-                content = (choices[0].get("message") or {}).get("content") or ""
+                choice = choices[0]
+                content = (choice.get("message") or {}).get("content") or ""
+                finish_reason = str(choice.get("finish_reason") or "")
+                usage = data.get("usage") or {}
                 elapsed = time.monotonic() - t0
                 if not content.strip():
                     log.warning("LiteLLM: пустой content (%.1f с)", elapsed)
                 else:
-                    log.info("LiteLLM ответ получен (%.1f с, %d символов)",
-                             elapsed, len(content))
-                return content
+                    log.info(
+                        "LiteLLM ответ получен (%.1f с, %d символов, "
+                        "finish_reason=%s)",
+                        elapsed, len(content), finish_reason,
+                    )
+                return {
+                    "content": content,
+                    "finish_reason": finish_reason,
+                    "usage": usage,
+                }
         except LiteLLMError:
             raise
         except asyncio.TimeoutError as exc:

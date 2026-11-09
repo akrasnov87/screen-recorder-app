@@ -128,6 +128,45 @@ def _read_protocol_and_transcript(
     return protocol_text.strip(), transcript_text.strip(), protocol_path
 
 
+def _extract_action_items_section(protocol_text: str) -> Tuple[str, bool]:
+    """
+    Вырезает из протокола только раздел с поручениями.
+
+    Возвращает кортеж: (извлеченный_текст, найден_ли_раздел).
+    Если маркер не найден, возвращает (исходный_текст, False).
+    """
+    if not protocol_text:
+        return "", False
+
+    lines = protocol_text.splitlines()
+    start_idx = -1
+
+    # Расширяем список маркеров для поиска (без учета регистра)
+    markers = [
+        "ПОРУЧЕНИЯ НА",
+        "ПОРУЧЕНИЯ",
+        "ACTION ITEMS",
+        "ЗАДАЧИ НА",
+        "СПИСОК ПОРУЧЕНИЙ",
+        "РЕШЕНИЯ И ПОРУЧЕНИЯ",
+    ]
+
+    for i, line in enumerate(lines):
+        line_upper = line.upper()
+        # Проверяем, есть ли в строке один из маркеров
+        if any(marker in line_upper for marker in markers):
+            start_idx = i
+            break
+
+    if start_idx == -1:
+        # Если раздел не найден — возвращаем весь текст
+        return protocol_text, False
+
+    # Возвращаем текст с найденного заголовка до конца
+    extracted_text = "\n".join(lines[start_idx:]).strip()
+    return extracted_text, True
+
+
 # ---------------------------------------------------------------------------
 # Дедупликация
 # ---------------------------------------------------------------------------
@@ -211,6 +250,7 @@ def regenerate_action_items_with_llm_sync(
           "total": int,          # всего поручений в файле после
           "protocol_path": str,
           "transcript_used": bool,
+          "section_found": bool, # найден ли раздел с поручениями
           "error": str,          # описание ошибки (если ok=False)
           "warning": str,        # предупреждение (не ошибка)
         }
@@ -222,6 +262,7 @@ def regenerate_action_items_with_llm_sync(
         "total": 0,
         "protocol_path": "",
         "transcript_used": False,
+        "section_found": False,
         "error": "",
         "warning": "",
     }
@@ -281,11 +322,11 @@ def regenerate_action_items_with_llm_sync(
     base_url = str(l.get("base_url") or "").strip()
     api_key = str(l.get("api_key") or "")
     model = str(l.get("model") or "gpt-4o-mini")
-    max_tokens = 8192 #int(l.get("max_tokens", 8192))
+    max_tokens = int(l.get("max_tokens", 8192))
     connect_timeout = float(l.get("connect_timeout", 15))
     read_timeout = float(l.get("read_timeout", 300))
 
-    # --- Сборка user-сообщения ---
+    # --- Умная сборка user-сообщения ---
     parts: List[str] = []
     if session_name:
         parts.append(f"# {session_name}")
@@ -293,15 +334,54 @@ def regenerate_action_items_with_llm_sync(
     if session_date:
         parts.append(f"Дата совещания: {session_date}")
         parts.append("")
+
+    section_found = False  # Флаг: нашли ли мы раздел с поручениями
+
     if protocol_text:
-        parts.append("=== ПРОТОКОЛ ===")
-        parts.append(protocol_text)
-        parts.append("")
+        # Пытаемся вырезать только раздел с поручениями
+        extracted_protocol, section_found = _extract_action_items_section(
+            protocol_text
+        )
+
+        if section_found and len(extracted_protocol) < len(protocol_text):
+            parts.append("=== ПОРУЧЕНИЯ ИЗ ПРОТОКОЛА ===")
+            parts.append(extracted_protocol)
+            parts.append("")
+            log.info(
+                "В LLM передается только раздел с поручениями "
+                "из протокола (%d симв.)", len(extracted_protocol)
+            )
+            # Обнуляем стенограмму, чтобы не раздувать контекст
+            transcript_text = ""
+        else:
+            # Если раздел не найден, передаем весь протокол
+            parts.append(
+                "=== ПОЛНЫЙ ПРОТОКОЛ "
+                "(раздел с поручениями не найден) ==="
+            )
+            parts.append(protocol_text)
+            parts.append("")
+
     if transcript_text:
         parts.append("=== СТЕНОГРАММА ===")
         parts.append(transcript_text)
 
     user_message = "\n".join(parts)
+
+    # Сохраняем в результат, был ли найден раздел
+    result["section_found"] = section_found
+
+    if not section_found:
+        warning_msg = (
+            "В протоколе не найден явный раздел с поручениями. "
+            "Модель обрабатывает весь текст целиком, что может "
+            "привести к обрезке ответа."
+        )
+        # Добавляем к общему warning, если он уже есть
+        if result.get("warning"):
+            result["warning"] += " " + warning_msg
+        else:
+            result["warning"] = warning_msg
 
     if progress_cb:
         progress_cb(
@@ -311,7 +391,7 @@ def regenerate_action_items_with_llm_sync(
 
     # --- Вызов LiteLLM ---
     try:
-        raw = asyncio.run(
+        resp = asyncio.run(
             _call_litellm(
                 base_url=base_url,
                 api_key=api_key,
@@ -333,6 +413,18 @@ def regenerate_action_items_with_llm_sync(
         )
         result["error"] = f"Ошибка: {exc}"
         return result
+
+    raw = resp.get("content") or ""
+    finish_reason = str(resp.get("finish_reason") or "")
+    if finish_reason == "length":
+        log.warning(
+            "Ответ LLM обрезан по лимиту токенов "
+            "(finish_reason=length, max_tokens=%d)", max_tokens,
+        )
+        result["warning"] = (
+            "Ответ LLM обрезан по лимиту токенов — "
+            "часть поручений может быть потеряна."
+        )
 
     if not raw or not raw.strip():
         result["error"] = "LiteLLM вернул пустой ответ"
@@ -424,7 +516,8 @@ async def _call_litellm(
     max_tokens: int,
     connect_timeout: float,
     read_timeout: float,
-) -> str:
+) -> Dict[str, Any]:
+    """Возвращает {"content": str, "finish_reason": str, "usage": dict}."""
     async with LiteLLMClient(
         base_url=base_url,
         api_key=api_key,
@@ -432,7 +525,7 @@ async def _call_litellm(
         connect_timeout=connect_timeout,
         read_timeout=read_timeout,
     ) as client:
-        return await client.chat_completion(
+        return await client.chat_completion_detailed(
             system_prompt=system_prompt,
             user_prompt=user_message,
             model=model,
