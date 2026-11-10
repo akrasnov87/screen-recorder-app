@@ -15,14 +15,22 @@
 Слева — исходный Markdown, справа — отрендеренный документ.
 Кнопка «Сохранить в DOCX…» выгружает текущий текст в .docx
 через markdown_docx.markdown_to_docx().
+
+Редактор и предпросмотр синхронизируют прокрутку в обе стороны:
+скролл слева ведёт за собой предпросмотр и наоборот. Позиция
+привязывается по карте «строка Markdown → блок предпросмотра»,
+которая пересобирается после каждого рендеринга (строки Markdown
+и блоки рендера не совпадают 1:1 — абзац из N строк это один
+блок, пустые строки исчезают).
 """
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtGui import QFont, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
     QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTextBrowser,
@@ -35,7 +43,282 @@ from ..markdown_docx import markdown_to_docx
 log = get_logger(__name__)
 
 
-class MarkdownEditorDialog(QDialog):
+# ----------------------------------------------------------------------
+# Синхронизация прокрутки: строки Markdown ↔ блоки предпросмотра
+# ----------------------------------------------------------------------
+#
+# Пропорциональный скролл (доля прокрутки слева → доля справа)
+# не работает: абзац из N строк рендерится одним блоком,
+# заголовок/пункт списка/код-блок — по одному блоку, пустые
+# строки исчезают. Сдвиг растёт с длиной документа. Поэтому
+# после каждого рендеринга строится карта «строка → блок»
+# сопоставлением блоков по нормализованному тексту.
+
+_SIG_LEN = 24     # длина сигнатуры блока для сопоставления
+_LOOKAHEAD = 8    # сколько блоков вперёд искать совпадение
+
+_MD_LINE_MARKER_RE = re.compile(
+    r"^(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s*)"
+)
+_MD_INLINE_MARKER_RE = re.compile(r"[*_`]+")
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s")
+_MD_LIST_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s")
+_MD_HR_RE = re.compile(r"^(?:-{3,}|\*{3,}|_{3,})$")
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_block_text(raw: str) -> str:
+    """Нормализует текст для сопоставления блоков.
+
+    Убирает инлайн-маркеры (жирный, курсив, код, ссылки),
+    схлопывает пробелы, приводит к нижнему регистру.
+    """
+    text = raw.replace("\u2029", " ")
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _MD_INLINE_MARKER_RE.sub(" ", text)
+    text = _WS_RE.sub(" ", text).strip()
+    return text.casefold()
+
+
+def _md_block_signature(raw: str) -> str:
+    """Сигнатура блока Markdown: нормализованный текст, усечённый."""
+    lines = raw.split("\n")
+    if lines:
+        lines[0] = _MD_LINE_MARKER_RE.sub("", lines[0].strip())
+    return _normalize_block_text("\n".join(lines))[:_SIG_LEN]
+
+
+def _is_md_special(stripped: str) -> bool:
+    """Является ли строка отдельным блоком (не частью абзаца)."""
+    return (
+        _MD_HEADING_RE.match(stripped) is not None
+        or _MD_LIST_RE.match(stripped) is not None
+        or stripped.startswith(">")
+        or stripped.startswith("```")
+        or _MD_HR_RE.match(stripped) is not None
+    )
+
+
+def _split_md_blocks(
+    lines: list[str],
+) -> list[tuple[int, int, str]]:
+    """Разбивает Markdown на блоки в порядке рендеринга.
+
+    Возвращает список (start_line, end_line, сигнатура):
+    код-фенс, заголовок, пункт списка, цитата, hr — по одному
+    блоку, абзац (подряд идущие обычные строки) — один блок.
+    Пустые строки в результат не попадают.
+    """
+    blocks: list[tuple[int, int, str]] = []
+    i, n = 0, len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        if not stripped:
+            i += 1
+            continue
+        if stripped.startswith("```"):
+            j = i + 1
+            while j < n and not lines[j].strip().startswith("```"):
+                j += 1
+            content = "\n".join(lines[i + 1:j])
+            blocks.append((i, j, _md_block_signature(content)))
+            i = j + 1
+            continue
+        if _is_md_special(stripped):
+            blocks.append((i, i, _md_block_signature(stripped)))
+            i += 1
+            continue
+        j = i
+        while j < n and lines[j].strip() and not _is_md_special(
+            lines[j].strip()
+        ):
+            j += 1
+        blocks.append(
+            (i, j - 1, _md_block_signature("\n".join(lines[i:j])))
+        )
+        i = j
+    return blocks
+
+
+def build_sync_maps(
+    md_text: str, rendered_doc: QTextDocument
+) -> tuple[list[int], list[int]]:
+    """Строит карты «строка → блок предпросмотра» и обратную.
+
+    Блоки Markdown сопоставляются с блоками отрендеренного
+    документа жадным двустрелочным поиском по нормализованному
+    тексту. При промахе (таблицы, вложенные списки и прочая
+    экзотика) блоки потребляются по очереди, поэтому карта
+    остаётся монотонной, а сдвиг — локальным.
+    """
+    lines = md_text.split("\n")
+    n_lines = max(1, len(lines))
+    line_to_block = [0] * n_lines
+
+    # Блоки рендера материализуем один раз: и сопоставление идёт
+    # по готовому списку, и нет O(n) обхода на каждый кандидат.
+    rendered_texts: list[str] = []
+    block = rendered_doc.begin()
+    while block.isValid():
+        rendered_texts.append(_normalize_block_text(block.text()))
+        block = block.next()
+    n_blocks = max(1, len(rendered_texts))
+
+    r = 0
+    for start, end, sig in _split_md_blocks(lines):
+        target = None
+        if len(sig) >= 4:
+            for cand in range(r, min(r + _LOOKAHEAD, n_blocks)):
+                if sig in rendered_texts[cand]:
+                    target = cand
+                    break
+        if target is None:
+            target = r if r < n_blocks else n_blocks - 1
+        for line in range(start, end + 1):
+            line_to_block[line] = target
+        r = target + 1
+
+    # Пустые строки, не покрытые блоками, наследуют ближайший
+    # предшествующий блок (самая первая строка остаётся блоком 0).
+    for i in range(1, n_lines):
+        if line_to_block[i] == 0 and line_to_block[i - 1] != 0:
+            line_to_block[i] = line_to_block[i - 1]
+
+    block_to_line = [n_lines - 1] * n_blocks
+    seen = [False] * n_blocks
+    for line, b in enumerate(line_to_block):
+        if not seen[b]:
+            block_to_line[b] = line
+            seen[b] = True
+
+    # Qt иногда рендерит пустые артефактные блоки (например, после
+    # код-фенса), которым не соответствует ни одна строка Markdown.
+    # Чтобы обратная синхронизация не прыгала в конец документа,
+    # такие блоки наследуют строку ближайшего предшествующего
+    # покрытого блока.
+    last = 0
+    for b in range(n_blocks):
+        if seen[b]:
+            last = block_to_line[b]
+        else:
+            block_to_line[b] = last
+
+    return line_to_block, block_to_line
+
+
+class _ScrollSyncMixin:
+    """Двунаправленная синхронизация прокрутки Markdown ↔ предпросмотр.
+
+    Позиция определяется верхней видимой строкой/блоком и картой
+    «строка → блок», построенной при рендеринге. Прокрутка — только
+    через verticalScrollBar().setValue(): текстовый курсор редактора
+    не трогаем (setTextCursor сдвинул бы позицию ввода).
+    """
+
+    def _setup_scroll_sync(
+        self, editor: QPlainTextEdit, preview: QTextBrowser
+    ) -> None:
+        self._sync_editor = editor
+        self._sync_preview = preview
+        self._line_to_block: list[int] = []
+        self._block_to_line: list[int] = []
+        # Антизацикловка: Qt-сигналы синхронные, поэтому вся цепочка
+        # setValue → valueChanged → setValue проходит под одним флагом.
+        self._syncing = False
+        editor.verticalScrollBar().valueChanged.connect(
+            self._on_editor_scrolled
+        )
+        preview.verticalScrollBar().valueChanged.connect(
+            self._on_preview_scrolled
+        )
+
+    def _rebuild_sync_map(self, md_text: str) -> None:
+        self._line_to_block, self._block_to_line = build_sync_maps(
+            md_text, self._sync_preview.document()
+        )
+
+    def _on_editor_scrolled(self) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self._sync_editor_to_preview()
+        finally:
+            self._syncing = False
+
+    def _on_preview_scrolled(self) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self._sync_preview_to_editor()
+        finally:
+            self._syncing = False
+
+    def _sync_editor_to_preview(self) -> None:
+        if not self._line_to_block:
+            return
+        line = self._first_visible_block_number(self._sync_editor)
+        if line < len(self._line_to_block):
+            self._scroll_view_to_block(
+                self._sync_preview, self._line_to_block[line]
+            )
+
+    def _sync_preview_to_editor(self) -> None:
+        if not self._block_to_line:
+            return
+        block = self._first_visible_block_number(self._sync_preview)
+        if block < len(self._block_to_line):
+            self._scroll_view_to_block(
+                self._sync_editor, self._block_to_line[block]
+            )
+
+    @staticmethod
+    def _first_visible_block_number(view) -> int:
+        """Номер верхнего видимого блока виджета.
+
+        QPlainTextEdit даёт firstVisibleBlock() за O(1). У
+        QTextBrowser этого метода нет (PySide6 его не экспортирует)
+        — ищем бинарным поиском: cursorRect возвращает
+        viewport-координаты, у верхнего видимого блока верхняя
+        граница <= 0, у последующих — > 0.
+        """
+        first_visible = getattr(view, "firstVisibleBlock", None)
+        if first_visible is not None:
+            return first_visible().blockNumber()
+        doc = view.document()
+        n = doc.blockCount()
+        if n <= 1:
+            return 0
+        lo, hi, result = 0, n - 1, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            cursor = QTextCursor(doc.findBlockByNumber(mid))
+            if view.cursorRect(cursor).top() <= 0:
+                result = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return result
+
+    @staticmethod
+    def _scroll_view_to_block(view, block: int) -> None:
+        """Прокручивает виджет так, чтобы блок оказался наверху."""
+        doc = view.document()
+        if block < 0 or block >= doc.blockCount():
+            return
+        cursor = QTextCursor(doc.findBlockByNumber(block))
+        rect = view.cursorRect(cursor)
+        if rect.isNull():
+            return
+        # cursorRect отдаёт viewport-координаты, поэтому
+        # документную y считаем как y + текущая прокрутка.
+        y = rect.top() + view.verticalScrollBar().value()
+        view.verticalScrollBar().setValue(int(y))
+
+
+class MarkdownEditorDialog(QDialog, _ScrollSyncMixin):
     """
     Модальный редактор Markdown.
 
@@ -164,6 +447,11 @@ class MarkdownEditorDialog(QDialog):
 
         splitter.setSizes([560, 540])
         root.addWidget(splitter, 1)
+
+        # Синхронизация прокрутки в обе стороны. Карта
+        # «строка → блок» строится в _refresh_preview после
+        # каждого рендеринга предпросмотра.
+        self._setup_scroll_sync(self.editor, self.preview)
 
         # --- Счётчик символов + предупреждение о длине ---
         root.addWidget(self._build_counter_bar())
@@ -295,12 +583,22 @@ class MarkdownEditorDialog(QDialog):
     # ------------------------------------------------------------------
     def _refresh_preview(self) -> None:
         text = self.editor.toPlainText()
+        # Флаг _syncing на всё время замены документа: setMarkdown
+        # сбрасывает скролл предпросмотра на 0, и valueChanged(0)
+        # должен проигнорировать обратную синхронизацию — иначе
+        # редактор уехал бы наверх при каждом нажатии клавиши.
+        self._syncing = True
         try:
-            # Qt умеет рендерить Markdown «из коробки».
-            self.preview.setMarkdown(text)
-        except Exception as exc:
-            log.exception("Ошибка предпросмотра Markdown: %s", exc)
-            self.preview.setPlainText(f"Ошибка предпросмотра: {exc}")
+            try:
+                # Qt умеет рендерить Markdown «из коробки».
+                self.preview.setMarkdown(text)
+            except Exception as exc:
+                log.exception("Ошибка предпросмотра Markdown: %s", exc)
+                self.preview.setPlainText(f"Ошибка предпросмотра: {exc}")
+            self._rebuild_sync_map(text)
+            self._sync_editor_to_preview()
+        finally:
+            self._syncing = False
 
     def _refresh_counter(self) -> None:
         """
@@ -425,7 +723,7 @@ class MarkdownEditorDialog(QDialog):
     def result_text(self) -> str:
         return self._result_text
 
-class MarkdownViewerDialog(QDialog):
+class MarkdownViewerDialog(QDialog, _ScrollSyncMixin):
     """
     Модальное окно для просмотра Markdown без редактирования.
 
@@ -473,6 +771,11 @@ class MarkdownViewerDialog(QDialog):
             log.exception("Ошибка рендера Markdown: %s", exc)
             self.preview.setPlainText(str(exc))
         splitter.addWidget(self.preview)
+
+        # Синхронизация прокрутки в обе стороны. Оба виджета
+        # read-only, текст не меняется — карта строится один раз.
+        self._setup_scroll_sync(self.source, self.preview)
+        self._rebuild_sync_map(text or "")
 
         splitter.setSizes([500, 500])
         root.addWidget(splitter, 1)
