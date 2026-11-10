@@ -3256,11 +3256,11 @@ class SettingsWindow(QDialog):
         layout.addWidget(self.scrum_template_edit)
 
         # ==============================================================
-        # Блок 2: шаблон промпта для поручений
+        # Блок 2: шаблоны промптов для поручений (два этапа)
         # ==============================================================
         items_header = QHBoxLayout()
         items_header.addWidget(
-            QLabel("<b>Шаблон промпта — поручения</b>")
+            QLabel("<b>Шаблоны промптов — поручения (2 этапа)</b>")
         )
         items_header.addStretch()
         items_icon = make_info_icon("scrum_action_items_template")
@@ -3270,10 +3270,13 @@ class SettingsWindow(QDialog):
 
         items_hint = QLabel(
             "<span style='color:#666'>"
-            "Этот промпт отправляется LiteLLM <b>отдельным "
-            "запросом</b> после формирования протокола. "
-            "Модель должна вернуть чистый JSON с поручениями "
-            "без markdown-обёртки.<br><br>"
+            "Генерация поручений выполняется <b>двумя запросами</b> "
+            "к LiteLLM после формирования протокола:<br>"
+            "<b>Этап 1 — сбор поручений:</b> модель читает полный "
+            "протокол/стенограмму и возвращает только фрагменты "
+            "текста про поручения (сужает контекст).<br>"
+            "<b>Этап 2 — генерация JSON:</b> модель превращает "
+            "сужённый текст в чистый JSON с поручениями.<br><br>"
             "Результат сохраняется в "
             "<code>action_items.json</code> внутри папки записи "
             "и доступен в окне «Поручения»."
@@ -3282,11 +3285,46 @@ class SettingsWindow(QDialog):
         items_hint.setWordWrap(True)
         layout.addWidget(items_hint)
 
+        # --- Этап 1: сбор поручений (сужение контекста) ---
+        collect_header = QHBoxLayout()
+        collect_header.addWidget(
+            QLabel("<b>Этап 1 — сбор поручений "
+                   "(сужение контекста)</b>")
+        )
+        collect_header.addStretch()
+        collect_icon = make_info_icon(
+            "scrum_action_items_collect_template"
+        )
+        if collect_icon is not None:
+            collect_header.addWidget(collect_icon)
+        layout.addLayout(collect_header)
+
+        self.action_items_collect_prompt_edit = QPlainTextEdit()
+        self.action_items_collect_prompt_edit.setMinimumHeight(160)
+        self.action_items_collect_prompt_edit.setPlaceholderText(
+            "Промпт для сбора поручений. Модель должна вернуть "
+            "только текстовые фрагменты про поручения, без "
+            "markdown и пояснений."
+        )
+        layout.addWidget(self.action_items_collect_prompt_edit)
+
+        # --- Этап 2: генерация JSON ---
+        json_header = QHBoxLayout()
+        json_header.addWidget(
+            QLabel("<b>Этап 2 — генерация JSON</b>")
+        )
+        json_header.addStretch()
+        json_icon = make_info_icon("scrum_action_items_template")
+        if json_icon is not None:
+            json_header.addWidget(json_icon)
+        layout.addLayout(json_header)
+
         self.action_items_prompt_edit = QPlainTextEdit()
         self.action_items_prompt_edit.setMinimumHeight(220)
         self.action_items_prompt_edit.setPlaceholderText(
-            "Промпт для извлечения поручений. Должен требовать "
-            "чистый JSON без markdown-обёртки."
+            "Промпт для генерации JSON. На вход приходит уже "
+            "сужённый текст этапа 1. Должен требовать чистый "
+            "JSON без markdown-обёртки."
         )
         layout.addWidget(self.action_items_prompt_edit)
 
@@ -4398,6 +4436,7 @@ class SettingsWindow(QDialog):
 
         from ..config_manager import (
             DEFAULT_SCRUM_PROMPT,
+            DEFAULT_ACTION_ITEMS_COLLECT_PROMPT,
             DEFAULT_ACTION_ITEMS_PROMPT,
         )
 
@@ -4406,7 +4445,15 @@ class SettingsWindow(QDialog):
             scrum.get("prompt_template", DEFAULT_SCRUM_PROMPT)
         )
 
-        # --- НОВОЕ: шаблон для поручений ---
+        # --- Шаблоны поручений: этап 1 (сбор) ---
+        self.action_items_collect_prompt_edit.setPlainText(
+            scrum.get(
+                "action_items_collect_prompt_template",
+                DEFAULT_ACTION_ITEMS_COLLECT_PROMPT,
+            )
+        )
+
+        # --- Шаблоны поручений: этап 2 (JSON) ---
         self.action_items_prompt_edit.setPlainText(
             scrum.get(
                 "action_items_prompt_template",
@@ -4828,7 +4875,11 @@ class SettingsWindow(QDialog):
             "prompt_template": (
                 self.scrum_template_edit.toPlainText()
             ),
-            # --- НОВОЕ: шаблон промпта для поручений ---
+            # --- Шаблоны поручений: этап 1 (сбор) ---
+            "action_items_collect_prompt_template": (
+                self.action_items_collect_prompt_edit.toPlainText()
+            ),
+            # --- Шаблоны поручений: этап 2 (JSON) ---
             "action_items_prompt_template": (
                 self.action_items_prompt_edit.toPlainText()
             ),

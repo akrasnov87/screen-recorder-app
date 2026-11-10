@@ -27,6 +27,13 @@
     get_prompt_summary_prompt(), upsert_prompt(); модульный
     хелпер find_prompt_summary() (используется и processor).
     get_prompts() теперь возвращает и summary_prompt.
+    • НОВОЕ: генерация поручений стала двухэтапной. В секции
+    config["scrum"] появился ключ
+    "action_items_collect_prompt_template" (этап 1 — сбор
+    поручений / сужение контекста, дефолт
+    DEFAULT_ACTION_ITEMS_COLLECT_PROMPT). Существующий
+    "action_items_prompt_template" — теперь этап 2 (генерация
+    JSON из сужённого текста).
 """
 from __future__ import annotations
 
@@ -76,6 +83,23 @@ DEFAULT_SCRUM_PROMPT = (
 DEFAULT_SUMMARY_PROMPT = (
     "Составь краткое содержание записи на русском языке. "
     "Выдели ключевые темы, решения и список action items."
+)
+DEFAULT_ACTION_ITEMS_COLLECT_PROMPT = (
+    "Ты — ассистент, который выхватывает из текста совещания только "
+    "то, что относится к поручениям.\n\n"
+    "На вход подаётся стенограмма и/или протокол совещания. "
+    "Твоя задача — вернуть ТОЛЬКО фрагменты текста, в которых "
+    "озвучены поручения (конкретные действия, которые кто-то "
+    "должен выполнить), сохранив исходные формулировки, имена "
+    "исполнителей, сроки, номера задач и ссылки.\n\n"
+    "ПРАВИЛА:\n"
+    "1. Включай только реальные поручения. Не включай статусы "
+    "работ, обсуждения, риски, ход мыслей и цитаты без действия.\n"
+    "2. Сохраняй исходные формулировки — не переписывай и не "
+    "усоветай.\n"
+    "3. Если поручений нет — верни пустую строку.\n"
+    "4. Никаких markdown-обёрток, комментариев, пояснений, "
+    "нумерации и заголовков — только сам текст поручений.\n"
 )
 DEFAULT_ACTION_ITEMS_PROMPT = (
     "Ты — ассистент, который извлекает поручения из протокола "
@@ -250,6 +274,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "scrum": {
         "prompt_template": DEFAULT_SCRUM_PROMPT,
+        # Этап 1 — сбор поручений (сужение контекста перед JSON).
+        "action_items_collect_prompt_template": (
+            DEFAULT_ACTION_ITEMS_COLLECT_PROMPT
+        ),
+        # Этап 2 — генерация JSON из сужённого текста.
         "action_items_prompt_template": DEFAULT_ACTION_ITEMS_PROMPT,
         "export_format": "docx",
         "generate_action_items": False,

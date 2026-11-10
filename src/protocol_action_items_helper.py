@@ -10,6 +10,20 @@
      JSON-ответ и добавляет поручения в action_items.json
      с дедупликацией.
 
+Изменения:
+  • Генерация поручений стала ДВУХЭТАПНОЙ (вместо поиска
+    подстроки-маркера «ПОРУЧЕНИЯ» в протоколе):
+      – Этап 1 (сбор): промпт
+        scrum.action_items_collect_prompt_template
+        (дефолт DEFAULT_ACTION_ITEMS_COLLECT_PROMPT). Модель
+        читает полный протокол/стенограмму и возвращает только
+        фрагменты текста про поручения — сужает контекст.
+      – Этап 2 (JSON): промпт
+        scrum.action_items_prompt_template
+        (дефолт DEFAULT_ACTION_ITEMS_PROMPT). Модель превращает
+        сужённый текст в JSON с поручениями.
+    Функция _extract_action_items_section() удалена.
+
 Модуль не зависит от UI и может вызываться:
   • из sessions_window.py (кнопка «Обновить промпт поручений»);
   • из CLI/тестов.
@@ -20,7 +34,10 @@ import asyncio
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .config_manager import DEFAULT_ACTION_ITEMS_PROMPT
+from .config_manager import (
+    DEFAULT_ACTION_ITEMS_COLLECT_PROMPT,
+    DEFAULT_ACTION_ITEMS_PROMPT,
+)
 from .file_readers import read_any_text
 from .litellm_client import LiteLLMClient, LiteLLMError
 from .logger import get_logger
@@ -126,45 +143,6 @@ def _read_protocol_and_transcript(
             transcript_text = ""
 
     return protocol_text.strip(), transcript_text.strip(), protocol_path
-
-
-def _extract_action_items_section(protocol_text: str) -> Tuple[str, bool]:
-    """
-    Вырезает из протокола только раздел с поручениями.
-
-    Возвращает кортеж: (извлеченный_текст, найден_ли_раздел).
-    Если маркер не найден, возвращает (исходный_текст, False).
-    """
-    if not protocol_text:
-        return "", False
-
-    lines = protocol_text.splitlines()
-    start_idx = -1
-
-    # Расширяем список маркеров для поиска (без учета регистра)
-    markers = [
-        "ПОРУЧЕНИЯ НА",
-        "ПОРУЧЕНИЯ",
-        "ACTION ITEMS",
-        "ЗАДАЧИ НА",
-        "СПИСОК ПОРУЧЕНИЙ",
-        "РЕШЕНИЯ И ПОРУЧЕНИЯ",
-    ]
-
-    for i, line in enumerate(lines):
-        line_upper = line.upper()
-        # Проверяем, есть ли в строке один из маркеров
-        if any(marker in line_upper for marker in markers):
-            start_idx = i
-            break
-
-    if start_idx == -1:
-        # Если раздел не найден — возвращаем весь текст
-        return protocol_text, False
-
-    # Возвращаем текст с найденного заголовка до конца
-    extracted_text = "\n".join(lines[start_idx:]).strip()
-    return extracted_text, True
 
 
 # ---------------------------------------------------------------------------
@@ -300,13 +278,19 @@ def regenerate_action_items_with_llm_sync(
             "только из стенограммы."
         )
 
-    # --- Промпт ---
+    # --- Промпты (два этапа) ---
     try:
         scrum_cfg = config_manager.config.get("scrum", {}) or {}
     except Exception:
         scrum_cfg = {}
 
-    template = str(
+    # Этап 1 — сбор поручений (сужение контекста).
+    collect_template = str(
+        scrum_cfg.get("action_items_collect_prompt_template")
+        or DEFAULT_ACTION_ITEMS_COLLECT_PROMPT
+    )
+    # Этап 2 — генерация JSON из сужённого текста.
+    json_template = str(
         scrum_cfg.get("action_items_prompt_template")
         or DEFAULT_ACTION_ITEMS_PROMPT
     )
@@ -326,7 +310,7 @@ def regenerate_action_items_with_llm_sync(
     connect_timeout = float(l.get("connect_timeout", 15))
     read_timeout = float(l.get("read_timeout", 300))
 
-    # --- Умная сборка user-сообщения ---
+    # --- Вход этапа 1: полный протокол + стенограмма ---
     parts: List[str] = []
     if session_name:
         parts.append(f"# {session_name}")
@@ -335,69 +319,32 @@ def regenerate_action_items_with_llm_sync(
         parts.append(f"Дата совещания: {session_date}")
         parts.append("")
 
-    section_found = False  # Флаг: нашли ли мы раздел с поручениями
-
     if protocol_text:
-        # Пытаемся вырезать только раздел с поручениями
-        extracted_protocol, section_found = _extract_action_items_section(
-            protocol_text
-        )
-
-        if section_found and len(extracted_protocol) < len(protocol_text):
-            parts.append("=== ПОРУЧЕНИЯ ИЗ ПРОТОКОЛА ===")
-            parts.append(extracted_protocol)
-            parts.append("")
-            log.info(
-                "В LLM передается только раздел с поручениями "
-                "из протокола (%d симв.)", len(extracted_protocol)
-            )
-            # Обнуляем стенограмму, чтобы не раздувать контекст
-            transcript_text = ""
-        else:
-            # Если раздел не найден, передаем весь протокол
-            parts.append(
-                "=== ПОЛНЫЙ ПРОТОКОЛ "
-                "(раздел с поручениями не найден) ==="
-            )
-            parts.append(protocol_text)
-            parts.append("")
+        parts.append("=== ПРОТОКОЛ ===")
+        parts.append(protocol_text)
+        parts.append("")
 
     if transcript_text:
         parts.append("=== СТЕНОГРАММА ===")
         parts.append(transcript_text)
 
-    user_message = "\n".join(parts)
-
-    # Сохраняем в результат, был ли найден раздел
-    result["section_found"] = section_found
-
-    if not section_found:
-        warning_msg = (
-            "В протоколе не найден явный раздел с поручениями. "
-            "Модель обрабатывает весь текст целиком, что может "
-            "привести к обрезке ответа."
-        )
-        # Добавляем к общему warning, если он уже есть
-        if result.get("warning"):
-            result["warning"] += " " + warning_msg
-        else:
-            result["warning"] = warning_msg
+    stage1_input = "\n".join(parts)
 
     if progress_cb:
         progress_cb(
-            f"Запрос к LiteLLM (модель: {model}, "
-            f"вход: {len(user_message)} симв.)…"
+            f"Запрос к LiteLLM (этап 1: сбор поручений, "
+            f"модель: {model}, вход: {len(stage1_input)} симв.)…"
         )
 
-    # --- Вызов LiteLLM ---
+    # --- Этап 1: сбор поручений (сужение контекста) ---
     try:
-        resp = asyncio.run(
+        collect_resp = asyncio.run(
             _call_litellm(
                 base_url=base_url,
                 api_key=api_key,
                 model=model,
-                system_prompt=template,
-                user_message=user_message,
+                system_prompt=collect_template,
+                user_message=stage1_input,
                 temperature=0.05,
                 max_tokens=max_tokens,
                 connect_timeout=connect_timeout,
@@ -405,33 +352,108 @@ def regenerate_action_items_with_llm_sync(
             )
         )
     except LiteLLMError as exc:
-        result["error"] = f"Ошибка LiteLLM: {exc}"
+        result["error"] = f"Ошибка LiteLLM (этап 1): {exc}"
         return result
     except Exception as exc:
         log.exception(
-            "regenerate_action_items_with_llm_sync: %s", exc
+            "regenerate_action_items_with_llm_sync (этап 1): %s", exc
         )
-        result["error"] = f"Ошибка: {exc}"
+        result["error"] = f"Ошибка (этап 1): {exc}"
+        return result
+
+    narrowed = (collect_resp.get("content") or "").strip()
+    if str(collect_resp.get("finish_reason") or "") == "length":
+        log.warning(
+            "Ответ этапа 1 обрезан по лимиту токенов "
+            "(finish_reason=length, max_tokens=%d)", max_tokens,
+        )
+        result["warning"] = (
+            "Ответ этапа 1 обрезан по лимиту токенов — "
+            "часть поручений может быть потеряна."
+        )
+
+    # Сохраняем сырой ответ этапа 1 (для отладки).
+    _save_raw_response(session_dir, narrowed, suffix="_collect")
+
+    if not narrowed:
+        result["ok"] = True
+        result["section_found"] = True
+        result["warning"] = (
+            "LLM не нашёл поручений в тексте — "
+            "добавлять нечего."
+        )
+        return result
+
+    log.info(
+        "Этап 1 завершён: собрано %d символов контекста поручений",
+        len(narrowed),
+    )
+
+    # --- Вход этапа 2: сужённый текст + метаданные ---
+    stage2_parts: List[str] = []
+    if session_name:
+        stage2_parts.append(f"# {session_name}")
+        stage2_parts.append("")
+    if session_date:
+        stage2_parts.append(f"Дата совещания: {session_date}")
+        stage2_parts.append("")
+    stage2_parts.append("=== ПОРУЧЕНИЯ, СОБРАННЫЕ ИЗ ПРОТОКОЛА ===")
+    stage2_parts.append(narrowed)
+    stage2_input = "\n".join(stage2_parts)
+
+    if progress_cb:
+        progress_cb(
+            f"Запрос к LiteLLM (этап 2: генерация JSON, "
+            f"модель: {model}, вход: {len(stage2_input)} симв.)…"
+        )
+
+    # --- Этап 2: генерация JSON ---
+    try:
+        resp = asyncio.run(
+            _call_litellm(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                system_prompt=json_template,
+                user_message=stage2_input,
+                temperature=0.05,
+                max_tokens=max_tokens,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            )
+        )
+    except LiteLLMError as exc:
+        result["error"] = f"Ошибка LiteLLM (этап 2): {exc}"
+        return result
+    except Exception as exc:
+        log.exception(
+            "regenerate_action_items_with_llm_sync (этап 2): %s", exc
+        )
+        result["error"] = f"Ошибка (этап 2): {exc}"
         return result
 
     raw = resp.get("content") or ""
     finish_reason = str(resp.get("finish_reason") or "")
     if finish_reason == "length":
         log.warning(
-            "Ответ LLM обрезан по лимиту токенов "
+            "Ответ этапа 2 обрезан по лимиту токенов "
             "(finish_reason=length, max_tokens=%d)", max_tokens,
         )
         result["warning"] = (
-            "Ответ LLM обрезан по лимиту токенов — "
+            "Ответ этапа 2 обрезан по лимиту токенов — "
             "часть поручений может быть потеряна."
         )
 
     if not raw or not raw.strip():
-        result["error"] = "LiteLLM вернул пустой ответ"
+        result["error"] = "LiteLLM вернул пустой ответ (этап 2)"
         return result
 
     # --- Сохраняем сырой ответ (для отладки) ---
     _save_raw_response(session_dir, raw)
+
+    # Этап 1 обрабатывал полный текст — поиск маркерного
+    # раздела больше не нужен.
+    result["section_found"] = True
 
     # --- Парсинг ---
     parsed = parse_action_items_json(raw)
@@ -534,13 +556,20 @@ async def _call_litellm(
         )
 
 
-def _save_raw_response(session_dir: str, raw: str) -> None:
-    """Сохраняет сырой ответ LLM для отладки."""
+def _save_raw_response(
+    session_dir: str, raw: str, *, suffix: str = "",
+) -> None:
+    """Сохраняет сырой ответ LLM для отладки.
+
+    Args:
+        session_dir: папка сессии.
+        raw:         сырой ответ модели.
+        suffix:      суффикс имени файла (для этапа 1 — "_collect").
+    """
     from datetime import datetime
 
-    path = os.path.join(
-        session_dir, "action_items_response_raw.txt"
-    )
+    fname = f"action_items_response{suffix}_raw.txt"
+    path = os.path.join(session_dir, fname)
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(
