@@ -39,6 +39,7 @@ from ..relations_manager import (
     list_all_sessions_except,
 )
 from ..tfs_client import extract_variables
+from .prompt_edit_dialog import PromptEditDialog
 from .tooltips import attach_tooltip, make_info_icon, with_info
 
 log = get_logger(__name__)
@@ -347,7 +348,9 @@ class MetadataDialog(QDialog):
         initial: Optional[Dict[str, Any]] = None,
         default_prompt: str = "",
         sessions_root: str = "",
-        on_save_prompt: Optional[Callable[[str, str], None]] = None,
+        on_save_prompt: Optional[
+            Callable[[str, str, str], None]
+        ] = None,
         get_prompts: Optional[
             Callable[[], List[Dict[str, str]]]
         ] = None,
@@ -3040,18 +3043,23 @@ class MetadataDialog(QDialog):
             )
             return
 
-        name, ok = QInputDialog.getText(
-            self, "Сохранить в библиотеку",
-            "Название промпта:",
+        # Окно редактирования: название + текст (пре-заполнен) +
+        # промпт для summary (опционально).
+        dlg = PromptEditDialog(
+            self,
+            text=text,
+            title="Сохранить в библиотеку",
         )
-        if not ok or not name.strip():
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        name = name.strip()
+        name, new_text, summary_prompt = dlg.get_values()
 
         saved = False
         if self._on_save_prompt_cb is not None:
             try:
-                self._on_save_prompt_cb(name, text)
+                self._on_save_prompt_cb(
+                    name, new_text, summary_prompt
+                )
                 saved = True
             except Exception as exc:
                 log.exception(
@@ -3066,7 +3074,8 @@ class MetadataDialog(QDialog):
 
         if not saved:
             self.result_data["new_prompt"] = {
-                "name": name, "text": text,
+                "name": name, "text": new_text,
+                "summary_prompt": summary_prompt,
             }
 
         self._refresh_prompts_list(selected_name=name)

@@ -72,6 +72,7 @@ from ..platform_utils import (
     default_temp_dir,
 )
 from .transcribe_service_dialog import TranscribeServiceEditDialog
+from .prompt_edit_dialog import PromptEditDialog
 
 log = get_logger(__name__)
 
@@ -1958,24 +1959,35 @@ class SettingsWindow(QDialog):
         prompts_header.addWidget(make_info_icon("prompts_table"))
         layout.addLayout(prompts_header)
 
-        self.prompts_table = QTableWidget(0, 2)
+        self.prompts_table = QTableWidget(0, 3)
         self.prompts_table.setHorizontalHeaderLabels(
-            ["Название", "Текст"]
+            ["Название", "Текст", "Промпт для summary"]
         )
         self.prompts_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        # Редактирование — только через окно (PromptEditDialog):
+        # в ячейках таблицы многострочный текст вводить неудобно.
+        self.prompts_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.prompts_table.itemDoubleClicked.connect(
+            self._on_prompt_double_click
         )
         header = self.prompts_table.horizontalHeader()
         header.setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.prompts_table.setMinimumHeight(150)
         layout.addWidget(self.prompts_table)
 
         prompt_btns = QHBoxLayout()
         add_btn = QPushButton("Добавить")
         add_btn.clicked.connect(self._prompt_add)
+        edit_btn = QPushButton("Изменить")
+        edit_btn.clicked.connect(self._prompt_edit)
         del_btn = QPushButton("Удалить")
         del_btn.clicked.connect(self._prompt_delete)
         up_btn = QPushButton("Вверх")
@@ -1983,6 +1995,7 @@ class SettingsWindow(QDialog):
         down_btn = QPushButton("Вниз")
         down_btn.clicked.connect(lambda: self._prompt_move(1))
         prompt_btns.addWidget(add_btn)
+        prompt_btns.addWidget(edit_btn)
         prompt_btns.addWidget(del_btn)
         prompt_btns.addWidget(up_btn)
         prompt_btns.addWidget(down_btn)
@@ -2060,14 +2073,87 @@ class SettingsWindow(QDialog):
         layout.addStretch()
         return w
 
+    @staticmethod
+    def _prompt_cell_preview(text: str) -> str:
+        """Однострочный preview многострочного текста для таблицы."""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        first_line = text.splitlines()[0].strip()
+        if len(first_line) > 120:
+            first_line = first_line[:120] + "…"
+        return first_line
+
     def _prompt_add(self) -> None:
+        dlg = PromptEditDialog(self, title="Новый промпт")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, text, summary_prompt = dlg.get_values()
         row = self.prompts_table.rowCount()
         self.prompts_table.insertRow(row)
-        self.prompts_table.setItem(
-            row, 0, QTableWidgetItem("Новый промпт")
+        self._set_prompt_row(row, name, text, summary_prompt)
+        self.prompts_table.setCurrentCell(row, 0)
+
+    def _prompt_edit(self) -> None:
+        row = self.prompts_table.currentRow()
+        if row < 0:
+            return
+        name_item = self.prompts_table.item(row, 0)
+        text_item = self.prompts_table.item(row, 1)
+        summary_item = self.prompts_table.item(row, 2)
+        # Полные тексты храним в UserRole-датах (в ячейках — preview).
+        name = (
+            name_item.data(Qt.ItemDataRole.UserRole)
+            or name_item.text()
+        ).strip() if name_item else ""
+        text = (
+            text_item.data(Qt.ItemDataRole.UserRole)
+            or text_item.text()
+        ).strip() if text_item else ""
+        summary_prompt = (
+            summary_item.data(Qt.ItemDataRole.UserRole)
+            if summary_item else ""
         )
-        self.prompts_table.setItem(row, 1, QTableWidgetItem(""))
-        self.prompts_table.editItem(self.prompts_table.item(row, 0))
+        summary_prompt = (summary_prompt or "").strip()
+
+        dlg = PromptEditDialog(
+            self,
+            name=name,
+            text=text,
+            summary_prompt=summary_prompt,
+            title="Редактирование промпта",
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_name, new_text, new_summary = dlg.get_values()
+        self._set_prompt_row(row, new_name, new_text, new_summary)
+        self.prompts_table.setCurrentCell(row, 0)
+
+    def _on_prompt_double_click(self, item: QTableWidgetItem) -> None:
+        if item.row() >= 0:
+            self.prompts_table.setCurrentCell(item.row(), 0)
+            self._prompt_edit()
+
+    def _set_prompt_row(
+        self, row: int, name: str, text: str, summary_prompt: str,
+    ) -> None:
+        """Заполняет строку таблицы: preview в ячейке, полный текст —
+        в UserRole-дате (для повторного редактирования)."""
+        name_item = QTableWidgetItem(name)
+        name_item.setData(Qt.ItemDataRole.UserRole, name)
+        text_item = QTableWidgetItem(
+            self._prompt_cell_preview(text)
+        )
+        text_item.setData(Qt.ItemDataRole.UserRole, text)
+        summary_item = QTableWidgetItem(
+            self._prompt_cell_preview(summary_prompt) or "—"
+        )
+        summary_item.setData(
+            Qt.ItemDataRole.UserRole, summary_prompt
+        )
+        self.prompts_table.setItem(row, 0, name_item)
+        self.prompts_table.setItem(row, 1, text_item)
+        self.prompts_table.setItem(row, 2, summary_item)
 
     def _prompt_delete(self) -> None:
         row = self.prompts_table.currentRow()
@@ -4183,11 +4269,11 @@ class SettingsWindow(QDialog):
         for p in prompts:
             row = self.prompts_table.rowCount()
             self.prompts_table.insertRow(row)
-            self.prompts_table.setItem(
-                row, 0, QTableWidgetItem(p.get("name", ""))
-            )
-            self.prompts_table.setItem(
-                row, 1, QTableWidgetItem(p.get("text", ""))
+            self._set_prompt_row(
+                row,
+                p.get("name", ""),
+                p.get("text", ""),
+                p.get("summary_prompt", ""),
             )
 
         self.default_prompt_edit.setPlainText(
@@ -4653,13 +4739,30 @@ class SettingsWindow(QDialog):
         for row in range(self.prompts_table.rowCount()):
             name_item = self.prompts_table.item(row, 0)
             text_item = self.prompts_table.item(row, 1)
-            name = name_item.text().strip() if name_item else ""
-            text = text_item.text().strip() if text_item else ""
+            summary_item = self.prompts_table.item(row, 2)
+            # Полный текст — из UserRole-даты (в ячейке preview).
+            name = (
+                name_item.data(Qt.ItemDataRole.UserRole)
+                or name_item.text()
+            ).strip() if name_item else ""
+            text = (
+                text_item.data(Qt.ItemDataRole.UserRole)
+                or text_item.text()
+            ).strip() if text_item else ""
+            summary_prompt = (
+                summary_item.data(Qt.ItemDataRole.UserRole)
+                if summary_item else ""
+            )
+            summary_prompt = (summary_prompt or "").strip()
             if not name and not text:
                 continue
             if not name:
                 name = f"Промпт {row + 1}"
-            prompts.append({"name": name, "text": text})
+            prompts.append({
+                "name": name,
+                "text": text,
+                "summary_prompt": summary_prompt,
+            })
 
         name_templates: List[dict] = []
         for row in range(self.name_templates_table.rowCount()):

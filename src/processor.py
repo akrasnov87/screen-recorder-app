@@ -8,6 +8,10 @@
     если файл есть — пропускаем конвертацию, проверку ВМ и
     транскрибацию. Суммаризация запускается только если она
     включена и файла video_summary.md нет.
+  • НОВОЕ: промпт для summary резолвится через
+    _resolve_summary_prompt() — приоритет: summary, привязанный
+    к выбранному промпту (Библиотека промптов → "summary_prompt"),
+    затем основной текст промпта, затем «Промпт по умолчанию».
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ from .action_items_prompt_builder import (
     read_protocol_text,
     regenerate_action_items_prompt,
 )
+from .config_manager import find_prompt_summary
 from .file_readers import read_any_text
 from .litellm_client import LiteLLMClient, LiteLLMError
 from .logger import get_logger
@@ -430,12 +435,7 @@ class VideoProcessor(QObject):
                         task_id, 75, "summarizing"
                     )
 
-                    prompt = (
-                        metadata.get("prompt")
-                        or self.config.get("metadata", {}).get(
-                            "default_prompt", ""
-                        )
-                    )
+                    prompt = self._resolve_summary_prompt(metadata)
                     ctx_header = self._build_context_header(
                         metadata=metadata,
                         include_name=bool(
@@ -537,12 +537,7 @@ class VideoProcessor(QObject):
                 )
                 self.task_progress.emit(task_id, 50, "transcribing")
 
-                prompt = (
-                    metadata.get("prompt")
-                    or self.config.get("metadata", {}).get(
-                        "default_prompt", ""
-                    )
-                )
+                prompt = self._resolve_summary_prompt(metadata)
                 log.debug(
                     "[%s] Промпт пользователя (%d символов)",
                     task_id, len(prompt),
@@ -1887,6 +1882,39 @@ class VideoProcessor(QObject):
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+
+    # ------------------------------------------------------------------
+    # Промпт для summary
+    # ------------------------------------------------------------------
+    def _resolve_summary_prompt(
+        self, metadata: Dict[str, Any],
+    ) -> str:
+        """Резолвит промпт для генерации summary.
+
+        Приоритеты:
+          1) summary, привязанный к выбранному в записи промпту
+             (поле "summary_prompt" в Библиотеке промптов);
+          2) основной текст промпта записи (metadata["prompt"]);
+          3) «Промпт по умолчанию» (metadata.default_prompt).
+
+        Назад-совместимость: если промпт не выбран или у него нет
+        summary — результат совпадает с прежним поведением
+        (metadata["prompt"] или default_prompt).
+        """
+        meta_cfg = self.config.get("metadata", {}) or {}
+        prompts = meta_cfg.get("prompts", [])
+        prompt_name = str(metadata.get("prompt_name") or "").strip()
+        prompt_text = str(metadata.get("prompt") or "").strip()
+
+        prompt_summary = find_prompt_summary(
+            prompts, prompt_name, prompt_text
+        )
+
+        return (
+            prompt_summary
+            or prompt_text
+            or str(meta_cfg.get("default_prompt", "") or "")
+        )
 
     # ------------------------------------------------------------------
     # Контекст записи

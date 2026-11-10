@@ -21,6 +21,12 @@
     По аналогии с тегами — список словарей {"name": <str>}.
     Методы: get_categories(), get_category_names(),
     set_categories().
+  • НОВОЕ: у промпта библиотеки (config["metadata"]["prompts"])
+    появилось опциональное поле "summary_prompt" — собственный
+    промпт для генерации summary. Методы:
+    get_prompt_summary_prompt(), upsert_prompt(); модульный
+    хелпер find_prompt_summary() (используется и processor).
+    get_prompts() теперь возвращает и summary_prompt.
 """
 from __future__ import annotations
 
@@ -389,6 +395,61 @@ _KEYRING_KEY_NAME = "__fernet_key__"
 _KEY_FILE_NAME = ".fernet_key"
 
 
+def find_prompt_summary(
+    prompts: Any,
+    name: str = "",
+    text: str = "",
+) -> str:
+    """Ищет промпт для summary у выбранного промпта библиотеки.
+
+    Работает с «сырым» списком промптов (config["metadata"]["prompts"]),
+    чтобы его мог использовать и processor (у которого нет ConfigManager,
+    а только dict конфига).
+
+    Логика поиска:
+      1) точное совпадение по ``name`` (затем без учёта регистра);
+      2) совпадение по ``text`` (если имя пустое или не найдено —
+         на случай старых записей, где имя может быть потеряно);
+      3) иначе — пустая строка (вызывающий применяет глобальный
+         fallback).
+
+    Назад-совместимость: промпты без поля ``summary_prompt`` (старые
+    конфиги) считаются не имеющими summary.
+    """
+    if not isinstance(prompts, list):
+        return ""
+
+    name = (name or "").strip()
+    text = (text or "").strip()
+
+    def _summary_of(p: Any) -> str:
+        if isinstance(p, dict):
+            return str(p.get("summary_prompt") or "").strip()
+        return ""
+
+    # 1) По имени (сначала точное, затем без учёта регистра).
+    if name:
+        for p in prompts:
+            if isinstance(p, dict) and p.get("name") == name:
+                return _summary_of(p)
+        lower = name.lower()
+        for p in prompts:
+            if isinstance(p, dict):
+                p_name = str(p.get("name") or "")
+                if p_name and p_name.lower() == lower:
+                    return _summary_of(p)
+
+    # 2) По тексту (если имя не сработало).
+    if text:
+        for p in prompts:
+            if isinstance(p, dict):
+                p_text = str(p.get("text") or "").strip()
+                if p_text and p_text == text:
+                    return _summary_of(p)
+
+    return ""
+
+
 class ConfigManager:
     """Менеджер конфигурации."""
 
@@ -691,12 +752,93 @@ class ConfigManager:
         result = []
         for p in prompts:
             if isinstance(p, dict) and p.get("name") and p.get("text"):
-                result.append({"name": str(p["name"]),
-                               "text": str(p["text"])})
+                result.append({
+                    "name": str(p["name"]),
+                    "text": str(p["text"]),
+                    # Назад-совместимость: у старых промптов поля нет —
+                    # считаем, что summary не задан.
+                    "summary_prompt": str(
+                        p.get("summary_prompt") or ""
+                    ).strip(),
+                })
             elif isinstance(p, str) and p.strip():
                 first_line = p.strip().splitlines()[0][:60]
-                result.append({"name": first_line, "text": p})
+                result.append(
+                    {"name": first_line, "text": p,
+                     "summary_prompt": ""}
+                )
         return result
+
+    def get_prompt_summary_prompt(
+        self, name: str = "", text: str = "",
+    ) -> str:
+        """Промпт для summary у выбранного промпта библиотеки.
+
+        Возвращает ``summary_prompt`` промпта из библиотеки по имени
+        (или по тексту, если имя не найдено). Пустая строка — если
+        промпт не найден или у него summary не задан (тогда вызывающий
+        применяет глобальный fallback).
+        """
+        prompts = self.config.get("metadata", {}).get("prompts", [])
+        return find_prompt_summary(prompts, name, text)
+
+    def upsert_prompt(
+        self,
+        name: str,
+        text: str,
+        summary_prompt: Optional[str] = None,
+    ) -> None:
+        """Добавляет или обновляет промпт в библиотеке.
+
+        Единая точка upsert (раньше логика дублировалась в main.py и
+        sessions_window.py).
+
+        Args:
+            name:           название промпта.
+            text:           текст промпта.
+            summary_prompt: промпт для summary. ``None`` — сохранить
+                            существующий (назад-совместимость со
+                            старыми вызовами без аргумента);
+                            ``""`` — явная очистка.
+        """
+        name = (name or "").strip()
+        text = (text or "").strip()
+        if not name or not text:
+            log.warning(
+                "upsert_prompt: пустое имя или текст — сохранение "
+                "отменено"
+            )
+            return
+
+        cfg = self.config
+        meta = cfg.setdefault("metadata", {})
+        prompts = meta.setdefault("prompts", [])
+        if not isinstance(prompts, list):
+            prompts = []
+            meta["prompts"] = prompts
+
+        for i, p in enumerate(prompts):
+            if isinstance(p, dict) and p.get("name") == name:
+                entry = {
+                    "name": name,
+                    "text": text,
+                    # None = не трогать существующий summary.
+                    "summary_prompt": (
+                        str(p.get("summary_prompt") or "")
+                        if summary_prompt is None
+                        else str(summary_prompt or "")
+                    ),
+                }
+                prompts[i] = entry
+                break
+        else:
+            prompts.append({
+                "name": name,
+                "text": text,
+                "summary_prompt": str(summary_prompt or ""),
+            })
+
+        self.save()
 
     def get_default_prompt(self) -> str:
         return self.config.get("metadata", {}).get("default_prompt", "") or ""

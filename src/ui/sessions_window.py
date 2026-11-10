@@ -7630,24 +7630,17 @@ class SessionsWindow(QDialog):
     # ------------------------------------------------------------------
     # Помощники для MetadataDialog
     # ------------------------------------------------------------------
-    def _on_save_prompt_to_config(self, name: str, text: str) -> None:
+    def _on_save_prompt_to_config(
+        self, name: str, text: str, summary_prompt: str = "",
+    ) -> None:
         try:
             name = (name or "").strip()
             text = (text or "").strip()
             if not name or not text:
                 return
-            cfg = self.config_manager.config
-            meta = cfg.setdefault("metadata", {})
-            prompts = meta.setdefault("prompts", [])
-            replaced = False
-            for i, p in enumerate(prompts):
-                if isinstance(p, dict) and p.get("name") == name:
-                    prompts[i] = {"name": name, "text": text}
-                    replaced = True
-                    break
-            if not replaced:
-                prompts.append({"name": name, "text": text})
-            self.config_manager.save()
+            self.config_manager.upsert_prompt(
+                name, text, summary_prompt
+            )
         except Exception as exc:
             log.exception("Ошибка сохранения промпта: %s", exc)
             raise

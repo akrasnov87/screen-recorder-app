@@ -11,6 +11,13 @@
   • вызываем LiteLLM с system_prompt из настроек суммаризации;
   • сохраняем результат в session.json → summary_bb и summary.md.
 
+Выбор промпта для summary (в порядке приоритета):
+  1) summary, привязанный к выбранному в записи промпту
+     (поле "summary_prompt" в Библиотеке промптов);
+  2) глобальный «Промпт для генерации summary» из настроек;
+  3) «Промпт по умолчанию»;
+  4) хардкод «Составь краткое содержание записи.».
+
 Модуль не зависит от UI и может вызываться:
   • из sessions_window.py после сохранения протокола;
   • из import_window.py при импорте записи с протоколом;
@@ -270,11 +277,55 @@ async def _generate_summary_async(
     read_timeout = float(litellm_cfg.get("read_timeout", 300))
     system_prompt = str(litellm_cfg.get("system_prompt") or "").strip()
 
-    # Пользовательский промпт — из настроек
-    # (Настройки → Промпты и имена → «Промпт для генерации summary»),
-    # fallback — «Промпт по умолчанию».
+    # Контекст записи (name/project) + выбранный промпт.
+    # Читаем session.json один раз: и для контекста, и чтобы
+    # узнать, какой промпт выбран в записи (для его summary).
+    context_lines = []
+    session_prompt_name = ""
+    session_prompt_text = ""
+    try:
+        import json
+        session_json = os.path.join(session_dir, "session.json")
+        if os.path.isfile(session_json):
+            with open(session_json, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if isinstance(meta, dict):
+                name = str(meta.get("name") or "").strip()
+                project = str(meta.get("project") or "").strip()
+                comment = str(meta.get("comment") or "").strip()
+                if name:
+                    context_lines.append(f"Название записи: {name}")
+                if project:
+                    context_lines.append(f"Проект: {project}")
+                if comment:
+                    context_lines.append(f"Комментарий: {comment}")
+                session_prompt_name = str(
+                    meta.get("prompt_name") or ""
+                ).strip()
+                session_prompt_text = str(
+                    meta.get("prompt") or ""
+                ).strip()
+    except Exception:
+        pass
+
+    # Пользовательский промпт. Приоритеты:
+    #   1) summary, привязанный к выбранному в записи промпту
+    #      (Библиотека промптов → поле «Промпт для summary»);
+    #   2) глобальный «Промпт для генерации summary»
+    #      (Настройки → Промпты и имена);
+    #   3) «Промпт по умолчанию»;
+    #   4) хардкод.
+    prompt_summary = ""
     summary_prompt = ""
     default_prompt = ""
+    try:
+        prompt_summary = (
+            config_manager.get_prompt_summary_prompt(
+                session_prompt_name, session_prompt_text
+            ) or ""
+        ).strip()
+    except Exception:
+        pass
     try:
         summary_prompt = (
             config_manager.get_summary_prompt() or ""
@@ -289,7 +340,8 @@ async def _generate_summary_async(
         pass
 
     user_prompt = (
-        summary_prompt.strip()
+        prompt_summary
+        or summary_prompt.strip()
         or default_prompt.strip()
         or "Составь краткое содержание записи."
     )
@@ -312,26 +364,6 @@ async def _generate_summary_async(
                     lines.append(f"- {term} — {desc}" if desc else f"- {term}")
             if lines:
                 glossary_text = "\n".join(lines)
-    except Exception:
-        pass
-
-    # Контекст записи (name/project)
-    context_lines = []
-    try:
-        import json
-        session_json = os.path.join(session_dir, "session.json")
-        if os.path.isfile(session_json):
-            with open(session_json, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            name = str(meta.get("name") or "").strip()
-            project = str(meta.get("project") or "").strip()
-            comment = str(meta.get("comment") or "").strip()
-            if name:
-                context_lines.append(f"Название записи: {name}")
-            if project:
-                context_lines.append(f"Проект: {project}")
-            if comment:
-                context_lines.append(f"Комментарий: {comment}")
     except Exception:
         pass
 

@@ -419,6 +419,7 @@ class ScreenRecorderApp(QObject):
                 self._add_prompt_to_library(
                     new_prompt.get("name", ""),
                     new_prompt.get("text", ""),
+                    new_prompt.get("summary_prompt", ""),
                 )
             log.info(
                 "Диалог метаданных завершён: Продолжить "
@@ -478,7 +479,9 @@ class ScreenRecorderApp(QObject):
         )
         return meta
 
-    def _add_prompt_to_library(self, name: str, text: str) -> None:
+    def _add_prompt_to_library(
+        self, name: str, text: str, summary_prompt: str = "",
+    ) -> None:
         try:
             name = (name or "").strip()
             text = (text or "").strip()
@@ -486,19 +489,9 @@ class ScreenRecorderApp(QObject):
                 log.warning("Промпт пустой, сохранение отменено")
                 return
 
-            cfg = self.config_manager.config
-            meta = cfg.setdefault("metadata", {})
-            prompts = meta.setdefault("prompts", [])
-            replaced = False
-            for i, p in enumerate(prompts):
-                if isinstance(p, dict) and p.get("name") == name:
-                    prompts[i] = {"name": name, "text": text}
-                    replaced = True
-                    break
-            if not replaced:
-                prompts.append({"name": name, "text": text})
-
-            self.config_manager.save()
+            self.config_manager.upsert_prompt(
+                name, text, summary_prompt
+            )
             self._notify(
                 "Промпты",
                 f"Промпт «{name}» сохранён в библиотеку",
